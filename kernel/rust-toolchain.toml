@@ -1,0 +1,8 @@
+[toolchain]
+# No host suffix on purpose (CI runs on Linux). On a Windows dev box with no
+# MSVC Build Tools (link.exe), the host-default nightly resolves to -msvc
+# and fails to link — invoke explicitly instead:
+#   rustup run nightly-x86_64-pc-windows-gnu cargo build
+channel = "nightly"
+components = ["clippy", "rustfmt"]
+targets = ["x86_64-unknown-none"]

@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    # NOTE: "kernel" is intentionally NOT a member. It's a freestanding
+    # x86_64-unknown-none binary (no_std, panic=abort) — a different target
+    # than every other crate here, which cargo can't mix into one
+    # `cargo build --workspace` invocation. It's a standalone package with
+    # its own .cargo/config.toml; build it via `cargo build` from kernel/.
+    #
+    # NOTE: "xtask" is also intentionally NOT a member, for a different
+    # reason: it depends on the `bootloader` crate (the image builder),
+    # whose build script needs a nightly cargo (`-Z` flags) regardless of
+    # host/target — mixing that into a `--workspace` build breaks the stable
+    # toolchain this repo otherwise runs on. It's standalone with its own
+    # rust-toolchain.toml pinning nightly; run it via `cargo run` from
+    # xtask/, which builds the kernel and wraps it into a bootable image.
+    "capability-manager",
+    "ipc",
+    "wasm-runtime",
+    "citadel-integration",
+    "desktop",
+    "mobile",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/opensecstack/runix"
+publish = false
+
+[workspace.dependencies]
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ed25519-dalek = "2"
+hex = "0.4"

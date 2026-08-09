@@ -1,0 +1,85 @@
+[package]
+name = "runix-kernel"
+description = "Runix microkernel — IPC, memory management, thread scheduling. Privileged space, target ~50K LOC."
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/opensecstack/runix"
+publish = false
+
+# NOT part of the root workspace — see the comment in ../Cargo.toml. This is
+# its own single-package workspace so it can pin its own target/profile
+# without affecting the host-side crates.
+[workspace]
+
+[dependencies]
+bootloader_api = "0.11"
+spin = "0.9"
+x86_64 = "0.15"
+lazy_static = { version = "1.5", default-features = false, features = ["spin_no_std"] }
+linked_list_allocator = "0.10"
+pic8259 = "0.11"
+runix-capability-manager = { path = "../capability-manager" }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+
+[features]
+# On by default because there is no other option yet — no firmware/WORM key
+# provisioning exists to fall back to (see capabilities.rs). Default-on is
+# itself the interim state, not an endorsement: it exists so that a future
+# release build recipe can pass `--no-default-features` and get a
+# `compile_error!` pointing at real key provisioning, instead of silently
+# shipping capabilities.rs's hardcoded Ed25519 seed.
+default = ["insecure-demo-keys"]
+insecure-demo-keys = []
+
+[lib]
+name = "runix_kernel"
+
+# `harness = false`: this is its own bootable freestanding binary with its
+# own `entry_point!`, not a `#[test]`-annotated function — the default
+# libtest harness cargo would otherwise inject needs `extern crate test`,
+# which doesn't exist for this target. See kernel/tests/basic_boot.rs.
+[[test]]
+name = "basic_boot"
+harness = false
+
+[[test]]
+name = "guard_page"
+harness = false
+
+[[test]]
+name = "thread_reclaim"
+harness = false
+
+[[test]]
+name = "watchdog"
+harness = false
+
+[[test]]
+name = "pci_scan"
+harness = false
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+# Unoptimized elliptic-curve arithmetic (curve25519-dalek, transitively via
+# ed25519-dalek) is stack-hungry enough in debug builds to overflow the
+# bootloader-provided boot stack — hit this for real: a GP fault with RSP
+# pointing *into the kernel heap* (0x4444_4444_xxxx, our HEAP_START) the
+# first time CapabilityToken::issue() ran, meaning the boot thread's stack
+# had already been blown through and corrupted adjacent memory before the
+# fault even happened. Opting these three into full optimization even in
+# `dev` profile (a common practice for crypto deps in embedded/kernel Rust)
+# fixes it via normal inlining/register allocation, not a stack-size hack.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.ed25519-dalek]
+opt-level = 3

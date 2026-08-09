@@ -1,0 +1,30 @@
+# No `[build] target = ...` default here on purpose: Cargo discovers
+# `.cargo/config.toml` by walking up from the *current working directory*,
+# not from `--manifest-path` — so an ambient default here previously leaked
+# into the `cargo run --manifest-path ../xtask/Cargo.toml` subprocess this
+# file's own `runner` invokes below, forcing xtask (a host-side tool that
+# depends on `serde` via `bootloader`) to try building for
+# x86_64-unknown-none and failing on `can't find crate for std`.
+#
+# Pass `--target x86_64-unknown-none` explicitly on every kernel
+# build/clippy/test invocation instead (see README.md).
+
+[target.x86_64-unknown-none]
+# `curve25519-dalek` (pulled in transitively via `ed25519-dalek`, for
+# `capability-manager`) auto-selects a "simd" backend on nightly toolchains
+# — which we always are, here (see rust-toolchain.toml) — regardless of
+# whether the target actually has usable SIMD codegen support. On
+# x86_64-unknown-none that trips an LLVM ICE ("Do not know how to split the
+# result of this operator"), not a normal compile error. Force the portable
+# scalar backend instead. Scoped to this target only (not a bare `[build]`
+# table) so it doesn't leak into the `runner`'s nested xtask invocation
+# below — same class of mistake as the removed `[build] target` default,
+# see the note at the top of this file.
+rustflags = ["--cfg", "curve25519_dalek_backend=\"serial\""]
+# Makes `cargo test --target x86_64-unknown-none` (run from kernel/)
+# actually boot each `tests/*.rs` integration test in QEMU and read its
+# pass/fail from the isa-debug-exit device, instead of trying (and failing —
+# no `test`/panic-unwind runtime on a bare target) to run them as normal
+# host processes. See xtask/src/main.rs's `test-runner` subcommand and
+# kernel/src/qemu_exit.rs.
+runner = ["cargo", "run", "--quiet", "--manifest-path", "../xtask/Cargo.toml", "--", "test-runner"]

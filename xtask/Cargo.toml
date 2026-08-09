@@ -1,0 +1,22 @@
+[package]
+name = "xtask"
+description = "Host-side dev tooling: build the kernel for x86_64-unknown-none, wrap it into a bootable disk image, run it in QEMU."
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/opensecstack/runix"
+publish = false
+
+# NOT part of the root workspace — see the comment in ../Cargo.toml. This
+# package needs nightly cargo (transitively, via `bootloader`'s build
+# script), which the rest of the repo does not.
+[workspace]
+
+[dependencies]
+# UEFI support disabled: its build script cross-links an x86_64-unknown-uefi
+# binary, which fails under the windows-gnu host toolchain in this
+# environment (rust-lld: undefined symbol `wcslen` — a known mingw-host/UEFI
+# linking gap, not something in our control). We only need BIOS boot to test
+# in QEMU (`-drive format=raw,file=...`); revisit if/when UEFI boot matters.
+bootloader = { version = "0.11", default-features = false, features = ["bios"] }

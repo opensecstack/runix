@@ -1,0 +1,9 @@
+[toolchain]
+# No host suffix here on purpose: CI runs on Linux, so this needs to resolve
+# to whatever nightly matches the local host, not a hardcoded Windows one.
+# On a Windows dev box without MSVC Build Tools (link.exe), the host-default
+# nightly resolves to the MSVC toolchain and fails to link — invoke
+# explicitly instead: `rustup run nightly-x86_64-pc-windows-gnu cargo run -- build`
+channel = "nightly"
+components = ["llvm-tools"]
+targets = ["x86_64-unknown-none"]

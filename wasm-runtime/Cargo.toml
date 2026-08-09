@@ -1,0 +1,22 @@
+[package]
+name = "runix-wasm-runtime"
+description = "Runix WASM runtime (L4 Grid Sandbox / mobile L5 App Runtime) — WebAssembly app isolation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+# no_std-capable by default (std is an opt-in feature we don't enable) —
+# matters later once this crate needs to run hosted by the kernel itself
+# rather than on the dev host; wasmtime, by contrast, requires an OS.
+wasmi = { version = "0.32", default-features = false }
+
+[dev-dependencies]
+wat = "1"
+
+[lib]
+name = "runix_wasm_runtime"

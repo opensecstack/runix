@@ -1,0 +1,17 @@
+[package]
+name = "runix-desktop"
+description = "Runix desktop platform — shell, grid sandbox isolation, drivers. Beta/RC scope; placeholder for Alpha."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+runix-capability-manager = { path = "../capability-manager" }
+runix-wasm-runtime = { path = "../wasm-runtime" }
+runix-citadel-integration = { path = "../citadel-integration" }
+
+[lib]
+name = "runix_desktop"

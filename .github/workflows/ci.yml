@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Every crate except kernel/ — see kernel/Cargo.toml's `[workspace]` stanza
+  # for why it's a standalone package instead of a member here.
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt check
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
+
+  # Freestanding x86_64-unknown-none build. Needs nightly from Phase 2
+  # onward: exception handlers use `extern "x86-interrupt"`, which is still
+  # unstable (rust-lang/rust#40180) despite being the standard way every
+  # x86_64 Rust kernel defines them — see kernel/src/lib.rs's
+  # `#![feature(abi_x86_interrupt)]`. `--target` is explicit rather than
+  # relying on a `.cargo/config.toml` default: kernel/.cargo/config.toml
+  # deliberately has none (see the comment there — an ambient default here
+  # once leaked into the `kernel-tests` job's nested xtask invocation below,
+  # forcing a host-side tool to try building for a bare-metal target).
+  # `--bins --lib` (not `--all-targets`): the *default* libtest harness
+  # still can't run on a bare target — `kernel-tests` below is what
+  # actually exercises `tests/*.rs`, via its own non-libtest mechanism.
+  kernel:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: kernel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+          targets: x86_64-unknown-none
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: kernel
+      - name: fmt check
+        run: cargo fmt --check
+      - name: clippy (lib + bin only)
+        run: cargo clippy --target x86_64-unknown-none --bins --lib -- -D warnings
+      - name: build
+        run: cargo build --target x86_64-unknown-none --bins --lib
+
+  # The real "Phase 8" harness: `cargo test` (run from kernel/, targeting
+  # x86_64-unknown-none) builds each `kernel/tests/*.rs` as its own bootable
+  # binary (`harness = false` in Cargo.toml — no libtest, since there's no
+  # `test`/panic-unwind runtime on bare metal), boots it for real in QEMU
+  # via kernel/.cargo/config.toml's `runner` (which delegates to xtask's
+  # `test-runner` subcommand), and reads pass/fail from the isa-debug-exit
+  # device (kernel/src/qemu_exit.rs) — a real exit code, not string-matched
+  # serial output. This is what catches architecture-specific bugs (like the
+  # GDT/segment-register one in the README) that `cargo test --workspace` on
+  # the host never could.
+  kernel-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+          targets: x86_64-unknown-none
+          components: llvm-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            kernel
+            xtask
+      - name: install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+      - name: cargo test (boots every kernel/tests/*.rs in QEMU)
+        working-directory: kernel
+        # `--test basic_boot`, not a bare `cargo test`: with no target
+        # selection, cargo also tries to build the lib's own unit-test
+        # harness (`--lib`), which needs `test`/panic-unwind — unavailable
+        # on a bare-metal target regardless of `harness = false` on the
+        # integration tests. Add `--test <name>` for each new file under
+        # tests/ as they're added; there's no single flag that means "every
+        # tests/*.rs but not lib/bin unit tests" (`--tests`, despite the
+        # name, still pulls in `--lib`/`--bins` too).
+        run: |
+          cargo test --target x86_64-unknown-none --test basic_boot
+          cargo test --target x86_64-unknown-none --test guard_page
+          cargo test --target x86_64-unknown-none --test thread_reclaim
+          cargo test --target x86_64-unknown-none --test watchdog
+          cargo test --target x86_64-unknown-none --test pci_scan
+
+  # Complements kernel-tests above: boots the *full* main.rs demo (every
+  # phase's feature, not just basic_boot's minimal boot+CPU-init smoke
+  # test) and greps its serial output. Coarser and more brittle than a real
+  # exit code, but it's the only thing here that actually exercises
+  # everything main.rs does end to end in one run.
+  boot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+          targets: x86_64-unknown-none
+          components: llvm-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            kernel
+            xtask
+      - name: install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+      - name: build boot image
+        working-directory: xtask
+        run: cargo run -- build
+      - name: boot in QEMU and check for kernel serial output
+        run: |
+          timeout 20 qemu-system-x86_64 \
+            -drive format=raw,file=target/runix-bios.img \
+            -serial stdio -display none -no-reboot -m 128M \
+            | tee /tmp/boot.log || true
+          grep -q "Runix kernel: boot OK" /tmp/boot.log
+          grep -q "Runix kernel: CPU init OK" /tmp/boot.log
+          grep -q "EXCEPTION: BREAKPOINT" /tmp/boot.log
+          grep -q "Runix kernel: breakpoint exception handled, execution resumed" /tmp/boot.log
+          grep -q "Runix kernel: memory init OK" /tmp/boot.log
+          grep -q "Runix kernel: heap alloc test OK (box=41, vec_len=100, vec_sum=4950)" /tmp/boot.log
+          grep -q "Runix kernel: interrupts enabled" /tmp/boot.log
+          grep -q "Runix kernel: timer interrupt OK" /tmp/boot.log
+          grep -q "Runix kernel: scheduler test OK" /tmp/boot.log
+          # Fair round-robin, not just "didn't crash": each of the three
+          # spawned threads must get all 3 of its turns, in order, before
+          # the run ends — a scheduler that starves one thread or replays
+          # another's context would produce a different sequence here.
+          grep -q "thread A: iteration 2" /tmp/boot.log
+          grep -q "thread B: iteration 2" /tmp/boot.log
+          grep -q "thread C: iteration 2" /tmp/boot.log
+          grep -q "Runix kernel: syscall ABI OK" /tmp/boot.log
+          # The exact bytes, in order — proves the channel didn't drop,
+          # duplicate, or reorder anything crossing the syscall boundary.
+          grep -q "Runix kernel: IPC test OK (Phase 6: received \['X', 'Y', 'Z'\] via port 0)" /tmp/boot.log
+          # Capability gate (B4): authorized sender's send lands (return 0),
+          # unauthorized sender's is denied (return u64::MAX) before it ever
+          # reaches the channel — only 'K' shows up, never 'X'.
+          grep -q "thread sender_authorized: SYS_IPC_SEND returned 0" /tmp/boot.log
+          grep -q "thread sender_unauthorized: SYS_IPC_SEND returned 18446744073709551615" /tmp/boot.log
+          grep -q "Runix kernel: capability gate OK (Phase B4: port 1 received Some('K')" /tmp/boot.log
+          # Revocation (B5): a token valid on every count verify() itself
+          # checks (signature, expiry, resource) is still denied once
+          # explicitly revoked — port 2 gets nothing.
+          grep -q "thread sender_revoked: SYS_IPC_SEND returned 18446744073709551615" /tmp/boot.log
+          grep -q "Runix kernel: capability revocation OK (Phase B5: port 2 received None" /tmp/boot.log
+          grep -q "Runix kernel: entering ring 3" /tmp/boot.log
+          # Printed by user_hello() running at CPL 3, one byte per SYS_WRITE
+          # syscall — proves the syscall gate's DPL actually admits a ring 3
+          # caller, not just that the ring 0 -> ring 3 jump didn't fault.
+          grep -q "^USR$" /tmp/boot.log

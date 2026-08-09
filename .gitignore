@@ -1,0 +1,41 @@
+# Build output — `kernel/`, `xtask/`, and the root workspace each produce
+# their own `target/` (see CLAUDE.md's "Workspace layout" on why they're
+# separate builds); xtask also writes bootable images to the root
+# `target/` (see xtask/src/main.rs's `image_from_binary`). `Cargo.lock` in
+# all three is intentionally *not* ignored here — this workspace produces
+# binaries/bootable images, not a library, so lockfiles are committed for
+# reproducible builds, not left to `cargo`'s default per-crate judgment.
+/target
+**/target
+Cargo.lock.bak
+*.pdb
+
+# Bootable disk images, in case one is ever built outside `target/`.
+*.img
+
+# QEMU/manual debugging output — serial capture logs from ad hoc local runs
+# (the checked-in `kernel/tests/*.rs` are the real, reproducible tests).
+*.log
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS-generated junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local environment overrides — never commit secrets/machine-specific config.
+.env
+.env.local
+
+# Claude Code tooling and its generated docs — local development aid only,
+# kept out of the public GitHub repo on purpose (not a build artifact, so
+# it's called out separately from everything above).
+CLAUDE.md
+.claude/
+docs/THREAT_MODEL.md

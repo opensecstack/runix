@@ -1,0 +1,16 @@
+[package]
+name = "runix-citadel-integration"
+description = "CITADEL runtime stub — MARSHAL 5-gate evaluation, WORM audit chain, VIGIL health monitoring, wired to the SIN Rust SDK."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+
+[lib]
+name = "runix_citadel_integration"

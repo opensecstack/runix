@@ -1,0 +1,16 @@
+[package]
+name = "runix-ipc"
+description = "Shared IPC message/wire types used across Runix user-space services."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lib]
+name = "runix_ipc"
