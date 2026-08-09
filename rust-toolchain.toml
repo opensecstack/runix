@@ -1,3 +1,8 @@
 [toolchain]
-channel = "stable-x86_64-pc-windows-gnu"
+# No host suffix on purpose (CI runs on Linux) — same convention as
+# kernel/rust-toolchain.toml and xtask/rust-toolchain.toml. On a Windows dev
+# box with no MSVC Build Tools (link.exe), the host-default stable resolves
+# to -msvc and fails to link — invoke explicitly instead:
+#   rustup run stable-x86_64-pc-windows-gnu cargo build
+channel = "stable"
 components = ["clippy", "rustfmt"]

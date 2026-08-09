@@ -77,7 +77,12 @@ jobs:
         with:
           toolchain: nightly
           targets: x86_64-unknown-none
-          components: llvm-tools
+          # `rust-src`: the `bootloader` crate's build script (invoked via
+          # `xtask` in this job) compiles its own boot-sector/stage-2/3/4
+          # helper binaries for bare-metal targets, which needs to build
+          # core/alloc from source — without this component that fails with
+          # "does not exist, unable to build with the standard library".
+          components: llvm-tools, rust-src
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -115,7 +120,12 @@ jobs:
         with:
           toolchain: nightly
           targets: x86_64-unknown-none
-          components: llvm-tools
+          # `rust-src`: the `bootloader` crate's build script (invoked via
+          # `xtask` in this job) compiles its own boot-sector/stage-2/3/4
+          # helper binaries for bare-metal targets, which needs to build
+          # core/alloc from source — without this component that fails with
+          # "does not exist, unable to build with the standard library".
+          components: llvm-tools, rust-src
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
