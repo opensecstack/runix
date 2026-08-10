@@ -226,10 +226,48 @@ static SCHEDULER: Mutex<Option<Scheduler>> = Mutex::new(None);
 
 pub fn init() {
     *SCHEDULER.lock() = Some(Scheduler::new());
+    reserve_stack_region_p4_slot();
     // See `interrupts.rs`'s watchdog doc comment: armed as soon as
     // cooperative scheduling starts, disarmed explicitly before any code
     // path (e.g. `userspace::enter_usermode`) that leaves it for good.
     crate::interrupts::arm_watchdog();
+}
+
+/// Maps one throwaway page just below `STACK_REGION_START`, purely to
+/// force that region's top-level (P4) page-table entry into existence —
+/// permanently "wastes" one page and its P3/P2/P1 chain, and that's the
+/// point.
+///
+/// Without this, calling `process::AddressSpace::new()` before any real
+/// thread has ever been spawned would copy a *not-present* P4 entry for
+/// this entire 512 GiB region (copying an empty slot has nothing to
+/// share — there's no P3 table yet to point at). Every thread stack
+/// mapped afterward — even a thread's *own* stack, mapped moments later
+/// inside the very `spawn_with_address_space` call that attaches that
+/// space to it — would then be invisible the instant that address space's
+/// `Cr3` loaded: the thread would double-fault trying to run on its own,
+/// suddenly-unmapped stack. Calling `init()` (which every caller already
+/// must, before spawning anything) before building any `AddressSpace`
+/// makes that ordering hazard impossible instead of merely documented.
+/// See `kernel/tests/scheduler_address_space.rs` for the regression this
+/// fixes — it hit exactly this double fault before `init()` reserved the
+/// slot up front.
+fn reserve_stack_region_p4_slot() {
+    let probe = Page::<Size4KiB>::containing_address(VirtAddr::new(
+        (STACK_REGION_START - GUARD_PAGE_SIZE) as u64,
+    ));
+    memory::with_mapper_and_frame_allocator(|mapper, frame_allocator| {
+        let frame = frame_allocator
+            .allocate_frame()
+            .expect("out of physical memory reserving the thread-stack region's P4 slot");
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        unsafe {
+            mapper
+                .map_to(probe, frame, flags, frame_allocator)
+                .expect("failed to reserve the thread-stack region's P4 slot")
+                .flush();
+        }
+    });
 }
 
 pub fn spawn(entry: extern "C" fn() -> !) {

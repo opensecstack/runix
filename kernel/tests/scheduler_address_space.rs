@@ -64,6 +64,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     })
     .expect("heap initialization failed");
 
+    // `scheduler::init()` must run before any `AddressSpace::new()` — it
+    // reserves the thread-stack region's top-level page-table entry, which
+    // every address space needs to already exist at copy time so a
+    // thread's own (later-mapped) stack stays visible once its `Cr3` is
+    // loaded. See `scheduler::init`'s doc comment.
+    scheduler::init();
+
     serial_println!("scheduler_address_space: building two per-thread address spaces");
     let page = Page::containing_address(VirtAddr::new(SHARED_VA));
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
@@ -73,7 +80,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mut space_b = AddressSpace::new();
     space_b.map_private_page(page, flags);
 
-    scheduler::init();
     scheduler::spawn_with_address_space(thread_a, space_a);
     scheduler::spawn_with_address_space(thread_b, space_b);
 

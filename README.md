@@ -474,6 +474,59 @@ Still not execution: this loader maps a binary's segments and hands back
 its entry point, nothing calls into it in ring 3 yet — that's what
 multi-process scheduling is for.
 
+**Multi-process scheduling — first slice: `Cr3` now follows the schedule.**
+Deliberately split into two pieces, in dependency order — this half first
+because it needed neither a scheduler stack per ring 3 thread nor a real
+`SYS_YIELD`, and gave the eventual harder half something concrete to
+switch between once it exists:
+
+- `scheduler::Thread` can now optionally own a `process::AddressSpace`
+  (`scheduler::spawn_with_address_space`). `yield_now` switches `Cr3` to
+  the incoming thread's address space right before resuming it — or back
+  to the kernel's own table (`memory::kernel_p4_frame`, captured once by
+  `memory::install`) when resuming a thread that doesn't have one — and
+  skips the write entirely when the target is already what's loaded, so
+  the common case (switching between two plain kernel threads, which is
+  most of what `thread_reclaim.rs`'s 20,000-iteration loop does) doesn't
+  pay for a TLB flush it doesn't need.
+- One real, subtle bug, found by actually running two address-space-owning
+  threads through the scheduler rather than just building the mechanism:
+  `AddressSpace::new()` copies the *currently active* table's P4 entries
+  at the moment it's called — copying is by pointer for a slot that
+  already has a P3 sub-table to point at, but a slot that's still empty at
+  copy time just copies "not present," full stop. Building an address
+  space *before* any thread had ever been spawned meant the thread-stack
+  region's P4 slot was still empty at copy time — so when
+  `spawn_with_address_space` then mapped that very thread's own stack
+  (populating that slot in the *live* kernel table, after the copy already
+  happened), the copy never saw it. The thread's own stack was invisible
+  the instant its `Cr3` loaded: an immediate double fault trying to run on
+  its own, suddenly-unmapped stack. Fixed at the root, not documented
+  around: `scheduler::init()` now unconditionally reserves the
+  thread-stack region's P4 slot (one permanent, otherwise-unused page)
+  before anything else, so `AddressSpace::new()` is safe to call any time
+  afterward — a real invariant instead of a call-order rule callers have
+  to remember.
+- `kernel/tests/scheduler_address_space.rs` is the regression test, and it
+  goes further than a single manual `Cr3` switch: two threads, each owning
+  its own address space, both mapping the *same* virtual address privately
+  with a different marker byte, running five interleaved round trips
+  through the real scheduler. Each thread writes its marker, yields
+  (handing control to the *other* thread, running under its *own* `Cr3`,
+  which writes its own different marker to the same VA), and on resuming
+  re-reads that VA to confirm its own value survived — if the scheduler's
+  `Cr3` tracking were wrong in either direction, one thread would observe
+  the other's marker instead of its own. Hit the exact double fault above
+  on the first real run; passed cleanly (`A=0xa5`/`B=0x5a`, five rounds
+  each) once the P4-slot reservation was in. Wired into CI's
+  `kernel-tests` job.
+
+Still ring 0 only: `entry` for a `spawn_with_address_space` thread runs in
+the kernel's own privilege level today, just under a private `Cr3` — real
+ring 3 execution inside one of these still needs a per-thread kernel-entry
+stack and a real `SYS_YIELD`, the harder half of multi-process scheduling
+and the natural next slice.
+
 **Network stack — started, ring 3-first by design.** Beta's roadmap item
 is "user-space network stack" (see the Roadmap table above) — the
 architecture decision made before writing any of it was to build the whole

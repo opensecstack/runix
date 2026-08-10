@@ -59,6 +59,20 @@ impl AddressSpace {
     /// to 4 KiB leaves would be enormous overhead for no benefit. Only the
     /// specific top-level slots a caller later touches via
     /// [`map_private_page`] ever become privately owned.
+    ///
+    /// That sharing is by *pointer* (the P4 entry, copied verbatim, still
+    /// points at the exact same P3 frame the source table uses) — it only
+    /// works for a slot that already has a P3 table to point at when this
+    /// runs. A P4 slot that's still empty at copy time copies as "not
+    /// present," full stop; anything mapped into that same slot in the
+    /// source table *afterward* is invisible here, because there was
+    /// nothing yet to share a pointer to. If this `AddressSpace` will ever
+    /// run as a `scheduler`-managed thread (`scheduler::spawn_with_address_space`),
+    /// call `scheduler::init()` first — it reserves the thread-stack
+    /// region's P4 slot up front specifically so this can't bite a thread
+    /// trying to run on its own, not-yet-existing-at-copy-time stack. See
+    /// `kernel/tests/scheduler_address_space.rs` for the double fault this
+    /// caused before that reservation existed.
     pub fn new() -> Self {
         let (active_frame, _) = Cr3::read();
         memory::with_mapper_and_frame_allocator(|_mapper, frame_allocator| {
