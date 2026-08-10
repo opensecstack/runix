@@ -801,5 +801,11 @@ were fixing.
   origin`. No longer a placeholder.
 - **SDK dependency**: `citadel-integration` will depend on
   `opensecstack/sdk/rust` once the real CITADEL binding is built. Until then
-  it's a stub with no external dependency. This is an external blocker, not
-  something Runix's own roadmap controls — tracked upstream, not here.
+  it's a stub with no external dependency. `sdk/rust` now exists, but its
+  `CITADELClient` doesn't unblock this yet — it's a WORM *event-delivery*
+  client (`send_event`/`get_events`/`verify_chain`, async on Tokio +
+  `reqwest`, needs a host OS), not a MARSHAL Kerkese submit/decision call,
+  and it can't compile inside `kernel/`'s `no_std` freestanding target
+  regardless. Tracked upstream:
+  [opensecstack/opensecstack#34](https://github.com/opensecstack/opensecstack/issues/34).
+  This is an external blocker, not something Runix's own roadmap controls.
