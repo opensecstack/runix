@@ -80,10 +80,7 @@ pub struct ModuleManifestEntry {
 impl ModuleManifestEntry {
     /// The exact bytes that get signed: `v1|module_id|sha256_hex`.
     fn canonical_string(&self) -> String {
-        format!(
-            "{CANONICAL_VERSION}|{}|{}",
-            self.module_id, self.sha256_hex
-        )
+        format!("{CANONICAL_VERSION}|{}|{}", self.module_id, self.sha256_hex)
     }
 
     /// Builds and signs a manifest entry for `module_id`/`sha256_hex` with
@@ -181,9 +178,7 @@ impl BootAllowlist {
         module_id: &str,
         module_bytes: &[u8],
     ) -> Result<(), CitadelError> {
-        let entry = self
-            .find(module_id)
-            .ok_or(CitadelError::NotAllowlisted)?;
+        let entry = self.find(module_id).ok_or(CitadelError::NotAllowlisted)?;
         let computed = hex::encode(Sha256::digest(module_bytes));
         entry.verify(verifying_key, module_id, &computed)
     }
@@ -282,7 +277,8 @@ mod tests {
         let hash = hex::encode(Sha256::digest(bytes));
 
         // Entry signed by an attacker's key, not the trusted release key.
-        let entry = ModuleManifestEntry::issue("net-driver", hash, "release-2027-q1", &attacker_key);
+        let entry =
+            ModuleManifestEntry::issue("net-driver", hash, "release-2027-q1", &attacker_key);
         let mut allowlist = BootAllowlist::new();
         allowlist.insert(entry);
 
