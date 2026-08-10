@@ -352,6 +352,128 @@ building successfully with a demo key inside; a future release recipe that
 wires in real key provisioning is expected to disable the default feature
 and satisfy that `compile_error!` for real, not silence it.
 
+**Per-process address spaces — the shared prerequisite `wasm-runtime`
+rehosting and the network stack's ring 3 driver were both blocked on.**
+Both of those already had a documented "ring 3 from day one" decision (see
+`wasm-runtime`'s architecture note above and the network-stack note below)
+— but both were stalled on the exact same missing piece: today there is
+**one page table for the entire system**. Every ring 3 thing that exists
+(`userspace::user_hello`) runs in the same address space as the kernel and
+every other thread, distinguished only by which pages happen to be flagged
+`USER_ACCESSIBLE` — a second untrusted process would be able to *address*
+the first one's memory even if today's flags happen to deny touching it.
+This was flagged explicitly in the threat model's "no per-process address
+space" gap, and rather than let both `wasm-runtime` and the network driver
+each independently work around it (or silently reinvent the same fix
+twice), it made more sense to build the real primitive once:
+
+- `kernel/src/process.rs`'s `AddressSpace` owns a *private* top-level page
+  table (PML4), built by copying — not linking — every entry from
+  whichever table is currently active. Copying, not deep-copying: the
+  kernel-space sub-tables end up physically shared across every address
+  space on purpose (kernel code/heap/interrupt handling must stay
+  reachable identically everywhere, and there's no benefit to duplicating
+  4 KiB leaves of a mapping that's supposed to be the same in every
+  process), while a specific slot a caller then touches via
+  `map_private_page` gets detached first (its P4 entry cleared) so the
+  fresh mapping built there is privately owned by that one address space,
+  never touching what any other table's copy of that same slot still
+  points at.
+- `AddressSpace::activate`/`process::restore` do the actual `Cr3` switch —
+  the real, hardware-enforced boundary, not just "we allocated a different
+  struct." `activate` returns the *pair* `(PhysFrame, Cr3Flags)` it read
+  before switching, not just the frame — restoring a frame with whatever
+  flags happen to be active *at restore time* would be silently wrong the
+  moment this kernel ever sets a non-default `Cr3Flags` (PCID), even
+  though it doesn't today.
+- `kernel/tests/process_isolation.rs` is the proof, and it's a real `Cr3`
+  switch, not a simulated one: builds two address spaces, maps the exact
+  same virtual address privately in each with different content (`0xAA`
+  vs. `0xBB`), then actually switches into each in turn and reads back
+  through that fixed VA from ring 0. If the "detach before mapping" logic
+  above ever regressed and both processes ended up sharing that slot,
+  this test would observe the same byte both times, or the wrong one —
+  instead it observes exactly `A=0xaa B=0xbb`, proving the same address
+  genuinely resolves to different physical memory depending on which
+  table is loaded. Deliberately entirely ring 0 — proving the address-space
+  primitive itself doesn't need ring 3 execution, a scheduler integration,
+  or an ELF loader, none of which exist yet (see `process.rs`'s module
+  doc comment for exactly what's still missing before anything can
+  actually *run* inside one of these). Wired into CI's `kernel-tests` job.
+- One real bug caught immediately by actually running this in QEMU rather
+  than just compiling it: the first version's test VA
+  (`0x_BBBB_BBBB_0000`) was non-canonical — bit 47 set while bits 63-48
+  were clear, which the `x86_64` crate correctly rejects
+  (`VirtAddr::new` panics: "virtual address must be sign extended in bits
+  48 to 64"). Every *working* hand-picked address already in this kernel
+  (`0x4444...`, `0x5555...`, `0x6666...`) happens to avoid this because
+  their leading nibble's top bit is 0 — `B`'s top bit isn't. Fixed by
+  picking `0x_7777_7777_0000` instead, matching the existing pattern
+  instead of extending it into an unsafe range.
+
+This does **not** yet mean `wasm-runtime` or the network driver can move
+into ring 3 — an ELF/module loader and multi-process scheduling (switching
+`Cr3` alongside the stack pointer on context switch, and giving a ring 3
+thread its own kernel-entry stack so it can `SYS_YIELD` back
+cooperatively) are still unbuilt. This is the foundation both of those
+now build on, not the rehosting itself.
+
+**ELF/module loader — the smaller, self-contained half of "something can
+actually run in one of these address spaces."** Deliberately built before
+multi-process scheduling, not after: it needs no scheduler, GDT/TSS, or
+syscall-dispatch changes at all, and gave the harder piece (Cr3-switching
+context switches, per-thread kernel-entry stacks, real `SYS_YIELD`) a
+concrete, real payload to schedule once it exists, instead of designing it
+against nothing.
+
+- `kernel/src/elf.rs`'s `Elf64` parses just enough of the ELF64 format —
+  `e_ident`/`e_entry`/`e_phoff`/`PT_LOAD` program headers — to map a
+  binary's loadable segments; deliberately not a general ELF library (no
+  section headers, no relocations, no dynamic linking) until something
+  real needs more than this.
+- `load_segments` generalizes `AddressSpace::map_private_page` (which used
+  to hardcode `PRESENT | WRITABLE` for every page) to take real flags,
+  translated from each segment's actual `PF_R`/`PF_W`/`PF_X` bits — a
+  read+exec segment is mapped non-writable, a read+write segment is mapped
+  non-executable. Real W^X, replacing a default that would have made
+  every loaded segment writable *and* executable at once, the exact
+  combination W^X exists to forbid.
+- BSS (the `p_memsz`-beyond-`p_filesz` tail) is explicitly zero-filled,
+  not left as whatever a freshly allocated physical frame happened to
+  contain — skipping that would leak stale physical memory content
+  (potentially another process's former data, given frames get reused —
+  see the memory-reclamation fix above) into a newly loaded process.
+- One real, latent bug in `AddressSpace` itself, caught by this being the
+  first caller to map more than one page per address space: the original
+  `map_private_page` unconditionally cleared its target's top-level (P4)
+  table entry on *every* call, to detach it from whatever the space was
+  seeded from. Fine for exactly one page per space (all
+  `process_isolation.rs` ever needed) — wrong the moment a second page
+  lands in the *same* P4 slot, which one P4 slot spanning 512 GiB makes
+  near-certain for any real multi-segment binary: the second call's clear
+  would have silently erased the first call's mapping. Fixed by tracking
+  which P4 slots a given `AddressSpace` has already detached
+  (`detached_p4_slots: BTreeSet<u16>`) and only clearing a slot the first
+  time it's touched.
+- `AddressSpace::translate` (built directly on the `x86_64` crate's own
+  `Translate` trait, not custom table-walking) lets a caller check what's
+  actually mapped where without activating the address space first —
+  added specifically so `kernel/tests/elf_loader.rs` could verify real
+  W^X permissions landed correctly, not just that content did.
+- `kernel/tests/elf_loader.rs` hand-assembles a minimal, valid two-segment
+  ELF64 image as a `Vec<u8>` at runtime (there's no filesystem yet to load
+  a real one from) — one read+exec segment, one read+write segment with a
+  BSS tail — and verifies all three properties above: correct content
+  (checked by an actual `Cr3` switch and read-back, same rigor as
+  `process_isolation.rs`), correct W^X permissions per segment (via
+  `translate`), and a zero BSS byte. All three passed on the first real
+  QEMU run once the P4-slot-reuse fix above was in. Wired into CI's
+  `kernel-tests` job.
+
+Still not execution: this loader maps a binary's segments and hands back
+its entry point, nothing calls into it in ring 3 yet — that's what
+multi-process scheduling is for.
+
 **Network stack — started, ring 3-first by design.** Beta's roadmap item
 is "user-space network stack" (see the Roadmap table above) — the
 architecture decision made before writing any of it was to build the whole
@@ -612,13 +734,19 @@ were fixing.
 
 ## Open questions
 
-- **License**: currently Apache-2.0 (matching `sdk/rust`). Needs a decision
-  on whether `citadel-integration` (governance-adjacent) should instead be
-  AGPL like the main CITADEL platform — depends on how much governance logic
-  ends up living in-kernel vs. called out to the SIN/CITADEL API.
-- **`repository` field**: `Cargo.toml` points at
-  `https://github.com/opensecstack/runix` as a placeholder — update once the
-  repo is actually pushed to GitHub.
+- **License**: workspace default stays Apache-2.0 through Alpha and Beta.
+  **Decision: deferred, not unresolved-by-accident.** Apache-2.0 vs. AGPL
+  for `citadel-integration` specifically only has a real answer once there's
+  actual governance logic in that crate to license — today it's
+  `CitadelRuntimeStub`, an empty placeholder (see below), so there's nothing
+  yet whose license would meaningfully differ. Revisit this the moment
+  `citadel-integration` gains real MARSHAL/WORM logic (i.e. once
+  `opensecstack/sdk/rust` exists and this crate depends on it) — don't ship
+  a Beta/RC that still has this open.
+- **`repository` field**: resolved — `Cargo.toml` now points at the real
+  remote (`https://github.com/opensecstack/runix`), matching `git remote
+  origin`. No longer a placeholder.
 - **SDK dependency**: `citadel-integration` will depend on
   `opensecstack/sdk/rust` once the real CITADEL binding is built. Until then
-  it's a stub with no external dependency.
+  it's a stub with no external dependency. This is an external blocker, not
+  something Runix's own roadmap controls — tracked upstream, not here.

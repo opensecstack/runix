@@ -2,14 +2,27 @@
 //! [`yield_now`] — there's no timer-interrupt-driven preemption yet (that
 //! needs a PIC/APIC timer, a later stage), so a thread that never yields
 //! blocks everything else forever.
+//!
+//! A thread can optionally own a [`process::AddressSpace`]
+//! (`spawn_with_address_space`) — when it does, `yield_now` switches `Cr3`
+//! to that space right before resuming it, and back to the kernel's own
+//! table (`memory::kernel_p4_frame`) when resuming a thread that doesn't.
+//! This is genuinely safe to do mid-switch, still on the *previous*
+//! thread's stack: every thread's own stack lives in the shared,
+//! kernel-space portion of every address space (mapped through the
+//! ordinary global allocator in `Thread::new`, never through
+//! `AddressSpace::map_private_page`'s detach logic), so it stays correctly
+//! mapped no matter which `Cr3` happens to be loaded at the moment.
 
 use crate::memory;
+use crate::process::AddressSpace;
 use alloc::collections::VecDeque;
 use core::arch::naked_asm;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use runix_capability_manager::CapabilityToken;
 use spin::Mutex;
+use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
     FrameAllocator, FrameDeallocator, Mapper, Page, PageTableFlags, Size4KiB,
 };
@@ -70,6 +83,12 @@ struct Thread {
     /// were never granted one, which any check treats as "denied," not
     /// "unrestricted."
     capability: Option<CapabilityToken>,
+    /// `Some` for a thread that owns its own private address space (a
+    /// "process," in the sense `process.rs` means it) — `yield_now`
+    /// switches `Cr3` to it right before resuming this thread. `None`
+    /// (every thread before this field existed, and most since) runs in
+    /// the kernel's own shared table, exactly as before.
+    address_space: Option<AddressSpace>,
 }
 
 impl Thread {
@@ -142,6 +161,7 @@ impl Thread {
             guard_page_base,
             stack_pointer: context_ptr as usize,
             capability: None,
+            address_space: None,
         }
     }
 
@@ -154,6 +174,7 @@ impl Thread {
             guard_page_base: VirtAddr::new(0),
             stack_pointer: 0,
             capability: None,
+            address_space: None,
         }
     }
 }
@@ -231,6 +252,24 @@ pub fn spawn_with_capability(entry: extern "C" fn() -> !, capability: Option<Cap
         .push_back(thread);
 }
 
+/// Same as [`spawn`], but the new thread owns `address_space` — every time
+/// the scheduler resumes this thread, it switches `Cr3` to `address_space`
+/// first (see this module's doc comment for why that's safe to do without
+/// the thread's own stack going invalid mid-switch). `entry` still runs in
+/// ring 0 today — this makes the *address space* real, not the ring 3
+/// execution; that still needs a per-thread kernel-entry stack and a real
+/// `SYS_YIELD`, both still future work (see `userspace.rs`).
+pub fn spawn_with_address_space(entry: extern "C" fn() -> !, address_space: AddressSpace) {
+    let mut thread = Thread::new(entry);
+    thread.address_space = Some(address_space);
+    SCHEDULER
+        .lock()
+        .as_mut()
+        .expect("scheduler::init() not called")
+        .run_queue
+        .push_back(thread);
+}
+
 /// The capability (if any) granted to whichever thread is currently
 /// running — what `syscall::dispatch` checks a gated syscall against. A
 /// clone, not a reference: the caller is on a different stack than the
@@ -264,6 +303,25 @@ pub fn yield_now() {
             return;
         };
         let next_sp = next.stack_pointer;
+
+        // Switch `Cr3` *before* `next` becomes `current` and this stack
+        // frame loses direct access to it — see the module doc comment for
+        // why doing this now, still running on the *previous* thread's
+        // stack, is safe. Skipped when the target is already what's
+        // loaded (the common case: switching between two plain kernel
+        // threads, which is most of what `thread_reclaim.rs`'s
+        // 20,000-iteration loop does) — an unconditional write here would
+        // flush the TLB on every single `yield_now` call for no reason.
+        let target_frame = next
+            .address_space
+            .as_ref()
+            .map_or_else(memory::kernel_p4_frame, AddressSpace::p4_frame);
+        let (current_frame, flags) = Cr3::read();
+        if current_frame != target_frame {
+            unsafe {
+                Cr3::write(target_frame, flags);
+            }
+        }
 
         let current = sched.current.take().expect("no current thread set");
         sched.run_queue.push_back(current);

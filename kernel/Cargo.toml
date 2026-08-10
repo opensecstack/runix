@@ -60,6 +60,18 @@ harness = false
 name = "pci_scan"
 harness = false
 
+[[test]]
+name = "process_isolation"
+harness = false
+
+[[test]]
+name = "elf_loader"
+harness = false
+
+[[test]]
+name = "scheduler_address_space"
+harness = false
+
 [profile.dev]
 panic = "abort"
 
