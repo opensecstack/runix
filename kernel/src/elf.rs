@@ -204,9 +204,12 @@ impl<'a> Elf64<'a> {
 /// maps directly to `WRITABLE`. `PF_X`'s *absence* sets `NO_EXECUTE` —
 /// code segments (which set `PF_X`) stay executable; data segments (which
 /// don't) become non-executable, real W^X rather than the old
-/// "everything is always writable" default this replaced.
+/// "everything is always writable" default this replaced. `USER_ACCESSIBLE`
+/// is unconditional — this loader exists specifically to build ring 3
+/// processes (see the module doc comment), there's no other consumer that
+/// would want a loaded segment to stay kernel-only.
 fn translate_flags(pf: u32) -> PageTableFlags {
-    let mut flags = PageTableFlags::PRESENT;
+    let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
     if pf & PF_W != 0 {
         flags |= PageTableFlags::WRITABLE;
     }

@@ -52,6 +52,58 @@ const STACK_REGION_STRIDE: usize = GUARD_PAGE_SIZE + STACK_SIZE;
 /// the actual leak that mattered.
 static NEXT_STACK_SLOT: AtomicUsize = AtomicUsize::new(0);
 
+/// A ring 3-capable thread's *own* kernel-entry stack — separate region
+/// from `STACK_REGION_START` (that one is each thread's cooperative-switch
+/// stack; this one is what RSP0 points at while it's running, so its own
+/// ring 3 traps land somewhere private — see `spawn_ring3_process`). `3`
+/// picked for the same "unused leading nibble with the top bit clear"
+/// reason as every other hand-picked address here (`0x4444`/`0x5555`/
+/// `0x6666`/`0x7777`) — an `8`-`f` leading nibble makes the address
+/// non-canonical (bit 47 set while bits 63-48 stay clear), which
+/// `kernel/tests/process_isolation.rs`'s first attempt hit for real.
+const KERNEL_ENTRY_STACK_SIZE: usize = 4096 * 4;
+const KERNEL_ENTRY_STACK_REGION_START: usize = 0x_3333_3333_0000;
+const KERNEL_ENTRY_STACK_REGION_STRIDE: usize = GUARD_PAGE_SIZE + KERNEL_ENTRY_STACK_SIZE;
+static NEXT_KERNEL_ENTRY_STACK_SLOT: AtomicUsize = AtomicUsize::new(0);
+
+/// Maps a fresh, guard-paged stack of `size` bytes at
+/// `region_start + slot * (GUARD_PAGE_SIZE + size)` and returns
+/// `(guard_page_base, stack_top)`. Shared by `Thread::new` (a thread's own
+/// cooperative-switch stack) and `spawn_ring3_process` (a ring 3-capable
+/// thread's separate, dedicated kernel-entry stack) — the same "overflow
+/// should fault loudly, not corrupt whatever's mapped next to it"
+/// reasoning applies to both.
+fn map_guarded_stack(
+    region_start: usize,
+    stride: usize,
+    slot: usize,
+    size: usize,
+) -> (VirtAddr, VirtAddr) {
+    let region_base = region_start + slot * stride;
+    let guard_page_base = VirtAddr::new(region_base as u64);
+    let stack_start = guard_page_base + GUARD_PAGE_SIZE as u64;
+    let stack_end = stack_start + size as u64 - 1u64;
+
+    memory::with_mapper_and_frame_allocator(|mapper, frame_allocator| {
+        let start_page = Page::<Size4KiB>::containing_address(stack_start);
+        let end_page = Page::<Size4KiB>::containing_address(stack_end);
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        for page in Page::range_inclusive(start_page, end_page) {
+            let frame = frame_allocator
+                .allocate_frame()
+                .expect("out of physical memory for a new guarded stack");
+            unsafe {
+                mapper
+                    .map_to(page, frame, flags, frame_allocator)
+                    .expect("failed to map a guarded stack page")
+                    .flush();
+            }
+        }
+    });
+
+    (guard_page_base, stack_start + size as u64)
+}
+
 /// Callee-saved registers, in the exact order `switch_to` pushes/pops them.
 /// `rip` isn't pushed by us explicitly — it's what `ret` consumes, so a
 /// freshly spawned thread's context has its entry point sitting there,
@@ -89,6 +141,13 @@ struct Thread {
     /// (every thread before this field existed, and most since) runs in
     /// the kernel's own shared table, exactly as before.
     address_space: Option<AddressSpace>,
+    /// `Some` for a thread spawned via `spawn_ring3_process` — its own
+    /// dedicated RSP0 target, which `yield_now` loads into the TSS (via
+    /// `gdt::set_kernel_stack`) right before resuming this thread, so its
+    /// ring 3 traps (in particular `SYS_YIELD`) land on a stack no other
+    /// thread is using. `None` for everything else — a plain kernel
+    /// thread never traps from ring 3, so it never touches RSP0 at all.
+    kernel_entry_stack_top: Option<VirtAddr>,
 }
 
 impl Thread {
@@ -109,29 +168,10 @@ impl Thread {
     /// overflowed. See `kernel/tests/guard_page.rs` for the actual proof.
     fn new(entry: extern "C" fn() -> !) -> Self {
         let slot = NEXT_STACK_SLOT.fetch_add(1, Ordering::Relaxed);
-        let region_start = STACK_REGION_START + slot * STACK_REGION_STRIDE;
-        let guard_page_base = VirtAddr::new(region_start as u64);
-        let stack_start = guard_page_base + GUARD_PAGE_SIZE as u64;
-        let stack_end = stack_start + STACK_SIZE as u64 - 1u64;
+        let (guard_page_base, stack_top) =
+            map_guarded_stack(STACK_REGION_START, STACK_REGION_STRIDE, slot, STACK_SIZE);
 
-        memory::with_mapper_and_frame_allocator(|mapper, frame_allocator| {
-            let start_page = Page::<Size4KiB>::containing_address(stack_start);
-            let end_page = Page::<Size4KiB>::containing_address(stack_end);
-            let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-            for page in Page::range_inclusive(start_page, end_page) {
-                let frame = frame_allocator
-                    .allocate_frame()
-                    .expect("out of physical memory for a new thread stack");
-                unsafe {
-                    mapper
-                        .map_to(page, frame, flags, frame_allocator)
-                        .expect("failed to map a thread stack page")
-                        .flush();
-                }
-            }
-        });
-
-        let raw_top = stack_start.as_u64() as usize + STACK_SIZE;
+        let raw_top = stack_top.as_u64() as usize;
 
         // SysV ABI: RSP must be ≡ 0 (mod 16) immediately *before* a `call`,
         // which makes it ≡ 8 (mod 16) at the callee's entry (the `call`
@@ -162,6 +202,7 @@ impl Thread {
             stack_pointer: context_ptr as usize,
             capability: None,
             address_space: None,
+            kernel_entry_stack_top: None,
         }
     }
 
@@ -175,6 +216,7 @@ impl Thread {
             stack_pointer: 0,
             capability: None,
             address_space: None,
+            kernel_entry_stack_top: None,
         }
     }
 }
@@ -226,45 +268,46 @@ static SCHEDULER: Mutex<Option<Scheduler>> = Mutex::new(None);
 
 pub fn init() {
     *SCHEDULER.lock() = Some(Scheduler::new());
-    reserve_stack_region_p4_slot();
+    reserve_p4_slot(STACK_REGION_START);
+    reserve_p4_slot(KERNEL_ENTRY_STACK_REGION_START);
     // See `interrupts.rs`'s watchdog doc comment: armed as soon as
     // cooperative scheduling starts, disarmed explicitly before any code
     // path (e.g. `userspace::enter_usermode`) that leaves it for good.
     crate::interrupts::arm_watchdog();
 }
 
-/// Maps one throwaway page just below `STACK_REGION_START`, purely to
-/// force that region's top-level (P4) page-table entry into existence —
-/// permanently "wastes" one page and its P3/P2/P1 chain, and that's the
-/// point.
+/// Maps one throwaway page just below `region_start`, purely to force that
+/// region's top-level (P4) page-table entry into existence — permanently
+/// "wastes" one page and its P3/P2/P1 chain, and that's the point.
 ///
 /// Without this, calling `process::AddressSpace::new()` before any real
-/// thread has ever been spawned would copy a *not-present* P4 entry for
-/// this entire 512 GiB region (copying an empty slot has nothing to
-/// share — there's no P3 table yet to point at). Every thread stack
-/// mapped afterward — even a thread's *own* stack, mapped moments later
-/// inside the very `spawn_with_address_space` call that attaches that
-/// space to it — would then be invisible the instant that address space's
-/// `Cr3` loaded: the thread would double-fault trying to run on its own,
+/// thread (or ring 3-capable thread, for `KERNEL_ENTRY_STACK_REGION_START`)
+/// has ever been spawned would copy a *not-present* P4 entry for that
+/// entire 512 GiB region (copying an empty slot has nothing to share —
+/// there's no P3 table yet to point at). Every stack mapped afterward —
+/// even a thread's *own*, mapped moments later inside the very
+/// `spawn_with_address_space`/`spawn_ring3_process` call that attaches
+/// that space to it — would then be invisible the instant that address
+/// space's `Cr3` loaded: a double fault trying to run on its own,
 /// suddenly-unmapped stack. Calling `init()` (which every caller already
 /// must, before spawning anything) before building any `AddressSpace`
 /// makes that ordering hazard impossible instead of merely documented.
 /// See `kernel/tests/scheduler_address_space.rs` for the regression this
 /// fixes — it hit exactly this double fault before `init()` reserved the
-/// slot up front.
-fn reserve_stack_region_p4_slot() {
+/// (then-only) stack region's slot up front.
+fn reserve_p4_slot(region_start: usize) {
     let probe = Page::<Size4KiB>::containing_address(VirtAddr::new(
-        (STACK_REGION_START - GUARD_PAGE_SIZE) as u64,
+        (region_start - GUARD_PAGE_SIZE) as u64,
     ));
     memory::with_mapper_and_frame_allocator(|mapper, frame_allocator| {
         let frame = frame_allocator
             .allocate_frame()
-            .expect("out of physical memory reserving the thread-stack region's P4 slot");
+            .expect("out of physical memory reserving a stack region's P4 slot");
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
         unsafe {
             mapper
                 .map_to(probe, frame, flags, frame_allocator)
-                .expect("failed to reserve the thread-stack region's P4 slot")
+                .expect("failed to reserve a stack region's P4 slot")
                 .flush();
         }
     });
@@ -300,6 +343,37 @@ pub fn spawn_with_capability(entry: extern "C" fn() -> !, capability: Option<Cap
 pub fn spawn_with_address_space(entry: extern "C" fn() -> !, address_space: AddressSpace) {
     let mut thread = Thread::new(entry);
     thread.address_space = Some(address_space);
+    SCHEDULER
+        .lock()
+        .as_mut()
+        .expect("scheduler::init() not called")
+        .run_queue
+        .push_back(thread);
+}
+
+/// Same as [`spawn_with_address_space`], but the new thread also gets its
+/// own dedicated kernel-entry stack — required for `entry` to actually
+/// call `userspace::enter_usermode` and have its ring 3 traps (in
+/// particular a real `SYS_YIELD`) land somewhere safe. Without a stack of
+/// its own, every ring 3-capable thread would share one RSP0 — harmless
+/// with only one such thread (as `userspace::user_hello`'s hand-run
+/// transition gets away with today), but a second one trapping in while
+/// the first is still suspended mid-syscall would corrupt it. `yield_now`
+/// rewrites `Cr3` *and* RSP0 (via `gdt::set_kernel_stack`) together, right
+/// before resuming a thread spawned this way — see
+/// `kernel/tests/ring3_cooperative.rs` for two such threads proving they
+/// don't corrupt each other.
+pub fn spawn_ring3_process(entry: extern "C" fn() -> !, address_space: AddressSpace) {
+    let mut thread = Thread::new(entry);
+    thread.address_space = Some(address_space);
+    let slot = NEXT_KERNEL_ENTRY_STACK_SLOT.fetch_add(1, Ordering::Relaxed);
+    let (_, stack_top) = map_guarded_stack(
+        KERNEL_ENTRY_STACK_REGION_START,
+        KERNEL_ENTRY_STACK_REGION_STRIDE,
+        slot,
+        KERNEL_ENTRY_STACK_SIZE,
+    );
+    thread.kernel_entry_stack_top = Some(stack_top);
     SCHEDULER
         .lock()
         .as_mut()
@@ -359,6 +433,14 @@ pub fn yield_now() {
             unsafe {
                 Cr3::write(target_frame, flags);
             }
+        }
+        // RSP0 alongside Cr3, for the same reason and at the same moment —
+        // a plain write, not worth conditionalizing like the Cr3/TLB-flush
+        // case above. Left untouched (whatever the previous thread set)
+        // when `next` has no kernel-entry stack of its own: it'll never
+        // trap from ring 3, so RSP0 is never consulted for it anyway.
+        if let Some(stack_top) = next.kernel_entry_stack_top {
+            crate::gdt::set_kernel_stack(stack_top);
         }
 
         let current = sched.current.take().expect("no current thread set");

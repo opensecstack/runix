@@ -131,17 +131,46 @@ kernel-hosted.** There are two ways it could eventually run under Runix:
    hardware-enforced ring 3 isolation, so an interpreter bug still can't
    reach kernel memory.
 
-Option 2 is the real target, but it needs kernel infrastructure that
-doesn't exist yet: an ELF/module loader (today there's exactly one
-hard-coded ring 3 entry point, `userspace::user_hello`, built by hand), a
-process abstraction with its own address space (today's scheduler
-round-robins threads sharing one address space, not separate processes),
-and multi-process scheduling. Building that is exactly what Beta's "Grid
-sandbox isolation" roadmap item already covers — so this isn't a new
-decision so much as confirming Alpha was never supposed to include it.
-Through Alpha, `wasm-runtime` stays a normal host-target crate for engine
-bring-up and testing; the ring 0 → ring 3 rehosting happens once Beta's
-kernel-side infrastructure exists to put it on.
+Option 2 is the real target, and the kernel infrastructure it needed —
+an ELF/module loader, per-process address spaces, and multi-process
+scheduling with real ring 3 cooperation — is now built (see the
+process-isolation and multi-process-scheduling sections above). That
+infrastructure being ready doesn't mean `wasm-runtime` itself was ready to
+run on it, though — until now it wasn't even `no_std`.
+
+**`wasm-runtime` is now `no_std` + `alloc`** — the concrete first step of
+actually moving onto that infrastructure, not the whole move. Two changes:
+
+- The crate gained `#![cfg_attr(not(test), no_std)]` + `extern crate alloc;`
+  (same split `capability-manager`/`citadel-integration` already use —
+  `#[cfg(test)]` opts back into `std` for the existing host-side test
+  suite, which is untouched and still passes).
+- `RuntimeError` stopped using `#[derive(thiserror::Error)]`. Confirmed by
+  actually trying to build this crate for `x86_64-unknown-none` (not by
+  reading `thiserror`'s docs): `thiserror` 1.x hard-requires
+  `std::error::Error` and fails inside its own code, not this crate's —
+  the same reason `capability-manager` and `citadel-integration` both
+  hand-roll a `Display` impl instead of using it. Replaced with a manual
+  `impl fmt::Display for RuntimeError`, matching that existing convention
+  rather than being a one-off exception.
+
+Confirmed by actually building for the real target, not just adding the
+attribute and hoping: `cargo build --target x86_64-unknown-none` from
+`wasm-runtime/` compiles clean, including the full `wasmi` dependency
+tree — `wasmi`'s own "no `std` feature enabled" claim (see above) held up
+under an actual bare-metal build, not just the default-features-off
+Cargo.toml setting. Full existing test suite (7 tests across `call_add.rs`/
+`host_import.rs`/`memory_isolation.rs`) still passes on the host, and
+`clippy` is clean on both targets.
+
+**Still not what "Grid Sandbox" means end to end.** This crate compiling
+for the bare-metal target is necessary, not sufficient — it's still a
+*library*, not something that runs. Actually hosting it in ring 3 needs it
+(or a thin binary wrapping it) built as its own freestanding ELF, loaded
+through `elf::Elf64` and `scheduler::spawn_ring3_process` the same way
+`ring3_cooperative.rs`'s hand-written processes are today — that wiring
+doesn't exist yet. This is the next concrete step, not a claim already
+made.
 
 **`capability-manager`** is no longer a stub either: `CapabilityToken`
 issuance and verification are real (Ed25519 over a canonical, pipe-joined
@@ -188,8 +217,30 @@ operation; they'd just stop using it.
 
 With this, Alpha's capability-manager work is done: issuance, verification,
 syscall-gate enforcement, and revocation, all end-to-end in QEMU.
-**`citadel-integration`** (no real MARSHAL/WORM binding) is the one
-remaining stub.
+
+**`citadel-integration`** is no longer a stub either, though it's not what
+the original "CITADEL stub" roadmap line implied. Rather than a live
+MARSHAL round-trip at boot (see the crate's own module docs for exactly
+why that doesn't fit — Kerkese requires Separation of Duties between two
+human principals, which a kernel boot has neither the identities nor the
+network stack to satisfy yet), it implements **boot-time module
+authorization via a build-time-signed allowlist**: `ModuleManifestEntry`
+(Ed25519 over a canonical string, same convention as
+`capability-manager`'s tokens) and `BootAllowlist`, which verifies a
+module's SHA-256 against a signed manifest entry before anything would
+load it — fail-closed, no fail-open mode. Five unit tests cover the real
+cases: authorizes a matching module, rejects an unlisted one, rejects
+tampered bytes, rejects a wrong signing key, and rejects a validly-signed
+entry reused for the wrong module ID.
+
+**Not yet wired into `kernel/`**, though: nothing in the boot path calls
+`authorize_module_load` — `kernel/Cargo.toml` doesn't even depend on this
+crate yet. Real, tested, and correct in isolation; inert until something
+in `main.rs`'s boot sequence actually calls it before loading a module.
+Real *runtime* MARSHAL/WORM/VIGIL integration (once Runix has running
+user-space processes to gate, not just boot-time module loads) remains
+Beta/RC work, blocked on the same external SDK gap as before — see "Open
+questions" below.
 
 Two real bugs surfaced integrating `capability-manager` into `kernel/`,
 both worth knowing before touching crypto-heavy code here again:
@@ -527,6 +578,68 @@ ring 3 execution inside one of these still needs a per-thread kernel-entry
 stack and a real `SYS_YIELD`, the harder half of multi-process scheduling
 and the natural next slice.
 
+**Multi-process scheduling — second slice: real ring 3 processes
+genuinely cooperating.** Closes the gap the first slice left open: a
+thread's `entry` can now actually call `userspace::enter_usermode` and
+have its ring 3 code cooperate with the scheduler via a real `SYS_YIELD`,
+not just run under a private `Cr3` from ring 0.
+
+- The TSS's RSP0 (`gdt.rs`) — where the CPU lands on any ring 3 -> ring 0
+  trap — used to be one shared stack for the whole system, fine with
+  exactly one ring 3 thing ever running (`userspace::user_hello`, which
+  deliberately never yields, precisely to avoid this gap). `gdt::TSS`
+  became a `static mut` (previously an immutable `lazy_static!`) so
+  `gdt::set_kernel_stack` can rewrite RSP0 at runtime; `scheduler.rs`'s new
+  `spawn_ring3_process` gives each ring 3-capable thread its *own*
+  dedicated, guard-paged kernel-entry stack (a new region,
+  `KERNEL_ENTRY_STACK_REGION_START`, separate from each thread's ordinary
+  cooperative-switch stack), and `yield_now` calls `set_kernel_stack`
+  alongside its existing `Cr3` switch, right before resuming a thread that
+  has one. Without a stack of its own, a second ring 3 thread trapping in
+  while the first was suspended mid-syscall would corrupt the first's
+  saved context — the exact failure mode a per-thread stack exists to
+  prevent.
+- No `SYS_YIELD` *implementation* changes were needed — `syscall::dispatch`
+  already just called `scheduler::yield_now()` unconditionally; the gap
+  was purely that every ring 3 trap shared one RSP0, making a second
+  concurrent ring 3-capable thread unsafe. Once each thread has its own,
+  the existing dispatch code is already correct for ring 3 callers too.
+- `AddressSpace` gained `map_existing_frame` (`process.rs`) — maps an
+  *already-compiled* kernel code page (a hand-written naked ring 3 entry
+  point's own `.text`, found via the new `memory::translate_kernel_addr`)
+  at a private VA, instead of copying its bytes into a freshly allocated
+  page like `map_private_page` does. Needed because two independent
+  processes each need their own code mapped read+exec (real W^X, same
+  discipline as the ELF loader) without either one being able to write to
+  it.
+- `kernel/tests/ring3_cooperative.rs` is the proof: two real ring 3
+  processes, each its own `AddressSpace` with its own private code+stack,
+  each running a hand-written naked function that does `SYS_WRITE` then
+  `SYS_YIELD` three times, then yields forever. A broken per-thread stack
+  would show up here as a fault, corrupted registers, or a hang well
+  within the bounded round trips this test runs. It didn't — the serial
+  output interleaves perfectly: `ABABAB`.
+- One real bug, caught by writing this test rather than just the
+  mechanism: the first version used RCX as a loop counter across the
+  `int 0x80` boundary without saving it. `int 0x80` isn't a normal call
+  with a register-preservation ABI — `syscall::entry`'s own register
+  remapping (`mov rcx, rdx`, part of turning `int 0x80` convention
+  registers into the `dispatch` function's SysV argument registers)
+  clobbers RCX on every trip through it, on top of whatever `dispatch`
+  itself uses as a normal `extern "C" fn`. The counter never reliably hit
+  zero — nothing faulted (proving the underlying per-thread-stack
+  mechanism genuinely was sound), but the serial output was a much longer,
+  uncontrolled run of `A`s and `B`s instead of the intended three each.
+  Fixed by `push rcx` / `pop rcx` around each syscall pair, using the ring
+  3 stack `build_process` already mapped but the original version never
+  actually needed until this.
+
+`userspace::user_hello` itself is untouched — it still runs by hand,
+outside the scheduler, on the single default RSP0. The next natural step
+is routing an ELF-loaded binary (not a hand-written naked function) through
+this same `spawn_ring3_process` path — at which point `wasm-runtime` or the
+network driver can actually start using it.
+
 **Network stack — started, ring 3-first by design.** Beta's roadmap item
 is "user-space network stack" (see the Roadmap table above) — the
 architecture decision made before writing any of it was to build the whole
@@ -788,14 +901,20 @@ were fixing.
 ## Open questions
 
 - **License**: workspace default stays Apache-2.0 through Alpha and Beta.
-  **Decision: deferred, not unresolved-by-accident.** Apache-2.0 vs. AGPL
-  for `citadel-integration` specifically only has a real answer once there's
-  actual governance logic in that crate to license — today it's
-  `CitadelRuntimeStub`, an empty placeholder (see below), so there's nothing
-  yet whose license would meaningfully differ. Revisit this the moment
-  `citadel-integration` gains real MARSHAL/WORM logic (i.e. once
-  `opensecstack/sdk/rust` exists and this crate depends on it) — don't ship
-  a Beta/RC that still has this open.
+  **Decision: still deferred, but the deferral's own reasoning is now
+  stale and worth re-checking soon.** The original reasoning was "there's
+  no real governance logic in `citadel-integration` yet, so there's
+  nothing whose license would meaningfully differ" — no longer true: the
+  crate now has real, tested logic (`ModuleManifestEntry`/`BootAllowlist`,
+  boot-time module authorization — see above). It's arguably still
+  Apache-2.0-appropriate (boot-time signature verification isn't the
+  MARSHAL/WORM *governance* logic the AGPL question was originally about),
+  but that argument hasn't actually been made yet, just assumed by
+  inertia. Revisit explicitly — either re-confirm Apache-2.0 with real
+  reasoning or switch — rather than letting "deferred until real logic
+  exists" silently stay deferred now that real logic exists. Full
+  MARSHAL/WORM runtime logic (once `opensecstack/sdk/rust` unblocks it —
+  see below) is still the harder version of this question.
 - **`repository` field**: resolved — `Cargo.toml` now points at the real
   remote (`https://github.com/opensecstack/runix`), matching `git remote
   origin`. No longer a placeholder.

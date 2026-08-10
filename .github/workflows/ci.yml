@@ -109,6 +109,7 @@ jobs:
           cargo test --target x86_64-unknown-none --test process_isolation
           cargo test --target x86_64-unknown-none --test elf_loader
           cargo test --target x86_64-unknown-none --test scheduler_address_space
+          cargo test --target x86_64-unknown-none --test ring3_cooperative
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke

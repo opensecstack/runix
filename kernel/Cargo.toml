@@ -72,6 +72,14 @@ harness = false
 name = "scheduler_address_space"
 harness = false
 
+[[test]]
+name = "ring3_cooperative"
+harness = false
+
+[[test]]
+name = "grid_sandbox_wasm"
+harness = false
+
 [profile.dev]
 panic = "abort"
 

@@ -114,6 +114,40 @@ impl AddressSpace {
         page: Page<Size4KiB>,
         flags: PageTableFlags,
     ) -> &'static mut [u8; 4096] {
+        let frame = memory::with_mapper_and_frame_allocator(|_mapper, frame_allocator| {
+            frame_allocator
+                .allocate_frame()
+                .expect("out of physical memory for a new process-private page")
+        });
+        self.map_frame(page, frame, flags);
+        let virt = memory::physical_memory_offset() + frame.start_address().as_u64();
+        unsafe { &mut *virt.as_mut_ptr::<[u8; 4096]>() }
+    }
+
+    /// Maps an *already-existing* physical frame at `page` within this
+    /// address space, instead of allocating a fresh one — for exposing a
+    /// kernel-compiled code page (a hand-written ring 3 entry point's own
+    /// `.text`, found via `memory::translate_kernel_addr`) as
+    /// user-accessible at a private VA, without copying its bytes. Same
+    /// "detach the P4 slot once" logic as [`map_private_page`] — see its
+    /// doc comment.
+    ///
+    /// # Safety
+    /// `frame` must be backed by real, currently-valid physical memory for
+    /// as long as this mapping exists — true for any frame still owned by
+    /// whatever mapped it originally (e.g. the kernel's own `.text`, which
+    /// is never freed), but this function has no way to verify that at the
+    /// call site.
+    pub unsafe fn map_existing_frame(
+        &mut self,
+        page: Page<Size4KiB>,
+        frame: PhysFrame,
+        flags: PageTableFlags,
+    ) {
+        self.map_frame(page, frame, flags);
+    }
+
+    fn map_frame(&mut self, page: Page<Size4KiB>, frame: PhysFrame, flags: PageTableFlags) {
         memory::with_mapper_and_frame_allocator(|_mapper, frame_allocator| {
             let index = u16::from(page.p4_index());
             if self.detached_p4_slots.insert(index) {
@@ -125,19 +159,13 @@ impl AddressSpace {
             let mut this_mapper =
                 unsafe { OffsetPageTable::new(level_4_table, memory::physical_memory_offset()) };
 
-            let frame = frame_allocator
-                .allocate_frame()
-                .expect("out of physical memory for a new process-private page");
             unsafe {
                 this_mapper
                     .map_to(page, frame, flags, frame_allocator)
-                    .expect("failed to map a process-private page")
+                    .expect("failed to map a page")
                     .flush();
             }
-
-            let virt = memory::physical_memory_offset() + frame.start_address().as_u64();
-            unsafe { &mut *virt.as_mut_ptr::<[u8; 4096]>() }
-        })
+        });
     }
 
     /// This address space's top-level frame, for callers (`scheduler.rs`)

@@ -1,0 +1,42 @@
+[package]
+name = "grid-sandbox-host"
+description = "Grid Sandbox host: a freestanding ring 3 binary that hosts the wasmi-based runix-wasm-runtime engine — Beta's 'Grid sandbox isolation' roadmap item, loaded via kernel/src/elf.rs and scheduler::spawn_ring3_process rather than linked into the kernel itself."
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+publish = false
+
+# NOT a member of the root workspace — same reasoning as kernel/xtask
+# (see the root Cargo.toml's own comment): this targets
+# `x86_64-unknown-none`, a different target than every host-side crate in
+# the root workspace, which cargo can't mix into one `--workspace`
+# invocation. Unlike kernel/xtask, this one doesn't need nightly — nothing
+# here uses `extern "x86-interrupt"` or naked functions; it's a plain
+# no_std ring 3 binary, not a kernel with its own IDT/GDT to define.
+[workspace]
+
+[dependencies]
+runix-wasm-runtime = { path = "../wasm-runtime" }
+linked_list_allocator = "0.10"
+
+[build-dependencies]
+# Host-side only (build scripts always run on the host, regardless of the
+# crate's own target) — compiles the WAT module in build.rs into real WASM
+# bytes at build time, so the actual guest module lives as readable text in
+# this repo instead of a hand-encoded byte array (unlike
+# `kernel/tests/elf_loader.rs`'s hand-built ELF, WASM's binary format
+# — LEB128 varints, section framing — isn't something worth hand-rolling
+# just to avoid one build-time dependency `wasm-runtime`'s own tests
+# already use the same way).
+wat = "1"
+
+[[bin]]
+name = "grid-sandbox-host"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

@@ -1,0 +1,15 @@
+# No `[build] target = ...` default here — same "don't leak an ambient
+# target into a nested host-side invocation" reasoning as
+# kernel/.cargo/config.toml, even though this crate has no nested
+# invocation of its own today: consistency now avoids the exact bug that
+# hit kernel/xtask if one ever gets added later.
+
+[target.x86_64-unknown-none]
+# Without this, rustc's default for this target produces a position-
+# independent (ET_DYN) executable, confirmed by actually inspecting the
+# compiled binary's ELF header (`e_type = 3`, not `ET_EXEC = 2`) — not
+# documented anywhere obvious, found by checking the real output.
+# `kernel/src/elf.rs`'s loader treats every segment's `p_vaddr` as an
+# absolute address with zero relocation processing, which only holds for a
+# static, non-PIE binary. `-C relocation-model=static` forces that.
+rustflags = ["-C", "relocation-model=static"]

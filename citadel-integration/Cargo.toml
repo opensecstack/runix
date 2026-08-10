@@ -1,6 +1,6 @@
 [package]
 name = "runix-citadel-integration"
-description = "CITADEL runtime stub — MARSHAL 5-gate evaluation, WORM audit chain, VIGIL health monitoring, wired to the SIN Rust SDK."
+description = "CITADEL boundary: signed boot-time module authorization today; MARSHAL 5-gate evaluation, WORM audit chain, and VIGIL health monitoring remain Beta/RC work pending opensecstack/sdk/rust."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

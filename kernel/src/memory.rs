@@ -180,3 +180,22 @@ pub fn with_mapper_and_frame_allocator<R>(
     let (mapper, frame_allocator) = guard.as_mut().expect("memory::install() not called yet");
     f(mapper, frame_allocator)
 }
+
+/// Finds the physical frame backing `addr` in the kernel's own table — for
+/// `process::AddressSpace::map_existing_frame` callers that want to expose
+/// an already-compiled kernel code page (a hand-written ring 3 entry
+/// point's own `.text`) at a private VA in some other address space,
+/// without copying its bytes. `None` if `addr` isn't mapped at all in the
+/// kernel's table, or is mapped at a larger page size than 4 KiB (this
+/// kernel never maps kernel `.text` any other way, so that's not expected
+/// in practice, just not something this function claims to handle).
+pub fn translate_kernel_addr(addr: VirtAddr) -> Option<PhysFrame> {
+    use x86_64::structures::paging::mapper::{MappedFrame, Translate, TranslateResult};
+    with_mapper_and_frame_allocator(|mapper, _frame_allocator| match mapper.translate(addr) {
+        TranslateResult::Mapped {
+            frame: MappedFrame::Size4KiB(frame),
+            ..
+        } => Some(frame),
+        _ => None,
+    })
+}

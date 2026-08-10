@@ -10,22 +10,60 @@
 //! enable, which matters once this crate needs to run hosted by the
 //! kernel itself instead of on the dev host — see the architecture note in
 //! the top-level README about `wasm-runtime`'s eventual `no_std` move.
+//!
+//! `no_std` + `alloc` (like `capability-manager`/`citadel-integration`),
+//! not full `std` — the whole point of the Grid Sandbox architecture (see
+//! README) is this crate eventually running as its own freestanding ring 3
+//! binary, which has no `std` at all. `#[cfg(test)]` opts back into `std`
+//! for its own test suite, same split those two crates already use.
+//! `thiserror` isn't used for [`RuntimeError`] for the same reason it
+//! isn't in those crates either: `thiserror` 1.x hard-requires `std::error::Error`
+//! (confirmed by trying to build this crate for `x86_64-unknown-none` —
+//! it fails inside `thiserror` itself, not this crate's own code), so a
+//! hand-written `Display` impl is the consistent choice here, not a
+//! one-off exception.
 
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+
+use alloc::vec::Vec;
+use core::fmt;
 use wasmi::{Caller, Engine, Instance, Linker, Module, Store};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum RuntimeError {
-    #[error("failed to parse/validate wasm module: {0}")]
+    /// Failed to parse/validate the wasm module.
     Module(wasmi::Error),
-    #[error("failed to define host import: {0}")]
+    /// Failed to define a host import.
     HostImport(wasmi::Error),
-    #[error("failed to instantiate wasm module: {0}")]
+    /// Failed to instantiate the wasm module.
     Instantiate(wasmi::Error),
-    #[error("exported function not found, or has the wrong signature: {0}")]
+    /// Exported function not found, or has the wrong signature.
     Function(wasmi::Error),
-    #[error("wasm function call trapped: {0}")]
+    /// A wasm function call trapped.
     Call(wasmi::Error),
 }
+
+impl fmt::Display for RuntimeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RuntimeError::Module(e) => write!(f, "failed to parse/validate wasm module: {e}"),
+            RuntimeError::HostImport(e) => write!(f, "failed to define host import: {e}"),
+            RuntimeError::Instantiate(e) => write!(f, "failed to instantiate wasm module: {e}"),
+            RuntimeError::Function(e) => {
+                write!(
+                    f,
+                    "exported function not found, or has the wrong signature: {e}"
+                )
+            }
+            RuntimeError::Call(e) => write!(f, "wasm function call trapped: {e}"),
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::error::Error for RuntimeError {}
 
 /// Per-instance state a host function can reach via [`Caller::data_mut`].
 /// `output` stands in for a real syscall bridge — a WASM module today has
