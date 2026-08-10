@@ -9,8 +9,20 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-thiserror.workspace = true
-serde.workspace = true
+# Declared directly rather than via `.workspace = true`, same reasoning as
+# capability-manager/Cargo.toml: this crate must stay `no_std` + `alloc` so
+# it can eventually be called directly from `kernel/` (freestanding, no
+# `std` at all) to gate module/driver loads at boot.
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+# force-soft: see capability-manager/Cargo.toml's comment — same LLVM ICE
+# on x86_64-unknown-none with the default SIMD-selecting backend.
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+
+[dev-dependencies]
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [lib]
 name = "runix_citadel_integration"
