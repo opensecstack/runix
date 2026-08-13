@@ -133,15 +133,35 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         | PageTableFlags::USER_ACCESSIBLE
         | PageTableFlags::NO_EXECUTE;
     for page in Page::range_inclusive(heap_start_page, heap_end_page) {
-        space.map_private_page(page, heap_flags);
+        // Unlike `elf::Elf64::load_segments` (which fills BSS explicitly),
+        // a freshly allocated frame here carries whatever its previous
+        // owner left in it, not guaranteed-zero — `LockedHeap::init` only
+        // writes its own free-list header at the front of the region, not
+        // every byte, so a payload that reads before writing (or a
+        // corrupted-looking pointer surfacing from stale physical memory)
+        // can observe that leftover content. Zero explicitly rather than
+        // relying on it happening to already be clean.
+        space.map_private_page(page, heap_flags).fill(0);
     }
 
-    let stack_page = Page::containing_address(VirtAddr::new(PAYLOAD_STACK_VA));
+    // `map_private_page` maps exactly one 4 KiB page per call — mapping only
+    // `stack_page` (the first of `PAYLOAD_STACK_SIZE`'s 4 pages) left the
+    // upper 3 pages unmapped while `kernel_trampoline` below still handed
+    // `_start` a top-of-stack pointer 4 pages up (`PAYLOAD_STACK_VA +
+    // PAYLOAD_STACK_SIZE`), so the very first push near the top of that
+    // stack (inside `wasmi`/the allocator, well before any guest bytecode
+    // runs) page-faulted. Loop over the whole range, same pattern as the
+    // heap mapping just above.
+    let stack_start_page = Page::containing_address(VirtAddr::new(PAYLOAD_STACK_VA));
+    let stack_end_page =
+        Page::containing_address(VirtAddr::new(PAYLOAD_STACK_VA + PAYLOAD_STACK_SIZE - 1));
     let stack_flags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
         | PageTableFlags::USER_ACCESSIBLE
         | PageTableFlags::NO_EXECUTE;
-    space.map_private_page(stack_page, stack_flags);
+    for page in Page::range_inclusive(stack_start_page, stack_end_page) {
+        space.map_private_page(page, stack_flags);
+    }
 
     #[allow(static_mut_refs)]
     unsafe {
