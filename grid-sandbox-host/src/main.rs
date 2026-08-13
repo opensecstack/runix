@@ -76,6 +76,23 @@ unsafe fn syscall(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             in("rdi") arg1,
             in("rsi") arg2,
             in("rdx") arg3,
+            // `syscall::entry`'s remapping shim (kernel/src/syscall.rs)
+            // does `mov rcx, rdx` before `call dispatch` — RCX is clobbered
+            // on every trip through `int 0x80`, exactly like
+            // `kernel/tests/ring3_cooperative.rs`'s doc comment warns about
+            // (that test works around it with a manual push/pop in hand-
+            // written asm; this is the same hazard in compiler-generated
+            // code, where an undeclared clobber corrupts whatever the
+            // compiler happened to be keeping live in RCX across the call
+            // instead of merely mis-counting a loop). `dispatch` itself is
+            // an ordinary SysV `extern "C"` function, free to use any
+            // caller-saved register as scratch, so R8-R11 are equally at
+            // risk even though nothing in the shim explicitly touches them.
+            lateout("rcx") _,
+            lateout("r8") _,
+            lateout("r9") _,
+            lateout("r10") _,
+            lateout("r11") _,
         );
     }
     ret

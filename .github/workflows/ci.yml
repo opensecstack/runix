@@ -88,8 +88,18 @@ jobs:
           workspaces: |
             kernel
             xtask
+            grid-sandbox-host
       - name: install QEMU
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+      # `grid_sandbox_wasm` below needs this binary already built on disk
+      # (`include_bytes!` embeds it at kernel-test compile time) — see
+      # `kernel/tests/grid_sandbox_wasm.rs`'s own doc comment. Built here,
+      # not as part of the `kernel-tests` `cargo test` invocation, since
+      # it's a separate standalone package (own `[workspace]`, same
+      # reasoning as `kernel`/`xtask` — see its `Cargo.toml`).
+      - name: build grid-sandbox-host (payload for grid_sandbox_wasm)
+        working-directory: grid-sandbox-host
+        run: cargo build --target x86_64-unknown-none --release
       - name: cargo test (boots every kernel/tests/*.rs in QEMU)
         working-directory: kernel
         # `--test basic_boot`, not a bare `cargo test`: with no target
@@ -110,6 +120,7 @@ jobs:
           cargo test --target x86_64-unknown-none --test elf_loader
           cargo test --target x86_64-unknown-none --test scheduler_address_space
           cargo test --target x86_64-unknown-none --test ring3_cooperative
+          cargo test --target x86_64-unknown-none --test grid_sandbox_wasm
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke

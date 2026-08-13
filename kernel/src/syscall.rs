@@ -105,6 +105,25 @@ pub unsafe fn syscall(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             in("rdi") arg1,
             in("rsi") arg2,
             in("rdx") arg3,
+            // `entry`'s own remapping shim above does `mov rcx, rdx` before
+            // `call dispatch` — RCX is clobbered on every trip through this,
+            // and `dispatch` is an ordinary SysV `extern "C"` function free
+            // to use R8-R11 as scratch too. Undeclared here, the compiler
+            // could keep a live value in any of these across the call and
+            // have it silently overwritten — confirmed as a real bug, not a
+            // theoretical one: `grid-sandbox-host/src/main.rs`'s copy of
+            // this exact wrapper (no shared code between kernel and a
+            // separately-linked ring 3 binary — see its own doc comment)
+            // had this same gap and it corrupted a live pointer across a
+            // `write_all` loop's second syscall, page-faulting on
+            // `kernel/tests/grid_sandbox_wasm.rs`. This kernel-side caller
+            // hasn't hit it yet only because nothing here happens to keep a
+            // live value in one of these registers across the call.
+            lateout("rcx") _,
+            lateout("r8") _,
+            lateout("r9") _,
+            lateout("r10") _,
+            lateout("r11") _,
         );
     }
     ret
