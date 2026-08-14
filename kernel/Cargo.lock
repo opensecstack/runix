@@ -246,15 +246,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "runix-citadel-integration"
+version = "0.0.1"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "serde",
+ "sha2",
+]
+
+[[package]]
 name = "runix-kernel"
 version = "0.0.1"
 dependencies = [
  "bootloader_api",
  "ed25519-dalek",
+ "hex",
  "lazy_static",
  "linked_list_allocator",
  "pic8259",
  "runix-capability-manager",
+ "runix-citadel-integration",
+ "sha2",
  "spin",
  "x86_64",
 ]

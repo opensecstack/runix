@@ -121,6 +121,7 @@ jobs:
           cargo test --target x86_64-unknown-none --test scheduler_address_space
           cargo test --target x86_64-unknown-none --test ring3_cooperative
           cargo test --target x86_64-unknown-none --test grid_sandbox_wasm
+          cargo test --target x86_64-unknown-none --test citadel_demo
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke

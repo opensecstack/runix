@@ -17,6 +17,7 @@ extern crate alloc;
 pub mod allocator;
 pub mod boot;
 pub mod capabilities;
+pub mod citadel;
 pub mod elf;
 pub mod gdt;
 pub mod interrupts;

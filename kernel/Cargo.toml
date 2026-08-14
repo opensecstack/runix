@@ -21,7 +21,12 @@ lazy_static = { version = "1.5", default-features = false, features = ["spin_no_
 linked_list_allocator = "0.10"
 pic8259 = "0.11"
 runix-capability-manager = { path = "../capability-manager" }
+runix-citadel-integration = { path = "../citadel-integration" }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+# force-soft: see capability-manager/Cargo.toml's comment — same LLVM ICE
+# on x86_64-unknown-none with the default SIMD-selecting backend.
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 
 [features]
 # On by default because there is no other option yet — no firmware/WORM key
@@ -78,6 +83,10 @@ harness = false
 
 [[test]]
 name = "grid_sandbox_wasm"
+harness = false
+
+[[test]]
+name = "citadel_demo"
 harness = false
 
 [profile.dev]

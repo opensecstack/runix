@@ -204,6 +204,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         port2_contents
     );
 
+    // CITADEL boot-time module authorization: proves the `citadel-integration`
+    // <-> kernel wiring works end to end (see `citadel.rs`'s doc comment) —
+    // an allowlist entry signed for this exact module's bytes is accepted,
+    // and the same check against tampered bytes is refused. Not yet gating
+    // an actual module load: `main.rs` doesn't ELF-load anything of its own
+    // today (only `kernel/tests/*.rs` do), so there's nothing real to gate
+    // here yet — this demonstrates the gate itself works, the same way the
+    // capability-token phases above demonstrate `capability-manager` works
+    // before anything real depends on it either.
+    let demo_module_bytes = b"demo module bytes - not a real loaded module yet";
+    let citadel_authorized = runix_kernel::citadel::demo_authorize("demo-module", demo_module_bytes);
+    let citadel_tampered_rejected =
+        runix_kernel::citadel::demo_reject_tampered("demo-module", demo_module_bytes);
+    serial_println!(
+        "Runix kernel: CITADEL boot authorization OK (Phase B6: authorized={:?}, tampered rejected={:?})",
+        citadel_authorized,
+        citadel_tampered_rejected
+    );
+
     // Ring 3: map a user-accessible stack, grant ring 3 access to the one
     // code page `user_hello` lives on, then `iretq` into it. There's no
     // return path — this really is the last thing the boot thread does;
