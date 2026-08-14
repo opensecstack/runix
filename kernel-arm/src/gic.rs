@@ -1,6 +1,8 @@
-//! GICv2 (Generic Interrupt Controller) bring-up -- QEMU `virt`'s default
-//! interrupt controller (unless started with `-M virt,gic-version=3`,
-//! which this crate doesn't target yet). ARM has no PIC/PIT the way
+//! GICv2 (Generic Interrupt Controller) bring-up. Explicitly requested via
+//! `-M virt,gic-version=2` -- QEMU's `virt` board docs note the *default*
+//! GIC version under TCG (no KVM) resolves to GICv3 (`gic-version=max`),
+//! not v2, so this isn't a "the default happens to be v2" assumption.
+//! ARM has no PIC/PIT the way
 //! x86_64 does (see `kernel/src/interrupts.rs`'s use of the 8259 PIC) --
 //! interrupt routing and masking both go through this instead.
 //!
@@ -14,24 +16,41 @@
 //!   "what's pending for me right now" -- acknowledge (`IAR`) and
 //!   end-of-interrupt (`EOIR`) both go through here.
 //!
-//! Alpha scope, and current status: enable both halves, then try to prove
-//! interrupt delivery end to end with a Software Generated Interrupt (SGI,
-//! IDs 0-15 reserved for exactly this -- a CPU can trigger one directly by
-//! writing to `GICD_SGIR`, no external device or timer needed). **Proven
-//! so far**: [`trigger_self_sgi0`] genuinely reaches the distributor --
+//! Alpha scope, and current status: enable both halves following the same
+//! `GICC_CTLR`/`GICD_CTLR` configuration ARM Trusted Firmware's own real
+//! GICv2 EL3 driver uses (`gicv2_cpuif_enable`/`gicv2_distif_init` in
+//! `drivers/arm/gic/v2/gicv2_main.c`), then try to prove interrupt
+//! delivery end to end with a Software Generated Interrupt (SGI, IDs 0-15
+//! reserved for exactly this -- a CPU can trigger one directly by writing
+//! to `GICD_SGIR`, no external device or timer needed).
+//!
+//! **Proven**: [`trigger_self_sgi0`] genuinely reaches the distributor --
 //! [`pending_raw`] (`GICD_ISPENDR0`) reads back `0x1` immediately after
 //! triggering, confirmed in QEMU. **Not yet proven**: delivery all the way
-//! into `vectors.rs`'s IRQ (or FIQ) vector at EL3. Tried so far without
-//! success: `GICD_CTLR`/`GICC_CTLR` `EnableGrp0` alone, both
-//! `EnableGrp0`+`EnableGrp1`, marking the SGI Group 1 via `GICD_IGROUPR0`
-//! (Group 1 should signal as IRQ; Group 0's `FIQEn` bit controls whether
-//! it signals as FIQ or IRQ), and unmasking both `PSTATE.I` and
-//! `PSTATE.F`. The distributor-level proof confirms the SGI mechanism and
-//! addresses are right; what's still missing is specific to GICv2's
-//! Security-Extensions CPU-interface configuration for a Secure EL3
-//! context, which needs the architecture reference manual open next to it
-//! to get right, not further guessing. Flagged rather than papered over
-//! with a claimed pass -- see `docs/THREAT_MODEL.md`.
+//! into `vectors.rs`'s FIQ/IRQ vector at EL3, even after matching ATF's
+//! own driver configuration (`Group 0` only enabled, `FIQEn` set so it
+//! signals as FIQ, all four `{FIQ,IRQ}_BYP_DIS_GRP{0,1}` bypass-disable
+//! bits set -- an earlier version had none of this and predictably got no
+//! delivery either, but this version doesn't either).
+//!
+//! Ruled out along the way, each with a real test, not a guess:
+//! - Wrong interrupt group (tried Group 0 alone, Group 1 alone, both).
+//! - Wrong signal (`FIQEn` on and off -- both `vectors.rs` vector 5 (IRQ)
+//!   and vector 6 (FIQ) are wired to the same handler, so either would be
+//!   caught).
+//! - `PSTATE` masking (`daifclr` clears both I and F before triggering).
+//! - Legacy bypass left enabled (this version explicitly disables all
+//!   four bypass paths, matching ATF).
+//! - QEMU defaulting to GICv3 instead of GICv2 under TCG (the `virt`
+//!   board's own docs note `gic-version=max` resolves to GICv3 by default
+//!   without KVM) -- retested with `-M virt,gic-version=2` explicit, same
+//!   result.
+//!
+//! What's left is genuinely a "attach GDB to QEMU and read the actual
+//! register/GIC state at the moment of the trigger" question, not
+//! something more guessing from outside the debugger will resolve --
+//! flagged as the concrete next step rather than iterated further blind.
+//! See `docs/THREAT_MODEL.md`.
 
 const GICD_BASE: usize = 0x0800_0000;
 const GICC_BASE: usize = 0x0801_0000;
@@ -41,7 +60,6 @@ const GICC_BASE: usize = 0x0801_0000;
 // GICv2 spec) is visible at a glance, consistent with every other entry.
 #[allow(clippy::identity_op)]
 const GICD_CTLR: usize = GICD_BASE + 0x000;
-const GICD_IGROUPR0: usize = GICD_BASE + 0x080;
 const GICD_ISENABLER0: usize = GICD_BASE + 0x100;
 const GICD_ISPENDR0: usize = GICD_BASE + 0x200;
 const GICD_SGIR: usize = GICD_BASE + 0xF00;
@@ -51,6 +69,24 @@ const GICC_CTLR: usize = GICC_BASE + 0x000;
 const GICC_PMR: usize = GICC_BASE + 0x004;
 const GICC_IAR: usize = GICC_BASE + 0x00C;
 const GICC_EOIR: usize = GICC_BASE + 0x010;
+
+// GICD_CTLR / GICC_CTLR bit layout, matching ARM Trusted Firmware's own
+// constant names (`include/drivers/arm/gicv2.h`) so this is checkable
+// against that source directly, not just against this module's own doc
+// comment.
+const CTLR_ENABLE_G0_BIT: u32 = 1 << 0;
+/// `GICC_CTLR` only: routes Group 0 interrupts to the CPU as FIQ (1) rather
+/// than IRQ (0) -- the Secure-world convention this module follows.
+const FIQ_EN_BIT: u32 = 1 << 3;
+/// `GICC_CTLR` only, all four: disable the CPU interface's legacy signal
+/// bypass for each (FIQ/IRQ) x (Group 0/Group 1) combination. Left at
+/// their reset value (bypass *enabled*), delivery can be silently
+/// suppressed even with everything else configured correctly -- see this
+/// module's doc comment for how that was found.
+const FIQ_BYP_DIS_GRP0: u32 = 1 << 5;
+const IRQ_BYP_DIS_GRP0: u32 = 1 << 6;
+const FIQ_BYP_DIS_GRP1: u32 = 1 << 7;
+const IRQ_BYP_DIS_GRP1: u32 = 1 << 8;
 
 fn write32(addr: usize, value: u32) {
     unsafe {
@@ -62,22 +98,27 @@ fn read32(addr: usize) -> u32 {
     unsafe { core::ptr::read_volatile(addr as *const u32) }
 }
 
-/// Enables the distributor and this CPU's interface, and unmasks SGI 0
-/// specifically (`GICD_ISENABLER0` bit 0) -- the one interrupt
-/// [`trigger_self_sgi0`] uses to prove delivery works. A real driver would
-/// enable whatever the caller asks for; Alpha's only caller is this
-/// module's own proof, so it only enables what that needs.
+/// Enables the distributor and this CPU's interface (Group 0/Secure only,
+/// matching ATF's own EL3 GICv2 driver -- see this module's doc comment),
+/// and unmasks SGI 0 specifically (`GICD_ISENABLER0` bit 0) -- the one
+/// interrupt [`trigger_self_sgi0`] uses to prove delivery works. A real
+/// driver would enable whatever the caller asks for; Alpha's only caller
+/// is this module's own proof, so it only enables what that needs. SGI 0
+/// is left at its reset group (Group 0) deliberately -- not written to
+/// `GICD_IGROUPR0` -- since Group 0 is exactly what this configuration
+/// expects to handle.
 pub fn init() {
-    // Bit 0 = EnableGrp0 (Secure), bit 1 = EnableGrp1 (Non-secure) -- both
-    // set on both distributor and CPU interface. SGI 0 is also explicitly
-    // marked Group 1 (`GICD_IGROUPR0` bit 0) below: from a Secure GICC_CTLR
-    // view, Group 0 interrupts route to FIQ by default (`FIQEn`), Group 1
-    // to plain IRQ -- marking it Group 1 is what makes `vectors.rs`'s IRQ
-    // vector (not FIQ) the one that actually fires for this test.
-    write32(GICD_CTLR, 0b11);
-    write32(GICC_CTLR, 0b11);
+    write32(GICD_CTLR, CTLR_ENABLE_G0_BIT);
+    write32(
+        GICC_CTLR,
+        CTLR_ENABLE_G0_BIT
+            | FIQ_EN_BIT
+            | FIQ_BYP_DIS_GRP0
+            | IRQ_BYP_DIS_GRP0
+            | FIQ_BYP_DIS_GRP1
+            | IRQ_BYP_DIS_GRP1,
+    );
     write32(GICC_PMR, 0xFF); // priority mask: 0xFF admits every priority level
-    write32(GICD_IGROUPR0, 1 << 0); // SGI 0 -> Group 1 (Non-secure/IRQ)
     write32(GICD_ISENABLER0, 1 << 0); // enable SGI 0
 }
 
