@@ -42,9 +42,12 @@ runix/
 │                         scheduling
 ├── kernel-arm/           standalone (not a workspace member — see below):
 │                         microkernel ARM/TrustZone boot bring-up (mobile,
-│                         aarch64) — Alpha scope: EL3 Secure Monitor boot +
-│                         UART only so far; see its own doc comment for the
-│                         "why a separate crate from kernel/" decision
+│                         aarch64) — EL3 boot, real exception vectors
+│                         (catch + resume with full context preserved),
+│                         the EL3→EL1 Non-secure drop (the TrustZone
+│                         boundary), partial GIC bring-up; see its own doc
+│                         comment for full status and the "why a separate
+│                         crate from kernel/" decision
 ├── xtask/                standalone (not a workspace member — see below):
 │                         builds kernel's bootable image, runs it in QEMU
 ├── capability-manager/   shared: capability-token access control (no_std +

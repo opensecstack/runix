@@ -125,9 +125,12 @@ jobs:
 
   # Mobile L1 (aarch64/TrustZone), separate from the x86_64 `kernel` job
   # above — different target triple, different toolchain requirement (this
-  # one builds on stable). Alpha scope so far: boot to EL3 (Secure Monitor)
-  # with a working UART, nothing more — see kernel-arm/src/main.rs's doc
-  # comment for status and the "why a separate crate from kernel/" decision.
+  # one builds on stable). Alpha scope so far: EL3 boot, a real exception
+  # vector table (catches and resumes a deliberate fault with full context
+  # preserved), the EL3->EL1 Non-secure drop (the actual TrustZone
+  # boundary), and partial GIC bring-up — see kernel-arm/src/main.rs's doc
+  # comment for full status and the "why a separate crate from kernel/"
+  # decision.
   kernel-arm:
     runs-on: ubuntu-latest
     defaults:
@@ -151,7 +154,7 @@ jobs:
         run: cargo build --target aarch64-unknown-none --release
       - name: install QEMU (aarch64)
         run: sudo apt-get update && sudo apt-get install -y qemu-system-arm
-      - name: boot in QEMU and check for EL3 (Secure Monitor) boot
+      - name: boot in QEMU and check EL3 boot, exception resume, EL3->EL1 drop
         run: |
           timeout 10 qemu-system-aarch64 \
             -M virt,secure=on -cpu cortex-a53 -nographic \
@@ -159,6 +162,15 @@ jobs:
             | tee /tmp/arm-boot.log || true
           grep -q "Runix ARM kernel: boot OK" /tmp/arm-boot.log
           grep -q "Runix ARM kernel: CurrentEL = EL3" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: VBAR_EL3 installed" /tmp/arm-boot.log
+          # Proves the exception vector table actually catches a fault and
+          # resumes with the interrupted register context intact, not just
+          # that installing VBAR_EL3 didn't crash on its own.
+          grep -q "EXCEPTION: vector 4 (Synchronous (current EL, SPx))" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: EXCEPTION test OK (resumed after brk)" /tmp/arm-boot.log
+          # The actual TrustZone boundary.
+          grep -q "Runix ARM kernel: reached EL1 (dropped from EL3, SCR_EL3.NS=1)" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: CurrentEL = EL1" /tmp/arm-boot.log
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke
