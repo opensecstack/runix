@@ -14,6 +14,12 @@ members = [
     # toolchain this repo otherwise runs on. It's standalone with its own
     # rust-toolchain.toml pinning nightly; run it via `cargo run` from
     # xtask/, which builds the kernel and wraps it into a bootable image.
+    #
+    # NOTE: "kernel-arm" is also intentionally NOT a member, same first
+    # reason as "kernel" — it's freestanding (aarch64-unknown-none, no_std,
+    # panic=abort), a third target triple alongside this workspace's host
+    # target and kernel/'s x86_64-unknown-none. Build it via `cargo build
+    # --target aarch64-unknown-none` from kernel-arm/.
     "capability-manager",
     "ipc",
     "wasm-runtime",

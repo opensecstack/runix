@@ -38,7 +38,13 @@ doesn't exist yet in Alpha.
 ```
 runix/
 ├── kernel/               standalone (not a workspace member — see below):
-│                         microkernel — boot, IPC, memory, scheduling
+│                         microkernel (desktop, x86_64) — boot, IPC, memory,
+│                         scheduling
+├── kernel-arm/           standalone (not a workspace member — see below):
+│                         microkernel ARM/TrustZone boot bring-up (mobile,
+│                         aarch64) — Alpha scope: EL3 Secure Monitor boot +
+│                         UART only so far; see its own doc comment for the
+│                         "why a separate crate from kernel/" decision
 ├── xtask/                standalone (not a workspace member — see below):
 │                         builds kernel's bootable image, runs it in QEMU
 ├── capability-manager/   shared: capability-token access control (no_std +
@@ -51,15 +57,22 @@ runix/
 └── mobile/               mobile-only: RIL, MVNO stack, TrustZone HAL
 ```
 
-`kernel/` and `xtask/` are each their own single-package workspace, not
-members of the root `[workspace]`:
+`kernel/`, `kernel-arm/`, and `xtask/` are each their own single-package
+workspace, not members of the root `[workspace]`:
 
 - `kernel/` is freestanding (`x86_64-unknown-none`, `no_std`, `panic=abort`)
   — a different target than every host-side crate here, which cargo can't
   mix into one `cargo build --workspace` invocation.
+- `kernel-arm/` is freestanding too, but targets `aarch64-unknown-none` — a
+  third target triple, distinct from both `kernel/`'s and the root
+  workspace's. Unlike `kernel/`, it builds on **stable** (no
+  `x86_64`-crate-style nightly-only dependency, no `extern
+  "x86-interrupt"` equivalent) — see its own `rust-toolchain.toml`.
 - `xtask/` depends on the `bootloader` crate (the image builder), whose
   build script needs a **nightly** cargo — mixing that into the otherwise
-  all-stable root workspace breaks it.
+  all-stable root workspace breaks it. (`kernel-arm/` needs no equivalent
+  image-building step at all — QEMU's `virt` machine loads a `-kernel` ELF
+  and jumps straight to its entry point; see `kernel-arm/linker.ld`.)
 
 Everything else (`capability-manager`, `ipc`, `wasm-runtime`,
 `citadel-integration`, `desktop`, `mobile`) is a normal host-target member of

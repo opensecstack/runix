@@ -1,0 +1,18 @@
+[toolchain]
+# No host suffix on purpose (CI runs on Linux) -- same convention as
+# kernel/rust-toolchain.toml and xtask/rust-toolchain.toml. On a Windows dev
+# box with no MSVC Build Tools (link.exe), the host-default stable resolves
+# to -msvc and fails to link -- invoke explicitly instead:
+#   rustup run stable-x86_64-pc-windows-gnu cargo build
+#
+# stable, unlike kernel/ (nightly): kernel/ needs nightly specifically for
+# `#![feature(abi_x86_interrupt)]` (x86_64 IDT gate functions) and its
+# `x86_64` crate dependency's own nightly-only `Step` trait usage -- neither
+# applies here. ARM exception vectors are a fixed-offset code table, not a
+# calling-convention attribute, and this crate has no x86_64-crate-style
+# dependency forcing nightly. Naked functions (`#[unsafe(naked)]`) have been
+# stable since Rust 1.88. Revisit if a real need for an unstable feature
+# shows up (a GIC or PSCI crate requiring one, for instance).
+channel = "stable"
+components = ["clippy", "rustfmt"]
+targets = ["aarch64-unknown-none"]

@@ -1,0 +1,24 @@
+[package]
+name = "runix-kernel-arm"
+description = "Runix microkernel, ARM/TrustZone boot bring-up (mobile L1). Alpha scope: EL3 Secure Monitor boot, UART, exception vectors -- see src/main.rs's module doc comment for status and the naming/placement decision this crate represents."
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/opensecstack/runix"
+publish = false
+
+# NOT part of the root workspace, same reasoning as ../kernel and ../xtask
+# (see the root Cargo.toml's own comment): this targets `aarch64-unknown-none`
+# -- a third target triple alongside the root workspace's host target and
+# `kernel`'s `x86_64-unknown-none`, none of which `cargo build --workspace`
+# can mix into one invocation.
+[workspace]
+
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

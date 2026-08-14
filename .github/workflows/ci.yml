@@ -123,6 +123,43 @@ jobs:
           cargo test --target x86_64-unknown-none --test grid_sandbox_wasm
           cargo test --target x86_64-unknown-none --test citadel_demo
 
+  # Mobile L1 (aarch64/TrustZone), separate from the x86_64 `kernel` job
+  # above — different target triple, different toolchain requirement (this
+  # one builds on stable). Alpha scope so far: boot to EL3 (Secure Monitor)
+  # with a working UART, nothing more — see kernel-arm/src/main.rs's doc
+  # comment for status and the "why a separate crate from kernel/" decision.
+  kernel-arm:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: kernel-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-none
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: kernel-arm
+      - name: fmt check
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --target aarch64-unknown-none -- -D warnings
+      - name: build
+        run: cargo build --target aarch64-unknown-none --release
+      - name: install QEMU (aarch64)
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-arm
+      - name: boot in QEMU and check for EL3 (Secure Monitor) boot
+        run: |
+          timeout 10 qemu-system-aarch64 \
+            -M virt,secure=on -cpu cortex-a53 -nographic \
+            -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
+            | tee /tmp/arm-boot.log || true
+          grep -q "Runix ARM kernel: boot OK" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: CurrentEL = EL3" /tmp/arm-boot.log
+
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke
   # test) and greps its serial output. Coarser and more brittle than a real

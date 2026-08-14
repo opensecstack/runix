@@ -1,0 +1,18 @@
+# Deliberately no `[build] target = ...` default here -- same "don't leak
+# an ambient target into a nested host-side invocation" reasoning as
+# kernel/.cargo/config.toml and grid-sandbox-host/.cargo/config.toml.
+# Invoke explicitly: `cargo build --target aarch64-unknown-none`.
+
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-Tlinker.ld",
+    # Without this, rustc's default for a bare-metal target can still
+    # produce position-independent code -- pinning a static relocation
+    # model keeps every address in `linker.ld` (and anything computed from
+    # `adrp`/`add` against a symbol) an absolute address, matching how
+    # `linker.ld` places `.text` at a fixed load address rather than
+    # expecting a loader to relocate it. Same reasoning
+    # grid-sandbox-host/.cargo/config.toml documents for its own
+    # `x86_64-unknown-none` target.
+    "-C", "relocation-model=static",
+]
