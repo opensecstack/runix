@@ -54,10 +54,13 @@
 //!   x86_64 kernel uses for `SYS_IPC_SEND`, not a separate ARM-side
 //!   reimplementation. `el0.rs`'s demo (`el0_demo`) proves the whole
 //!   chain end to end: an unconditional `SYS_WRITE` (proves the `SVC`
-//!   gate itself works), then `SYS_RIL_ACCESS` for a channel it holds a
-//!   capability for (authorized) and one it doesn't (denied) -- proving
-//!   the capability check actually distinguishes the two, not just that
-//!   EL0 can reach EL1 at all. **Not yet real EL0/EL1 memory isolation**
+//!   gate itself works), `SYS_RIL_ACCESS` for a channel it holds a
+//!   capability for (authorized) and one it doesn't (denied), then
+//!   `SYS_RIL_SEND`/`SYS_RIL_RECV` round-tripping a real byte through the
+//!   authorized channel's mailbox (`ril_channel.rs`) and getting denied
+//!   on the unauthorized one -- proving the capability check gates
+//!   actual per-operation I/O, not just a one-time access decision. **Not
+//!   yet real EL0/EL1 memory isolation**
 //!   -- `mmu.rs`'s Normal block stays EL1-only (`AP[2:1]=0b00`); the
 //!   architecturally-correct `0b01` (grants EL0 data access) was tried
 //!   and reverted after it reproducibly hung QEMU on the EL1 side alone,
@@ -115,6 +118,7 @@ mod heap;
 mod mmu;
 mod nonsecure;
 mod ril_capability;
+mod ril_channel;
 mod serial;
 mod svc;
 mod vectors;

@@ -195,6 +195,15 @@ jobs:
           grep -q "^U$" /tmp/arm-boot.log
           grep -q "SVC: SYS_RIL_ACCESS channel 0 authorized" /tmp/arm-boot.log
           grep -q "SVC: SYS_RIL_ACCESS channel 99 DENIED" /tmp/arm-boot.log
+          # The check gates real per-operation I/O, not just a one-time
+          # access decision: a byte sent on the authorized channel round
+          # -trips back out (0x41, echoed as 'A'), the same operation on
+          # the unauthorized channel is denied outright.
+          grep -q "SVC: SYS_RIL_SEND channel 0 byte 0x41 authorized" /tmp/arm-boot.log
+          grep -q "SVC: SYS_RIL_RECV channel 0 authorized, byte 0x41" /tmp/arm-boot.log
+          grep -q "^A$" /tmp/arm-boot.log
+          grep -q "SVC: SYS_RIL_SEND channel 99 DENIED" /tmp/arm-boot.log
+          grep -q "SVC: SYS_RIL_RECV channel 99 DENIED" /tmp/arm-boot.log
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke

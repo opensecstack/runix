@@ -9,11 +9,13 @@
 //! naked asm, the same reasoning as `userspace::user_hello` on the
 //! x86_64 side -- no calls into normal EL1 code, since EL0 can only ever
 //! reach EL1 through the `SVC` gate, not by jumping into arbitrary EL1
-//! code). It calls `SYS_WRITE` (proving the syscall gate itself works,
-//! unconditionally) and `SYS_RIL_ACCESS` twice -- once for a channel it
-//! holds a capability for, once for one it doesn't -- proving `svc.rs`'s
-//! capability check actually distinguishes the two, not just that EL0
-//! code can reach EL1 at all.
+//! code). It exercises the full syscall surface: `SYS_WRITE` (proves the
+//! gate itself works, unconditionally), `SYS_RIL_ACCESS` for an
+//! authorized and an unauthorized channel (proves the capability check
+//! distinguishes the two), then `SYS_RIL_SEND`/`SYS_RIL_RECV` round-tripping
+//! a real byte through the authorized channel and getting denied on the
+//! unauthorized one -- proving the check gates actual I/O
+//! (`ril_channel.rs`), not just a bare decision.
 
 use core::arch::naked_asm;
 
@@ -64,8 +66,11 @@ pub unsafe fn drop_to_el0(entry: u64) -> ! {
     // inside that block. Doing the arithmetic in ordinary Rust first and
     // passing the final value in as a normal `in(reg)` operand sidesteps
     // the restriction entirely.
-    let stack_top =
-        unsafe { core::ptr::addr_of!(EL0_STACK.0).cast::<u8>().add(EL0_STACK_SIZE) as u64 };
+    let stack_top = unsafe {
+        core::ptr::addr_of!(EL0_STACK.0)
+            .cast::<u8>()
+            .add(EL0_STACK_SIZE) as u64
+    };
     unsafe {
         core::arch::asm!(
             "msr SPSR_EL1, {spsr}",
@@ -80,21 +85,23 @@ pub unsafe fn drop_to_el0(entry: u64) -> ! {
     }
 }
 
-/// `SYS_WRITE`/`SYS_RIL_ACCESS` -- must match `svc.rs`'s dispatch table
-/// exactly; duplicated here (not shared via a `const` module both sides
-/// import) for the same reason `grid-sandbox-host/src/main.rs` duplicates
-/// the x86_64 syscall ABI numbers instead of sharing them with
-/// `kernel/src/syscall.rs`: this is a standalone-linked EL0 binary in
-/// spirit (even though it's compiled into the same image today), and only
-/// the syscall *ABI* connects the two sides, not shared Rust items.
+/// Must match `svc.rs`'s dispatch table exactly; duplicated here (not
+/// shared via a `const` module both sides import) for the same reason
+/// `grid-sandbox-host/src/main.rs` duplicates the x86_64 syscall ABI
+/// numbers instead of sharing them with `kernel/src/syscall.rs`: this is a
+/// standalone-linked EL0 binary in spirit (even though it's compiled into
+/// the same image today), and only the syscall *ABI* connects the two
+/// sides, not shared Rust items.
 const SYS_WRITE: u64 = 1;
 const SYS_RIL_ACCESS: u64 = 2;
+const SYS_RIL_SEND: u64 = 3;
+const SYS_RIL_RECV: u64 = 4;
 
 /// The EL0 demo itself. `.balign 4096` for the same reason
 /// `userspace::user_hello` does: keeping it on its own page matters once
 /// EL0 permissions become page-granular instead of the whole 1 GiB block
-/// (see `mmu.rs`'s `AP_EL0_RW` doc comment) -- not load-bearing today,
-/// but the right habit to already be in.
+/// (see `mmu.rs`'s doc comment on `normal_block_descriptor`) -- not
+/// load-bearing today, but the right habit to already be in.
 ///
 /// # Safety
 /// Never call this directly -- only ever reached via `drop_to_el0`'s
@@ -111,17 +118,46 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         // SYS_RIL_ACCESS(0) -- a channel this context holds a capability
         // for (see ril_capability::issue_and_set_current's caller in
         // nonsecure.rs). x0 on return: 0 = authorized, nonzero = denied.
-        "mov x0, {sys_ril}",
+        "mov x0, {sys_ril_access}",
         "mov x1, #0",
         "svc #0",
         // SYS_RIL_ACCESS(99) -- a channel with no matching capability.
-        "mov x0, {sys_ril}",
+        "mov x0, {sys_ril_access}",
+        "mov x1, #99",
+        "svc #0",
+        // SYS_RIL_SEND(0, 'A') -- authorized channel, real payload byte.
+        "mov x0, {sys_ril_send}",
+        "mov x1, #0",
+        "mov x2, #65", // 'A'
+        "svc #0",
+        // SYS_RIL_RECV(0) -- reads the byte just sent back; x0 on return
+        // is the byte itself (0..=255), not a bare status code (see
+        // svc.rs's RIL_RECV_EMPTY/RIL_RECV_DENIED). Moved into x1 and
+        // echoed via SYS_WRITE so the round trip is visible in the serial
+        // log, not just asserted by the return value.
+        "mov x0, {sys_ril_recv}",
+        "mov x1, #0",
+        "svc #0",
+        "mov x1, x0",
+        "mov x0, {sys_write}",
+        "svc #0",
+        // SYS_RIL_SEND(99, 'Z') -- unauthorized channel: denied before
+        // ril_channel::send ever runs, proving the check re-gates I/O on
+        // every operation, not just once at "open" time.
+        "mov x0, {sys_ril_send}",
+        "mov x1, #99",
+        "mov x2, #90", // 'Z'
+        "svc #0",
+        // SYS_RIL_RECV(99) -- likewise denied.
+        "mov x0, {sys_ril_recv}",
         "mov x1, #99",
         "svc #0",
         "1:",
         "wfe",
         "b 1b",
         sys_write = const SYS_WRITE,
-        sys_ril = const SYS_RIL_ACCESS,
+        sys_ril_access = const SYS_RIL_ACCESS,
+        sys_ril_send = const SYS_RIL_SEND,
+        sys_ril_recv = const SYS_RIL_RECV,
     );
 }

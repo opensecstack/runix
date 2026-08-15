@@ -655,21 +655,24 @@ separate freestanding crate from `kernel/` (which is deeply `x86_64`-specific
   didn't crash. Getting a working MMU up took two more real fixes — see
   below.
 - The actual RIL isolation boundary (`el0.rs`/`svc.rs`/
-  `ril_capability.rs`): a real EL1 -> EL0 drop, an `SVC` syscall gate
-  (dispatched through `el1_vectors.rs`'s vector-8 handling — the ARM
-  analogue of `int 0x80`), and a resource-access check gated by a real
-  `capability-manager` token — the *same* crate the x86_64 kernel uses
-  for `SYS_IPC_SEND`, reused rather than reimplemented. Proven end to
-  end: an EL0 demo (`el0_demo`) issues an unconditional `SYS_WRITE`
-  (proves the `SVC` gate works), then `SYS_RIL_ACCESS` for a channel it
-  holds a capability for (authorized) and one it doesn't (denied) —
-  proving the capability check actually distinguishes the two. **Not**
-  real EL0/EL1 memory isolation yet — `mmu.rs`'s Normal block stays
-  EL1-only (`AP[2:1]=0b00`); the correct `0b01` bit was tried and
-  reverted after a real, reproducible QEMU hang — see the bug entry
-  below. The enforced boundary today is the capability check at the
-  `SVC` gate, matching `kernel/src/capabilities.rs`'s role on the
-  x86_64 side, not an MMU permission boundary (which doesn't exist at
+  `ril_capability.rs`/`ril_channel.rs`): a real EL1 -> EL0 drop, an `SVC`
+  syscall gate (dispatched through `el1_vectors.rs`'s vector-8 handling —
+  the ARM analogue of `int 0x80`), and per-operation resource-access
+  checks gated by a real `capability-manager` token — the *same* crate
+  the x86_64 kernel uses for `SYS_IPC_SEND`, reused rather than
+  reimplemented. Proven end to end: an EL0 demo (`el0_demo`) issues an
+  unconditional `SYS_WRITE` (proves the `SVC` gate works), `SYS_RIL_ACCESS`
+  for a channel it holds a capability for (authorized) and one it doesn't
+  (denied), then `SYS_RIL_SEND`/`SYS_RIL_RECV` round-tripping a real byte
+  (`0x41`, `'A'`) through the authorized channel's single-slot mailbox and
+  getting denied on the unauthorized one — proving the capability check
+  gates actual per-operation I/O, re-checked on every call, not just a
+  one-time access decision. **Not** real EL0/EL1 memory isolation yet —
+  `mmu.rs`'s Normal block stays EL1-only (`AP[2:1]=0b00`); the correct
+  `0b01` bit was tried and reverted after a real, reproducible QEMU hang —
+  see the bug entry below. The enforced boundary today is the capability
+  check at the `SVC` gate, matching `kernel/src/capabilities.rs`'s role on
+  the x86_64 side, not an MMU permission boundary (which doesn't exist at
   this granularity yet regardless).
 
 Not yet started: RIL/SIM protocol work itself — per `mobile/src/lib.rs`'s

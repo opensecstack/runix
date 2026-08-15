@@ -67,13 +67,12 @@ pub unsafe extern "C" fn el1_exception_vectors() {
 /// `vectors.rs`'s `vector_common`. After the stub's `str x0` and this
 /// function's own 10 `stp`s, the saved context sits on the stack (from
 /// current `sp` at the `bl`, ascending): `x29,x30` at `+0`/`+8`, ...,
-/// `x1,x2` at `+144`/`+152`, the stub's original `x0` at `+160`. `x1`
-/// (`+144`, EL0's original `x1` -- `SVC`'s `arg1`) and the stub's `x0`
-/// (`+160`, EL0's original `x0` -- `SVC`'s syscall number) are loaded
-/// into `x1`/`x2` *before* the `bl`, landing exactly where
-/// `el1_exception_handler(vector, num, arg1)`'s AAPCS64 argument
-/// registers expect them -- no register shuffling needed beyond the two
-/// loads.
+/// `x1,x2` at `+144`/`+152`, the stub's original `x0` at `+160`. EL0's
+/// original `x0`/`x1`/`x2` (`SVC`'s syscall number, `arg1`, `arg2`) are
+/// loaded into `x1`/`x2`/`x3` *before* the `bl`, landing exactly where
+/// `el1_exception_handler(vector, num, arg1, arg2)`'s AAPCS64 argument
+/// registers expect them -- no register shuffling needed beyond the
+/// three loads.
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
 unsafe extern "C" fn el1_vector_common() {
@@ -90,6 +89,7 @@ unsafe extern "C" fn el1_vector_common() {
         "stp x29, x30, [sp, #-16]!",
         "ldr x1, [sp, #160]", // EL0's original x0 (syscall number) -> handler's arg 2 (x1)
         "ldr x2, [sp, #144]", // EL0's original x1 (arg1) -> handler's arg 3 (x2)
+        "ldr x3, [sp, #152]", // EL0's original x2 (arg2) -> handler's arg 4 (x3)
         "bl {h}",
         // Only reached if el1_exception_handler actually returned (the
         // SVC-resume case -- every other vector loops wfe forever inside
@@ -142,7 +142,7 @@ const ESR_EC_SVC64: u64 = 0x15;
 /// before -- this handler doesn't yet know what a safe resume means for
 /// anything else.
 #[unsafe(no_mangle)]
-extern "C" fn el1_exception_handler(vector: u64, syscall_num: u64, arg1: u64) -> u64 {
+extern "C" fn el1_exception_handler(vector: u64, syscall_num: u64, arg1: u64, arg2: u64) -> u64 {
     let esr_el1: u64;
     unsafe {
         core::arch::asm!("mrs {}, ESR_EL1", out(reg) esr_el1);
@@ -150,7 +150,7 @@ extern "C" fn el1_exception_handler(vector: u64, syscall_num: u64, arg1: u64) ->
     let ec = (esr_el1 >> 26) & 0x3F;
 
     if vector == 8 && ec == ESR_EC_SVC64 {
-        return crate::svc::dispatch(syscall_num, arg1);
+        return crate::svc::dispatch(syscall_num, arg1, arg2);
     }
 
     let far_el1: u64;
