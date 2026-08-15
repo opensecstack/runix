@@ -102,23 +102,52 @@ fn current_el() -> u8 {
 /// check is indirect: whether a Secure-only resource behaves as
 /// inaccessible/different from EL1. `dumping ELR_EL3`/`SCR_EL3` isn't
 /// possible from here by design (that's the isolation working) --
-/// reaching this function at `CurrentEL == EL1` at all, immediately after
-/// `drop_to_el1_nonsecure` set `SCR_EL3.NS = 1` and `eret`'d, is the
-/// available proof at Alpha's scope: a real security-state switch
-/// happened, evidenced by the mechanism used to get here, not by EL1
-/// re-deriving it after the fact.
+/// reaching this function at `CurrentEL == EL1` immediately after
+/// `drop_to_el1_nonsecure` set `SCR_EL3.NS = 1` and `eret`'d is the
+/// available proof at Alpha's scope, *when an EL3 phase ran at all*: a
+/// real security-state switch happened, evidenced by the mechanism used
+/// to get here, not by EL1 re-deriving it after the fact.
+///
+/// Also reachable a second way, from `main.rs::rust_start::el1_entry_no_el3`:
+/// when the platform never had an EL3 to begin with (e.g. QEMU's `-M virt`
+/// without `secure=on`, which resets straight to EL1), there is no Secure
+/// Monitor phase to run and no `SCR_EL3.NS` switch to make -- see
+/// `rust_start`'s own doc comment for why skipping straight to EL1 setup,
+/// instead of still trying to run the EL3-only boot phase, is the fix for
+/// that path rather than a shortcut around it. Both entry points set
+/// `CPACR_EL1.FPEN` and print their own (different) account of *how* EL1
+/// was reached before falling into the shared `el1_setup` -- printing
+/// "dropped from EL3" here when no EL3 ever ran would be actively false,
+/// not just imprecise.
 #[unsafe(no_mangle)]
-extern "C" fn el1_entry() -> ! {
-    // CPACR_EL1.FPEN (bits [21:20]) traps FP/SIMD access by default at
-    // reset -- and compiler-generated code can use NEON registers for
-    // things as mundane as a string copy (observed for real: one
-    // `serial_println!` call with no format arguments faulted here with
-    // ESR_EL1.EC=0x7, "FP/SIMD access trapped", while earlier ones with
-    // the exact same shape didn't -- the compiler's own memcpy-lowering
-    // threshold, not anything this code does deliberately). Set to
-    // `0b11` (access permitted from EL0 and EL1, uncontrolled) before any
-    // other EL1 code runs, rather than debug this class of trap on a
-    // case-by-case basis.
+pub extern "C" fn el1_entry() -> ! {
+    set_cpacr_fpen();
+    serial_println!("Runix ARM kernel: reached EL1 (dropped from EL3, SCR_EL3.NS=1)");
+    el1_setup()
+}
+
+/// See `el1_entry`'s doc comment -- the no-EL3 counterpart, called directly
+/// from `rust_start` rather than via `drop_to_el1_nonsecure`'s `eret`.
+pub extern "C" fn el1_entry_no_el3() -> ! {
+    set_cpacr_fpen();
+    serial_println!(
+        "Runix ARM kernel: EL1 entered directly -- no EL3 ever ran, so no \
+         security-state switch to report"
+    );
+    el1_setup()
+}
+
+/// `CPACR_EL1.FPEN` (bits [21:20]) traps FP/SIMD access by default at
+/// reset -- and compiler-generated code can use NEON registers for things
+/// as mundane as a string copy (observed for real: one `serial_println!`
+/// call with no format arguments faulted here with `ESR_EL1.EC=0x7`,
+/// "FP/SIMD access trapped", while earlier ones with the exact same shape
+/// didn't -- the compiler's own memcpy-lowering threshold, not anything
+/// this code does deliberately). Set to `0b11` (access permitted from EL0
+/// and EL1, uncontrolled) before any other EL1 code runs -- in particular
+/// before the very first print, on *either* entry path -- rather than
+/// debug this class of trap on a case-by-case basis.
+fn set_cpacr_fpen() {
     unsafe {
         core::arch::asm!(
             "mrs x0, CPACR_EL1",
@@ -128,8 +157,13 @@ extern "C" fn el1_entry() -> ! {
             out("x0") _,
         );
     }
+}
 
-    serial_println!("Runix ARM kernel: reached EL1 (dropped from EL3, SCR_EL3.NS=1)");
+/// Shared EL1 bring-up, common to both ways of reaching EL1 (see
+/// `el1_entry`'s doc comment) -- MMU, heap, capability issuance, and the
+/// drop to EL0 don't care how EL1 was reached, only that `CPACR_EL1.FPEN`
+/// is already set (both callers do this before calling in).
+fn el1_setup() -> ! {
     serial_println!("Runix ARM kernel: CurrentEL = EL{}", current_el());
 
     // Install EL1's own exception vector table *before* touching the MMU:

@@ -204,6 +204,29 @@ jobs:
           grep -q "^A$" /tmp/arm-boot.log
           grep -q "SVC: SYS_RIL_SEND channel 99 DENIED" /tmp/arm-boot.log
           grep -q "SVC: SYS_RIL_RECV channel 99 DENIED" /tmp/arm-boot.log
+      - name: boot in QEMU without secure=on and check the no-EL3 path
+        # Regression check for a real, previously-shipped bug: this used to
+        # produce zero UART output (rust_start ran the EL3-only phase
+        # unconditionally, which UNDEFINED-traps from EL1 with no VBAR_EL1
+        # installed yet to catch it) -- see main.rs's doc comment and
+        # docs/STATUS.md's "Real bugs" section for the full account.
+        run: |
+          timeout 8 qemu-system-aarch64 \
+            -M virt,gic-version=2 -cpu cortex-a53 -nographic \
+            -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
+            | tee /tmp/arm-boot-nosecure.log || true
+          grep -q "Runix ARM kernel: boot OK" /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: CurrentEL = EL1" /tmp/arm-boot-nosecure.log
+          grep -q "no EL3 present -- skipping" /tmp/arm-boot-nosecure.log
+          # Must NOT claim a security-state switch that never happened.
+          grep -q "no EL3 ever ran, so no security-state switch to report" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: MMU enabled" /tmp/arm-boot-nosecure.log
+          grep -q "^U$" /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_RIL_ACCESS channel 0 authorized" /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_RIL_RECV channel 0 authorized, byte 0x41" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "^A$" /tmp/arm-boot-nosecure.log
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke

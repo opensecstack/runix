@@ -76,12 +76,25 @@
 //! isolation boundary now proven) is still QEMU-only, not target hardware
 //! bring-up.
 //!
-//! **Known gap**: the identical binary produces no UART output at all when
-//! booted without secure mode (`-M virt` without `secure=on`, which starts
-//! at EL1 instead of EL3). Not yet root-caused -- flagged rather than
-//! silently ignored. Not a blocker for Alpha's actual target (EL3 Secure
-//! Monitor boot, which does work), but worth investigating before anything
-//! depends on a non-secure boot path specifically.
+//! - **Non-secure boot now works too**, not just EL3 Secure Monitor boot:
+//!   `-M virt` without `secure=on` resets straight to EL1 (no EL3 present
+//!   at all), and `rust_start` used to run the EL3-only phase regardless
+//!   -- `vectors::install()`'s `VBAR_EL3` write UNDEFINED-traps when
+//!   executed from EL1, and with `VBAR_EL1` not installed yet either, that
+//!   trap silently jumped to whatever raw bytes sit at physical address
+//!   `0x200` (`VBAR_EL1`'s reset value), producing no UART output
+//!   whatsoever -- the same failure class as `el1_vectors.rs`'s own doc
+//!   comment describes for a bad `mmu::install` page table entry, now hit
+//!   a third time on a third code path. Root-caused with a GDB `stepi`
+//!   from `_start` (the same technique that found the GIC's `SCR_EL3`
+//!   gap), then confirmed with a raw-asm UART probe (see
+//!   `rust_start`'s own doc comment) that ruled out an `FP`/`SIMD`-trap
+//!   theory first. Fixed: `rust_start` now checks `CurrentEL` and, when
+//!   no EL3 is present, calls `nonsecure::el1_entry_no_el3` directly
+//!   instead of running the EL3-only phase -- verified end to end in
+//!   QEMU without `secure=on`, reaching the same RIL isolation demo
+//!   above with an honest boot log (it never claims a security-state
+//!   switch happened, since none did).
 //!
 //! # Why a separate crate from `kernel/`
 //!
@@ -181,7 +194,32 @@ fn current_el() -> u8 {
 #[unsafe(no_mangle)]
 extern "C" fn rust_start() -> ! {
     serial_println!("Runix ARM kernel: boot OK");
-    serial_println!("Runix ARM kernel: CurrentEL = EL{}", current_el());
+    let el = current_el();
+    serial_println!("Runix ARM kernel: CurrentEL = EL{}", el);
+
+    // No EL3 present -- e.g. QEMU's `-M virt` without `secure=on`, which
+    // resets straight to EL1 instead of EL3. Root-caused, not guessed:
+    // everything below this branch (`VBAR_EL3`, the deliberate `brk` test,
+    // `gic::init`'s `SCR_EL3` IRQ/FIQ routing, the EL3->EL1 `eret`) writes
+    // or relies on EL3-only state. `VBAR_EL3` in particular UNDEFINED-traps
+    // when executed from EL1 -- and since `VBAR_EL1` isn't installed yet
+    // at this point either, that trap silently jumps to whatever raw bytes
+    // sit at physical address `0x200` (`VBAR_EL1`'s reset value), the same
+    // failure class `el1_vectors.rs`'s own doc comment already documents
+    // for a bad `mmu::install` page table entry -- confirmed with GDB
+    // stepping from `_start`, the same technique that found the GIC's
+    // `SCR_EL3` gap. This was this crate's "known gap: no UART output at
+    // all" without secure mode. Fix: skip the EL3-only phase entirely and
+    // go straight to EL1's own setup -- there's no Secure Monitor level to
+    // boot through if EL3 never existed.
+    if el == 1 {
+        serial_println!(
+            "Runix ARM kernel: no EL3 present -- skipping the TrustZone-only \
+             boot phase (VBAR_EL3, brk test, GIC/SCR_EL3 routing) and \
+             continuing directly as EL1 Non-secure"
+        );
+        nonsecure::el1_entry_no_el3();
+    }
 
     vectors::install();
     serial_println!("Runix ARM kernel: VBAR_EL3 installed");

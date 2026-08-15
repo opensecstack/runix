@@ -678,11 +678,11 @@ separate freestanding crate from `kernel/` (which is deeply `x86_64`-specific
 Not yet started: RIL/SIM protocol work itself — per `mobile/src/lib.rs`'s
 doc comment, that starts once the shared kernel boots on target hardware;
 everything above (including the isolation boundary now proven) is still
-QEMU-only. Known gap, not yet root-caused: the identical binary produces
-no UART output at all when booted without secure mode (`-M virt` without
-`secure=on`, which starts at EL1 instead of EL3) — not a blocker for the
-EL3 Secure Monitor path, which works, but flagged rather than silently
-ignored.
+QEMU-only.
+
+Non-secure boot (`-M virt` without `secure=on`, which resets straight to
+EL1 instead of EL3) now works too — previously produced no UART output at
+all, root-caused and fixed; see the bug entry below.
 
 ## Real bugs worth knowing before touching the relevant code again
 
@@ -814,3 +814,29 @@ before `el0_demo` ever got to use it (`SYS_RIL_ACCESS channel 0 DENIED
 (capability token expired)`, for a token issued moments earlier). Fixed by
 sizing the window off `CNTFRQ_EL0` directly (`svc::frequency_hz()`) instead
 of a magic tick count.
+
+One more, closing out the "no UART output without `secure=on`" known gap
+from earlier: `-M virt` without `secure=on` resets straight to EL1 (no
+EL3 exists at all in that config), but `rust_start` ran the EL3-only boot
+phase unconditionally regardless of which EL it actually landed at.
+`vectors::install()`'s `VBAR_EL3` write is UNDEFINED when executed from
+EL1, and — same failure signature as the MMU bug above, now hit a third
+time — with `VBAR_EL1` not installed yet either, that trap silently
+jumped to whatever raw bytes sit at physical address `0x200`, producing
+no output at all. Root-caused with a GDB `stepi` from `_start` (same
+technique as the GIC fix), which showed `$pc` landing at `0x200` after
+only a handful of instructions; confirmed by adding a raw-asm UART
+write-probe directly in `_start` (zero Rust codegen, to rule out an
+`FP`/`SIMD`-trap theory first) — worth noting the probe itself had a bug
+on the first attempt (`movz x2, #0x9000, lsl #16` computes `0x9000_0000`,
+not UART0's real `0x0900_0000` — an extra hex digit shifted the whole
+address by 16x), which produced a real store-permission fault to
+unmapped memory and briefly looked like confirmation of the wrong theory
+before the immediate was corrected. Fixed by having `rust_start` check
+`CurrentEL` and, when no EL3 is present, call a new
+`nonsecure::el1_entry_no_el3` directly instead of running the EL3-only
+phase — factored out of the existing `el1_entry` so both paths share the
+same EL1 setup (MMU, heap, capability issuance, EL0 drop) but print an
+honest, distinct account of *how* EL1 was reached (the EL3-drop path
+still says "dropped from EL3, `SCR_EL3.NS=1`"; the no-EL3 path no longer
+claims a security-state switch that never happened).
