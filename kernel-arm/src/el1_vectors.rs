@@ -19,6 +19,20 @@
 //! Installing this table before calling `mmu::install` turns that class of
 //! failure back into a normal, diagnosable "EXCEPTION: ... ESR_EL1=...
 //! FAR_EL1=..." report, the same as `vectors.rs` already does for EL3.
+//!
+//! # `SVC` resume, added once `el0.rs` needed it
+//!
+//! Vector 8 ("Synchronous, lower EL, AArch64") is where `el0.rs`'s `SVC
+//! #0` calls land. Unlike every other vector here (diagnose and halt
+//! forever), an `SVC` needs to *resume EL0*, with a real return value in
+//! `x0` -- so `el1_vector_common`'s epilogue restores every saved
+//! register from `x1` onward, but deliberately does *not* restore the
+//! stub's saved `x0`: `el1_exception_handler`'s own return value (in `x0`
+//! already, per the standard call return convention, right after `bl`)
+//! becomes EL0's new `x0` instead. This only works because
+//! `el1_exception_handler` never actually returns for any *other* vector
+//! (every other case loops `wfe` forever internally) -- the epilogue is
+//! unreachable except by the one path that's supposed to reach it.
 
 use crate::serial_println;
 use core::arch::naked_asm;
@@ -36,6 +50,7 @@ pub unsafe extern "C" fn el1_exception_vectors() {
         ".balign 0x80", "str x0, [sp, #-16]!", "mov x0, #5",  "b {c}",
         ".balign 0x80", "str x0, [sp, #-16]!", "mov x0, #6",  "b {c}",
         ".balign 0x80", "str x0, [sp, #-16]!", "mov x0, #7",  "b {c}",
+        // Vector 8: Synchronous, lower EL, AArch64 -- SVC lands here.
         ".balign 0x80", "str x0, [sp, #-16]!", "mov x0, #8",  "b {c}",
         ".balign 0x80", "str x0, [sp, #-16]!", "mov x0, #9",  "b {c}",
         ".balign 0x80", "str x0, [sp, #-16]!", "mov x0, #10", "b {c}",
@@ -49,11 +64,16 @@ pub unsafe extern "C" fn el1_exception_vectors() {
 }
 
 /// Save-context-then-call-Rust trampoline, same reasoning as
-/// `vectors.rs`'s `vector_common`. Unlike EL3's version, this one never
-/// resumes (no case here needs it yet -- Alpha's EL1 fault handling is
-/// diagnose-and-halt, not catch-and-continue) so there's no epilogue to
-/// restore registers before an `eret`; `el1_exception_handler` simply
-/// never returns.
+/// `vectors.rs`'s `vector_common`. After the stub's `str x0` and this
+/// function's own 10 `stp`s, the saved context sits on the stack (from
+/// current `sp` at the `bl`, ascending): `x29,x30` at `+0`/`+8`, ...,
+/// `x1,x2` at `+144`/`+152`, the stub's original `x0` at `+160`. `x1`
+/// (`+144`, EL0's original `x1` -- `SVC`'s `arg1`) and the stub's `x0`
+/// (`+160`, EL0's original `x0` -- `SVC`'s syscall number) are loaded
+/// into `x1`/`x2` *before* the `bl`, landing exactly where
+/// `el1_exception_handler(vector, num, arg1)`'s AAPCS64 argument
+/// registers expect them -- no register shuffling needed beyond the two
+/// loads.
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
 unsafe extern "C" fn el1_vector_common() {
@@ -68,10 +88,27 @@ unsafe extern "C" fn el1_vector_common() {
         "stp x15, x16, [sp, #-16]!",
         "stp x17, x18, [sp, #-16]!",
         "stp x29, x30, [sp, #-16]!",
+        "ldr x1, [sp, #160]", // EL0's original x0 (syscall number) -> handler's arg 2 (x1)
+        "ldr x2, [sp, #144]", // EL0's original x1 (arg1) -> handler's arg 3 (x2)
         "bl {h}",
-        "1:",
-        "wfe",
-        "b 1b",
+        // Only reached if el1_exception_handler actually returned (the
+        // SVC-resume case -- every other vector loops wfe forever inside
+        // the handler instead). x0 already holds the handler's return
+        // value (the SysV return-value register, unchanged since `bl`) --
+        // restore x1 upward as normal, then *discard* (not restore) the
+        // stub's saved x0 so the handler's return value reaches EL0.
+        "ldp x29, x30, [sp], #16",
+        "ldp x17, x18, [sp], #16",
+        "ldp x15, x16, [sp], #16",
+        "ldp x13, x14, [sp], #16",
+        "ldp x11, x12, [sp], #16",
+        "ldp x9, x10, [sp], #16",
+        "ldp x7, x8, [sp], #16",
+        "ldp x5, x6, [sp], #16",
+        "ldp x3, x4, [sp], #16",
+        "ldp x1, x2, [sp], #16",
+        "add sp, sp, #16", // discard the stub's saved x0, not restore it
+        "eret",
         h = sym el1_exception_handler,
     );
 }
@@ -94,22 +131,34 @@ fn vector_name(vector: u64) -> &'static str {
     }
 }
 
-/// Reports the fault and halts. `FAR_EL1` (Fault Address Register) is what
-/// makes this actually useful for diagnosing a bad translation-table
-/// entry -- `ESR_EL1` says *what kind* of fault (translation, permission,
-/// access-flag, ...), `FAR_EL1` says *which address* triggered it, which
-/// `mmu.rs`'s two 1 GiB block descriptors alone don't reveal at a glance.
+/// `ESR_EL1.EC` value for "SVC instruction execution in AArch64 state".
+const ESR_EC_SVC64: u64 = 0x15;
+
+/// Vector 8 (Synchronous, lower EL AArch64), specifically an `SVC`: routes
+/// to `svc::dispatch` and *returns* its result -- the one case this
+/// handler resumes instead of halting. Every other vector (including
+/// vector 8 for a non-`SVC` synchronous exception, e.g. a real EL0 data
+/// abort once anything can trigger one) reports and halts, same as
+/// before -- this handler doesn't yet know what a safe resume means for
+/// anything else.
 #[unsafe(no_mangle)]
-extern "C" fn el1_exception_handler(vector: u64) -> ! {
+extern "C" fn el1_exception_handler(vector: u64, syscall_num: u64, arg1: u64) -> u64 {
     let esr_el1: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, ESR_EL1", out(reg) esr_el1);
+    }
+    let ec = (esr_el1 >> 26) & 0x3F;
+
+    if vector == 8 && ec == ESR_EC_SVC64 {
+        return crate::svc::dispatch(syscall_num, arg1);
+    }
+
     let far_el1: u64;
     let elr_el1: u64;
     unsafe {
-        core::arch::asm!("mrs {}, ESR_EL1", out(reg) esr_el1);
         core::arch::asm!("mrs {}, FAR_EL1", out(reg) far_el1);
         core::arch::asm!("mrs {}, ELR_EL1", out(reg) elr_el1);
     }
-    let ec = (esr_el1 >> 26) & 0x3F;
     serial_println!(
         "EL1 EXCEPTION: vector {} ({}), ELR_EL1={:#x}, ESR_EL1={:#x} (EC={:#x}), FAR_EL1={:#x}",
         vector,

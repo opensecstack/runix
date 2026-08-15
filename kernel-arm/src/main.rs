@@ -45,15 +45,33 @@
 //!   code can hit FP/SIMD-trapped-by-default in ordinary-looking code
 //!   (see `nonsecure.rs`'s doc comment on `el1_entry` for both).
 //!
-//! Not yet started: RIL/SIM work itself. See `mobile/src/lib.rs`'s doc
-//! comment: that work "starts once the shared kernel boots on target
-//! hardware" -- this crate is that first slice, not the target hardware
-//! bring-up itself yet (everything above is QEMU-only so far), but with
-//! MMU bring-up done, the actual RIL isolation boundary (a separate,
-//! restricted EL1 (or eventually EL0) context RIL code runs in, gated by
-//! capability tokens the same way `capability-manager` already gates
-//! things on the x86_64 side) is the next real step, not blocked on
-//! further infrastructure.
+//! - The actual RIL isolation boundary (see `el0.rs`/`svc.rs`/
+//!   `ril_capability.rs`): a real EL1 -> EL0 drop (the ARM analogue of
+//!   `kernel/src/userspace.rs`'s ring 0 -> ring 3 transition), an `SVC`
+//!   syscall gate (the ARM analogue of `int 0x80`, dispatched through
+//!   `el1_vectors.rs`'s vector-8 handling), and a resource-access check
+//!   gated by a real `capability-manager` token -- the *same* crate the
+//!   x86_64 kernel uses for `SYS_IPC_SEND`, not a separate ARM-side
+//!   reimplementation. `el0.rs`'s demo (`el0_demo`) proves the whole
+//!   chain end to end: an unconditional `SYS_WRITE` (proves the `SVC`
+//!   gate itself works), then `SYS_RIL_ACCESS` for a channel it holds a
+//!   capability for (authorized) and one it doesn't (denied) -- proving
+//!   the capability check actually distinguishes the two, not just that
+//!   EL0 can reach EL1 at all. **Not yet real EL0/EL1 memory isolation**
+//!   -- `mmu.rs`'s Normal block stays EL1-only (`AP[2:1]=0b00`); the
+//!   architecturally-correct `0b01` (grants EL0 data access) was tried
+//!   and reverted after it reproducibly hung QEMU on the EL1 side alone,
+//!   before any EL0 code ran -- see `mmu.rs`'s doc comment on
+//!   `normal_block_descriptor` for the full account and why it isn't
+//!   blocking today (the capability check at the `SVC` gate is the
+//!   boundary this slice actually proves, and `el0_demo` never performs
+//!   an EL0 data access, so nothing currently depends on that bit).
+//!
+//! Not yet started: the real RIL/SIM protocol work itself. See
+//! `mobile/src/lib.rs`'s doc comment: that work "starts once the shared
+//! kernel boots on target hardware" -- everything above (including the
+//! isolation boundary now proven) is still QEMU-only, not target hardware
+//! bring-up.
 //!
 //! **Known gap**: the identical binary produces no UART output at all when
 //! booted without secure mode (`-M virt` without `secure=on`, which starts
@@ -88,11 +106,17 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+mod el0;
 mod el1_vectors;
 mod gic;
+mod heap;
 mod mmu;
 mod nonsecure;
+mod ril_capability;
 mod serial;
+mod svc;
 mod vectors;
 
 use core::arch::naked_asm;

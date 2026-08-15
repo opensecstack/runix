@@ -129,10 +129,12 @@ jobs:
   # vector table (catches and resumes a deliberate fault with full context
   # preserved), a fully proven GIC bring-up (SGI delivered through the IRQ
   # vector, acknowledged and EOI'd), the EL3->EL1 Non-secure drop (the
-  # actual TrustZone boundary), and EL1's own MMU (identity-mapped,
-  # verified with AT S1E1R actually translating, not just enabling
-  # without crashing) — see kernel-arm/src/main.rs's doc comment for full
-  # status and the "why a separate crate from kernel/" decision.
+  # actual TrustZone boundary), EL1's own MMU (identity-mapped, verified
+  # with AT S1E1R actually translating, not just enabling without
+  # crashing), and the RIL isolation boundary itself (EL1->EL0 drop, SVC
+  # syscall gate, capability-token-gated resource check reusing
+  # capability-manager) — see kernel-arm/src/main.rs's doc comment for
+  # full status and the "why a separate crate from kernel/" decision.
   kernel-arm:
     runs-on: ubuntu-latest
     defaults:
@@ -185,6 +187,14 @@ jobs:
           # SCTLR_EL1.M's write didn't crash: AT S1E1R asks the hardware
           # itself to translate UART0's VA and report the result.
           grep -q "fault=false, PA=0x9000000" /tmp/arm-boot.log
+          # The RIL isolation boundary: EL1->EL0 drop, SVC gate, and a real
+          # capability-manager token check distinguishing an authorized
+          # channel from an unauthorized one — not just that EL0 code ran.
+          grep -q "Runix ARM kernel: heap initialized" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: RIL capability issued" /tmp/arm-boot.log
+          grep -q "^U$" /tmp/arm-boot.log
+          grep -q "SVC: SYS_RIL_ACCESS channel 0 authorized" /tmp/arm-boot.log
+          grep -q "SVC: SYS_RIL_ACCESS channel 99 DENIED" /tmp/arm-boot.log
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke

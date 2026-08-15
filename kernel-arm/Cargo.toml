@@ -16,6 +16,19 @@ publish = false
 [workspace]
 
 [dependencies]
+# Reused directly, not reimplemented: capability-manager is already no_std +
+# alloc (see its own Cargo.toml), platform-agnostic (Ed25519 over a
+# canonical string, no x86_64-specific anything), and this is exactly the
+# access-control primitive the x86_64 kernel's own SYS_IPC_SEND gate uses
+# -- see kernel/src/capabilities.rs / kernel/src/syscall.rs for the pattern
+# this crate's own capability-gated SVC mirrors.
+runix-capability-manager = { path = "../capability-manager" }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+# The same heap-allocator crate grid-sandbox-host uses for its own ring 3
+# (x86_64) private heap -- capability-manager needs `alloc` (String/Vec),
+# and nothing in this crate has ever needed a heap before now.
+linked_list_allocator = "0.10"
+spin = "0.9"
 
 [profile.dev]
 panic = "abort"

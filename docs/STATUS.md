@@ -653,22 +653,33 @@ separate freestanding crate from `kernel/` (which is deeply `x86_64`-specific
   S1E1R` actually asking the hardware to translate an address and
   confirming the result matches — not just that `SCTLR_EL1.M`'s write
   didn't crash. Getting a working MMU up took two more real fixes — see
-  below. This is the prerequisite every future isolation boundary (RIL,
-  SIM provisioning) actually needs; it doesn't provide isolation itself
-  yet (one flat identity map, no per-process address spaces, no
-  fine-grained permissions).
+  below.
+- The actual RIL isolation boundary (`el0.rs`/`svc.rs`/
+  `ril_capability.rs`): a real EL1 -> EL0 drop, an `SVC` syscall gate
+  (dispatched through `el1_vectors.rs`'s vector-8 handling — the ARM
+  analogue of `int 0x80`), and a resource-access check gated by a real
+  `capability-manager` token — the *same* crate the x86_64 kernel uses
+  for `SYS_IPC_SEND`, reused rather than reimplemented. Proven end to
+  end: an EL0 demo (`el0_demo`) issues an unconditional `SYS_WRITE`
+  (proves the `SVC` gate works), then `SYS_RIL_ACCESS` for a channel it
+  holds a capability for (authorized) and one it doesn't (denied) —
+  proving the capability check actually distinguishes the two. **Not**
+  real EL0/EL1 memory isolation yet — `mmu.rs`'s Normal block stays
+  EL1-only (`AP[2:1]=0b00`); the correct `0b01` bit was tried and
+  reverted after a real, reproducible QEMU hang — see the bug entry
+  below. The enforced boundary today is the capability check at the
+  `SVC` gate, matching `kernel/src/capabilities.rs`'s role on the
+  x86_64 side, not an MMU permission boundary (which doesn't exist at
+  this granularity yet regardless).
 
-Not yet started: RIL isolation, SIM provisioning themselves — per
-`mobile/src/lib.rs`'s doc comment, that work starts once the shared kernel
-boots on target hardware, and everything above is QEMU-only so far, but
-with MMU bring-up done the actual isolation boundary (a restricted EL1/EL0
-context RIL code runs in, capability-token-gated the same way
-`capability-manager` already gates things on the x86_64 side) is the next
-real step, not blocked on further infrastructure. Known gap, not yet
-root-caused: the identical binary produces no UART output at all when
-booted without secure mode (`-M virt` without `secure=on`, which starts at
-EL1 instead of EL3) — not a blocker for the EL3 Secure Monitor path, which
-works, but flagged rather than silently ignored.
+Not yet started: RIL/SIM protocol work itself — per `mobile/src/lib.rs`'s
+doc comment, that starts once the shared kernel boots on target hardware;
+everything above (including the isolation boundary now proven) is still
+QEMU-only. Known gap, not yet root-caused: the identical binary produces
+no UART output at all when booted without secure mode (`-M virt` without
+`secure=on`, which starts at EL1 instead of EL3) — not a blocker for the
+EL3 Secure Monitor path, which works, but flagged rather than silently
+ignored.
 
 ## Real bugs worth knowing before touching the relevant code again
 
@@ -768,3 +779,35 @@ code asked for. Fixed by setting `CPACR_EL1.FPEN=0b11` as the very first
 thing `el1_entry` does, before any other EL1 code (including the first
 print) runs, rather than debugging this class of trap fault-by-fault as
 different string lengths happen to trigger it.
+
+Two more, bringing up `kernel-arm/`'s RIL isolation boundary (`el0.rs`/
+`svc.rs`/`ril_capability.rs`). First, a genuine compile error rather than a
+silent one: `el0::drop_to_el0`'s `asm!` block used `adrp`/`add` against a
+scratch `x0` register to compute the EL0 stack pointer, declared as
+`out("x0") _` alongside `options(noreturn)` — but `noreturn` forbids
+declaring *any* asm output, since the compiler assumes control never
+returns to observe one. Fixed by computing the stack address in ordinary
+Rust *before* the `asm!` block and passing the final value in as a normal
+`in(reg)` operand, removing the need for an in-block scratch register
+entirely. Second, a real QEMU behavior, not a logic bug in the page table:
+setting `mmu.rs`'s Normal block to `AP[2:1]=0b01` (the architecturally
+correct bit for granting EL0 data access, needed once `el0.rs` existed)
+reproducibly hung QEMU (`cortex-a53`, `virt`) at `mmu::install`'s
+`SCTLR_EL1.M` write/`isb` — entirely on the EL1 side, before any EL0 code
+had run. That doesn't fit the architecture (`AP[1]` is defined to gate
+EL0's own access, not EL1's), and adding a `tlbi vmalle1` before enabling
+translation (a real correctness fix, kept regardless) made no difference —
+ruled out as the cause without being root-caused further. Reverted the bit
+rather than block on it: it isn't the enforced isolation boundary (that's
+the capability check at the `SVC` gate), and `el0_demo` never performs an
+EL0 data access, so nothing today actually depends on it. Revisit once EL0
+code needs direct memory access instead of only `SVC`. Third, in
+`ril_capability.rs`: the demo capability's expiry window was a fixed
+`1_000_000`-tick constant, sized without checking `CNTFRQ_EL0` first — on
+this platform's actual generic-timer frequency that's under a millisecond
+of real time, comfortably exceeded by heap init plus a handful of UART
+prints between issuance and the first check, so every demo token "expired"
+before `el0_demo` ever got to use it (`SYS_RIL_ACCESS channel 0 DENIED
+(capability token expired)`, for a token issued moments earlier). Fixed by
+sizing the window off `CNTFRQ_EL0` directly (`svc::frequency_hz()`) instead
+of a magic tick count.

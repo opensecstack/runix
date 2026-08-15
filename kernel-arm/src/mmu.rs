@@ -79,6 +79,28 @@ fn device_block_descriptor(output_addr: u64) -> u64 {
     output_addr | DESC_BLOCK | AF | (ATTRINDX_DEVICE << 2) | SH_OUTER | UXN | PXN
 }
 
+/// `AP[2:1]` (Access Permissions, bits [7:6]) `0b01` would grant read/write
+/// from *both* EL1 and EL0 -- the architecturally "correct" bit to set once
+/// `el0.rs` needs EL0 to touch its own stack/code page directly, rather than
+/// only through the `SVC` gate.
+///
+/// **Not currently set -- tried, and reverted, not just never attempted.**
+/// Setting this bit reproducibly hangs QEMU (`cortex-a53`, `virt`) right at
+/// `mmu::install`'s `SCTLR_EL1.M` write/`isb` -- entirely on the EL1 side,
+/// *before* any EL0 code has run. That's the part that doesn't fit the
+/// architecture: `AP[1]` is defined to gate EL0's own access, not EL1's (EL1
+/// always has access per `AP[2]` regardless of `AP[1]`), so this looks like
+/// a QEMU/TCG emulation quirk for this specific field, not a logic bug in
+/// this table -- ruled out an unrelated cause by also adding a `tlbi
+/// vmalle1` before enabling translation (a real correctness fix on its own,
+/// kept below) and confirming the hang persists identically either way.
+/// Not run to ground further at Alpha's scope: it isn't the enforced
+/// isolation boundary anyway (that's the capability-token check at the
+/// `SVC` gate in `svc.rs`, the same layer `SYS_IPC_SEND` gates on the
+/// x86_64 side) -- `el0.rs`'s current demo never performs an EL0 data
+/// access (`el0_demo` is pure `mov`/`svc`/`wfe`, no loads or stores), so
+/// nothing today actually depends on this bit being set. Revisit once EL0
+/// code needs to touch memory directly instead of only through `SVC`.
 fn normal_block_descriptor(output_addr: u64) -> u64 {
     output_addr | DESC_BLOCK | AF | (ATTRINDX_NORMAL << 2) | SH_INNER
 }
@@ -141,6 +163,12 @@ pub unsafe fn install() {
 
         let ttbr0 = table as u64;
         core::arch::asm!("msr TTBR0_EL1, {}", in(reg) ttbr0);
+
+        // Invalidate any stale EL1&0 TLB entries before enabling translation --
+        // architecturally, TLB state at reset is unspecified, not guaranteed
+        // empty, so relying on it never having cached anything for this VA
+        // range is not safe even on a cold boot.
+        core::arch::asm!("tlbi vmalle1");
 
         // Every table/register write above must be visible to the walker
         // before the MMU starts using them, and the pipeline must not
