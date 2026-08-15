@@ -10,12 +10,17 @@
 //! x86_64 side -- no calls into normal EL1 code, since EL0 can only ever
 //! reach EL1 through the `SVC` gate, not by jumping into arbitrary EL1
 //! code). It exercises the full syscall surface: `SYS_WRITE` (proves the
-//! gate itself works, unconditionally), `SYS_RIL_ACCESS` for an
+//! gate itself works, unconditionally); `SYS_RIL_ACCESS` for an
 //! authorized and an unauthorized channel (proves the capability check
-//! distinguishes the two), then `SYS_RIL_SEND`/`SYS_RIL_RECV` round-tripping
-//! a real byte through the authorized channel and getting denied on the
-//! unauthorized one -- proving the check gates actual I/O
-//! (`ril_channel.rs`), not just a bare decision.
+//! distinguishes the two); `SYS_RIL_SEND`/`SYS_RIL_RECV` round-tripping a
+//! real byte through the authorized channel and getting denied on the
+//! unauthorized one (proves the check gates actual I/O, `ril_channel.rs`,
+//! not just a bare decision); then `SYS_SIM_STATUS`/`SYS_SIM_PROVISION`/
+//! `SYS_SIM_ACTIVATE` walking an authorized SIM slot through its real
+//! state machine (`Uninitialized -> Provisioned -> Activated`, `sim.rs`)
+//! and getting denied on an unauthorized one -- proving the *same*
+//! capability check gates a second, differently-shaped resource kind, not
+//! something special-cased for RIL.
 
 use core::arch::naked_asm;
 
@@ -96,6 +101,9 @@ const SYS_WRITE: u64 = 1;
 const SYS_RIL_ACCESS: u64 = 2;
 const SYS_RIL_SEND: u64 = 3;
 const SYS_RIL_RECV: u64 = 4;
+const SYS_SIM_PROVISION: u64 = 5;
+const SYS_SIM_ACTIVATE: u64 = 6;
+const SYS_SIM_STATUS: u64 = 7;
 
 /// The EL0 demo itself. `.balign 4096` for the same reason
 /// `userspace::user_hello` does: keeping it on its own page matters once
@@ -116,8 +124,8 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x1, #85", // 'U'
         "svc #0",
         // SYS_RIL_ACCESS(0) -- a channel this context holds a capability
-        // for (see ril_capability::issue_and_set_current's caller in
-        // nonsecure.rs). x0 on return: 0 = authorized, nonzero = denied.
+        // for (see capabilities::issue_and_hold's caller in nonsecure.rs).
+        // x0 on return: 0 = authorized, nonzero = denied.
         "mov x0, {sys_ril_access}",
         "mov x1, #0",
         "svc #0",
@@ -152,6 +160,42 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x0, {sys_ril_recv}",
         "mov x1, #99",
         "svc #0",
+        // SYS_SIM_STATUS(0) -- authorized, slot not provisioned yet:
+        // expect state 0 (Uninitialized).
+        "mov x0, {sys_sim_status}",
+        "mov x1, #0",
+        "svc #0",
+        // SYS_SIM_PROVISION(0, identity) -- authorized, Uninitialized ->
+        // Provisioned. `identity` stands in for ICCID/IMSI (see sim.rs's
+        // doc comment on why this is one opaque u64, not a real digit
+        // string).
+        "mov x0, {sys_sim_provision}",
+        "mov x1, #0",
+        "mov x2, #0x1234",
+        "svc #0",
+        // SYS_SIM_STATUS(0) again -- expect state 1 (Provisioned).
+        "mov x0, {sys_sim_status}",
+        "mov x1, #0",
+        "svc #0",
+        // SYS_SIM_ACTIVATE(0) -- authorized, Provisioned -> Activated.
+        "mov x0, {sys_sim_activate}",
+        "mov x1, #0",
+        "svc #0",
+        // SYS_SIM_STATUS(0) once more -- expect state 2 (Activated).
+        "mov x0, {sys_sim_status}",
+        "mov x1, #0",
+        "svc #0",
+        // SYS_SIM_PROVISION(99, ...) -- unauthorized slot: denied before
+        // sim::provision ever runs, same "checked on every operation, not
+        // cached from an open call" property SYS_RIL_SEND(99) proves.
+        "mov x0, {sys_sim_provision}",
+        "mov x1, #99",
+        "mov x2, #0x5678",
+        "svc #0",
+        // SYS_SIM_STATUS(99) -- likewise denied.
+        "mov x0, {sys_sim_status}",
+        "mov x1, #99",
+        "svc #0",
         "1:",
         "wfe",
         "b 1b",
@@ -159,5 +203,8 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         sys_ril_access = const SYS_RIL_ACCESS,
         sys_ril_send = const SYS_RIL_SEND,
         sys_ril_recv = const SYS_RIL_RECV,
+        sys_sim_provision = const SYS_SIM_PROVISION,
+        sys_sim_activate = const SYS_SIM_ACTIVATE,
+        sys_sim_status = const SYS_SIM_STATUS,
     );
 }

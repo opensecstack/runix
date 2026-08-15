@@ -219,20 +219,26 @@ fn el1_setup() -> ! {
     }
     serial_println!("Runix ARM kernel: heap initialized");
 
-    // Issue a demo capability authorizing RIL channel 0 -- stands in for
-    // a real issuer (CITADEL MARSHAL) the same way every other demo
-    // trust root in this repo does. el0_demo (el0.rs) will request
-    // channel 0 (authorized) and channel 99 (not) to prove svc.rs's
-    // capability check actually distinguishes the two.
+    // Issue demo capabilities authorizing RIL channel 0 and SIM slot 0 --
+    // stands in for a real issuer (CITADEL MARSHAL) the same way every
+    // other demo trust root in this repo does. el0_demo (el0.rs) will
+    // request channel/slot 0 (authorized) and channel/slot 99 (not, for
+    // both resource kinds) to prove svc.rs's capability check actually
+    // distinguishes the two -- uniformly across RIL and SIM, not just
+    // within RIL (see `capabilities.rs`'s doc comment on why it holds a
+    // *set* of tokens now, not a single one).
     let now = crate::svc::now_ticks();
-    crate::ril_capability::issue_and_set_current(0, now);
+    crate::capabilities::issue_and_hold(crate::capabilities::ril_resource(0), now);
     serial_println!("Runix ARM kernel: RIL capability issued (channel 0, demo trust root)");
+    crate::capabilities::issue_and_hold(crate::capabilities::sim_resource(0), now);
+    serial_println!("Runix ARM kernel: SIM capability issued (slot 0, demo trust root)");
 
-    // The RIL isolation boundary itself: drop to EL0, capability-gated
-    // through the SVC syscall gate (svc.rs) exactly like SYS_IPC_SEND
-    // gates capability-checked IPC on the x86_64 side. Never returns --
-    // el0_demo (el0.rs) runs its three SVC calls and then spins forever;
-    // there is no scheduler here yet to hand control to anything else.
+    // The RIL isolation boundary and basic SIM provisioning: drop to EL0,
+    // capability-gated through the SVC syscall gate (svc.rs) exactly like
+    // SYS_IPC_SEND gates capability-checked IPC on the x86_64 side. Never
+    // returns -- el0_demo (el0.rs) runs its SVC calls and then spins
+    // forever; there is no scheduler here yet to hand control to anything
+    // else.
     unsafe {
         crate::el0::drop_to_el0(crate::el0::el0_demo as *const () as u64);
     }

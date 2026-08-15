@@ -204,6 +204,17 @@ jobs:
           grep -q "^A$" /tmp/arm-boot.log
           grep -q "SVC: SYS_RIL_SEND channel 99 DENIED" /tmp/arm-boot.log
           grep -q "SVC: SYS_RIL_RECV channel 99 DENIED" /tmp/arm-boot.log
+          # Basic SIM provisioning: the same capability check gating a
+          # real state machine (sim.rs) instead of RIL's byte mailbox --
+          # a full Uninitialized -> Provisioned -> Activated walk on an
+          # authorized slot, denied outright on an unauthorized one.
+          grep -q "SVC: SYS_SIM_STATUS slot 0 authorized, state Uninitialized" /tmp/arm-boot.log
+          grep -q "SVC: SYS_SIM_PROVISION slot 0 identity 0x1234 authorized" /tmp/arm-boot.log
+          grep -q "SVC: SYS_SIM_STATUS slot 0 authorized, state Provisioned" /tmp/arm-boot.log
+          grep -q "SVC: SYS_SIM_ACTIVATE slot 0 authorized" /tmp/arm-boot.log
+          grep -q "SVC: SYS_SIM_STATUS slot 0 authorized, state Activated" /tmp/arm-boot.log
+          grep -q "SVC: SYS_SIM_PROVISION slot 99 DENIED" /tmp/arm-boot.log
+          grep -q "SVC: SYS_SIM_STATUS slot 99 DENIED" /tmp/arm-boot.log
       - name: boot in QEMU without secure=on and check the no-EL3 path
         # Regression check for a real, previously-shipped bug: this used to
         # produce zero UART output (rust_start ran the EL3-only phase
@@ -227,6 +238,9 @@ jobs:
           grep -q "SVC: SYS_RIL_RECV channel 0 authorized, byte 0x41" \
             /tmp/arm-boot-nosecure.log
           grep -q "^A$" /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_SIM_STATUS slot 0 authorized, state Activated" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_SIM_PROVISION slot 99 DENIED" /tmp/arm-boot-nosecure.log
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke

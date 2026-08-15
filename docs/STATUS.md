@@ -655,7 +655,7 @@ separate freestanding crate from `kernel/` (which is deeply `x86_64`-specific
   didn't crash. Getting a working MMU up took two more real fixes — see
   below.
 - The actual RIL isolation boundary (`el0.rs`/`svc.rs`/
-  `ril_capability.rs`/`ril_channel.rs`): a real EL1 -> EL0 drop, an `SVC`
+  `capabilities.rs`/`ril_channel.rs`): a real EL1 -> EL0 drop, an `SVC`
   syscall gate (dispatched through `el1_vectors.rs`'s vector-8 handling —
   the ARM analogue of `int 0x80`), and per-operation resource-access
   checks gated by a real `capability-manager` token — the *same* crate
@@ -674,11 +674,32 @@ separate freestanding crate from `kernel/` (which is deeply `x86_64`-specific
   check at the `SVC` gate, matching `kernel/src/capabilities.rs`'s role on
   the x86_64 side, not an MMU permission boundary (which doesn't exist at
   this granularity yet regardless).
+- **Basic SIM provisioning** (`sim.rs`) — closing out Alpha mobile's last
+  unstarted roadmap item. A minimal per-slot profile state machine
+  (`Uninitialized -> Provisioned -> Activated`), gated by the *same*
+  capability check the RIL syscalls use: this slice generalized the demo
+  capability store (`ril_capability.rs`, now `capabilities.rs`) from a
+  single RIL-only slot to a small set of tokens covering any resource
+  kind, specifically so SIM slots and RIL channels could be authorized
+  independently for the one EL0 context. Proven end to end: `el0_demo`
+  walks slot 0 through `SYS_SIM_STATUS` (`Uninitialized`) ->
+  `SYS_SIM_PROVISION` (`Provisioned`) -> `SYS_SIM_ACTIVATE` (`Activated`),
+  confirming each transition with another `SYS_SIM_STATUS`, then gets
+  denied on `SYS_SIM_PROVISION`/`SYS_SIM_STATUS` for an unauthorized
+  slot — proving the capability boundary is uniform across resource
+  kinds, not something special-cased for RIL. Deliberately not a real
+  SIM/eSIM implementation: no APDU protocol, and `provision`'s "identity"
+  is one opaque `u64` (the `SVC` ABI only carries plain register
+  arguments — a real ICCID/IMSI needs ~15-20 digits, more than fits in
+  one), not real ICCID/IMSI digit strings. A fixed-size-buffer syscall ABI
+  is real follow-up work, not something to fake by packing digits into a
+  register.
 
-Not yet started: RIL/SIM protocol work itself — per `mobile/src/lib.rs`'s
+Not yet started: the real RIL/SIM *protocol* work itself (talking to
+actual radio/SIM hardware, not just proving the isolation boundary and
+provisioning state machine they'll run under) — per `mobile/src/lib.rs`'s
 doc comment, that starts once the shared kernel boots on target hardware;
-everything above (including the isolation boundary now proven) is still
-QEMU-only.
+everything above is still QEMU-only.
 
 Non-secure boot (`-M virt` without `secure=on`, which resets straight to
 EL1 instead of EL3) now works too — previously produced no UART output at

@@ -46,12 +46,12 @@
 //!   (see `nonsecure.rs`'s doc comment on `el1_entry` for both).
 //!
 //! - The actual RIL isolation boundary (see `el0.rs`/`svc.rs`/
-//!   `ril_capability.rs`): a real EL1 -> EL0 drop (the ARM analogue of
-//!   `kernel/src/userspace.rs`'s ring 0 -> ring 3 transition), an `SVC`
-//!   syscall gate (the ARM analogue of `int 0x80`, dispatched through
-//!   `el1_vectors.rs`'s vector-8 handling), and a resource-access check
-//!   gated by a real `capability-manager` token -- the *same* crate the
-//!   x86_64 kernel uses for `SYS_IPC_SEND`, not a separate ARM-side
+//!   `capabilities.rs`/`ril_channel.rs`): a real EL1 -> EL0 drop (the ARM
+//!   analogue of `kernel/src/userspace.rs`'s ring 0 -> ring 3 transition),
+//!   an `SVC` syscall gate (the ARM analogue of `int 0x80`, dispatched
+//!   through `el1_vectors.rs`'s vector-8 handling), and a resource-access
+//!   check gated by a real `capability-manager` token -- the *same* crate
+//!   the x86_64 kernel uses for `SYS_IPC_SEND`, not a separate ARM-side
 //!   reimplementation. `el0.rs`'s demo (`el0_demo`) proves the whole
 //!   chain end to end: an unconditional `SYS_WRITE` (proves the `SVC`
 //!   gate itself works), `SYS_RIL_ACCESS` for a channel it holds a
@@ -69,12 +69,27 @@
 //!   blocking today (the capability check at the `SVC` gate is the
 //!   boundary this slice actually proves, and `el0_demo` never performs
 //!   an EL0 data access, so nothing currently depends on that bit).
+//! - **Basic SIM provisioning** (see `sim.rs`): the last unstarted item on
+//!   Alpha mobile's roadmap line. A minimal per-slot profile state
+//!   machine (`Uninitialized -> Provisioned -> Activated`), gated by the
+//!   *same* capability check the RIL syscalls use, generalized in this
+//!   slice from RIL-only (`ril_capability.rs`, now `capabilities.rs`,
+//!   holding a *set* of tokens for the one EL0 context rather than a
+//!   single RIL-only slot) to any resource kind. `el0_demo` walks an
+//!   authorized slot through the whole state machine
+//!   (`SYS_SIM_STATUS`/`SYS_SIM_PROVISION`/`SYS_SIM_ACTIVATE`) and gets
+//!   denied on an unauthorized one -- proving the capability boundary is
+//!   uniform across resource kinds, not something special-cased for RIL.
+//!   Deliberately not a real SIM/eSIM implementation (no APDU protocol,
+//!   no real ICCID/IMSI digit strings -- see `sim.rs`'s doc comment for
+//!   why and what a real version needs next).
 //!
-//! Not yet started: the real RIL/SIM protocol work itself. See
-//! `mobile/src/lib.rs`'s doc comment: that work "starts once the shared
-//! kernel boots on target hardware" -- everything above (including the
-//! isolation boundary now proven) is still QEMU-only, not target hardware
-//! bring-up.
+//! Not yet started: the real RIL/SIM *protocol* work itself (talking to
+//! actual radio/SIM hardware, not just proving the isolation boundary they
+//! will run under). See `mobile/src/lib.rs`'s doc comment: that work
+//! "starts once the shared kernel boots on target hardware" -- everything
+//! above (including the isolation boundary and provisioning state machine
+//! now proven) is still QEMU-only, not target hardware bring-up.
 //!
 //! - **Non-secure boot now works too**, not just EL3 Secure Monitor boot:
 //!   `-M virt` without `secure=on` resets straight to EL1 (no EL3 present
@@ -124,15 +139,16 @@
 
 extern crate alloc;
 
+mod capabilities;
 mod el0;
 mod el1_vectors;
 mod gic;
 mod heap;
 mod mmu;
 mod nonsecure;
-mod ril_capability;
 mod ril_channel;
 mod serial;
+mod sim;
 mod svc;
 mod vectors;
 
