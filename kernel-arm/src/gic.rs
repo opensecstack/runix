@@ -16,41 +16,47 @@
 //!   "what's pending for me right now" -- acknowledge (`IAR`) and
 //!   end-of-interrupt (`EOIR`) both go through here.
 //!
-//! Alpha scope, and current status: enable both halves following the same
-//! `GICC_CTLR`/`GICD_CTLR` configuration ARM Trusted Firmware's own real
-//! GICv2 EL3 driver uses (`gicv2_cpuif_enable`/`gicv2_distif_init` in
-//! `drivers/arm/gic/v2/gicv2_main.c`), then try to prove interrupt
-//! delivery end to end with a Software Generated Interrupt (SGI, IDs 0-15
-//! reserved for exactly this -- a CPU can trigger one directly by writing
-//! to `GICD_SGIR`, no external device or timer needed).
+//! Alpha scope: enable both halves following the same `GICC_CTLR`/
+//! `GICD_CTLR` configuration ARM Trusted Firmware's own real GICv2 EL3
+//! driver uses (`gicv2_cpuif_enable`/`gicv2_distif_init` in
+//! `drivers/arm/gic/v2/gicv2_main.c`), then prove interrupt delivery end
+//! to end with a Software Generated Interrupt (SGI, IDs 0-15 reserved for
+//! exactly this -- a CPU can trigger one directly by writing to
+//! `GICD_SGIR`, no external device or timer needed). **Fully proven**: a
+//! triggered SGI is caught by `vectors.rs`'s IRQ vector, acknowledged and
+//! EOI'd through the GIC, and execution resumes -- confirmed in QEMU, not
+//! assumed.
 //!
-//! **Proven**: [`trigger_self_sgi0`] genuinely reaches the distributor --
-//! [`pending_raw`] (`GICD_ISPENDR0`) reads back `0x1` immediately after
-//! triggering, confirmed in QEMU. **Not yet proven**: delivery all the way
-//! into `vectors.rs`'s FIQ/IRQ vector at EL3, even after matching ATF's
-//! own driver configuration (`Group 0` only enabled, `FIQEn` set so it
-//! signals as FIQ, all four `{FIQ,IRQ}_BYP_DIS_GRP{0,1}` bypass-disable
-//! bits set -- an earlier version had none of this and predictably got no
-//! delivery either, but this version doesn't either).
+//! # The actual missing piece, and how it was found
 //!
-//! Ruled out along the way, each with a real test, not a guess:
-//! - Wrong interrupt group (tried Group 0 alone, Group 1 alone, both).
-//! - Wrong signal (`FIQEn` on and off -- both `vectors.rs` vector 5 (IRQ)
-//!   and vector 6 (FIQ) are wired to the same handler, so either would be
-//!   caught).
-//! - `PSTATE` masking (`daifclr` clears both I and F before triggering).
-//! - Legacy bypass left enabled (this version explicitly disables all
-//!   four bypass paths, matching ATF).
-//! - QEMU defaulting to GICv3 instead of GICv2 under TCG (the `virt`
-//!   board's own docs note `gic-version=max` resolves to GICv3 by default
-//!   without KVM) -- retested with `-M virt,gic-version=2` explicit, same
-//!   result.
+//! Getting here took two real fixes, not one. The first (matching ATF's
+//! `GICC_CTLR`/`GICD_CTLR` values -- Group 0 only, `FIQEn` set, all four
+//! `{FIQ,IRQ}_BYP_DIS_GRP{0,1}` bypass-disable bits set) was necessary but
+//! not sufficient: applied on its own, the distributor still confirmed
+//! the SGI pending (`GICD_ISPENDR0` read back `0x1`), but nothing trapped
+//! into EL3. GDB attached to QEMU (`qemu-system-aarch64 ... -S -s`, `gdb
+//! -x script.py`) is what actually resolved it: with `PSTATE.I`/`F` both
+//! confirmed clear and `GICC_HPPIR` confirmed showing the SGI as the
+//! highest-priority pending interrupt -- i.e. every register that looked
+//! relevant said "this should fire" -- a `continue` still ran straight
+//! past the trigger into unrelated later code, never touching
+//! `exception_handler`. The one register neither ATF's own driver
+//! (`gicv2_main.c` alone doesn't set `SCR_EL3`; a separate driver layer
+//! does) nor any of this module's own earlier attempts had touched:
+//! `SCR_EL3.IRQ`/`SCR_EL3.FIQ` (bits 1/2) -- physical interrupt *routing*
+//! to EL3, a separate concern from both the GIC's own state and `PSTATE`
+//! masking. Left at 0 (reset default), physical IRQ/FIQ simply never
+//! route to EL3 at all, regardless of anything else being correct. Set in
+//! [`init`] via `mrs`/`orr`/`msr` on `SCR_EL3`, and delivery started
+//! working immediately, no other change needed.
 //!
-//! What's left is genuinely a "attach GDB to QEMU and read the actual
-//! register/GIC state at the moment of the trigger" question, not
-//! something more guessing from outside the debugger will resolve --
-//! flagged as the concrete next step rather than iterated further blind.
-//! See `docs/THREAT_MODEL.md`.
+//! Ruled out along the way, each with a real test, not a guess: wrong
+//! interrupt group, wrong signal (IRQ vs FIQ -- both `vectors.rs` vector 5
+//! and vector 6 are wired to the same handler, so either would have been
+//! caught), `PSTATE` masking, legacy CPU-interface bypass left enabled,
+//! and QEMU defaulting to GICv3 instead of GICv2 under TCG (the `virt`
+//! board's own docs note `gic-version=max` resolves to GICv3 by default
+//! without KVM -- retested with `-M virt,gic-version=2` explicit).
 
 const GICD_BASE: usize = 0x0800_0000;
 const GICC_BASE: usize = 0x0801_0000;
@@ -100,11 +106,18 @@ fn read32(addr: usize) -> u32 {
 
 /// Enables the distributor and this CPU's interface (Group 0/Secure only,
 /// matching ATF's own EL3 GICv2 driver -- see this module's doc comment),
-/// and unmasks SGI 0 specifically (`GICD_ISENABLER0` bit 0) -- the one
-/// interrupt [`trigger_self_sgi0`] uses to prove delivery works. A real
-/// driver would enable whatever the caller asks for; Alpha's only caller
-/// is this module's own proof, so it only enables what that needs. SGI 0
-/// is left at its reset group (Group 0) deliberately -- not written to
+/// unmasks SGI 0 specifically (`GICD_ISENABLER0` bit 0) -- the one
+/// interrupt [`trigger_self_sgi0`] uses to prove delivery works -- and sets
+/// `SCR_EL3.IRQ`/`SCR_EL3.FIQ` (bits 1/2) so physical IRQ/FIQ actually
+/// *route to EL3* at all. That routing is a separate thing from the GIC's
+/// own state and from `PSTATE.I`/`F` masking -- confirmed the hard way (see
+/// this module's doc comment): with everything else correct (distributor
+/// pending, `GICC_HPPIR` showing the interrupt as highest-priority-pending,
+/// `PSTATE.I`/`F` both clear), a physical interrupt still never traps into
+/// EL3 while `SCR_EL3.IRQ`/`FIQ` are 0 (their reset value). A real driver
+/// would enable whatever the caller asks for; Alpha's only caller is this
+/// module's own proof, so it only enables what that needs. SGI 0 is left
+/// at its reset group (Group 0) deliberately -- not written to
 /// `GICD_IGROUPR0` -- since Group 0 is exactly what this configuration
 /// expects to handle.
 pub fn init() {
@@ -120,6 +133,19 @@ pub fn init() {
     );
     write32(GICC_PMR, 0xFF); // priority mask: 0xFF admits every priority level
     write32(GICD_ISENABLER0, 1 << 0); // enable SGI 0
+
+    // Read-modify-write, not an unconditional overwrite: this runs before
+    // `nonsecure::drop_to_el1_nonsecure` sets the rest of SCR_EL3 (NS/RW),
+    // and preserves whatever reset-time bits (e.g. RES1 fields) were
+    // already there.
+    unsafe {
+        core::arch::asm!(
+            "mrs x0, SCR_EL3",
+            "orr x0, x0, #0x6", // bit 1 (IRQ) | bit 2 (FIQ)
+            "msr SCR_EL3, x0",
+            out("x0") _,
+        );
+    }
 }
 
 /// Triggers SGI 0, targeted at this same CPU (`TargetList` = bit 0 of
