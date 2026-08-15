@@ -648,10 +648,23 @@ separate freestanding crate from `kernel/` (which is deeply `x86_64`-specific
 - The actual TrustZone boundary: drops from EL3 to EL1 Non-secure via
   `eret` (`nonsecure.rs`), confirmed by EL1 code reading `CurrentEL` after
   landing.
+- EL1's own MMU is up (`mmu.rs`): two 1 GiB identity-mapped blocks (Device
+  for the GIC/UART, Normal non-cacheable for RAM), verified with `AT
+  S1E1R` actually asking the hardware to translate an address and
+  confirming the result matches — not just that `SCTLR_EL1.M`'s write
+  didn't crash. Getting a working MMU up took two more real fixes — see
+  below. This is the prerequisite every future isolation boundary (RIL,
+  SIM provisioning) actually needs; it doesn't provide isolation itself
+  yet (one flat identity map, no per-process address spaces, no
+  fine-grained permissions).
 
-Not yet started: RIL isolation, SIM provisioning — per `mobile/src/lib.rs`'s
-doc comment, that work starts once the shared kernel boots on target
-hardware, and everything above is QEMU-only so far. Known gap, not yet
+Not yet started: RIL isolation, SIM provisioning themselves — per
+`mobile/src/lib.rs`'s doc comment, that work starts once the shared kernel
+boots on target hardware, and everything above is QEMU-only so far, but
+with MMU bring-up done the actual isolation boundary (a restricted EL1/EL0
+context RIL code runs in, capability-token-gated the same way
+`capability-manager` already gates things on the x86_64 side) is the next
+real step, not blocked on further infrastructure. Known gap, not yet
 root-caused: the identical binary produces no UART output at all when
 booted without secure mode (`-M virt` without `secure=on`, which starts at
 EL1 instead of EL3) — not a blocker for the EL3 Secure Monitor path, which
@@ -732,3 +745,26 @@ concern entirely from both the GIC's own state and `PSTATE` masking. Left
 at 0 (their reset value), physical IRQ/FIQ simply never route to EL3 at
 all, no matter how correct everything else is. See `kernel-arm/src/gic.rs`
 for the full list of GIC configurations ruled out before finding this.
+
+Two more, bringing up `kernel-arm/`'s EL1 MMU (`mmu.rs`). First: EL1 had no
+exception vector table at all when the first `mmu::install()` attempt ran
+— `VBAR_EL1` defaults to `0` at reset, so the wrong page-table entry didn't
+produce a diagnosable fault, it silently jumped the CPU to whatever raw
+bytes sit at physical address `0x200` (the zero-based "current EL, SPx,
+Synchronous" vector offset). The only way to see *that* a fault had even
+happened was attaching GDB and noticing `$pc` had moved there — nothing
+printed, nothing else visibly changed. Fixed by building EL1's own vector
+table (`el1_vectors.rs`, install it *before* touching the MMU) — the same
+lesson as `kernel/`'s own boot sequence learned early (see its own vector
+table's history), just re-learned on a second architecture. Second, found
+immediately after that fix made the fault actually diagnosable:
+`CPACR_EL1.FPEN` (bits [21:20]) traps FP/SIMD access by default, and nothing
+here ever touches a `v`/`q` register on purpose, yet a plain
+`serial_println!` call with no format arguments faulted with
+`ESR_EL1.EC=0x7` ("FP/SIMD access trapped") while other, structurally
+identical calls didn't — the compiler's own memcpy-lowering choice for
+that particular string's length used NEON registers, not anything this
+code asked for. Fixed by setting `CPACR_EL1.FPEN=0b11` as the very first
+thing `el1_entry` does, before any other EL1 code (including the first
+print) runs, rather than debugging this class of trap fault-by-fault as
+different string lengths happen to trigger it.

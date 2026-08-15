@@ -109,8 +109,73 @@ fn current_el() -> u8 {
 /// re-deriving it after the fact.
 #[unsafe(no_mangle)]
 extern "C" fn el1_entry() -> ! {
+    // CPACR_EL1.FPEN (bits [21:20]) traps FP/SIMD access by default at
+    // reset -- and compiler-generated code can use NEON registers for
+    // things as mundane as a string copy (observed for real: one
+    // `serial_println!` call with no format arguments faulted here with
+    // ESR_EL1.EC=0x7, "FP/SIMD access trapped", while earlier ones with
+    // the exact same shape didn't -- the compiler's own memcpy-lowering
+    // threshold, not anything this code does deliberately). Set to
+    // `0b11` (access permitted from EL0 and EL1, uncontrolled) before any
+    // other EL1 code runs, rather than debug this class of trap on a
+    // case-by-case basis.
+    unsafe {
+        core::arch::asm!(
+            "mrs x0, CPACR_EL1",
+            "orr x0, x0, #0x300000", // FPEN = 0b11 at bits [21:20]
+            "msr CPACR_EL1, x0",
+            "isb",
+            out("x0") _,
+        );
+    }
+
     serial_println!("Runix ARM kernel: reached EL1 (dropped from EL3, SCR_EL3.NS=1)");
     serial_println!("Runix ARM kernel: CurrentEL = EL{}", current_el());
+
+    // Install EL1's own exception vector table *before* touching the MMU:
+    // VBAR_EL1 defaults to 0 at reset, so a fault here before this point
+    // (in particular, from a wrong mmu::install page table entry) jumps
+    // into whatever raw bytes sit at physical address 0x200, silently --
+    // see el1_vectors.rs's doc comment for how that was actually found.
+    crate::el1_vectors::install();
+    serial_println!("Runix ARM kernel: VBAR_EL1 installed");
+
+    unsafe {
+        crate::mmu::install();
+    }
+    serial_println!("Runix ARM kernel: MMU enabled (SCTLR_EL1.M=1, identity-mapped)");
+
+    // Prove translation is actually active and correct, not just that
+    // SCTLR_EL1.M didn't crash on write: `AT S1E1R` asks the MMU hardware
+    // itself to translate a VA (UART0's) and report the result in
+    // PAR_EL1, the same mechanism a real page-fault handler would use to
+    // inspect a faulting address. Reaching this print at all already
+    // proves *something* (an identity-map error would instruction-abort
+    // into EL1's nonexistent vector table immediately after SCTLR_EL1.M's
+    // write, right on the next fetch -- not further down the function
+    // like this), but PAR_EL1's F bit and physical-address field
+    // independently confirm it.
+    let uart_va: u64 = 0x0900_0000;
+    let par_el1: u64;
+    unsafe {
+        core::arch::asm!(
+            "at S1E1R, {va}",
+            "isb",
+            "mrs {par}, PAR_EL1",
+            va = in(reg) uart_va,
+            par = out(reg) par_el1,
+        );
+    }
+    let translation_faulted = par_el1 & 1 != 0;
+    let translated_pa = par_el1 & 0x000F_FFFF_FFFF_F000;
+    serial_println!(
+        "Runix ARM kernel: AT S1E1R UART0 VA {:#x} -> PAR_EL1={:#x} (fault={}, PA={:#x})",
+        uart_va,
+        par_el1,
+        translation_faulted,
+        translated_pa
+    );
+
     loop {
         unsafe {
             core::arch::asm!("wfe");

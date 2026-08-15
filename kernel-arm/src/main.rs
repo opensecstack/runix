@@ -29,11 +29,31 @@
 //! - The actual TrustZone boundary: drops from EL3 to EL1 Non-secure via
 //!   `eret` (see `nonsecure.rs`), and EL1 code confirms via `CurrentEL`
 //!   that it landed there.
+//! - EL1's own MMU is up (see `mmu.rs`): identity-mapped, two 1 GiB
+//!   blocks (Device for the GIC/UART, Normal for RAM), verified with
+//!   `AT S1E1R` actually asking the hardware to translate an address and
+//!   confirming the result, not just that `SCTLR_EL1.M`'s write didn't
+//!   crash. This is the prerequisite every future isolation boundary (RIL,
+//!   SIM provisioning, anything else under the Non-secure kernel) actually
+//!   needs -- see `mmu.rs`'s doc comment for scope (identity-mapped,
+//!   non-cacheable, two coarse 1 GiB blocks; no per-process address
+//!   spaces, no fine-grained permissions yet). Getting here needed EL1's
+//!   own exception vector table first (`el1_vectors.rs`) -- without one, a
+//!   translation-table bug is not a diagnosable fault, it's a silent jump
+//!   to whatever raw bytes sit at physical address `0x200` (`VBAR_EL1`'s
+//!   reset value) -- and a `CPACR_EL1.FPEN` fix, since compiler-generated
+//!   code can hit FP/SIMD-trapped-by-default in ordinary-looking code
+//!   (see `nonsecure.rs`'s doc comment on `el1_entry` for both).
 //!
-//! Not yet started: RIL/SIM work. See `mobile/src/lib.rs`'s doc comment:
-//! that work "starts once the shared kernel boots on target hardware" --
-//! this crate is that first slice, not the target hardware bring-up
-//! itself yet (everything above is QEMU-only so far).
+//! Not yet started: RIL/SIM work itself. See `mobile/src/lib.rs`'s doc
+//! comment: that work "starts once the shared kernel boots on target
+//! hardware" -- this crate is that first slice, not the target hardware
+//! bring-up itself yet (everything above is QEMU-only so far), but with
+//! MMU bring-up done, the actual RIL isolation boundary (a separate,
+//! restricted EL1 (or eventually EL0) context RIL code runs in, gated by
+//! capability tokens the same way `capability-manager` already gates
+//! things on the x86_64 side) is the next real step, not blocked on
+//! further infrastructure.
 //!
 //! **Known gap**: the identical binary produces no UART output at all when
 //! booted without secure mode (`-M virt` without `secure=on`, which starts
@@ -68,7 +88,9 @@
 #![no_std]
 #![no_main]
 
+mod el1_vectors;
 mod gic;
+mod mmu;
 mod nonsecure;
 mod serial;
 mod vectors;

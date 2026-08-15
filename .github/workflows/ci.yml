@@ -128,9 +128,11 @@ jobs:
   # one builds on stable). Alpha scope so far: EL3 boot, a real exception
   # vector table (catches and resumes a deliberate fault with full context
   # preserved), a fully proven GIC bring-up (SGI delivered through the IRQ
-  # vector, acknowledged and EOI'd), and the EL3->EL1 Non-secure drop (the
-  # actual TrustZone boundary) — see kernel-arm/src/main.rs's doc comment
-  # for full status and the "why a separate crate from kernel/" decision.
+  # vector, acknowledged and EOI'd), the EL3->EL1 Non-secure drop (the
+  # actual TrustZone boundary), and EL1's own MMU (identity-mapped,
+  # verified with AT S1E1R actually translating, not just enabling
+  # without crashing) — see kernel-arm/src/main.rs's doc comment for full
+  # status and the "why a separate crate from kernel/" decision.
   kernel-arm:
     runs-on: ubuntu-latest
     defaults:
@@ -177,6 +179,12 @@ jobs:
           # The actual TrustZone boundary.
           grep -q "Runix ARM kernel: reached EL1 (dropped from EL3, SCR_EL3.NS=1)" /tmp/arm-boot.log
           grep -q "Runix ARM kernel: CurrentEL = EL1" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: VBAR_EL1 installed" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: MMU enabled" /tmp/arm-boot.log
+          # Proves the MMU is actually translating, not just that
+          # SCTLR_EL1.M's write didn't crash: AT S1E1R asks the hardware
+          # itself to translate UART0's VA and report the result.
+          grep -q "fault=false, PA=0x9000000" /tmp/arm-boot.log
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke
