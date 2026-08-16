@@ -902,3 +902,25 @@ same EL1 setup (MMU, heap, capability issuance, EL0 drop) but print an
 honest, distinct account of *how* EL1 was reached (the EL3-drop path
 still says "dropped from EL3, `SCR_EL3.NS=1`"; the no-EL3 path no longer
 claims a security-state switch that never happened).
+
+A follow-up investigation into the `AP[2:1]=0b01` QEMU hang above, not a
+resolution: rather than re-deriving the same "hangs, not root-caused"
+result, this pass swept all four `AP[2:1]` encodings on the same table
+entry to narrow down *which* bit actually triggers it. `0b00` (today's
+value) works, `0b01` (`AP[2]`=0, EL1 rw / EL0 rw — what's actually
+wanted) hangs immediately at `SCTLR_EL1.M`/`isb`, and `0b10`/`0b11`
+(`AP[2]`=1, EL1 read-only either way) both instead get *past* that point
+— "MMU enabled" prints — and hang one step later, exactly where the next
+code needs to write to this block's own stack, which is the expected
+consequence of making EL1's data read-only, not an anomaly. That
+localizes the real issue precisely: `AP[2]=0` (EL1 keeps full
+read/write, architecturally unaffected by `AP[1]` per the spec) combined
+with `AP[1]=1` (EL0 access newly granted) hangs immediately, while every
+`AP[2]=1` encoding gets further. Also ruled out this pass: `nG` (bit 11)
+set alongside `0b01<<6` — identical immediate hang. Checked for a
+matching known QEMU issue (none found, QEMU 10.1.5, `cortex-a53` and
+`max` both reproduce it identically — not CPU-model-specific either).
+Reverted again, same reasoning as before (not the enforced isolation
+boundary, nothing today depends on it) — see `mmu.rs`'s doc comment on
+`normal_block_descriptor` for the full, precise account, worth reading
+before attempting a third pass at this.

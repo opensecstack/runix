@@ -79,28 +79,50 @@ fn device_block_descriptor(output_addr: u64) -> u64 {
     output_addr | DESC_BLOCK | AF | (ATTRINDX_DEVICE << 2) | SH_OUTER | UXN | PXN
 }
 
-/// `AP[2:1]` (Access Permissions, bits [7:6]) `0b01` would grant read/write
-/// from *both* EL1 and EL0 -- the architecturally "correct" bit to set once
-/// `el0.rs` needs EL0 to touch its own stack/code page directly, rather than
-/// only through the `SVC` gate.
+/// `AP[2:1]` (Access Permissions, bits [7:6]) `0b01` (`AP[2]`=bit7=0,
+/// `AP[1]`=bit6=1) would grant read/write from *both* EL1 and EL0 -- the
+/// architecturally correct bit to set once `el0.rs` needs EL0 to touch its
+/// own stack/code page directly, rather than only through the `SVC` gate.
 ///
-/// **Not currently set -- tried, and reverted, not just never attempted.**
-/// Setting this bit reproducibly hangs QEMU (`cortex-a53`, `virt`) right at
-/// `mmu::install`'s `SCTLR_EL1.M` write/`isb` -- entirely on the EL1 side,
-/// *before* any EL0 code has run. That's the part that doesn't fit the
-/// architecture: `AP[1]` is defined to gate EL0's own access, not EL1's (EL1
-/// always has access per `AP[2]` regardless of `AP[1]`), so this looks like
-/// a QEMU/TCG emulation quirk for this specific field, not a logic bug in
-/// this table -- ruled out an unrelated cause by also adding a `tlbi
-/// vmalle1` before enabling translation (a real correctness fix on its own,
-/// kept below) and confirming the hang persists identically either way.
-/// Not run to ground further at Alpha's scope: it isn't the enforced
-/// isolation boundary anyway (that's the capability-token check at the
-/// `SVC` gate in `svc.rs`, the same layer `SYS_IPC_SEND` gates on the
-/// x86_64 side) -- `el0.rs`'s current demo never performs an EL0 data
-/// access (`el0_demo` is pure `mov`/`svc`/`wfe`, no loads or stores), so
-/// nothing today actually depends on this bit being set. Revisit once EL0
-/// code needs to touch memory directly instead of only through `SVC`.
+/// **Not currently set -- tried twice, with a real second investigation, and
+/// reverted both times.** First pass: setting `0b01<<6` reproducibly hangs
+/// QEMU (`virt`) right at `mmu::install`'s `SCTLR_EL1.M` write/`isb`,
+/// entirely on the EL1 side, before any EL0 code has run -- confirmed not a
+/// stale-TLB artifact (`tlbi vmalle1`, kept below regardless as a real
+/// correctness fix, made no difference).
+///
+/// Second pass, narrowing it down further rather than re-deriving the same
+/// result: swept all four `AP[2:1]` encodings on this exact table entry.
+/// `0b00` (today's value, EL1 rw / no EL0) boots the full RIL+SIM demo
+/// end to end -- the known-good baseline. `0b01` (`AP[2]`=0, EL1 rw / EL0
+/// rw) hangs immediately, as above. `0b10` (`AP[2]`=1, EL1 *read-only* / no
+/// EL0) and `0b11` (`AP[2]`=1, EL1 read-only / EL0 read-only) both instead
+/// get *past* `SCTLR_EL1.M`/`isb` -- "MMU enabled" prints -- and hang one
+/// step later, right where the next code needs to write to this same
+/// block's stack, which is architecturally the expected consequence of
+/// making EL1's own data read-only, not a QEMU anomaly.
+///
+/// That rules out a simple wrong-bit-position mistake (both interpretations
+/// of the field were tried, at both possible byte positions) and localizes
+/// the actual anomaly precisely: **`AP[2]=0` (EL1 keeps full read/write,
+/// architecturally unaffected by `AP[1]`) combined with `AP[1]=1` (EL0
+/// access newly granted) hangs immediately, while every encoding with
+/// `AP[2]=1` gets further.** Also ruled out: `nG` (bit 11, not-global) set
+/// alongside `0b01<<6` -- identical immediate hang, not the missing
+/// variable either. Checked for a matching known QEMU issue (none found by
+/// search at the time of writing, QEMU 10.1.5). Not run further to ground
+/// at Alpha's scope -- it isn't the enforced isolation boundary anyway
+/// (that's the capability-token check at the `SVC` gate in `svc.rs`, the
+/// same layer `SYS_IPC_SEND` gates on the x86_64 side), and `el0.rs`'s
+/// current demo never performs an EL0 data access (`el0_demo` is pure
+/// `mov`/`svc`/`wfe`, no loads or stores), so nothing today actually
+/// depends on this bit being set. Revisit once EL0 code needs to touch
+/// memory directly instead of only through `SVC` -- worth trying GDB
+/// single-stepping through the exact faulting instruction next (flaky in
+/// this environment when last attempted, see the RIL isolation work's own
+/// history, not impossible with more patience), or filing a minimal
+/// reproduction upstream against QEMU's `target/arm` TCG code given how
+/// precisely this is now characterized.
 fn normal_block_descriptor(output_addr: u64) -> u64 {
     output_addr | DESC_BLOCK | AF | (ATTRINDX_NORMAL << 2) | SH_INNER
 }
