@@ -266,14 +266,29 @@ jobs:
           workspaces: |
             kernel
             xtask
+            grid-sandbox-host
+      # main.rs now `include_bytes!`s grid-sandbox-host's compiled output
+      # directly (Phase B7 — see citadel.rs's doc comment), so the kernel
+      # itself won't even compile without this built first, the same
+      # ordering requirement kernel-tests' grid_sandbox_wasm job already
+      # has for the same reason.
+      - name: build grid-sandbox-host (payload for Phase B7)
+        working-directory: grid-sandbox-host
+        run: cargo build --target x86_64-unknown-none --release
       - name: install QEMU
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
       - name: build boot image
         working-directory: xtask
-        run: cargo run -- build
+        run: cargo run -- build --release
       - name: boot in QEMU and check for kernel serial output
         run: |
-          timeout 20 qemu-system-x86_64 \
+          # 90s, not 20s: a legacy multi-stage BIOS boot (SeaBIOS -> this
+          # crate's own stage 2/3/4 -> kernel ELF load) reading a
+          # multi-megabyte payload has real, observed variance depending
+          # on the runner's disk/CPU emulation path -- 20s was cutting it
+          # close even before Phase B7 added a ~2 MB embedded binary to
+          # read.
+          timeout 90 qemu-system-x86_64 \
             -drive format=raw,file=target/runix-bios.img \
             -serial stdio -display none -no-reboot -m 128M \
             | tee /tmp/boot.log || true
@@ -308,6 +323,19 @@ jobs:
           # explicitly revoked — port 2 gets nothing.
           grep -q "thread sender_revoked: SYS_IPC_SEND returned 18446744073709551615" /tmp/boot.log
           grep -q "Runix kernel: capability revocation OK (Phase B5: port 2 received None" /tmp/boot.log
+          # CITADEL (B6): demo call proves the allowlist gate itself works
+          # — a module signed for its exact bytes is accepted, tampered
+          # bytes are refused.
+          grep -q "Runix kernel: CITADEL boot authorization OK (Phase B6: authorized=Ok(())" /tmp/boot.log
+          # CITADEL (B7): the same gate, now actually deciding whether a
+          # real binary (grid-sandbox-host) gets loaded and run at all —
+          # authorized, then parsed/loaded/run as an isolated ring 3
+          # process hosting wasmi, printing "Hi" via two host.print calls
+          # that round-trip through the syscall gate.
+          grep -q "Runix kernel: grid-sandbox-host authorized by CITADEL allowlist" /tmp/boot.log
+          grep -q "Runix kernel: grid-sandbox-host loaded, entry point" /tmp/boot.log
+          grep -q "^Hi" /tmp/boot.log
+          grep -q "Runix kernel: grid-sandbox-host ran wasmi in an isolated ring 3 process" /tmp/boot.log
           grep -q "Runix kernel: entering ring 3" /tmp/boot.log
           # Printed by user_hello() running at CPL 3, one byte per SYS_WRITE
           # syscall — proves the syscall gate's DPL actually admits a ring 3

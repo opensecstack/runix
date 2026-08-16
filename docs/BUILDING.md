@@ -44,6 +44,17 @@ name) also tries to build the *library's own* unit-test harness, which needs
 cargo test --target x86_64-unknown-none --test basic_boot
 ```
 
+**`grid-sandbox-host` must be built first**: `kernel/src/main.rs` now
+`include_bytes!`s its compiled output directly (the CITADEL-gated real
+module load, Phase B7 — see `kernel/src/citadel.rs`'s doc comment), so
+`kernel/` itself won't compile without it, the same requirement
+`kernel/tests/grid_sandbox_wasm.rs` already has:
+
+```
+cd grid-sandbox-host
+cargo build --target x86_64-unknown-none --release
+```
+
 Building a bootable image and running it in QEMU by hand (this needs
 nightly too, separately — transitively through the `bootloader` crate's
 build script, see `xtask/rust-toolchain.toml`):
@@ -53,6 +64,14 @@ cd xtask
 cargo run -- build   # -> ../target/runix-bios.img
 cargo run -- run     # build + boot in QEMU, serial on stdio
 ```
+
+A legacy BIOS boot through this crate's own multi-stage loader (SeaBIOS ->
+stage 2/3/4 -> the kernel ELF, now with `grid-sandbox-host`'s ~2 MB
+embedded) can take well over the naive-looking default QEMU timeout on a
+slow or nested-virtualization host — give it real time (a minute-plus) in
+scripts before concluding a boot has hung, not just crashed silently; see
+`.github/workflows/ci.yml`'s `boot` job for the timeout this project
+actually uses in CI.
 
 On a Windows dev box with no MSVC Build Tools (`link.exe`) installed, the
 host-default nightly resolves to `-msvc` and fails to link. Force GNU

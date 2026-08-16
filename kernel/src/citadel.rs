@@ -1,20 +1,19 @@
 //! Demo CITADEL boot-time trust root: proves the `citadel-integration`
 //! <-> kernel wiring works end to end, the same way `capabilities.rs`
 //! proves the `capability-manager` <-> syscall-gate wiring works — this is
-//! not a real trust anchor, and nothing here gates a real module load yet.
+//! not a real trust anchor.
 //!
 //! `citadel-integration`'s `BootAllowlist::authorize_module_load` exists,
 //! is tested, and until this module was added, `kernel/Cargo.toml` didn't
 //! even depend on the crate — the logic was "correct in isolation and
 //! inert in practice" (see `docs/THREAT_MODEL.md`). This module closes
-//! that specific gap: `main.rs`'s boot sequence now actually calls
-//! `authorize_module_load` and observes a real accept/reject outcome.
-//!
-//! What this does *not* yet do: gate an actual module the kernel goes on to
-//! load. `main.rs` doesn't ELF-load anything in its own boot path today
-//! (only `kernel/tests/*.rs` do, e.g. `grid_sandbox_wasm.rs` loading
-//! `grid-sandbox-host`) — moving that load into `main.rs` and gating it
-//! through this allowlist is the next slice, not this one.
+//! that gap in two stages: `demo_authorize`/`demo_reject_tampered` prove
+//! the call chain works on throwaway bytes (`main.rs`'s Phase B6), and
+//! `main.rs`'s Phase B7 calls `demo_authorize` again on
+//! `grid-sandbox-host`'s *real* compiled bytes, this time actually gating
+//! whether that binary gets parsed, loaded, and run as a ring 3 process --
+//! the first real module load in this kernel's boot path that depends on
+//! this gate, not just a demo call proving the gate itself works.
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use runix_citadel_integration::{BootAllowlist, CitadelError, ModuleManifestEntry};

@@ -184,22 +184,28 @@ cases: authorizes a matching module, rejects an unlisted one, rejects
 tampered bytes, rejects a wrong signing key, and rejects a validly-signed
 entry reused for the wrong module ID.
 
-**Now wired into `kernel/`**, not just tested in isolation:
-`kernel/Cargo.toml` depends on `citadel-integration`, and a new
+**Now wired into `kernel/`, and gating a real module load** — not just
+tested in isolation, and not just a demo call on throwaway bytes.
+`kernel/Cargo.toml` depends on `citadel-integration`, and
 `kernel/src/citadel.rs` (a demo trust root, same pattern as
 `capabilities.rs`'s demo capability-token root) calls
-`BootAllowlist::authorize_module_load` from `main.rs`'s boot sequence —
-an allowlist entry signed for a demo module's exact bytes is accepted,
-and the same check against tampered bytes is correctly refused.
-Verified end to end in QEMU by `kernel/tests/citadel_demo.rs`, wired
-into CI alongside the rest of the `kernel-tests` suite. **Does not yet
-gate a real module load**, though: `main.rs` doesn't ELF-load anything
-of its own in its boot path today (only `kernel/tests/*.rs` do, via
-`elf::Elf64` — see the `grid-sandbox-host` section above), so there's
-nothing real to gate yet — this demonstrates the gate itself works, the
-same way the capability-token phases above demonstrate
-`capability-manager` works before anything real depended on it either.
-Real *runtime* MARSHAL/WORM/VIGIL integration (once Runix has running
+`BootAllowlist::authorize_module_load` from `main.rs`'s boot sequence in
+two phases. Phase B6: an allowlist entry signed for a demo module's exact
+bytes is accepted, and the same check against tampered bytes is correctly
+refused — verified end to end in QEMU by `kernel/tests/citadel_demo.rs`,
+wired into CI alongside the rest of the `kernel-tests` suite. Phase B7:
+the *same* check, this time against `grid-sandbox-host`'s real compiled
+bytes, actually gating whether `main.rs` goes on to parse, load, and run
+it as a ring 3 process (via `elf::Elf64` -> `process::AddressSpace` ->
+`scheduler::spawn_ring3_process` — the same mechanism the
+`grid-sandbox-host` section above proved works, now reached from the real
+boot path instead of only a test) — fail-closed, an unauthorized module
+is never touched. Verified in QEMU: the real boot log shows
+`grid-sandbox-host authorized by CITADEL allowlist`, then the binary
+loading and running to completion (its `wasmi`-hosted WASM module prints
+`"Hi"`, round-tripping through the syscall gate, exactly as
+`grid_sandbox_wasm.rs` already proved), before the boot thread continues
+on to `user_hello`. Real *runtime* MARSHAL/WORM/VIGIL integration (once Runix has running
 user-space processes to gate, not just boot-time module loads) remains
 Beta/RC work, blocked on the same external SDK gap as before — see
 [ROADMAP.md § Open questions](ROADMAP.md#open-questions).

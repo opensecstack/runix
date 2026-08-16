@@ -14,8 +14,34 @@ use alloc::vec::Vec;
 use bootloader_api::config::{BootloaderConfig, Mapping};
 use bootloader_api::{entry_point, BootInfo};
 use core::panic::PanicInfo;
+use runix_kernel::elf::Elf64;
+use runix_kernel::process::AddressSpace;
 use runix_kernel::serial_println;
+use x86_64::structures::paging::{Page, PageTableFlags};
 use x86_64::VirtAddr;
+
+/// The real payload the CITADEL boot-authorization gate (Phase B7, below)
+/// checks before loading -- see `citadel.rs`'s doc comment: this used to
+/// only be exercised by `kernel/tests/grid_sandbox_wasm.rs`, not gated by
+/// anything on the real boot path. Requires `grid-sandbox-host` already
+/// built (`cd grid-sandbox-host && cargo build --target x86_64-unknown-none
+/// --release`) before `main.rs` itself will compile -- `include_bytes!` is
+/// a compile-time file read, not a Cargo dependency the build graph
+/// resolves on its own. See `docs/BUILDING.md`.
+static GRID_SANDBOX_HOST_ELF: &[u8] =
+    include_bytes!("../../grid-sandbox-host/target/x86_64-unknown-none/release/grid-sandbox-host");
+
+/// Must match `grid-sandbox-host/src/main.rs`'s own `HEAP_START`/`HEAP_SIZE`
+/// -- that binary has no privilege to map its own memory (ring 3 code can't
+/// touch page tables at all), so whoever loads it sets this up. Same
+/// addresses `kernel/tests/grid_sandbox_wasm.rs` uses -- no conflict
+/// possible, since `AddressSpace::new()` gives this its own private page
+/// table, entirely separate from `user_hello`'s (mapped directly into the
+/// boot thread's own address space, not a fresh `AddressSpace`).
+const GRID_SANDBOX_HEAP_START: u64 = 0x_2222_2222_0000;
+const GRID_SANDBOX_HEAP_SIZE: u64 = 256 * 1024;
+const GRID_SANDBOX_STACK_VA: u64 = 0x_2222_3333_0000;
+const GRID_SANDBOX_STACK_SIZE: u64 = 4096 * 4;
 
 /// The default config doesn't map all of physical memory into the kernel's
 /// address space — `memory::init`'s `OffsetPageTable` needs that mapping to
@@ -207,14 +233,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // CITADEL boot-time module authorization: proves the `citadel-integration`
     // <-> kernel wiring works end to end (see `citadel.rs`'s doc comment) —
     // an allowlist entry signed for this exact module's bytes is accepted,
-    // and the same check against tampered bytes is refused. Not yet gating
-    // an actual module load: `main.rs` doesn't ELF-load anything of its own
-    // today (only `kernel/tests/*.rs` do), so there's nothing real to gate
-    // here yet — this demonstrates the gate itself works, the same way the
-    // capability-token phases above demonstrate `capability-manager` works
-    // before anything real depends on it either.
+    // and the same check against tampered bytes is refused. Still throwaway
+    // bytes here, not a real module — Phase B7 below is what actually gates
+    // a real load with this same mechanism, on `grid-sandbox-host`.
     let demo_module_bytes = b"demo module bytes - not a real loaded module yet";
-    let citadel_authorized = runix_kernel::citadel::demo_authorize("demo-module", demo_module_bytes);
+    let citadel_authorized =
+        runix_kernel::citadel::demo_authorize("demo-module", demo_module_bytes);
     let citadel_tampered_rejected =
         runix_kernel::citadel::demo_reject_tampered("demo-module", demo_module_bytes);
     serial_println!(
@@ -222,6 +246,37 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         citadel_authorized,
         citadel_tampered_rejected
     );
+
+    // The real integration Phase B6 (and citadel.rs's own doc comment) was
+    // building toward: gate an actual module load through the allowlist,
+    // not a demo call on throwaway bytes. `grid-sandbox-host`'s real
+    // compiled bytes are checked against a demo allowlist built for those
+    // exact bytes -- fail-closed, same as `BootAllowlist`'s own contract --
+    // and only loaded/run if authorized. The load/run mechanism itself
+    // (`elf::Elf64` -> `process::AddressSpace` -> `scheduler::spawn_ring3_process`)
+    // is exactly what `kernel/tests/grid_sandbox_wasm.rs` already proved
+    // works; what's new here is a real boot path actually depending on the
+    // gate in front of it, not a test calling both pieces independently.
+    match runix_kernel::citadel::demo_authorize("grid-sandbox-host", GRID_SANDBOX_HOST_ELF) {
+        Ok(()) => {
+            serial_println!(
+                "Runix kernel: grid-sandbox-host authorized by CITADEL allowlist (Phase B7)"
+            );
+            load_and_run_grid_sandbox_host();
+        }
+        Err(e) => {
+            // Fail-closed: an unauthorized module is never parsed, loaded,
+            // or run. The demo allowlist above is built to match these
+            // exact bytes, so this branch shouldn't fire in practice today
+            // -- Phase B6 already proves the rejection path works, against
+            // deliberately tampered bytes; this is the same gate, just
+            // guarding a real load instead of a demo-only check.
+            serial_println!(
+                "Runix kernel: grid-sandbox-host REJECTED by CITADEL allowlist ({:?}) — not loaded (Phase B7)",
+                e
+            );
+        }
+    }
 
     // Ring 3: map a user-accessible stack, grant ring 3 access to the one
     // code page `user_hello` lives on, then `iretq` into it. There's no
@@ -247,6 +302,96 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("Runix kernel: entering ring 3 (Phase 7: user-space transition)");
     unsafe {
         runix_kernel::userspace::enter_usermode(user_entry, user_stack_top);
+    }
+}
+
+/// Parses, loads, and runs `GRID_SANDBOX_HOST_ELF` as a real ring 3
+/// process -- called only after Phase B7's CITADEL check authorizes it.
+/// Identical mechanism to `kernel/tests/grid_sandbox_wasm.rs` (see that
+/// file for why each step is shaped the way it is, including the two real
+/// bugs -- stack under-mapping, an unzeroed heap page -- found getting
+/// this working the first time); this is that same proven path, just
+/// reached from the real boot sequence instead of a standalone test.
+fn load_and_run_grid_sandbox_host() {
+    serial_println!(
+        "Runix kernel: parsing grid-sandbox-host ({} bytes)",
+        GRID_SANDBOX_HOST_ELF.len()
+    );
+    let elf = Elf64::parse(GRID_SANDBOX_HOST_ELF)
+        .expect("grid-sandbox-host failed to parse as a valid ELF64 binary");
+
+    let mut space = AddressSpace::new();
+    let entry = elf
+        .load_segments(&mut space)
+        .expect("grid-sandbox-host failed to load its PT_LOAD segments");
+    serial_println!(
+        "Runix kernel: grid-sandbox-host loaded, entry point {:#x}",
+        entry.as_u64()
+    );
+
+    // The ELF loader only maps what the ELF itself declares -- the
+    // payload's heap and ring 3 stack are runtime-only regions with no
+    // PT_LOAD segment behind them, so mapping those is this loader's job.
+    let heap_start_page = Page::containing_address(VirtAddr::new(GRID_SANDBOX_HEAP_START));
+    let heap_end_page = Page::containing_address(VirtAddr::new(
+        GRID_SANDBOX_HEAP_START + GRID_SANDBOX_HEAP_SIZE - 1,
+    ));
+    let heap_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+    for page in Page::range_inclusive(heap_start_page, heap_end_page) {
+        // A freshly allocated frame carries whatever its previous owner
+        // left in it, not guaranteed-zero -- `LockedHeap::init` only
+        // writes its own free-list header, not the whole region.
+        space.map_private_page(page, heap_flags).fill(0);
+    }
+
+    let stack_start_page = Page::containing_address(VirtAddr::new(GRID_SANDBOX_STACK_VA));
+    let stack_end_page = Page::containing_address(VirtAddr::new(
+        GRID_SANDBOX_STACK_VA + GRID_SANDBOX_STACK_SIZE - 1,
+    ));
+    let stack_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+    for page in Page::range_inclusive(stack_start_page, stack_end_page) {
+        space.map_private_page(page, stack_flags);
+    }
+
+    #[allow(static_mut_refs)]
+    unsafe {
+        GRID_SANDBOX_ENTRY_POINT = entry.as_u64();
+    }
+    runix_kernel::scheduler::spawn_ring3_process(grid_sandbox_host_trampoline, space);
+
+    // The payload writes 'H', 'i', then yields forever -- a handful of
+    // round trips is plenty to let its output land before the boot thread
+    // moves on; it keeps existing afterward as a background thread that
+    // yields forever, same as thread_a/b/c above do once their own bursts
+    // finish.
+    for _ in 0..20 {
+        runix_kernel::scheduler::yield_now();
+    }
+    serial_println!(
+        "Runix kernel: grid-sandbox-host ran wasmi in an isolated ring 3 process (Phase B7)"
+    );
+}
+
+/// `entry` (the ELF's own entry point, `_start` in `grid-sandbox-host`) is
+/// only known at runtime, parsed from the loaded binary -- captured here so
+/// the `extern "C" fn() -> !` trampoline `spawn_ring3_process` requires (a
+/// bare function pointer, no captures) can still reach it.
+static mut GRID_SANDBOX_ENTRY_POINT: u64 = 0;
+
+extern "C" fn grid_sandbox_host_trampoline() -> ! {
+    #[allow(static_mut_refs)]
+    let entry = unsafe { GRID_SANDBOX_ENTRY_POINT };
+    unsafe {
+        runix_kernel::userspace::enter_usermode(
+            VirtAddr::new(entry),
+            VirtAddr::new(GRID_SANDBOX_STACK_VA + GRID_SANDBOX_STACK_SIZE),
+        );
     }
 }
 

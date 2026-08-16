@@ -49,7 +49,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     serial_println!("citadel_demo: authorizing a module signed for the demo allowlist");
     if let Err(e) = runix_kernel::citadel::demo_authorize("demo-module", module_bytes) {
-        serial_println!("citadel_demo: FAIL — expected authorization to succeed, got {}", e);
+        serial_println!(
+            "citadel_demo: FAIL — expected authorization to succeed, got {}",
+            e
+        );
         exit_qemu(QemuExitCode::Failed);
     }
 
