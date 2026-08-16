@@ -17,20 +17,45 @@ of Alpha's scope (and beyond it) is done, in progress, or not started.
 ## Open questions
 
 - **License**: workspace default stays Apache-2.0 through Alpha and Beta.
-  **Decision: still deferred, but the deferral's own reasoning is now
-  stale and worth re-checking soon.** The original reasoning was "there's
-  no real governance logic in `citadel-integration` yet, so there's
-  nothing whose license would meaningfully differ" — no longer true: the
-  crate now has real, tested logic (`ModuleManifestEntry`/`BootAllowlist`,
-  boot-time module authorization — see [STATUS.md](STATUS.md)). It's
-  arguably still Apache-2.0-appropriate (boot-time signature verification
-  isn't the MARSHAL/WORM *governance* logic the AGPL question was
-  originally about), but that argument hasn't actually been made yet, just
-  assumed by inertia. Revisit explicitly — either re-confirm Apache-2.0
-  with real reasoning or switch — rather than letting "deferred until real
-  logic exists" silently stay deferred now that real logic exists. Full
-  MARSHAL/WORM runtime logic (once `opensecstack/sdk/rust` unblocks it —
-  see below) is still the harder version of this question.
+  **Decision: re-confirmed Apache-2.0 for `citadel-integration` as it
+  exists today, with an actual argument instead of the old "no real logic
+  yet" deferral (no longer true — the crate now has real, tested logic:
+  `ModuleManifestEntry`/`BootAllowlist`, boot-time module authorization —
+  see [STATUS.md](STATUS.md)).**
+  - **The reference point**: `opensecstack/opensecstack`'s own root
+    `LICENSE` splits the ecosystem explicitly — "Governance Platforms
+    (AGPL-3.0)" lists `citadel/` by name (the actual MARSHAL/WORM/VIGIL
+    platform); "Tool Platforms (Apache 2.0)" lists `sdk/` and everything
+    else. AGPL in that split marks the governance *decision engine*
+    itself, not everything that happens to talk to it.
+  - **What `citadel-integration` actually does today, per its own module
+    doc** (`citadel-integration/src/lib.rs`'s "Why not a Kerkese/MARSHAL
+    round-trip" section): boot-time module authorization is explicitly
+    *not* a governance round-trip — no `Kerkese` submission, no
+    Separation-of-Duties evaluation, no Gate logic. It's "a
+    signature-verification problem... solved the same way
+    `capability-manager` solves capability tokens: Ed25519 over a
+    canonical string, verified entirely offline." `capability-manager`
+    itself has never been in question for Apache-2.0 — verifying a
+    pre-computed signature is the same category of code whether the
+    thing being verified is a capability token or a module manifest
+    entry, and that category isn't what opensecstack's own AGPL split is
+    marking.
+  - **So**: Apache-2.0 for `citadel-integration` as it stands is the
+    correct call, not inertia — the actual governance logic (Kerkese
+    evaluation, WORM audit chain, VIGIL health monitoring) lives entirely
+    in the external `citadel/` platform (correctly AGPL-3.0 there) and
+    has not been reimplemented here. Runix only verifies signatures that
+    platform produced, the same relationship any client verifying a
+    third-party signature has to the signer.
+  - **Real revisit trigger, not a vague "later"**: if/when this crate
+    grows actual MARSHAL policy/Gate evaluation logic client-side (not
+    just signature verification against a pre-signed artifact) — the
+    "Full MARSHAL/WORM runtime logic" work blocked on
+    `opensecstack/sdk/rust` below — re-run this analysis then. That would
+    cross from "verifies a governance platform's output" into "reimplements
+    governance platform logic," which is a materially different question
+    this same reasoning doesn't answer.
 - **`repository` field**: resolved — `Cargo.toml` now points at the real
   remote (`https://github.com/opensecstack/runix`), matching `git remote
   origin`. No longer a placeholder.
