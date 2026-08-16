@@ -29,16 +29,13 @@
 //! - The actual TrustZone boundary: drops from EL3 to EL1 Non-secure via
 //!   `eret` (see `nonsecure.rs`), and EL1 code confirms via `CurrentEL`
 //!   that it landed there.
-//! - EL1's own MMU is up (see `mmu.rs`): identity-mapped, two 1 GiB
-//!   blocks (Device for the GIC/UART, Normal for RAM), verified with
-//!   `AT S1E1R` actually asking the hardware to translate an address and
-//!   confirming the result, not just that `SCTLR_EL1.M`'s write didn't
-//!   crash. This is the prerequisite every future isolation boundary (RIL,
-//!   SIM provisioning, anything else under the Non-secure kernel) actually
-//!   needs -- see `mmu.rs`'s doc comment for scope (identity-mapped,
-//!   non-cacheable, two coarse 1 GiB blocks; no per-process address
-//!   spaces, no fine-grained permissions yet). Getting here needed EL1's
-//!   own exception vector table first (`el1_vectors.rs`) -- without one, a
+//! - EL1's own MMU is up (see `mmu.rs`): identity-mapped, a 1 GiB Device
+//!   block plus a three-level Normal region (mostly 2 MiB blocks, with one
+//!   2 MiB slice further split into 4 KiB pages for EL0-accessible memory
+//!   -- see below), verified with `AT S1E1R` actually asking the hardware
+//!   to translate an address and confirming the result, not just that
+//!   `SCTLR_EL1.M`'s write didn't crash. Getting here needed EL1's own
+//!   exception vector table first (`el1_vectors.rs`) -- without one, a
 //!   translation-table bug is not a diagnosable fault, it's a silent jump
 //!   to whatever raw bytes sit at physical address `0x200` (`VBAR_EL1`'s
 //!   reset value) -- and a `CPACR_EL1.FPEN` fix, since compiler-generated
@@ -54,21 +51,28 @@
 //!   the x86_64 kernel uses for `SYS_IPC_SEND`, not a separate ARM-side
 //!   reimplementation. `el0.rs`'s demo (`el0_demo`) proves the whole
 //!   chain end to end: an unconditional `SYS_WRITE` (proves the `SVC`
-//!   gate itself works), `SYS_RIL_ACCESS` for a channel it holds a
-//!   capability for (authorized) and one it doesn't (denied), then
-//!   `SYS_RIL_SEND`/`SYS_RIL_RECV` round-tripping a real byte through the
-//!   authorized channel's mailbox (`ril_channel.rs`) and getting denied
-//!   on the unauthorized one -- proving the capability check gates
-//!   actual per-operation I/O, not just a one-time access decision. **Not
-//!   yet real EL0/EL1 memory isolation**
-//!   -- `mmu.rs`'s Normal block stays EL1-only (`AP[2:1]=0b00`); the
-//!   architecturally-correct `0b01` (grants EL0 data access) was tried
-//!   and reverted after it reproducibly hung QEMU on the EL1 side alone,
-//!   before any EL0 code ran -- see `mmu.rs`'s doc comment on
-//!   `normal_block_descriptor` for the full account and why it isn't
-//!   blocking today (the capability check at the `SVC` gate is the
-//!   boundary this slice actually proves, and `el0_demo` never performs
-//!   an EL0 data access, so nothing currently depends on that bit).
+//!   gate itself works), a real EL0 stack write/read-back (proves *data*
+//!   access, not just instruction fetch -- see below), `SYS_RIL_ACCESS`
+//!   for a channel it holds a capability for (authorized) and one it
+//!   doesn't (denied), then `SYS_RIL_SEND`/`SYS_RIL_RECV` round-tripping a
+//!   real byte through the authorized channel's mailbox (`ril_channel.rs`)
+//!   and getting denied on the unauthorized one -- proving the capability
+//!   check gates actual per-operation I/O, not just a one-time access
+//!   decision.
+//! - **Real EL0/EL1 memory isolation, page-granular** -- `mmu.rs`'s Normal
+//!   region descends to 4 KiB pages for the one 2 MiB slice containing
+//!   this crate's own image, and marks *only* `el0_demo`'s code page and
+//!   `EL0_STACK`'s pages `AP[2:1]=0b01` (EL0-accessible); everything else,
+//!   in particular `el1_exception_vectors`, stays `AP[2:1]=0b00`
+//!   (EL1-only). This replaced an earlier attempt that set `AP[1]=1` on
+//!   the *entire* 1 GiB Normal block, which reproducibly hung QEMU --
+//!   root-caused via `-d int,guest_errors` tracing to a genuine QEMU/TCG
+//!   bug where EL1 could no longer fetch its own exception vector table
+//!   once `AP[1]=1` was set anywhere in the same region, even though `AP`
+//!   bits are architecturally defined to gate data access, not instruction
+//!   fetch. Confining the bit to a small, dedicated page range instead of
+//!   the whole block sidesteps the bug entirely -- see `mmu.rs`'s doc
+//!   comment on `Level3Table` for the full investigation and root cause.
 //! - **Basic SIM provisioning** (see `sim.rs`): the last unstarted item on
 //!   Alpha mobile's roadmap line. A minimal per-slot profile state
 //!   machine (`Uninitialized -> Provisioned -> Activated`), gated by the

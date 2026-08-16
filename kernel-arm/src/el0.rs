@@ -24,17 +24,33 @@
 
 use core::arch::naked_asm;
 
-const EL0_STACK_SIZE: usize = 4096 * 4;
+pub const EL0_STACK_SIZE: usize = 4096 * 4;
 
 // The field is never read through Rust -- only its address (computed in
 // `drop_to_el0`) and its raw memory (as EL0's stack, written directly by
 // the CPU) are ever used. Same pattern as `main.rs`'s `BOOT_STACK`.
-#[repr(align(16))]
+//
+// `repr(align(4096))`, not just `align(16)`: `mmu.rs`'s page-granular EL0
+// mapping (see its doc comment on why block-granular `AP[1]=1` isn't used)
+// needs this to start on its own page boundary, not share a 4 KiB page
+// with unrelated EL1-only static data -- sharing would force that
+// neighboring data to also be EL0-accessible, or force this stack to not
+// be, since `AP[2:1]` is a whole-page property.
+#[repr(align(4096))]
 #[allow(dead_code)]
 struct El0Stack([u8; EL0_STACK_SIZE]);
 
 #[unsafe(no_mangle)]
 static mut EL0_STACK: El0Stack = El0Stack([0; EL0_STACK_SIZE]);
+
+/// The stack's base address -- `mmu.rs` needs this (alongside
+/// [`EL0_STACK_SIZE`]) to compute which page-table entries to mark
+/// EL0-accessible. Exactly the range `drop_to_el0` hands EL0 as `SP_EL0`
+/// (`[base, base + EL0_STACK_SIZE)`), 4 KiB-aligned per `El0Stack`'s
+/// `repr(align(4096))`.
+pub fn stack_base() -> u64 {
+    core::ptr::addr_of!(EL0_STACK) as u64
+}
 
 /// `SPSR_EL1` value `eret` restores `PSTATE` from: `M[3:0] = 0b0000`
 /// selects EL0t (EL0 has no SP0/SPx distinction the way EL1/EL2/EL3 do --
@@ -53,15 +69,15 @@ const SPSR_EL0T_MASKED: u64 = 0b1111 << 6;
 /// # Safety
 /// `entry` must point at code that's self-contained enough to run
 /// correctly at EL0: no calls into ordinary EL1 code (EL0 can only
-/// re-enter EL1 through `SVC`), and no EL0 *data* access (loads/stores,
-/// including an implicit stack push/pop) -- `mmu.rs`'s `AP[2:1]` for this
-/// block is `0b00` (EL1-only data access) today, not `0b01`, see that
-/// module's doc comment on `normal_block_descriptor` for why the
-/// architecturally-correct bit is reverted rather than set. Instruction
-/// *fetch* still works regardless (governed by `UXN`/`PXN`, not `AP`,
-/// and this block sets neither) -- which is exactly why `el0_demo` (pure
-/// `mov`/`svc`/`wfe`, no loads or stores) runs fine under this
-/// constraint today.
+/// re-enter EL1 through `SVC`). Data access (loads/stores, including an
+/// implicit stack push/pop) is only valid within the specific pages
+/// `mmu.rs::install` actually marks `AP[2:1]=0b01` for -- this stack
+/// (`EL0_STACK`, sized/located via [`stack_base`]/[`EL0_STACK_SIZE`]) and
+/// `entry`'s own code page. Anywhere else in this crate's Normal region
+/// stays EL1-only (`AP[2:1]=0b00`) -- see `mmu.rs`'s doc comment on
+/// `Level3Table` for why the whole 1 GiB block never gets `AP[1]=1` at
+/// once (a real, reproducible QEMU hang), and why page-granular mapping
+/// is the fix rather than a workaround.
 pub unsafe fn drop_to_el0(entry: u64) -> ! {
     // Computed here, not with `adrp`/`add` scratch instructions inside the
     // asm block below: `options(noreturn)` forbids declaring any register
@@ -106,10 +122,11 @@ const SYS_SIM_ACTIVATE: u64 = 6;
 const SYS_SIM_STATUS: u64 = 7;
 
 /// The EL0 demo itself. `.balign 4096` for the same reason
-/// `userspace::user_hello` does: keeping it on its own page matters once
-/// EL0 permissions become page-granular instead of the whole 1 GiB block
-/// (see `mmu.rs`'s doc comment on `normal_block_descriptor`) -- not
-/// load-bearing today, but the right habit to already be in.
+/// `userspace::user_hello` does: this crate's EL0 permissions *are*
+/// page-granular now (see `mmu.rs`'s doc comment on `Level3Table`), and
+/// `mmu::install` relies on this function occupying exactly one page to
+/// mark it `AP[2:1]=0b01` without also granting EL0 access to any
+/// neighboring EL1-only code that happened to share a page.
 ///
 /// # Safety
 /// Never call this directly -- only ever reached via `drop_to_el0`'s
@@ -122,6 +139,25 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         // SYS_WRITE('U') -- proves the SVC gate itself works.
         "mov x0, {sys_write}",
         "mov x1, #85", // 'U'
+        "svc #0",
+        // Real EL0 *data* access proof -- push a byte onto our own stack
+        // and read it back, both genuine loads/stores through SP_EL0, not
+        // just instruction fetch (which never needed AP[2:1] at all --
+        // only UXN/PXN gate execute permission). Echoed via SYS_WRITE so
+        // the round trip is visible in the serial log: reaching this print
+        // means mmu.rs's page-granular AP[2:1]=0b01 mapping for this
+        // stack's own pages actually grants EL0 read/write, the thing
+        // `AP[2:1]` on the *whole* 1 GiB block reproducibly hung QEMU on
+        // (see mmu.rs's doc comment on `Level3Table` for that
+        // investigation) -- confining the bit to this small, dedicated
+        // region instead of the block containing the vector table sidesteps
+        // it entirely.
+        "mov x3, #0x42", // 'B'
+        "strb w3, [sp, #-16]!",
+        "ldrb w4, [sp]",
+        "add sp, sp, #16",
+        "mov x0, {sys_write}",
+        "mov x1, x4",
         "svc #0",
         // SYS_RIL_ACCESS(0) -- a channel this context holds a capability
         // for (see capabilities::issue_and_hold's caller in nonsecure.rs).
@@ -199,6 +235,19 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "1:",
         "wfe",
         "b 1b",
+        // Pad out to the *next* page boundary -- `.balign 4096` at the top
+        // only aligns this function's *start*; without this, the linker is
+        // free to pack whatever comes next (in the build that first
+        // exposed this bug, `el1_exception_vectors` itself) into the same
+        // page's remaining, otherwise-unused space, since this function's
+        // real body is nowhere near 4 KiB. `mmu::install` marks this whole
+        // page `AP[2:1]=0b01` (EL0-accessible) based on this function's
+        // start address alone -- anything sharing the page becomes
+        // EL0-accessible too, silently. This is what actually made the
+        // EL1-only vector table EL0-accessible last time, retriggering the
+        // exact QEMU instruction-fetch bug `Level3Table`'s doc comment
+        // describes, just confined to a smaller region.
+        ".balign 4096",
         sys_write = const SYS_WRITE,
         sys_ril_access = const SYS_RIL_ACCESS,
         sys_ril_send = const SYS_RIL_SEND,

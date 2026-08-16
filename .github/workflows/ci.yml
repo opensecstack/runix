@@ -192,7 +192,12 @@ jobs:
           # channel from an unauthorized one — not just that EL0 code ran.
           grep -q "Runix ARM kernel: heap initialized" /tmp/arm-boot.log
           grep -q "Runix ARM kernel: RIL capability issued" /tmp/arm-boot.log
-          grep -q "^U$" /tmp/arm-boot.log
+          # "U" (SYS_WRITE gate proof) immediately followed by "B" (0x42,
+          # a real EL0 stack strb/ldrb round-trip) on the same line, since
+          # neither syscall emits a newline -- proves real EL0/EL1 page-
+          # granular memory isolation actually grants data access on
+          # el0_demo's own page, not just that instruction fetch works.
+          grep -q "^UB$" /tmp/arm-boot.log
           grep -q "SVC: SYS_RIL_ACCESS channel 0 authorized" /tmp/arm-boot.log
           grep -q "SVC: SYS_RIL_ACCESS channel 99 DENIED" /tmp/arm-boot.log
           # The check gates real per-operation I/O, not just a one-time
@@ -233,7 +238,7 @@ jobs:
           grep -q "no EL3 ever ran, so no security-state switch to report" \
             /tmp/arm-boot-nosecure.log
           grep -q "Runix ARM kernel: MMU enabled" /tmp/arm-boot-nosecure.log
-          grep -q "^U$" /tmp/arm-boot-nosecure.log
+          grep -q "^UB$" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_RIL_ACCESS channel 0 authorized" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_RIL_RECV channel 0 authorized, byte 0x41" \
             /tmp/arm-boot-nosecure.log

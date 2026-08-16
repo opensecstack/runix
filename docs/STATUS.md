@@ -708,13 +708,30 @@ separate freestanding crate from `kernel/` (which is deeply `x86_64`-specific
   (`0x41`, `'A'`) through the authorized channel's single-slot mailbox and
   getting denied on the unauthorized one — proving the capability check
   gates actual per-operation I/O, re-checked on every call, not just a
-  one-time access decision. **Not** real EL0/EL1 memory isolation yet —
-  `mmu.rs`'s Normal block stays EL1-only (`AP[2:1]=0b00`); the correct
-  `0b01` bit was tried and reverted after a real, reproducible QEMU hang —
-  see the bug entry below. The enforced boundary today is the capability
-  check at the `SVC` gate, matching `kernel/src/capabilities.rs`'s role on
-  the x86_64 side, not an MMU permission boundary (which doesn't exist at
-  this granularity yet regardless).
+  one-time access decision.
+- **Real EL0/EL1 memory isolation, page-granular, not just the SVC-gate
+  capability check.** `mmu.rs` now builds a real three-level translation
+  table for the Normal region: mostly 2 MiB blocks (EL1-only, same as
+  before), except the one 2 MiB slice containing this crate's own image,
+  which descends further to 4 KiB pages. Only two things in that slice are
+  marked `AP[2:1]=0b01` (EL0-accessible): `el0_demo`'s code page and
+  `EL0_STACK`'s pages. Everything else — in particular
+  `el1_exception_vectors` — stays `AP[2:1]=0b00`. `el0_demo` now proves
+  *data* access genuinely works, not just execute: a real `strb`/`ldrb`
+  push-and-read-back onto its own stack, echoed via `SYS_WRITE` (`0x42`,
+  `'B'`, printed right after the `SYS_WRITE` gate proof). This closes the
+  gap an earlier attempt (see the bug entry below) left open — that
+  attempt set `AP[1]=1` on the *entire* 1 GiB block and hung QEMU
+  reproducibly; the real root cause (found via `-d int,guest_errors`
+  tracing) was that EL1 could no longer fetch its own exception vector
+  table once `AP[1]=1` was set anywhere in the block it lived in — a
+  genuine QEMU/TCG bug, since `AP` bits are architecturally defined to
+  gate data access, not instruction fetch. The fix isn't a workaround for
+  that bug, it's the architecturally correct design regardless: real
+  isolation needs page-granular permissions, not "the whole block or
+  nothing," and confining `AP[1]=1` to a small, dedicated page range never
+  triggers the QEMU issue in the first place. See `mmu.rs`'s doc comment
+  on `Level3Table` for the full account.
 - **Basic SIM provisioning** (`sim.rs`) — closing out Alpha mobile's last
   unstarted roadmap item. A minimal per-slot profile state machine
   (`Uninitialized -> Provisioned -> Activated`), gated by the *same*
@@ -862,11 +879,10 @@ reproducibly hung QEMU (`cortex-a53`, `virt`) at `mmu::install`'s
 had run. That doesn't fit the architecture (`AP[1]` is defined to gate
 EL0's own access, not EL1's), and adding a `tlbi vmalle1` before enabling
 translation (a real correctness fix, kept regardless) made no difference —
-ruled out as the cause without being root-caused further. Reverted the bit
-rather than block on it: it isn't the enforced isolation boundary (that's
-the capability check at the `SVC` gate), and `el0_demo` never performs an
-EL0 data access, so nothing today actually depends on it. Revisit once EL0
-code needs direct memory access instead of only `SVC`. Third, in
+ruled out as the cause without being root-caused further at the time.
+Reverted the bit rather than block on it, with two later follow-up
+investigations that did eventually root-cause and fix it — see further
+below, after the other bugs found in between. Third, in
 `ril_capability.rs`: the demo capability's expiry window was a fixed
 `1_000_000`-tick constant, sized without checking `CNTFRQ_EL0` first — on
 this platform's actual generic-timer frequency that's under a millisecond
@@ -903,24 +919,67 @@ honest, distinct account of *how* EL1 was reached (the EL3-drop path
 still says "dropped from EL3, `SCR_EL3.NS=1`"; the no-EL3 path no longer
 claims a security-state switch that never happened).
 
-A follow-up investigation into the `AP[2:1]=0b01` QEMU hang above, not a
-resolution: rather than re-deriving the same "hangs, not root-caused"
-result, this pass swept all four `AP[2:1]` encodings on the same table
-entry to narrow down *which* bit actually triggers it. `0b00` (today's
-value) works, `0b01` (`AP[2]`=0, EL1 rw / EL0 rw — what's actually
-wanted) hangs immediately at `SCTLR_EL1.M`/`isb`, and `0b10`/`0b11`
-(`AP[2]`=1, EL1 read-only either way) both instead get *past* that point
-— "MMU enabled" prints — and hang one step later, exactly where the next
-code needs to write to this block's own stack, which is the expected
-consequence of making EL1's data read-only, not an anomaly. That
-localizes the real issue precisely: `AP[2]=0` (EL1 keeps full
-read/write, architecturally unaffected by `AP[1]` per the spec) combined
-with `AP[1]=1` (EL0 access newly granted) hangs immediately, while every
-`AP[2]=1` encoding gets further. Also ruled out this pass: `nG` (bit 11)
-set alongside `0b01<<6` — identical immediate hang. Checked for a
-matching known QEMU issue (none found, QEMU 10.1.5, `cortex-a53` and
-`max` both reproduce it identically — not CPU-model-specific either).
-Reverted again, same reasoning as before (not the enforced isolation
-boundary, nothing today depends on it) — see `mmu.rs`'s doc comment on
-`normal_block_descriptor` for the full, precise account, worth reading
-before attempting a third pass at this.
+A follow-up investigation into the `AP[2:1]=0b01` QEMU hang above, not
+yet a resolution: rather than re-deriving the same "hangs, not
+root-caused" result, this pass swept all four `AP[2:1]` encodings on the
+same table entry to narrow down *which* bit actually triggers it. `0b00`
+(then-current value) works, `0b01` (`AP[2]`=0, EL1 rw / EL0 rw — what's
+actually wanted) hangs immediately at `SCTLR_EL1.M`/`isb`, and
+`0b10`/`0b11` (`AP[2]`=1, EL1 read-only either way) both instead get
+*past* that point — "MMU enabled" prints — and hang one step later,
+exactly where the next code needs to write to this block's own stack,
+which is the expected consequence of making EL1's data read-only, not an
+anomaly. That localized the real issue precisely: `AP[2]=0` (EL1 keeps
+full read/write, architecturally unaffected by `AP[1]` per the spec)
+combined with `AP[1]=1` (EL0 access newly granted) hangs immediately,
+while every `AP[2]=1` encoding gets further. Also ruled out this pass:
+`nG` (bit 11) set alongside `0b01<<6` — identical immediate hang. Checked
+for a matching known QEMU issue (none found, QEMU 10.1.5, `cortex-a53`
+and `max` both reproduce it identically — not CPU-model-specific
+either). Reverted again pending the actual root cause.
+
+**Third pass: root-caused and fixed for real.** `-d int,guest_errors`
+tracing (QEMU's own exception log, independent of whether this crate's
+handler ever runs) showed the "hang" was never a soft lockup — it's a
+real, repeating `Taking exception 3 [Prefetch Abort]`, `ESR
+0x21/0x8600000d` (`EC=0x21` Instruction Abort from-EL1-to-EL1,
+`IFSC=0b001101` Permission fault level 1), `FAR`/`ELR` both pinned at the
+*exact address of `el1_exception_vectors`' own vector-4 entry*. EL1's
+exception vector table, living in the same 1 GiB block, could no longer
+be *fetched* once `AP[1]=1` was set anywhere in that block — even though
+`AP` bits are architecturally defined to gate data access, not
+instruction fetch (`UXN`/`PXN` govern that, and neither was set). A
+genuine QEMU/TCG emulation bug, not a logic error in this crate's
+descriptors.
+
+The fix isn't a workaround for the QEMU bug — it's to stop triggering it,
+by never putting `AP[1]=1` on a region that also contains code EL1 needs
+to keep fetching. `mmu.rs` now builds a real three-level translation
+table: the Normal region stays mostly 2 MiB blocks (`AP[2:1]=0b00`,
+identical to before), except the one 2 MiB slice containing this crate's
+own image, which descends to 4 KiB pages. Only `el0_demo`'s code page
+and `EL0_STACK`'s pages (computed from their real linked addresses, not
+hardcoded offsets) get `AP[2:1]=0b01`; `el1_exception_vectors` and
+everything else stays `AP[2:1]=0b00`. This sidesteps the QEMU bug
+entirely and *is* the architecturally correct design anyway — real
+isolation needs page-granular permissions, not "the whole block or
+nothing."
+
+One real bug surfaced building the fix, worth remembering as its own
+lesson: the first attempt still hung, identically, even with the fix in
+place — because `el0_demo`'s `.balign 4096` only aligns its own *start*,
+not its whole page. The linker packed `el1_exception_vectors` right
+after it in the same 4 KiB page (confirmed via `nm`: `el0_demo` at
+`0x40081000`, `el1_exception_vectors` at `0x40081800`, both inside
+`[0x40081000, 0x40082000)`), so marking "el0_demo's page" EL0-accessible
+silently marked the vector table too, retriggering the exact same fault
+at a smaller scale. Fixed by padding `el0_demo`'s `naked_asm!` with a
+*trailing* `.balign 4096`, forcing whatever the linker places next onto
+a fresh page instead of packing it into el0_demo's unused tail space.
+After that fix, confirmed with a real EL0 *data* access, not just "no
+crash": `el0_demo` now pushes a byte onto its own stack and reads it
+back via genuine `strb`/`ldrb` through `SP_EL0`, echoed via `SYS_WRITE`
+(`'B'`, `0x42`) — a real read/write round-trip through the page-granular
+mapping, verified in QEMU for both the `secure=on` and no-`secure`
+boot paths. See `mmu.rs`'s doc comment on `Level3Table` for the complete
+account.
