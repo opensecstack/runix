@@ -16,9 +16,12 @@ end to end in QEMU (the `main.rs` demo boots through every phase, exercises
 capability-gated IPC — see `capability-manager` below — and lands in ring 3,
 which prints `USR` back through the syscall gate as its last act).
 
-Of Alpha's five roadmap items, four are done: microkernel boot, basic IPC,
-WASM runtime engine bring-up, and — as of the capability-gate work below —
-the capability manager. **`wasm-runtime`** now has a real engine
+All five of Alpha's roadmap items are done: microkernel boot, basic IPC,
+WASM runtime (engine bring-up *and* ring 3 hosting — see the
+`grid-sandbox-host` section below), the capability manager (as of the
+capability-gate work below), and CITADEL boot-time module authorization
+wired into `kernel/`'s own boot sequence (see the `citadel-integration`
+section below). **`wasm-runtime`** now has a real engine
 (`wasmi`) that loads and executes WASM bytecode, calls exported functions,
 and — as of the host-function import work — lets WASM code call back into
 the runtime. `wasmi` over `wasmtime` on purpose: no `std` feature enabled,
@@ -90,14 +93,35 @@ Cargo.toml setting. Full existing test suite (7 tests across `call_add.rs`/
 `host_import.rs`/`memory_isolation.rs`) still passes on the host, and
 `clippy` is clean on both targets.
 
-**Still not what "Grid Sandbox" means end to end.** This crate compiling
-for the bare-metal target is necessary, not sufficient — it's still a
-*library*, not something that runs. Actually hosting it in ring 3 needs it
-(or a thin binary wrapping it) built as its own freestanding ELF, loaded
-through `elf::Elf64` and `scheduler::spawn_ring3_process` the same way
-`ring3_cooperative.rs`'s hand-written processes are today — that wiring
-doesn't exist yet. This is the next concrete step, not a claim already
-made.
+**Now actually what "Grid Sandbox" means end to end, not just a
+bare-metal-compiling library.** `grid-sandbox-host` (a separate
+freestanding crate, own `[workspace]`, same pattern as
+`kernel`/`xtask`) is a real, `rustc`-compiled binary hosting the
+`wasmi` engine, built as its own ELF and loaded through `elf::Elf64`
+into its own `process::AddressSpace`, then run as a genuine ring 3
+process via `scheduler::spawn_ring3_process` — not a hand-written naked
+function like `ring3_cooperative.rs`'s processes. Verified end to end
+by `kernel/tests/grid_sandbox_wasm.rs`: `grid-sandbox-host` executes a
+real embedded WASM module (`hello.wat`) via two `host.print` calls that
+cross back out through the syscall gate to the kernel's `SYS_WRITE`
+handler, reaching the host and printing `"Hi"` — proof the whole chain
+worked (host allocator init on a kernel-mapped private heap, `wasmi`
+engine/module/store construction, host-function import wiring, guest
+bytecode execution, and the syscall gate back out) inside a genuinely
+hardware-isolated ring 3 process, not simulated. Wired into CI
+(`.github/workflows/ci.yml` builds `grid-sandbox-host` first, since
+`grid_sandbox_wasm.rs`'s `include_bytes!` needs its compiled output
+already on disk, then runs the test) — not a manual-only step. Two real
+bugs found getting here, both worth knowing before touching this path
+again: `map_private_page` maps one 4 KiB page per call, but the ring 3
+entry stack (`PAYLOAD_STACK_SIZE`, 4 pages) was only mapped once,
+leaving the actual stack pointer 3 pages past what was mapped and
+page-faulting on first use — fixed by looping over the full page range,
+same pattern the heap mapping already used; and a fresh heap page isn't
+guaranteed zeroed by the allocator, only its own free-list header is,
+so newly mapped heap pages are now explicitly zeroed. No sandbox tiers
+or MARSHAL channel permits yet — this proves the mechanism, not the
+full Beta-scope Grid Sandbox policy layer.
 
 **`capability-manager`** is no longer a stub either: `CapabilityToken`
 issuance and verification are real (Ed25519 over a canonical, pipe-joined
@@ -160,10 +184,21 @@ cases: authorizes a matching module, rejects an unlisted one, rejects
 tampered bytes, rejects a wrong signing key, and rejects a validly-signed
 entry reused for the wrong module ID.
 
-**Not yet wired into `kernel/`**, though: nothing in the boot path calls
-`authorize_module_load` — `kernel/Cargo.toml` doesn't even depend on this
-crate yet. Real, tested, and correct in isolation; inert until something
-in `main.rs`'s boot sequence actually calls it before loading a module.
+**Now wired into `kernel/`**, not just tested in isolation:
+`kernel/Cargo.toml` depends on `citadel-integration`, and a new
+`kernel/src/citadel.rs` (a demo trust root, same pattern as
+`capabilities.rs`'s demo capability-token root) calls
+`BootAllowlist::authorize_module_load` from `main.rs`'s boot sequence —
+an allowlist entry signed for a demo module's exact bytes is accepted,
+and the same check against tampered bytes is correctly refused.
+Verified end to end in QEMU by `kernel/tests/citadel_demo.rs`, wired
+into CI alongside the rest of the `kernel-tests` suite. **Does not yet
+gate a real module load**, though: `main.rs` doesn't ELF-load anything
+of its own in its boot path today (only `kernel/tests/*.rs` do, via
+`elf::Elf64` — see the `grid-sandbox-host` section above), so there's
+nothing real to gate yet — this demonstrates the gate itself works, the
+same way the capability-token phases above demonstrate
+`capability-manager` works before anything real depended on it either.
 Real *runtime* MARSHAL/WORM/VIGIL integration (once Runix has running
 user-space processes to gate, not just boot-time module loads) remains
 Beta/RC work, blocked on the same external SDK gap as before — see

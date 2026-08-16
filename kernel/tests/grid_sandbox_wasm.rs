@@ -7,19 +7,20 @@
 //! like `ring3_cooperative.rs`'s processes, a genuine `rustc`-compiled
 //! program that hosts the `wasmi` engine and executes a real WASM module.
 //!
-//! **Manual build step required**: unlike every other test here,
-//! `include_bytes!` below needs `grid-sandbox-host`'s compiled output to
-//! already exist on disk — this crate isn't part of any workspace `cargo
-//! test` orchestrates automatically (it targets `x86_64-unknown-none` from
-//! a separate standalone package, like `kernel`/`xtask` themselves). Build
-//! it first:
+//! **Manual build step required when running this locally**: unlike every
+//! other test here, `include_bytes!` below needs `grid-sandbox-host`'s
+//! compiled output to already exist on disk — this crate isn't part of any
+//! workspace `cargo test` orchestrates automatically (it targets
+//! `x86_64-unknown-none` from a separate standalone package, like
+//! `kernel`/`xtask` themselves). Build it first:
 //!
 //! ```text
 //! cd grid-sandbox-host && cargo build --target x86_64-unknown-none --release
 //! ```
 //!
-//! Wiring that build step into CI (so this test can run unattended) is a
-//! known follow-up, not done yet — see the top-level README.
+//! CI does this step automatically (`.github/workflows/ci.yml` builds
+//! `grid-sandbox-host` before running this test) — the manual step above is
+//! only needed for a local `cargo test` run.
 //!
 //! If `grid-sandbox-host`'s expected output ("Hi", via two `host.print`
 //! calls from its embedded `hello.wat` module) reaches the kernel's
