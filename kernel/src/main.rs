@@ -131,13 +131,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         runix_kernel::interrupts::ticks()
     );
 
-    // Cooperative round-robin scheduling: spawn three threads that each do
-    // a bit of real work (proving their own saved context resumes exactly
-    // where it left off — not just that switch_to() returns *somewhere*
-    // without faulting), then let this thread (the boot context, folded
-    // into the same run queue as a placeholder) drive several rounds of
-    // yielding so their output actually interleaves instead of running to
-    // completion back-to-back.
+    // Round-robin scheduling: spawn three threads that each do a bit of
+    // real work (proving their own saved context resumes exactly where it
+    // left off — not just that a reschedule lands *somewhere* without
+    // faulting), then let this thread (the boot context, folded into the
+    // same run queue as a placeholder) drive several rounds of yielding so
+    // their output actually interleaves instead of running to completion
+    // back-to-back.
     runix_kernel::scheduler::init();
     runix_kernel::scheduler::spawn(thread_a);
     runix_kernel::scheduler::spawn(thread_b);
@@ -279,10 +279,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     // Ring 3: map a user-accessible stack, grant ring 3 access to the one
-    // code page `user_hello` lives on, then `iretq` into it. There's no
-    // return path — this really is the last thing the boot thread does;
-    // everything from here on runs at CPL 3, bouncing back into the
-    // kernel only through the syscall gate.
+    // code page `user_hello` lives on, then spawn it as a real scheduler
+    // thread (its own dedicated kernel-entry stack, so the timer can safely
+    // preempt it mid-spin — see `spawn_ring3_shared`'s doc comment for why
+    // a raw, un-scheduled `enter_usermode` from the boot thread is no
+    // longer safe now that preemption is real, not just cooperative).
     let user_stack_top = runix_kernel::memory::with_mapper_and_frame_allocator(
         runix_kernel::userspace::map_user_stack,
     )
@@ -291,17 +292,33 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     runix_kernel::memory::with_mapper_and_frame_allocator(|mapper, _frame_allocator| unsafe {
         runix_kernel::userspace::allow_user_access(mapper, user_entry);
     });
-    // The scheduler watchdog (see `interrupts.rs`) expects every thread it
-    // knows about to keep calling `yield_now()` — true here up to this
-    // point, but ring 3 code doesn't cooperate with the scheduler at all
-    // yet (see `userspace.rs`'s note on why `SYS_YIELD` is meaningless for
-    // `user_hello`). Left armed, the watchdog would eventually panic on
-    // `user_hello`'s intentional forever-spin, mistaking deliberate
-    // behavior for a real hang.
-    runix_kernel::interrupts::disarm_watchdog();
-    serial_println!("Runix kernel: entering ring 3 (Phase 7: user-space transition)");
+    #[allow(static_mut_refs)]
     unsafe {
-        runix_kernel::userspace::enter_usermode(user_entry, user_stack_top);
+        USER_HELLO_ENTRY = user_entry.as_u64();
+        USER_HELLO_STACK_TOP = user_stack_top.as_u64();
+    }
+    serial_println!("Runix kernel: entering ring 3 (Phase 7: user-space transition)");
+    runix_kernel::scheduler::spawn_ring3_shared(user_hello_trampoline);
+
+    // The boot thread's own work is done — everything left to prove (ring 3
+    // running, real preemption not corrupting anything) happens on other
+    // threads now. It has no dedicated stack region of its own for
+    // `exit_current_thread` to reclaim (see that function's doc comment),
+    // so it joins the same forever-yield pattern `thread_a`/`b`/`c` use
+    // rather than actually exiting.
+    loop {
+        runix_kernel::scheduler::yield_now();
+    }
+}
+
+static mut USER_HELLO_ENTRY: u64 = 0;
+static mut USER_HELLO_STACK_TOP: u64 = 0;
+
+extern "C" fn user_hello_trampoline() -> ! {
+    #[allow(static_mut_refs)]
+    let (entry, stack_top) = unsafe { (USER_HELLO_ENTRY, USER_HELLO_STACK_TOP) };
+    unsafe {
+        runix_kernel::userspace::enter_usermode(VirtAddr::new(entry), VirtAddr::new(stack_top));
     }
 }
 

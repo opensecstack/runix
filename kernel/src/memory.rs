@@ -173,12 +173,29 @@ pub fn install(mapper: OffsetPageTable<'static>, frame_allocator: BootInfoFrameA
 
 /// Runs `f` with mutable access to the installed mapper and frame
 /// allocator. Panics if [`install`] hasn't run yet.
+///
+/// Runs with interrupts disabled for the same reason [`crate::scheduler`]'s
+/// `SCHEDULER` lock does (see its call sites) — with real preemption, the
+/// timer can land while this lock is held by whatever thread it interrupts
+/// (`scheduler::Thread::new`'s stack mapping, `userspace::map_user_stack`,
+/// heap init, ...), and `scheduler::reap_zombies` (called from inside
+/// `scheduler::reschedule`, itself already running with interrupts off)
+/// takes this same lock to unmap a zombie thread's stack. Without disabling
+/// interrupts around every *other* acquisition, that timer tick would try
+/// to lock a `spin::Mutex` this same CPU already holds, from a context that
+/// can never be preempted away from it — a permanent deadlock, not a stall.
+/// `kernel/tests/thread_reclaim.rs` (20,000 spawn/exit cycles, virtually
+/// guaranteed to eventually straddle a timer tick) hit exactly this before
+/// this fix, hanging with zero progress rather than just running slowly.
 pub fn with_mapper_and_frame_allocator<R>(
     f: impl FnOnce(&mut OffsetPageTable<'static>, &mut BootInfoFrameAllocator) -> R,
 ) -> R {
-    let mut guard = MAPPER_AND_FRAME_ALLOCATOR.lock();
-    let (mapper, frame_allocator) = guard.as_mut().expect("memory::install() not called yet");
-    f(mapper, frame_allocator)
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut guard = MAPPER_AND_FRAME_ALLOCATOR.lock();
+        let (mapper, frame_allocator) =
+            guard.as_mut().expect("memory::install() not called yet");
+        f(mapper, frame_allocator)
+    })
 }
 
 /// Finds the physical frame backing `addr` in the kernel's own table — for

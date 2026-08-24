@@ -28,42 +28,46 @@ impl InterruptIndex {
     }
 }
 
-/// Incremented on every timer IRQ. The base a preemptive scheduler (next
-/// phase) will tick against — nothing schedules off it yet.
+/// Incremented on every timer IRQ — also every real preemption tick, see
+/// `on_timer_tick`.
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
-/// Cooperative-scheduler watchdog: **detection, not preemption.** There's
-/// no timer-interrupt-driven context switch yet (see `scheduler.rs`'s
-/// module doc comment) — a thread that never calls `yield_now()` still
-/// can't be forcibly interrupted and moved aside. What this *does* do is
-/// turn "the whole kernel silently hangs forever" into a loud, immediate,
-/// diagnosable panic instead — the same "detect deterministically instead
-/// of silently misbehaving" trade guard pages made for stack overflows
-/// (see the top-level README). Not a substitute for real preemption, which
-/// is what T1 Critical's <300ms MARSHAL real-time constraint (see README's
-/// "Sandbox tiers") actually needs — this only guarantees a hang is *found*
-/// quickly, not that the system keeps making progress through one.
+/// **Backstop, not the primary defense anymore.** Used to be the *only*
+/// thing standing between a thread that never calls `yield_now()` and the
+/// whole kernel silently hanging forever — see `scheduler.rs`'s module doc
+/// comment for the real fix now in place: every timer tick forces a
+/// reschedule regardless of what's running, so a thread that never
+/// cooperates no longer blocks anything (T1 Critical's <300ms MARSHAL
+/// real-time constraint — see README's "Sandbox tiers" — needed exactly
+/// this, not just faster detection). What this still catches: `reschedule`
+/// itself panicking, hanging, or somehow never getting called at all (a
+/// bug in the mechanism, not in a thread using it) — genuinely different
+/// failure classes than "a thread forgot to yield," which preemption now
+/// makes irrelevant on its own. `kernel/tests/watchdog.rs` was rewritten
+/// to prove *that* — real recovery, not just detection — once this landed.
 ///
-/// Lock-free by necessity: this is checked from `timer_interrupt_handler`,
-/// which can fire while any code — including code already holding
-/// `scheduler::SCHEDULER`'s lock, mid-`yield_now()` — is running. Taking
-/// that same lock here would deadlock the CPU against itself the moment an
-/// interrupt landed inside its own critical section. Plain atomics avoid
-/// that entirely, at the cost of not being able to inspect the run queue
-/// (so this can't tell *which* thread is stuck, only that *something* has
-/// gone too long without any thread cooperating).
+/// Lock-free by necessity: this is checked from `on_timer_tick`, which
+/// fires with `RFLAGS.IF=0` (an interrupt gate) — nothing else can be
+/// mid-`SCHEDULER.lock()` while this runs, so a plain atomic isn't required
+/// for *that* reason anymore, but stays lock-free anyway: reading it here
+/// must never itself be what causes a hang this is supposed to catch.
 static LAST_YIELD_TICK: AtomicU64 = AtomicU64::new(0);
 
-/// Off until `scheduler::init()` arms it, and deliberately turned back off
-/// before a ring 3 handoff (see `userspace::enter_usermode`'s call site in
-/// `main.rs`) — ring 3 code doesn't call `yield_now()` at all yet (see
-/// `userspace.rs`'s doc comment on why `SYS_YIELD` is meaningless there
-/// today), so leaving the watchdog armed across that handoff would
-/// eventually panic on perfectly intended behavior, not a real hang.
+/// Off until `scheduler::init()` arms it — stays armed permanently after
+/// that now (nothing disarms it anymore). Safe to leave on across a ring 3
+/// handoff, unlike before real preemption existed: back when `user_hello`
+/// was entered via a raw `userspace::enter_usermode` call invisible to the
+/// scheduler, its intentional forever-spin (never calling `yield_now()`)
+/// would eventually trip this watchdog on perfectly intended behavior, so
+/// `main.rs` disarmed it first. Now `user_hello` runs as a real, preemptible
+/// scheduler thread (`scheduler::spawn_ring3_shared`) — the timer keeps
+/// forcing a `reschedule` every tick regardless of whether it cooperates,
+/// which is exactly what keeps [`LAST_YIELD_TICK`] moving and this watchdog
+/// quiet.
 static WATCHDOG_ARMED: AtomicBool = AtomicBool::new(false);
 
 /// ~20 PIT ticks at the default (unreprogrammed) ~18.2 Hz rate this kernel
@@ -73,10 +77,10 @@ static WATCHDOG_ARMED: AtomicBool = AtomicBool::new(false);
 /// noticing something's wrong, let alone a CI run timing out.
 const WATCHDOG_THRESHOLD_TICKS: u64 = 20;
 
-/// Called from `scheduler::yield_now()` on every call, whether or not it
-/// actually switches to another thread — a system with only one runnable
-/// thread that keeps calling `yield_now()` in its own loop is still
-/// cooperating, even though no context switch happens.
+/// Called from `scheduler::reschedule` on every call, whether triggered by
+/// a voluntary `yield_now()` or an involuntary timer tick, and whether or
+/// not it actually switches to another thread — any of those is proof the
+/// mechanism itself is still alive.
 pub fn record_yield() {
     LAST_YIELD_TICK.store(ticks(), Ordering::Relaxed);
 }
@@ -84,10 +88,6 @@ pub fn record_yield() {
 pub fn arm_watchdog() {
     record_yield();
     WATCHDOG_ARMED.store(true, Ordering::Relaxed);
-}
-
-pub fn disarm_watchdog() {
-    WATCHDOG_ARMED.store(false, Ordering::Relaxed);
 }
 
 lazy_static! {
@@ -102,7 +102,17 @@ lazy_static! {
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         }
-        idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
+        // `timer_entry` is naked, not `extern "x86-interrupt" fn` — it
+        // needs to capture the *complete* register state (a
+        // `scheduler::TrapFrame`) for real preemption to be able to resume
+        // it later, which the typed interrupt-calling-convention ABI
+        // doesn't expose. Same raw-address registration `syscall::entry`
+        // already uses, below.
+        unsafe {
+            idt[InterruptIndex::Timer.as_u8()]
+                .set_handler_addr(x86_64::VirtAddr::new(timer_entry as *const () as u64))
+                .set_present(true);
+        }
         // `crate::syscall::entry` is a naked function, not
         // `extern "x86-interrupt" fn` — it doesn't fit `set_handler_fn`'s
         // typed signature, hence the raw-address variant. Software
@@ -120,6 +130,19 @@ lazy_static! {
                 // Ring 3 exists from Phase 7 onward, so the gate has to
                 // actually admit it.
                 .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+        }
+        // `scheduler::reschedule_entry`, same reasoning as `timer_entry`
+        // above (needs a full `TrapFrame`, not the typed ABI) — kernel-only
+        // (default Ring0 DPL), unlike `syscall::VECTOR`: every caller,
+        // including a ring 3 thread's `SYS_YIELD`, already reaches
+        // `scheduler::yield_now()` from inside `syscall::dispatch`, i.e.
+        // from ring 0.
+        unsafe {
+            idt[crate::scheduler::RESCHEDULE_VECTOR]
+                .set_handler_addr(x86_64::VirtAddr::new(
+                    crate::scheduler::reschedule_entry as *const () as u64,
+                ))
+                .set_present(true);
         }
         idt
     };
@@ -191,7 +214,77 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     }
 }
 
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+/// Entry point installed at the timer IRQ vector. Naked, not
+/// `extern "x86-interrupt" fn` — see this module's IDT-registration comment
+/// on why real preemption needs the *complete* register state
+/// (`scheduler::TrapFrame`) a typed interrupt handler doesn't expose.
+/// Structurally identical to `scheduler::reschedule_entry` (same GPR
+/// push/pop sequence, same final `iretq`) — the only difference is what
+/// Rust function each calls in between, which is exactly the point: one
+/// mechanism, two triggers.
+///
+/// # Safety
+/// Never call this directly — reached only by the CPU delivering IRQ0
+/// (timer), which guarantees a matching hardware-pushed frame already sits
+/// on the stack for the final `iretq` to consume.
+#[unsafe(naked)]
+unsafe extern "C" fn timer_entry() {
+    core::arch::naked_asm!(
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rdi, rsp",
+        // See `scheduler::reschedule_entry`'s identical line for why this
+        // is required, not optional: a hardware interrupt (this one) can
+        // land with RSP at any alignment, unlike a real `call` site, and
+        // `on_timer_tick` is an ordinary Rust function that can't safely
+        // assume otherwise. Discarded, not restored, afterward — the very
+        // next instruction unconditionally replaces RSP with whichever
+        // frame `on_timer_tick` returns.
+        "and rsp, -16",
+        "call {on_timer_tick}",
+        "mov rsp, rax",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rbp",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rbx",
+        "pop rax",
+        "iretq",
+        on_timer_tick = sym on_timer_tick,
+    );
+}
+
+/// The actual preemption tick: EOI, bump `TICKS`, the watchdog backstop
+/// check (see its own doc comment on why this is a backstop now, not the
+/// primary defense), then hand off to `scheduler::reschedule` — every
+/// timer tick forces a reschedule attempt, unconditionally, regardless of
+/// what's currently running. `frame` is a complete `TrapFrame` (hardware
+/// fields + `timer_entry`'s GPR pushes); the return value is what
+/// `timer_entry` resumes from — the same frame unchanged (nothing else was
+/// runnable) or a different thread's.
+extern "C" fn on_timer_tick(frame: *mut crate::scheduler::TrapFrame) -> *mut crate::scheduler::TrapFrame {
     let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     unsafe {
         PICS.lock()
@@ -206,9 +299,25 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
         && now.saturating_sub(LAST_YIELD_TICK.load(Ordering::Relaxed)) > WATCHDOG_THRESHOLD_TICKS
     {
         panic!(
-            "scheduler watchdog: no thread called yield_now() for over {} ticks — \
-             something is stuck without cooperating",
+            "scheduler watchdog: no reschedule succeeded for over {} ticks — \
+             the preemption mechanism itself is stuck, not just an uncooperative thread",
             WATCHDOG_THRESHOLD_TICKS
         );
     }
+
+    // `boot::init()` enables interrupts well before `main.rs` ever calls
+    // `scheduler::init()` — the timer starts ticking immediately, with no
+    // scheduler yet to reschedule against. Without this check, the very
+    // first tick during that window would hit `reschedule`'s
+    // `SCHEDULER.lock().expect(...)` and panic — confirmed for real the
+    // first time this shipped (`scheduler::init() not called`, fired
+    // during Phase 3, well before Phase 5 ever calls `scheduler::init()`).
+    // Resuming the interrupted context unchanged is always correct here:
+    // it's exactly what `reschedule` itself does whenever nothing else is
+    // runnable, just decided one step earlier.
+    if !crate::scheduler::is_initialized() {
+        return frame;
+    }
+
+    crate::scheduler::reschedule(frame)
 }

@@ -1,15 +1,42 @@
-//! Cooperative round-robin scheduler. Threads voluntarily call
-//! [`yield_now`] — there's no timer-interrupt-driven preemption yet (that
-//! needs a PIC/APIC timer, a later stage), so a thread that never yields
-//! blocks everything else forever.
+//! Round-robin scheduler with **real, timer-interrupt-driven preemption** —
+//! not just cooperative `yield_now()`. A thread that never yields no longer
+//! blocks everything else forever; the PIT timer (`interrupts.rs`) forces a
+//! reschedule on every tick regardless of what's currently running.
+//!
+//! # One resume mechanism for both triggers
+//!
+//! Voluntary yield and involuntary preemption share the exact same
+//! save/resume mechanism: both trap into ring 0 through a real interrupt
+//! (hardware, for the timer; `int RESCHEDULE_VECTOR`, for a voluntary
+//! yield), which is what makes a
+//! *complete* register capture (all GPRs, RFLAGS, CS/SS, RSP/RIP — a
+//! [`TrapFrame`], not just the callee-saved subset a plain function call
+//! can get away with) both correct and free: the CPU (for the timer) or the
+//! `int` instruction (for a yield) captures it, [`reschedule_entry`]'s
+//! naked stub finishes the GPR half, and resuming *any* thread later is
+//! always the same `iretq`. A thread suspended by preemption might be
+//! resumed by a different thread's voluntary yield, or vice versa — with
+//! one unified frame format, it never matters which caused which.
+//!
+//! This replaced an earlier design (`switch_to`, callee-saved registers
+//! only, resumed via a plain `ret`) that was correct for cooperative-only
+//! yielding — at a real function-call boundary, the SysV ABI already
+//! guarantees caller-saved registers are dead — but fundamentally can't
+//! extend to preemption: an interrupt can land at *any* instruction, with
+//! arbitrary live registers a `ret`-based resume would silently corrupt.
+//! See `docs/STATUS.md`'s "Real preemption" entry for why a two-format
+//! (`Cooperative`/`Preempted`) design was considered and rejected: RFLAGS.IF
+//! handling across a resume triggered by the *other* mechanism than the one
+//! that suspended a thread turns out to be a real correctness hazard, not
+//! just extra bookkeeping.
 //!
 //! A thread can optionally own a [`process::AddressSpace`]
-//! (`spawn_with_address_space`) — when it does, `yield_now` switches `Cr3`
-//! to that space right before resuming it, and back to the kernel's own
-//! table (`memory::kernel_p4_frame`) when resuming a thread that doesn't.
-//! This is genuinely safe to do mid-switch, still on the *previous*
-//! thread's stack: every thread's own stack lives in the shared,
-//! kernel-space portion of every address space (mapped through the
+//! (`spawn_with_address_space`) — when it does, [`reschedule`] switches
+//! `Cr3` to that space right before resuming it, and back to the kernel's
+//! own table (`memory::kernel_p4_frame`) when resuming a thread that
+//! doesn't. This is genuinely safe to do mid-switch, still on the
+//! *previous* thread's stack: every thread's own stack lives in the
+//! shared, kernel-space portion of every address space (mapped through the
 //! ordinary global allocator in `Thread::new`, never through
 //! `AddressSpace::map_private_page`'s detach logic), so it stays correctly
 //! mapped no matter which `Cr3` happens to be loaded at the moment.
@@ -19,7 +46,7 @@ use crate::process::AddressSpace;
 use alloc::collections::VecDeque;
 use core::arch::naked_asm;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use runix_capability_manager::CapabilityToken;
 use spin::Mutex;
 use x86_64::registers::control::Cr3;
@@ -104,20 +131,38 @@ fn map_guarded_stack(
     (guard_page_base, stack_start + size as u64)
 }
 
-/// Callee-saved registers, in the exact order `switch_to` pushes/pops them.
-/// `rip` isn't pushed by us explicitly — it's what `ret` consumes, so a
-/// freshly spawned thread's context has its entry point sitting there,
-/// making the first switch into it behave like `ret`-ing into a function
-/// that was never actually `call`ed.
+/// A complete saved execution context — every general-purpose register plus
+/// the hardware-defined `iretq` frame (`rip`/`cs`/`rflags`/`rsp`/`ss`) —
+/// unlike the old `switch_to`'s callee-saved-only `Context`, this is
+/// correct to capture from *any* instruction boundary, not just a
+/// controlled function-call site. Field order matches
+/// [`reschedule_entry`]/`interrupts::timer_entry`'s exact push sequence
+/// (GPRs, low to high address) followed immediately by whatever pushed the
+/// last five fields — the CPU itself, for a hardware interrupt, or
+/// [`Thread::new`] synthesizing an identical layout for a thread that's
+/// never actually run yet.
 #[repr(C)]
-struct Context {
+pub(crate) struct TrapFrame {
     r15: u64,
     r14: u64,
     r13: u64,
     r12: u64,
-    rbx: u64,
+    r11: u64,
+    r10: u64,
+    r9: u64,
+    r8: u64,
     rbp: u64,
+    rdi: u64,
+    rsi: u64,
+    rdx: u64,
+    rcx: u64,
+    rbx: u64,
+    rax: u64,
     rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
 }
 
 struct Thread {
@@ -126,9 +171,13 @@ struct Thread {
     /// exactly which pages this thread's stack occupied, so they can be
     /// unmapped and their physical frames handed back to the allocator.
     guard_page_base: VirtAddr,
-    /// Saved RSP when this thread isn't the one running. For the
-    /// `main`-thread placeholder this is never read (main always yields
-    /// from — and resumes on — its real boot stack, not this field).
+    /// Points at this thread's saved [`TrapFrame`] when it isn't the one
+    /// running — cast, not stored typed, since it's read/written as a raw
+    /// address on both sides of a context switch (`reschedule_entry`'s
+    /// naked stub, `interrupts::timer_entry`'s). For the `main`-thread
+    /// placeholder this is never read until the first time it's ever
+    /// suspended (main always resumes on whatever real stack it was
+    /// already running on, not this field, before that).
     stack_pointer: usize,
     /// What this thread is authorized to do, per `syscall::dispatch`'s
     /// capability checks (e.g. `SYS_IPC_SEND`) — `None` for threads that
@@ -136,13 +185,13 @@ struct Thread {
     /// "unrestricted."
     capability: Option<CapabilityToken>,
     /// `Some` for a thread that owns its own private address space (a
-    /// "process," in the sense `process.rs` means it) — `yield_now`
+    /// "process," in the sense `process.rs` means it) — [`reschedule`]
     /// switches `Cr3` to it right before resuming this thread. `None`
     /// (every thread before this field existed, and most since) runs in
     /// the kernel's own shared table, exactly as before.
     address_space: Option<AddressSpace>,
     /// `Some` for a thread spawned via `spawn_ring3_process` — its own
-    /// dedicated RSP0 target, which `yield_now` loads into the TSS (via
+    /// dedicated RSP0 target, which [`reschedule`] loads into the TSS (via
     /// `gdt::set_kernel_stack`) right before resuming this thread, so its
     /// ring 3 traps (in particular `SYS_YIELD`) land on a stack no other
     /// thread is using. `None` for everything else — a plain kernel
@@ -175,31 +224,65 @@ impl Thread {
 
         // SysV ABI: RSP must be ≡ 0 (mod 16) immediately *before* a `call`,
         // which makes it ≡ 8 (mod 16) at the callee's entry (the `call`
-        // itself pushed an 8-byte return address). Our `ret` trick below
-        // fakes that same entry state, so `entry_rsp` — where RSP lands
-        // right after the synthetic "return" — must land on the same ≡ 8
-        // (mod 16) offset. Get this wrong and nothing fails loudly here; it
-        // silently misaligns any stack-spilled SSE register in `entry`,
-        // faulting only once such a spill actually happens.
+        // itself pushed an 8-byte return address). `entry` is an ordinary
+        // Rust function, compiled assuming it was reached that way (in
+        // particular, any stack-spilled SSE register inside it assumes this
+        // alignment) — resuming it for the first time via `iretq` instead of
+        // an actual `call` doesn't change that requirement, so `rsp`'s value
+        // *inside* the synthesized `TrapFrame` below still needs to land on
+        // the same ≡ 8 (mod 16) offset a real `call` would have produced.
         let entry_rsp = (raw_top & !0xf) - 8;
-        let context_ptr = (entry_rsp - size_of::<Context>()) as *mut Context;
-        debug_assert_eq!(context_ptr as usize % 16, 0);
+
+        // Where this synthesized frame itself lives is unrelated to
+        // `entry_rsp` above (that's the RSP `entry` will see *after* being
+        // resumed, restored by `iretq` from this frame's own `rsp` field) —
+        // it just needs to be some mapped, 8-byte-aligned location on this
+        // same stack for `reschedule_entry`'s pops to read from.
+        let frame_ptr = (entry_rsp - size_of::<TrapFrame>()) as *mut TrapFrame;
+
+        // The values a *real* interrupt would have captured for this
+        // thread, had it actually been running: current CS/SS (this is a
+        // kernel thread — ring 0 — same segments regardless of which thread
+        // asks), and RFLAGS with IF=1 (bit 9) so resuming this thread for
+        // the first time leaves interrupts enabled, same as every other
+        // context here runs with; bit 1 is always reserved-set.
+        let cs: u64;
+        let ss: u64;
+        unsafe {
+            core::arch::asm!("mov {}, cs", out(reg) cs);
+            core::arch::asm!("mov {}, ss", out(reg) ss);
+        }
+        const RFLAGS_IF: u64 = 1 << 9;
+        const RFLAGS_RESERVED_BIT1: u64 = 1 << 1;
 
         unsafe {
-            context_ptr.write(Context {
+            frame_ptr.write(TrapFrame {
                 r15: 0,
                 r14: 0,
                 r13: 0,
                 r12: 0,
-                rbx: 0,
+                r11: 0,
+                r10: 0,
+                r9: 0,
+                r8: 0,
                 rbp: 0,
+                rdi: 0,
+                rsi: 0,
+                rdx: 0,
+                rcx: 0,
+                rbx: 0,
+                rax: 0,
                 rip: entry as usize as u64,
+                cs,
+                rflags: RFLAGS_IF | RFLAGS_RESERVED_BIT1,
+                rsp: entry_rsp as u64,
+                ss,
             });
         }
 
         Thread {
             guard_page_base,
-            stack_pointer: context_ptr as usize,
+            stack_pointer: frame_ptr as usize,
             capability: None,
             address_space: None,
             kernel_entry_stack_top: None,
@@ -226,8 +309,8 @@ struct Scheduler {
     current: Option<Thread>,
     /// Threads that called [`exit_current_thread`] but whose stack hasn't
     /// been unmapped yet — deferred because a thread can't safely unmap the
-    /// very stack it's still running on. Reaped from `yield_now`, which by
-    /// construction always runs on some *other* thread's stack.
+    /// very stack it's still running on. Reaped from [`reschedule`], which
+    /// by construction always runs on some *other* thread's stack.
     zombies: VecDeque<Thread>,
 }
 
@@ -274,6 +357,16 @@ pub fn init() {
     // cooperative scheduling starts, disarmed explicitly before any code
     // path (e.g. `userspace::enter_usermode`) that leaves it for good.
     crate::interrupts::arm_watchdog();
+    // Last, deliberately: interrupts are already enabled by the time
+    // `main.rs` calls this (`boot::init()`, earlier), so a timer tick can
+    // land *during* this very function — including while the `SCHEDULER`
+    // lock above is still held on this same stack. `on_timer_tick` checks
+    // `is_initialized()` before ever calling `reschedule` (which itself
+    // locks `SCHEDULER`); setting this flag only once everything above has
+    // genuinely finished means that check can never observe "initialized"
+    // while a lock this function took is still outstanding, which would
+    // otherwise deadlock the timer against itself.
+    INITIALIZED.store(true, Ordering::Relaxed);
 }
 
 /// Maps one throwaway page just below `region_start`, purely to force that
@@ -325,12 +418,7 @@ pub fn spawn(entry: extern "C" fn() -> !) {
 pub fn spawn_with_capability(entry: extern "C" fn() -> !, capability: Option<CapabilityToken>) {
     let mut thread = Thread::new(entry);
     thread.capability = capability;
-    SCHEDULER
-        .lock()
-        .as_mut()
-        .expect("scheduler::init() not called")
-        .run_queue
-        .push_back(thread);
+    push_thread(thread);
 }
 
 /// Same as [`spawn`], but the new thread owns `address_space` — every time
@@ -343,12 +431,7 @@ pub fn spawn_with_capability(entry: extern "C" fn() -> !, capability: Option<Cap
 pub fn spawn_with_address_space(entry: extern "C" fn() -> !, address_space: AddressSpace) {
     let mut thread = Thread::new(entry);
     thread.address_space = Some(address_space);
-    SCHEDULER
-        .lock()
-        .as_mut()
-        .expect("scheduler::init() not called")
-        .run_queue
-        .push_back(thread);
+    push_thread(thread);
 }
 
 /// Same as [`spawn_with_address_space`], but the new thread also gets its
@@ -358,7 +441,7 @@ pub fn spawn_with_address_space(entry: extern "C" fn() -> !, address_space: Addr
 /// its own, every ring 3-capable thread would share one RSP0 — harmless
 /// with only one such thread (as `userspace::user_hello`'s hand-run
 /// transition gets away with today), but a second one trapping in while
-/// the first is still suspended mid-syscall would corrupt it. `yield_now`
+/// the first is still suspended mid-syscall would corrupt it. [`reschedule`]
 /// rewrites `Cr3` *and* RSP0 (via `gdt::set_kernel_stack`) together, right
 /// before resuming a thread spawned this way — see
 /// `kernel/tests/ring3_cooperative.rs` for two such threads proving they
@@ -366,6 +449,35 @@ pub fn spawn_with_address_space(entry: extern "C" fn() -> !, address_space: Addr
 pub fn spawn_ring3_process(entry: extern "C" fn() -> !, address_space: AddressSpace) {
     let mut thread = Thread::new(entry);
     thread.address_space = Some(address_space);
+    thread.kernel_entry_stack_top = Some(alloc_kernel_entry_stack());
+    push_thread(thread);
+}
+
+/// Same as [`spawn_ring3_process`], but the new thread runs in the kernel's
+/// own shared address space instead of a private [`AddressSpace`] — for
+/// ring 3 code that lives on a page carved out of the kernel's existing
+/// mappings (`userspace::allow_user_access`) rather than a fully isolated
+/// process. Still gets its own dedicated kernel-entry stack: that part of
+/// the hazard `spawn_ring3_process`'s doc comment describes (RSP0 shared
+/// across ring 3-capable threads) has nothing to do with address-space
+/// isolation — it's about *any* ring 3 trap needing a stack no other
+/// suspended ring 3 thread is using, real preemption included. Before this
+/// existed, `userspace::user_hello` was entered via a raw
+/// `userspace::enter_usermode` call from the boot thread, invisible to the
+/// scheduler entirely — the real timer preemption this module now does
+/// would land its trap frame on whatever RSP0 last pointed at (a *different*
+/// ring 3-capable thread's own dedicated stack, if one had ever run), which
+/// is exactly the corruption this function's stack allocation prevents.
+pub fn spawn_ring3_shared(entry: extern "C" fn() -> !) {
+    let mut thread = Thread::new(entry);
+    thread.kernel_entry_stack_top = Some(alloc_kernel_entry_stack());
+    push_thread(thread);
+}
+
+/// Maps and returns the top of a fresh, dedicated kernel-entry stack —
+/// shared allocation logic between [`spawn_ring3_process`] and
+/// [`spawn_ring3_shared`].
+fn alloc_kernel_entry_stack() -> VirtAddr {
     let slot = NEXT_KERNEL_ENTRY_STACK_SLOT.fetch_add(1, Ordering::Relaxed);
     let (_, stack_top) = map_guarded_stack(
         KERNEL_ENTRY_STACK_REGION_START,
@@ -373,13 +485,31 @@ pub fn spawn_ring3_process(entry: extern "C" fn() -> !, address_space: AddressSp
         slot,
         KERNEL_ENTRY_STACK_SIZE,
     );
-    thread.kernel_entry_stack_top = Some(stack_top);
-    SCHEDULER
-        .lock()
-        .as_mut()
-        .expect("scheduler::init() not called")
-        .run_queue
-        .push_back(thread);
+    stack_top
+}
+
+/// Pushes a freshly built [`Thread`] onto the run queue — shared tail end
+/// of every `spawn*` function.
+///
+/// Runs with interrupts disabled for the same reason
+/// `memory::with_mapper_and_frame_allocator` now does (see its doc
+/// comment): every `spawn*` call runs in normal thread context (interrupts
+/// enabled), so without this, a timer tick landing between `SCHEDULER.lock()`
+/// and its release here would try to run [`reschedule`] — which locks the
+/// *same* `SCHEDULER` mutex — from inside a handler that can never be
+/// preempted away from it. A `spin::Mutex` doesn't know or care who's
+/// holding it; from its own thread's perspective, this CPU just tries to
+/// lock a lock it already holds, and spins forever. `current_capability`
+/// (also called from normal thread context) needs the same protection.
+fn push_thread(thread: Thread) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        SCHEDULER
+            .lock()
+            .as_mut()
+            .expect("scheduler::init() not called")
+            .run_queue
+            .push_back(thread);
+    });
 }
 
 /// The capability (if any) granted to whichever thread is currently
@@ -388,157 +518,224 @@ pub fn spawn_ring3_process(entry: extern "C" fn() -> !, address_space: AddressSp
 /// scheduler's internal state and has no business holding a live borrow
 /// into it across a potential future `yield_now()`.
 pub fn current_capability() -> Option<CapabilityToken> {
-    SCHEDULER
-        .lock()
-        .as_ref()
-        .and_then(|sched| sched.current.as_ref())
-        .and_then(|thread| thread.capability.clone())
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        SCHEDULER
+            .lock()
+            .as_ref()
+            .and_then(|sched| sched.current.as_ref())
+            .and_then(|thread| thread.capability.clone())
+    })
 }
 
-/// Save the calling thread's context, hand the CPU to the next thread in
-/// the run queue, and return only once *this* thread is scheduled again.
+/// The IDT vector a voluntary [`yield_now`]/[`exit_current_thread`] traps
+/// through — `int RESCHEDULE_VECTOR` is deliberately the *same kind* of
+/// event as a timer tick (a real interrupt, not a function call), so
+/// [`reschedule`] never has to know or care which one triggered it. Kernel
+/// code only (`interrupts.rs` registers this at the default Ring0 gate
+/// privilege level) — every caller, including a ring 3 thread's
+/// `SYS_YIELD`, already reaches this from ring 0, inside `syscall::dispatch`.
+pub const RESCHEDULE_VECTOR: u8 = 0x81;
+
+/// Set by [`exit_current_thread`] right before trapping in, so [`reschedule`]
+/// zombies the outgoing thread instead of requeueing it. A single global
+/// flag, not a parameter — software interrupts carry none — safe without
+/// further synchronization because [`reschedule`] always runs with
+/// `RFLAGS.IF=0` (an interrupt gate, not a trap gate): nothing else can
+/// observe or modify this between the `store` and the `int` that follows
+/// it, and [`reschedule`] atomically swaps it back to `false` on every
+/// call, so it can never leak into an unrelated later reschedule.
+static EXITING: AtomicBool = AtomicBool::new(false);
+
+/// Hand the CPU to the next thread in the run queue, and return only once
+/// *this* thread is scheduled again. Implemented as a real trap
+/// (`int RESCHEDULE_VECTOR`), not a function call — see this module's doc
+/// comment for why that's what makes the *exact same* resume mechanism
+/// also correct for involuntary, timer-driven preemption.
 pub fn yield_now() {
-    // Before anything else — a thread that's about to block on the
-    // `SCHEDULER` lock or spend time in `reap_zombies` is still
-    // cooperating, and the watchdog only cares that *some* thread called
-    // this recently, not how long the rest of the function takes.
-    crate::interrupts::record_yield();
-
-    let (current_sp_ptr, next_sp) = {
-        let mut guard = SCHEDULER.lock();
-        let sched = guard.as_mut().expect("scheduler::init() not called");
-        reap_zombies(sched);
-
-        let Some(next) = sched.run_queue.pop_front() else {
-            // Nothing else is runnable — carry on, there's no one to
-            // switch to.
-            return;
-        };
-        let next_sp = next.stack_pointer;
-
-        // Switch `Cr3` *before* `next` becomes `current` and this stack
-        // frame loses direct access to it — see the module doc comment for
-        // why doing this now, still running on the *previous* thread's
-        // stack, is safe. Skipped when the target is already what's
-        // loaded (the common case: switching between two plain kernel
-        // threads, which is most of what `thread_reclaim.rs`'s
-        // 20,000-iteration loop does) — an unconditional write here would
-        // flush the TLB on every single `yield_now` call for no reason.
-        let target_frame = next
-            .address_space
-            .as_ref()
-            .map_or_else(memory::kernel_p4_frame, AddressSpace::p4_frame);
-        let (current_frame, flags) = Cr3::read();
-        if current_frame != target_frame {
-            unsafe {
-                Cr3::write(target_frame, flags);
-            }
-        }
-        // RSP0 alongside Cr3, for the same reason and at the same moment —
-        // a plain write, not worth conditionalizing like the Cr3/TLB-flush
-        // case above. Left untouched (whatever the previous thread set)
-        // when `next` has no kernel-entry stack of its own: it'll never
-        // trap from ring 3, so RSP0 is never consulted for it anyway.
-        if let Some(stack_top) = next.kernel_entry_stack_top {
-            crate::gdt::set_kernel_stack(stack_top);
-        }
-
-        let current = sched.current.take().expect("no current thread set");
-        sched.run_queue.push_back(current);
-        sched.current = Some(next);
-
-        // Taken *after* pushing `current` into its final storage location
-        // in `run_queue` — a pointer grabbed before the push would dangle
-        // the moment `VecDeque` moves the `Thread` struct into place.
-        let current_sp_ptr: *mut usize = &mut sched
-            .run_queue
-            .back_mut()
-            .expect("just pushed a thread")
-            .stack_pointer;
-
-        (current_sp_ptr, next_sp)
-        // `guard` drops here — must happen before `switch_to`, since the
-        // thread we're switching to may itself try to lock `SCHEDULER`
-        // (every thread does, via its own `yield_now()`), which would
-        // deadlock against a lock this stack frame is still holding.
-    };
-
     unsafe {
-        switch_to(current_sp_ptr, next_sp);
+        core::arch::asm!("int {vector}", vector = const RESCHEDULE_VECTOR);
     }
 }
 
 /// Ends the calling thread: hands the CPU to the next runnable thread and
 /// never returns. The exiting thread's stack can't be unmapped here — it's
 /// still running on it — so it's queued as a zombie instead and reclaimed
-/// the next time some *other* thread calls [`yield_now`] (see
-/// `reap_zombies`). Before this existed, the only way for a thread to stop
-/// running was to loop forever, which meant every spawned thread's stack
-/// frames were permanently unreclaimable — the "unbounded memory leak"
-/// this fixes.
+/// the next time some *other* thread reschedules (see `reap_zombies`).
+/// Before this existed, the only way for a thread to stop running was to
+/// loop forever, which meant every spawned thread's stack frames were
+/// permanently unreclaimable — the "unbounded memory leak" this fixes.
 ///
 /// Must not be called from the boot/placeholder thread (the one
 /// `scheduler::init()` starts as `current` before anything is spawned) — it
 /// has no dedicated stack region of its own for `reap_zombies` to reclaim.
 pub fn exit_current_thread() -> ! {
-    crate::interrupts::record_yield();
-
-    let next_sp = {
-        let mut guard = SCHEDULER.lock();
-        let sched = guard.as_mut().expect("scheduler::init() not called");
-        reap_zombies(sched);
-
-        let next = sched
-            .run_queue
-            .pop_front()
-            .expect("exit_current_thread: no other thread left to run");
-        let next_sp = next.stack_pointer;
-
-        let exiting = sched.current.take().expect("no current thread set");
-        sched.zombies.push_back(exiting);
-        sched.current = Some(next);
-
-        next_sp
-        // `guard` drops here — same reasoning as `yield_now`.
-    };
-
-    let mut discard: usize = 0;
+    EXITING.store(true, Ordering::Relaxed);
     unsafe {
-        switch_to(&mut discard as *mut usize, next_sp);
-    }
-    // Unreachable in practice: `switch_to`'s `ret` jumps into whatever
-    // thread `next_sp` belongs to, which never returns control to this
-    // now-zombified stack. This only exists to satisfy `-> !` — the type
-    // system has no way to know `switch_to` (an ordinary `fn`, not itself
-    // `-> !`) never comes back here.
-    loop {
-        x86_64::instructions::hlt();
+        core::arch::asm!("int {vector}", vector = const RESCHEDULE_VECTOR, options(noreturn));
     }
 }
 
+/// Whether [`init`] has run yet. The timer starts ticking well before that
+/// — `boot::init()` enables interrupts long before `main.rs` ever calls
+/// `scheduler::init()` — so `interrupts::on_timer_tick` checks this before
+/// calling [`reschedule`] at all, and just resumes the interrupted context
+/// unchanged otherwise. [`reschedule`] itself still `expect()`s a live
+/// scheduler and panics loudly if that's missing: reaching `reschedule` at
+/// all means something called `yield_now()`/`exit_current_thread()`
+/// *before* `init()`, a real caller bug distinct from "the timer just
+/// happened to tick during normal boot," which this flag exists to let
+/// the timer path tell apart without conflating the two.
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn is_initialized() -> bool {
+    INITIALIZED.load(Ordering::Relaxed)
+}
+
+/// The actual work of every context switch, cooperative or preemptive:
+/// reap zombies, pick the next runnable thread, requeue (or zombie, if
+/// [`EXITING`]) the outgoing one, swap `Cr3`/RSP0, and return the
+/// [`TrapFrame`] to resume from. Called only from [`reschedule_entry`]'s
+/// naked stub (a voluntary yield) or `interrupts::timer_entry`'s (an
+/// involuntary tick, only once [`is_initialized`] confirms there's a
+/// scheduler to reschedule against — see its own doc comment) — both
+/// guarantee `current_frame` is a complete, valid `TrapFrame`, and both run
+/// with `RFLAGS.IF=0` throughout, so this can never be reentered (no
+/// `try_lock`/deadlock-avoidance needed on `SCHEDULER` — an interrupt
+/// literally cannot land while this function is already running).
+pub(crate) extern "C" fn reschedule(current_frame: *mut TrapFrame) -> *mut TrapFrame {
+    // A reschedule happening at all — whether requested or forced — is
+    // exactly the "the system is still making progress" signal the
+    // watchdog cares about; see `interrupts.rs`'s updated doc comment on
+    // why this makes the watchdog a backstop against `reschedule` itself
+    // breaking, not against a misbehaving thread (real preemption already
+    // handles that case without any panic).
+    crate::interrupts::record_yield();
+
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut().expect("scheduler::init() not called");
+    reap_zombies(sched);
+
+    let Some(next) = sched.run_queue.pop_front() else {
+        // Nothing else is runnable — resume the same thread, unchanged.
+        return current_frame;
+    };
+    let next_ptr = next.stack_pointer as *mut TrapFrame;
+
+    // Switch `Cr3` *before* `next` becomes `current` — see the module doc
+    // comment for why doing this now, still on the *previous* thread's
+    // stack, is safe. Skipped when the target is already what's loaded
+    // (the common case: switching between two plain kernel threads) — an
+    // unconditional write here would flush the TLB on every single
+    // reschedule for no reason.
+    let target_frame = next
+        .address_space
+        .as_ref()
+        .map_or_else(memory::kernel_p4_frame, AddressSpace::p4_frame);
+    let (current_p4, flags) = Cr3::read();
+    if current_p4 != target_frame {
+        unsafe {
+            Cr3::write(target_frame, flags);
+        }
+    }
+    // RSP0 alongside Cr3, for the same reason and at the same moment — a
+    // plain write, not worth conditionalizing like the Cr3/TLB-flush case
+    // above. Left untouched (whatever the previous thread set) when `next`
+    // has no kernel-entry stack of its own: it'll never trap from ring 3,
+    // so RSP0 is never consulted for it anyway.
+    if let Some(stack_top) = next.kernel_entry_stack_top {
+        crate::gdt::set_kernel_stack(stack_top);
+    }
+
+    let mut outgoing = sched.current.take().expect("no current thread set");
+    outgoing.stack_pointer = current_frame as usize;
+    if EXITING.swap(false, Ordering::Relaxed) {
+        sched.zombies.push_back(outgoing);
+    } else {
+        sched.run_queue.push_back(outgoing);
+    }
+    sched.current = Some(next);
+
+    next_ptr
+    // `guard` drops here, before `reschedule_entry`/`timer_entry` resume
+    // whatever `next_ptr` points at — the thread being resumed may itself
+    // reschedule again (a nested `SCHEDULER.lock()`), which would deadlock
+    // against a lock this call is still holding otherwise.
+}
+
+/// Entry point installed at [`RESCHEDULE_VECTOR`] (from `interrupts.rs`).
+/// Naked, not `extern "x86-interrupt"`: the interrupt-calling-convention
+/// ABI only exposes the hardware-pushed `InterruptStackFrame` fields, not
+/// the general-purpose registers a *complete* [`TrapFrame`] needs — pushed
+/// here by hand, in the exact order `TrapFrame`'s fields expect, then
+/// popped in exact reverse from whichever frame [`reschedule`] returns
+/// (the same thread, unchanged, or a different one it just switched to).
+///
 /// # Safety
-/// `current_sp_ptr` must point at a valid, writable `usize` that will
-/// outlive this call, and `next_sp` must be a stack pointer previously
-/// produced by [`Thread::new`] or previously saved by this same function —
-/// anything else and the `pop`s on the far side read garbage into real
-/// registers.
+/// Never call this directly — reached only via `int RESCHEDULE_VECTOR`
+/// (see [`yield_now`]/[`exit_current_thread`]), which guarantees a matching
+/// CPU-pushed `iretq` frame already sits on the stack for the final
+/// `iretq` to consume.
 #[unsafe(naked)]
-unsafe extern "C" fn switch_to(current_sp_ptr: *mut usize, next_sp: usize) {
+pub unsafe extern "C" fn reschedule_entry() {
     naked_asm!(
-        "push rbp",
+        "push rax",
         "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
         "push r12",
         "push r13",
         "push r14",
         "push r15",
-        "mov [rdi], rsp",
-        "mov rsp, rsi",
+        "mov rdi, rsp",
+        // `rdi` (the `TrapFrame` pointer, and `reschedule`'s only argument)
+        // must capture the *true* current RSP, before the alignment fix
+        // below -- reap_zombies/Cr3 writes/etc. all trust `current_frame`
+        // to be exactly where this GPR block starts. `rsp` itself, once
+        // clobbered, is never restored to its pre-aligned value: the very
+        // next instruction after the call unconditionally replaces it with
+        // whichever frame `reschedule` returns, so nothing downstream
+        // depends on it.
+        //
+        // Real SysV callers guarantee RSP ≡ 0 (mod 16) at a `call` site,
+        // but this isn't a `call` site -- it's an interrupt entry, which
+        // can land with RSP at *any* alignment (a ring 3 `SYS_YIELD`
+        // trapping through `syscall::entry` into this exact vector, e.g.,
+        // leaves RSP wherever `dispatch`'s own call chain happened to put
+        // it, not guaranteed 16-aligned). `reschedule` is an ordinary Rust
+        // function that can't safely assume otherwise (SSE spills and
+        // similar codegen do), so align down explicitly before calling
+        // it — confirmed as a real, not theoretical, bug: the first
+        // version of this without the `and` general-protection-faulted
+        // the first time a ring 3 thread's `SYS_YIELD` actually took this
+        // exact nested path (`int 0x80` -> `dispatch` -> `yield_now` ->
+        // `int RESCHEDULE_VECTOR`, landing here with whatever RSP that
+        // call chain happened to leave, not 16-aligned).
+        "and rsp, -16",
+        "call {reschedule}",
+        "mov rsp, rax",
         "pop r15",
         "pop r14",
         "pop r13",
         "pop r12",
-        "pop rbx",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
         "pop rbp",
-        "ret",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rbx",
+        "pop rax",
+        "iretq",
+        reschedule = sym reschedule,
     );
 }
