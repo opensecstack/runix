@@ -284,7 +284,9 @@ unsafe extern "C" fn timer_entry() {
 /// fields + `timer_entry`'s GPR pushes); the return value is what
 /// `timer_entry` resumes from — the same frame unchanged (nothing else was
 /// runnable) or a different thread's.
-extern "C" fn on_timer_tick(frame: *mut crate::scheduler::TrapFrame) -> *mut crate::scheduler::TrapFrame {
+extern "C" fn on_timer_tick(
+    frame: *mut crate::scheduler::TrapFrame,
+) -> *mut crate::scheduler::TrapFrame {
     let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     unsafe {
         PICS.lock()

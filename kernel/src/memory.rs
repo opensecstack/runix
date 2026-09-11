@@ -192,8 +192,7 @@ pub fn with_mapper_and_frame_allocator<R>(
 ) -> R {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut guard = MAPPER_AND_FRAME_ALLOCATOR.lock();
-        let (mapper, frame_allocator) =
-            guard.as_mut().expect("memory::install() not called yet");
+        let (mapper, frame_allocator) = guard.as_mut().expect("memory::install() not called yet");
         f(mapper, frame_allocator)
     })
 }
