@@ -51,9 +51,18 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: kernel
+          workspaces: |
+            kernel
+            grid-sandbox-host
       - name: fmt check
         run: cargo fmt --check
+      # main.rs `include_bytes!`s grid-sandbox-host's compiled output (Phase
+      # B7 — see citadel.rs's doc comment), so clippy/build here won't even
+      # compile without this built first — same ordering requirement the
+      # `boot` and `kernel-tests` jobs already have for the same reason.
+      - name: build grid-sandbox-host (payload for Phase B7)
+        working-directory: grid-sandbox-host
+        run: cargo build --target x86_64-unknown-none --release
       - name: clippy (lib + bin only)
         run: cargo clippy --target x86_64-unknown-none --bins --lib -- -D warnings
       - name: build
