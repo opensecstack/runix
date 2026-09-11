@@ -1,0 +1,21 @@
+[toolchain]
+# This crate needs no nightly-only feature (see Cargo.toml's own comment:
+# "unlike kernel/xtask, this one doesn't need nightly") — but it still
+# targets x86_64-unknown-none, so it needs its OWN toolchain file declaring
+# that target, not to inherit one from wherever Cargo's directory walk-up
+# happens to land.
+#
+# Without this file, `cargo build --target x86_64-unknown-none` from this
+# directory picks up the *root* rust-toolchain.toml instead (Cargo resolves
+# rust-toolchain.toml by walking up from the current working directory, same
+# behavior that made an ambient .cargo/config.toml leak into a nested cargo
+# invocation once before — see kernel/.cargo/config.toml's own comment) —
+# silently overriding whatever toolchain CI's own step just installed with
+# `--target x86_64-unknown-none`, onto the root's plain "stable" with no
+# target declared. Since that stable toolchain never had rust-std for
+# x86_64-unknown-none installed, any std-touching dependency (`once_cell`,
+# pulled in transitively via `wasmi`) failed with `E0463: can't find crate
+# for 'core'` — a build-environment bug, not a code regression; see
+# docs/STATUS.md's CI section for the full account.
+channel = "stable"
+targets = ["x86_64-unknown-none"]
