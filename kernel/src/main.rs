@@ -81,7 +81,14 @@ const NET_TXQ_VA: u64 = 0x_1111_5555_0000;
 const NET_RXBUF_VA: u64 = 0x_1111_6666_0000;
 const NET_TXBUF_VA: u64 = 0x_1111_7777_0000;
 const NET_QUEUE_ALIGN: u64 = 4096;
-const NET_RX_BUFFER_COUNT: u64 = 4;
+/// Grown from Phase 1's 4 -- see `net-driver-host/src/smoltcp_device.rs`'s
+/// `RX_BUFFER_COUNT` for why (a more usable receive window under smoltcp).
+const NET_RX_BUFFER_COUNT: u64 = 8;
+/// New in Phase 2a -- Phase 1 only ever used one TX buffer (always
+/// descriptor 0); smoltcp needs more than one in flight at once (e.g. an
+/// ARP reply interleaved with the packet it's routing). See
+/// `net-driver-host/src/smoltcp_device.rs`'s `TX_BUFFER_COUNT`.
+const NET_TX_BUFFER_COUNT: u64 = 4;
 
 /// Mirrors `net-driver-host/src/main.rs`'s own `NetBootInfo` — `repr(C)`,
 /// same field order, in both independently-compiled crates. The only
@@ -93,8 +100,8 @@ struct NetBootInfo {
     _pad: u16,
     rx_queue_phys: u64,
     tx_queue_phys: u64,
-    rx_buffer_phys: [u64; 4],
-    tx_buffer_phys: u64,
+    rx_buffer_phys: [u64; 8],
+    tx_buffer_phys: [u64; 4],
 }
 
 /// The default config doesn't map all of physical memory into the kernel's
@@ -637,19 +644,20 @@ fn load_and_run_net_driver_host(io_base: u16, now: u64, signing_key: &ed25519_da
     // descriptor only needs *its own* buffer to be one contiguous physical
     // range (true by construction: each buffer fits in the one page backing
     // it).
-    let mut rx_buffer_phys = [0u64; 4];
+    let mut rx_buffer_phys = [0u64; 8];
     for i in 0..NET_RX_BUFFER_COUNT {
         let page = Page::containing_address(VirtAddr::new(NET_RXBUF_VA + i * 4096));
         let content = space.map_private_page(page, rw_user_flags);
         content.fill(0);
         rx_buffer_phys[i as usize] = page_phys_addr(content);
     }
-    let tx_buffer_phys = {
-        let page = Page::containing_address(VirtAddr::new(NET_TXBUF_VA));
+    let mut tx_buffer_phys = [0u64; 4];
+    for i in 0..NET_TX_BUFFER_COUNT {
+        let page = Page::containing_address(VirtAddr::new(NET_TXBUF_VA + i * 4096));
         let content = space.map_private_page(page, rw_user_flags);
         content.fill(0);
-        page_phys_addr(content)
-    };
+        tx_buffer_phys[i as usize] = page_phys_addr(content);
+    }
 
     // NetBootInfo itself: the one page net-driver-host reads at startup to
     // learn the physical addresses above.

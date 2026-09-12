@@ -126,8 +126,8 @@ jobs:
       - name: build grid-sandbox-host (payload for grid_sandbox_wasm)
         working-directory: grid-sandbox-host
         run: cargo build --target x86_64-unknown-none --release
-      # Same requirement, same reasoning, for `net_driver_arp` below.
-      - name: build net-driver-host (payload for net_driver_arp)
+      # Same requirement, same reasoning, for `net_driver_icmp` below.
+      - name: build net-driver-host (payload for net_driver_icmp)
         working-directory: net-driver-host
         run: cargo build --target x86_64-unknown-none --release
       - name: cargo test (boots every kernel/tests/*.rs in QEMU)
@@ -152,7 +152,7 @@ jobs:
           cargo test --target x86_64-unknown-none --test ring3_cooperative
           cargo test --target x86_64-unknown-none --test grid_sandbox_wasm
           cargo test --target x86_64-unknown-none --test citadel_demo
-          cargo test --target x86_64-unknown-none --test net_driver_arp
+          cargo test --target x86_64-unknown-none --test net_driver_icmp
 
   # Mobile L1 (aarch64/TrustZone), separate from the x86_64 `kernel` job
   # above — different target triple, different toolchain requirement (this
@@ -384,16 +384,19 @@ jobs:
           grep -q "Runix kernel: grid-sandbox-host loaded, entry point" /tmp/boot.log
           grep -q "^Hi" /tmp/boot.log
           grep -q "Runix kernel: grid-sandbox-host ran wasmi in an isolated ring 3 process" /tmp/boot.log
-          # Network stack, Phase 1 (B8): the same CITADEL-gate-then-load
+          # Network stack, Phase 2a (B8): the same CITADEL-gate-then-load
           # mechanism, this time for net-driver-host -- proves it probed the
-          # real virtio-net device (QEMU's default MAC) and got a real ARP
-          # reply back from QEMU/SLIRP through the virtqueue, all from
-          # inside a capability-gated ring 3 process with no raw port I/O
-          # privilege of its own.
+          # real virtio-net device (QEMU's default MAC), brought up smoltcp
+          # on top of the virtqueue transport, and got a real ICMP echo
+          # reply back from QEMU/SLIRP (smoltcp's own ARP resolution of the
+          # gateway is a transparent prerequisite here -- see
+          # docs/STATUS.md's network-stack section), all from inside a
+          # capability-gated ring 3 process with no raw port I/O privilege
+          # of its own.
           grep -q "Runix kernel: net-driver-host authorized by CITADEL allowlist" /tmp/boot.log
           grep -q "Runix kernel: net-driver-host loaded, entry point" /tmp/boot.log
           grep -q "net-driver-host: virtio-net probed, MAC=52:54:00:12:34:56" /tmp/boot.log
-          grep -q "net-driver-host: ARP reply received (Phase 1 OK)" /tmp/boot.log
+          grep -q "net-driver-host: ICMP echo reply received (Phase 2a OK)" /tmp/boot.log
           grep -q "Runix kernel: net-driver-host spawned as an isolated ring 3 process" /tmp/boot.log
           grep -q "Runix kernel: entering ring 3" /tmp/boot.log
           # Printed by user_hello() running at CPL 3, one byte per SYS_WRITE

@@ -1,10 +1,20 @@
-//! Network stack, Phase 1 (see docs/STATUS.md's network-stack section):
-//! proves the legacy virtio-net virtqueue mechanism actually works, not
-//! just that the driver compiles. Loads `net-driver-host` (a real compiled
-//! ELF, same mechanism `grid_sandbox_wasm.rs` already proved for
-//! `grid-sandbox-host`) as a capability-gated ring 3 process, lets it probe
-//! virtio-net, transmit one hand-built ARP request, and poll for QEMU/
-//! SLIRP's reply.
+//! Network stack, Phase 2a (see docs/STATUS.md's network-stack section):
+//! proves `smoltcp`'s `Device`/`Interface` bring-up actually works, not
+//! just that it compiles. Loads `net-driver-host` (a real compiled ELF,
+//! same mechanism `grid_sandbox_wasm.rs` already proved for
+//! `grid-sandbox-host`) as a capability-gated ring 3 process, and lets it
+//! bring up smoltcp on top of the virtio-net virtqueue transport (Phase 1)
+//! and exchange one real ICMP echo with QEMU/SLIRP's own gateway
+//! (10.0.2.2) — which SLIRP answers out of the box, needing no new QEMU/CI
+//! infrastructure.
+//!
+//! Supersedes `net_driver_arp.rs` (Phase 1's dedicated test, now retired):
+//! `net-driver-host`'s `_start` no longer sends a hand-built ARP request
+//! directly — smoltcp's own neighbor-discovery cache performs the
+//! equivalent ARP resolution automatically as a prerequisite to routing
+//! the ICMP echo, so this test still exercises the exact same virtqueue
+//! mechanism Phase 1 proved, plus real IPv4/ICMP checksums Phase 1 never
+//! touched.
 //!
 //! **Manual build step required when running this locally** (same
 //! requirement `grid_sandbox_wasm.rs` already has for its own payload):
@@ -21,8 +31,8 @@
 //! bounded poll loop finishes (see that crate's own doc comment on
 //! `NET_RESULT_OFFSET`) — reaching the end of this test's yield budget
 //! without a fault only proves nothing crashed; reading back an actual
-//! PASS byte proves the ARP round-trip through QEMU/SLIRP genuinely
-//! succeeded.
+//! PASS byte proves the ICMP echo round-trip through QEMU/SLIRP genuinely
+//! succeeded, with the exact payload bytes verified.
 
 #![no_std]
 #![no_main]
@@ -68,7 +78,10 @@ const NET_TXQ_VA: u64 = 0x_1111_5555_0000;
 const NET_RXBUF_VA: u64 = 0x_1111_6666_0000;
 const NET_TXBUF_VA: u64 = 0x_1111_7777_0000;
 const NET_QUEUE_ALIGN: u64 = 4096;
-const NET_RX_BUFFER_COUNT: u64 = 4;
+// Grown from Phase 1's 4/1 -- see `net-driver-host/src/smoltcp_device.rs`'s
+// `RX_BUFFER_COUNT`/`TX_BUFFER_COUNT`.
+const NET_RX_BUFFER_COUNT: u64 = 8;
+const NET_TX_BUFFER_COUNT: u64 = 4;
 
 // Must match `net-driver-host/src/main.rs`'s `NET_RESULT_OFFSET`/`NET_RESULT_PASS`.
 const NET_RESULT_OFFSET: u64 = 128;
@@ -80,8 +93,8 @@ struct NetBootInfo {
     _pad: u16,
     rx_queue_phys: u64,
     tx_queue_phys: u64,
-    rx_buffer_phys: [u64; 4],
-    tx_buffer_phys: u64,
+    rx_buffer_phys: [u64; 8],
+    tx_buffer_phys: [u64; 4],
 }
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
@@ -116,7 +129,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Some(io_base) => io_base,
         None => {
             serial_println!(
-                "net_driver_arp: FAIL — no virtio-net I/O-space BAR0 found (is xtask's \
+                "net_driver_icmp: FAIL — no virtio-net I/O-space BAR0 found (is xtask's \
                  -device virtio-net-pci still wired into run_qemu?)"
             );
             exit_qemu(QemuExitCode::Failed);
@@ -125,21 +138,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     if let Err(e) = runix_kernel::citadel::demo_authorize("net-driver-host", NET_DRIVER_HOST_ELF) {
         serial_println!(
-            "net_driver_arp: FAIL — CITADEL allowlist rejected net-driver-host: {:?}",
+            "net_driver_icmp: FAIL — CITADEL allowlist rejected net-driver-host: {:?}",
             e
         );
         exit_qemu(QemuExitCode::Failed);
     }
 
     serial_println!(
-        "net_driver_arp: parsing net-driver-host ({} bytes)",
+        "net_driver_icmp: parsing net-driver-host ({} bytes)",
         NET_DRIVER_HOST_ELF.len()
     );
     let elf = match Elf64::parse(NET_DRIVER_HOST_ELF) {
         Ok(elf) => elf,
         Err(e) => {
             serial_println!(
-                "net_driver_arp: FAIL — parse() rejected the binary: {:?}",
+                "net_driver_icmp: FAIL — parse() rejected the binary: {:?}",
                 e
             );
             exit_qemu(QemuExitCode::Failed);
@@ -150,11 +163,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let entry = match elf.load_segments(&mut space) {
         Ok(entry) => entry,
         Err(e) => {
-            serial_println!("net_driver_arp: FAIL — load_segments() failed: {:?}", e);
+            serial_println!("net_driver_icmp: FAIL — load_segments() failed: {:?}", e);
             exit_qemu(QemuExitCode::Failed);
         }
     };
-    serial_println!("net_driver_arp: loaded, entry point {:#x}", entry.as_u64());
+    serial_println!("net_driver_icmp: loaded, entry point {:#x}", entry.as_u64());
 
     let rw_user_flags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
@@ -176,19 +189,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let txq_first_frame_phys =
         map_zeroed_contiguous_region(&mut space, NET_TXQ_VA, 3, rw_user_flags);
 
-    let mut rx_buffer_phys = [0u64; 4];
+    let mut rx_buffer_phys = [0u64; 8];
     for i in 0..NET_RX_BUFFER_COUNT {
         let page = Page::containing_address(VirtAddr::new(NET_RXBUF_VA + i * 4096));
         let content = space.map_private_page(page, rw_user_flags);
         content.fill(0);
         rx_buffer_phys[i as usize] = page_phys_addr(content);
     }
-    let tx_buffer_phys = {
-        let page = Page::containing_address(VirtAddr::new(NET_TXBUF_VA));
+    let mut tx_buffer_phys = [0u64; 4];
+    for i in 0..NET_TX_BUFFER_COUNT {
+        let page = Page::containing_address(VirtAddr::new(NET_TXBUF_VA + i * 4096));
         let content = space.map_private_page(page, rw_user_flags);
         content.fill(0);
-        page_phys_addr(content)
-    };
+        tx_buffer_phys[i as usize] = page_phys_addr(content);
+    }
 
     let info_page = Page::containing_address(VirtAddr::new(NET_INFO_VA));
     let info_content = space.map_private_page(info_page, rw_user_flags);
@@ -240,14 +254,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     if result == NET_RESULT_PASS {
         serial_println!(
-            "net_driver_arp: PASS — a real compiled binary drove the virtio-net virtqueue \
-             and received a genuine ARP reply from QEMU/SLIRP in an isolated ring 3 process"
+            "net_driver_icmp: PASS — a real compiled binary brought up smoltcp on the virtio-net \
+             virtqueue and received a genuine ICMP echo reply from QEMU/SLIRP in an isolated \
+             ring 3 process"
         );
         exit_qemu(QemuExitCode::Success);
     } else {
         serial_println!(
-            "net_driver_arp: FAIL — net-driver-host reported result byte {} (0 = never finished, \
-             2 = ARP reply never arrived)",
+            "net_driver_icmp: FAIL — net-driver-host reported result byte {} (0 = never finished, \
+             2 = ICMP echo reply never arrived)",
             result
         );
         exit_qemu(QemuExitCode::Failed);
@@ -315,6 +330,6 @@ extern "C" fn kernel_trampoline() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    serial_println!("net_driver_arp: PANIC: {}", info);
+    serial_println!("net_driver_icmp: PANIC: {}", info);
     exit_qemu(QemuExitCode::Failed);
 }

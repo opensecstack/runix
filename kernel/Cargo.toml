@@ -90,7 +90,7 @@ name = "citadel_demo"
 harness = false
 
 [[test]]
-name = "net_driver_arp"
+name = "net_driver_icmp"
 harness = false
 
 [profile.dev]

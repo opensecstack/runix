@@ -1,11 +1,23 @@
-//! Network driver host, Phase 1: proves the legacy virtio-net virtqueue
-//! mechanism works at all — transmit one hand-built ARP request, poll for
-//! QEMU/SLIRP's reply — before any TCP/IP stack (smoltcp, Phase 2) gets
-//! built on top of it. See docs/STATUS.md's network-stack section for why
-//! this is split into two phases: the virtqueue/physical-addressing
-//! mechanics here have zero prior art in this codebase and are a different
-//! class of bug than TCP/IP protocol correctness, best diagnosed
-//! separately.
+//! Network driver host, Phase 2a: brings up `smoltcp`'s `Interface` on top
+//! of the virtqueue transport Phase 1 proved works, and verifies it with a
+//! real ICMP echo round-trip against QEMU/SLIRP's own gateway (10.0.2.2) —
+//! which SLIRP answers out of the box, needing no new QEMU/CI
+//! infrastructure. See docs/STATUS.md's network-stack section for why this
+//! is split from Phase 2b (a real TCP client, needing QEMU `guestfwd` and a
+//! host-side listener): a `Device`/`Interface` bring-up bug is a different
+//! failure class than TCP's much larger stateful protocol correctness, and
+//! ICMP already exercises the IPv4 header path (checksums, addressing, and
+//! — transparently, via smoltcp's own ARP cache resolving the gateway's MAC
+//! before it can send anything — the exact ARP round-trip Phase 1 proved
+//! by hand) without touching TCP at all.
+//!
+//! Phase 1's hand-built ARP-request-and-poll flow (`kernel/tests/net_driver_arp.rs`,
+//! now retired) is superseded here, not run alongside it: `smoltcp_device::RunixNetDevice`
+//! owns the RX/TX virtqueues exclusively from `_start` onward, and smoltcp's
+//! own neighbor-discovery cache performs the equivalent ARP resolution
+//! automatically as a prerequisite to routing the ICMP echo — a strictly
+//! stronger proof (it now also exercises real IPv4/ICMP checksums) of the
+//! same underlying virtqueue mechanism, not a weaker or different one.
 //!
 //! This process never gets raw port-I/O privilege itself — every register
 //! access goes through the capability-gated `SYS_PORT_IN`/`SYS_PORT_OUT`
@@ -25,17 +37,26 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+mod smoltcp_device;
 mod syscall;
 mod virtio;
 
+use alloc::vec;
 use linked_list_allocator::LockedHeap;
-use net_driver_host::{is_arp_reply, validate_rx_completion, VIRTIO_NET_HDR_LEN};
+use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::socket::icmp;
+use smoltcp::time::Instant;
+use smoltcp::wire::{EthernetAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address};
+use smoltcp_device::{RunixNetDevice, RX_BUFFER_COUNT, TX_BUFFER_COUNT};
 use syscall::{write_all, write_byte, yield_now};
-use virtio::Virtqueue;
 
 /// Must match `kernel/src/main.rs`'s own `NET_HEAP_START`/`NET_HEAP_SIZE` —
 /// same "the loader sets this up, this binary has no privilege to map its
-/// own memory" split `grid-sandbox-host` already documents.
+/// own memory" split `grid-sandbox-host` already documents. Unchanged from
+/// Phase 1 — smoltcp's footprint for one interface and one ICMP socket
+/// comfortably fits the existing 256 KiB.
 pub const HEAP_START: usize = 0x_1111_1111_0000;
 pub const HEAP_SIZE: usize = 256 * 1024;
 
@@ -60,12 +81,18 @@ struct NetBootInfo {
     /// memory.
     rx_queue_phys: u64,
     tx_queue_phys: u64,
-    /// Physical addresses of 4 individually-mapped, page-sized RX packet
+    /// Physical addresses of individually-mapped, page-sized RX packet
     /// buffers — matching virtual base [`NET_RXBUF_VA`], one page apart.
-    rx_buffer_phys: [u64; 4],
-    /// Physical address of the one TX packet buffer — matching virtual
-    /// address [`NET_TXBUF_VA`].
-    tx_buffer_phys: u64,
+    /// Grown from Phase 1's 4 to `RX_BUFFER_COUNT` (8) for a more usable
+    /// receive window under smoltcp.
+    rx_buffer_phys: [u64; RX_BUFFER_COUNT],
+    /// Physical addresses of individually-mapped TX packet buffers —
+    /// matching virtual base [`NET_TXBUF_VA`]. Grown from Phase 1's single
+    /// buffer (always descriptor 0) to `TX_BUFFER_COUNT` (4): smoltcp needs
+    /// more than one in-flight TX buffer at once (e.g. an ARP reply/request
+    /// interleaved with the ICMP packet it's routing), unlike Phase 1's one
+    /// hand-built frame at a time.
+    tx_buffer_phys: [u64; TX_BUFFER_COUNT],
 }
 
 const NET_INFO_VA: usize = 0x_1111_3333_0000;
@@ -74,9 +101,13 @@ const NET_TXQ_VA: usize = 0x_1111_5555_0000;
 const NET_RXBUF_VA: usize = 0x_1111_6666_0000;
 const NET_TXBUF_VA: usize = 0x_1111_7777_0000;
 
-const RX_QUEUE_INDEX: u16 = 0;
-const TX_QUEUE_INDEX: u16 = 1;
-const RX_BUFFER_COUNT: usize = 4;
+/// SLIRP's own fixed defaults (see `docs/STATUS.md`'s network-stack
+/// section) — no DHCP negotiated, matching Phase 1's same hardcoded
+/// addresses.
+const LOCAL_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
+const GATEWAY_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
+const ICMP_IDENT: u16 = 0x22b;
+const ICMP_PAYLOAD: &[u8] = b"RUNIX-ICMP-PROOF";
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -86,29 +117,10 @@ pub extern "C" fn _start() -> ! {
 
     let info = unsafe { &*(NET_INFO_VA as *const NetBootInfo) };
     let net = virtio::VirtioNet::probe(info.io_base);
-
-    let rx_size = net.queue_size(RX_QUEUE_INDEX);
-    net.set_queue_address(RX_QUEUE_INDEX, info.rx_queue_phys);
-    let tx_size = net.queue_size(TX_QUEUE_INDEX);
-    net.set_queue_address(TX_QUEUE_INDEX, info.tx_queue_phys);
-
-    let mut rx_queue = unsafe { Virtqueue::new(NET_RXQ_VA, rx_size) };
-    let mut tx_queue = unsafe { Virtqueue::new(NET_TXQ_VA, tx_size) };
-    rx_queue.init_avail_flags();
-    tx_queue.init_avail_flags();
-
-    // Pre-fill every RX descriptor before DRIVER_OK — the device must never
-    // see itself as "ready" with nowhere to write an incoming frame.
-    for i in 0..RX_BUFFER_COUNT {
-        unsafe {
-            rx_queue.post(i as u16, info.rx_buffer_phys[i], 4096, true);
-        }
-    }
-    net.mark_ready();
-    net.notify(RX_QUEUE_INDEX);
+    let mac = net.mac;
 
     write_all(b"net-driver-host: virtio-net probed, MAC=");
-    for (i, byte) in net.mac.iter().enumerate() {
+    for (i, byte) in mac.iter().enumerate() {
         write_hex_byte(*byte);
         if i != 5 {
             write_byte(b':');
@@ -116,68 +128,114 @@ pub extern "C" fn _start() -> ! {
     }
     write_byte(b'\n');
 
-    send_arp_request(&net, &mut tx_queue, info.tx_buffer_phys, net.mac);
+    let rx_size = net.queue_size(0);
+    net.set_queue_address(0, info.rx_queue_phys);
+    let tx_size = net.queue_size(1);
+    net.set_queue_address(1, info.tx_queue_phys);
 
-    // Bounded poll: a real reply from QEMU/SLIRP arrives promptly (well
-    // under a second in practice) — this bound exists so a genuinely broken
-    // driver reports failure instead of hanging the boot forever.
+    let mut device = unsafe {
+        RunixNetDevice::new(
+            info.io_base,
+            NET_RXQ_VA,
+            rx_size,
+            NET_TXQ_VA,
+            tx_size,
+            NET_RXBUF_VA,
+            info.rx_buffer_phys,
+            NET_TXBUF_VA,
+            info.tx_buffer_phys,
+        )
+    };
+    net.mark_ready();
+    device.notify_rx();
+
+    let config = Config::new(EthernetAddress(mac).into());
+    let mut iface = Interface::new(config, &mut device, Instant::from_millis(0));
+    iface.update_ip_addrs(|ip_addrs| {
+        ip_addrs
+            .push(IpCidr::new(IpAddress::Ipv4(LOCAL_IP), 24))
+            .unwrap();
+    });
+    iface
+        .routes_mut()
+        .add_default_ipv4_route(GATEWAY_IP)
+        .unwrap();
+
+    let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
+    let icmp_tx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
+    let icmp_socket = icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer);
+    let mut sockets = SocketSet::new(vec![]);
+    let icmp_handle = sockets.add(icmp_socket);
+
+    let device_checksum_caps = smoltcp::phy::Device::capabilities(&device).checksum;
+
+    let mut sent = false;
     let mut found = false;
+    // Same bound (2,000,000 iterations, yield every 10,000) and reasoning
+    // as Phase 1's poll loop: a real reply from QEMU/SLIRP arrives promptly
+    // in practice, so this bound exists purely to make a genuinely broken
+    // driver report failure instead of hanging the boot forever.
     'poll: for iteration in 0..2_000_000u32 {
-        if let Some((desc_id, len)) = rx_queue.poll_used() {
-            // Both fields come from the device's used-ring entry -- treated
-            // as untrusted input (see net_driver_host::validate_rx_completion's
-            // doc comment): an unchecked `len` past the real 4096-byte
-            // buffer, or an unchecked `desc_id` used directly as a buffer
-            // index/address offset, would be a real out-of-bounds read. A
-            // completion that fails this check is dropped outright, not
-            // repaired or guessed at.
-            match validate_rx_completion(desc_id, len, RX_BUFFER_COUNT) {
-                Some((index, len)) => {
-                    let buf = unsafe {
-                        core::slice::from_raw_parts(
-                            (NET_RXBUF_VA + index * 4096) as *const u8,
-                            len as usize,
-                        )
-                    };
-                    if is_arp_reply(buf) {
+        let timestamp = Instant::from_millis(iteration as i64);
+        iface.poll(timestamp, &mut device, &mut sockets);
+
+        let socket = sockets.get_mut::<icmp::Socket>(icmp_handle);
+        if !socket.is_open() {
+            socket.bind(icmp::Endpoint::Ident(ICMP_IDENT)).unwrap();
+        }
+
+        if socket.can_send() && !sent {
+            let repr = Icmpv4Repr::EchoRequest {
+                ident: ICMP_IDENT,
+                seq_no: 0,
+                data: ICMP_PAYLOAD,
+            };
+            let payload = socket
+                .send(repr.buffer_len(), IpAddress::Ipv4(GATEWAY_IP))
+                .unwrap();
+            let mut packet = Icmpv4Packet::new_unchecked(payload);
+            repr.emit(&mut packet, &device_checksum_caps);
+            sent = true;
+        }
+
+        if socket.can_recv() {
+            let (payload, _) = socket.recv().unwrap();
+            if let Ok(packet) = Icmpv4Packet::new_checked(payload) {
+                if let Ok(Icmpv4Repr::EchoReply {
+                    ident,
+                    seq_no,
+                    data,
+                }) = Icmpv4Repr::parse(&packet, &device_checksum_caps)
+                {
+                    // Exact bytes checked, not just "got a reply" -- the
+                    // same discipline Phase 1's `is_arp_reply` already
+                    // applied to opcodes.
+                    if ident == ICMP_IDENT && seq_no == 0 && data == ICMP_PAYLOAD {
                         found = true;
                         break 'poll;
                     }
-                    // Not what we were looking for (could be unrelated
-                    // broadcast traffic SLIRP itself generates) — repost the
-                    // same buffer and keep waiting.
-                    unsafe {
-                        rx_queue.post(index as u16, info.rx_buffer_phys[index], 4096, true);
-                    }
-                    net.notify(RX_QUEUE_INDEX);
-                }
-                None => {
-                    write_all(b"net-driver-host: WARNING ignoring out-of-range RX completion\n");
                 }
             }
         }
+
         if iteration % 10_000 == 0 {
             yield_now();
         }
     }
 
     if found {
-        write_all(b"net-driver-host: ARP reply received (Phase 1 OK)\n");
+        write_all(b"net-driver-host: ICMP echo reply received (Phase 2a OK)\n");
     } else {
-        write_all(b"net-driver-host: no ARP reply within poll bound (Phase 1 FAILED)\n");
+        write_all(b"net-driver-host: no ICMP echo reply within poll bound (Phase 2a FAILED)\n");
     }
 
-    // Beyond the human-readable serial output above, `kernel/tests/net_driver_arp.rs`
+    // Beyond the human-readable serial output above, `kernel/tests/net_driver_icmp.rs`
     // needs a way to tell PASS from FAIL that doesn't depend on grepping
     // text -- reaching this point without a fault only proves nothing
-    // *crashed*, not that the ARP round-trip actually succeeded (a silent
-    // "no reply, poll bound exceeded" would print FAILED but never fault).
-    // Write a real result code into the shared `NetBootInfo` page at a
-    // fixed offset well past that struct's own fields, matching the same
-    // repr(C)-by-convention contract already connecting these two
-    // independently compiled crates for `NetBootInfo` itself. The kernel
-    // (or a test) can read this page's content directly since it stayed
-    // mapped in this process's `AddressSpace` throughout.
+    // *crashed*, not that the ICMP round-trip actually succeeded. Same
+    // convention Phase 1 established: write a real result code into the
+    // shared `NetBootInfo` page at a fixed offset well past that struct's
+    // own fields.
     unsafe {
         core::ptr::write_volatile(
             (NET_INFO_VA + NET_RESULT_OFFSET) as *mut u8,
@@ -195,9 +253,10 @@ pub extern "C" fn _start() -> ! {
 }
 
 /// Offset into the `NetBootInfo` page reserved for this process's own
-/// PASS/FAIL result byte — past `NetBootInfo`'s own ~60 bytes with room to
+/// PASS/FAIL result byte — past `NetBootInfo`'s own fields with room to
 /// spare, so a future field added to that struct can't collide with it.
-/// Must match whatever reads this byte back (`kernel/tests/net_driver_arp.rs`).
+/// Must match whatever reads this byte back (`kernel/tests/net_driver_icmp.rs`).
+/// Unchanged from Phase 1 (same offset, same convention).
 pub const NET_RESULT_OFFSET: usize = 128;
 pub const NET_RESULT_PASS: u8 = 1;
 pub const NET_RESULT_FAIL: u8 = 2;
@@ -206,45 +265,6 @@ fn write_hex_byte(byte: u8) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     write_byte(HEX[(byte >> 4) as usize]);
     write_byte(HEX[(byte & 0xF) as usize]);
-}
-
-/// Builds a gratuitous-ish ARP request ("who has 10.0.2.2? tell 10.0.2.15")
-/// straight into the TX buffer and hands it to the device. `10.0.2.2` is
-/// QEMU SLIRP's built-in gateway address, and `10.0.2.15` its default first
-/// guest lease — both fixed by SLIRP's own defaults (no DHCP negotiated
-/// here, see the module doc comment), so SLIRP is expected to answer this
-/// exact query regardless of what IP this driver actually ends up with in a
-/// later phase.
-fn send_arp_request(
-    net: &virtio::VirtioNet,
-    tx_queue: &mut Virtqueue,
-    tx_buf_phys: u64,
-    mac: [u8; 6],
-) {
-    let buf = unsafe { core::slice::from_raw_parts_mut(NET_TXBUF_VA as *mut u8, 4096) };
-    buf[..VIRTIO_NET_HDR_LEN].fill(0);
-
-    let eth = &mut buf[VIRTIO_NET_HDR_LEN..];
-    eth[0..6].fill(0xFF); // broadcast destination
-    eth[6..12].copy_from_slice(&mac);
-    eth[12..14].copy_from_slice(&0x0806u16.to_be_bytes()); // Ethertype: ARP
-
-    let arp = &mut eth[14..14 + 28];
-    arp[0..2].copy_from_slice(&1u16.to_be_bytes()); // htype: Ethernet
-    arp[2..4].copy_from_slice(&0x0800u16.to_be_bytes()); // ptype: IPv4
-    arp[4] = 6; // hlen
-    arp[5] = 4; // plen
-    arp[6..8].copy_from_slice(&1u16.to_be_bytes()); // oper: request
-    arp[8..14].copy_from_slice(&mac); // sha
-    arp[14..18].copy_from_slice(&[10, 0, 2, 15]); // spa
-    arp[18..24].fill(0); // tha: unknown
-    arp[24..28].copy_from_slice(&[10, 0, 2, 2]); // tpa: SLIRP's gateway
-
-    let frame_len = VIRTIO_NET_HDR_LEN + 14 + 28;
-    unsafe {
-        tx_queue.post(0, tx_buf_phys, frame_len as u32, false);
-    }
-    net.notify(TX_QUEUE_INDEX);
 }
 
 #[panic_handler]

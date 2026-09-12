@@ -753,15 +753,61 @@ here — calling through one jumps to address 0. Fixed by giving
 `net-driver-host` the identical `.cargo/config.toml` `grid-sandbox-host`
 already has.
 
-Not done: Phase 2 (a real TCP/IP stack via `smoltcp`, built on top of the
-now-proven transport) is a deliberate, separate follow-up — see this
-section's own reasoning above for why the phase split matters: virtqueue/
-physical-addressing mechanics and TCP/IP protocol correctness are different
-classes of bug, best diagnosed separately. Also still deferred: DHCP,
-multiple concurrent sockets, a sockets API/IPC surface for other ring 3
-processes to use this stack, TX/RX interrupts, MSI-X/IOAPIC, and fuzzing
-the virtqueue/frame-parsing code (required per the testing-rigor commitment
-below, scoped as a fast-follow now that Phase 1's parser actually exists).
+**Network stack, Phase 2a: `smoltcp` brought up on the proven transport,
+verified with a real ICMP echo.** `net-driver-host/src/smoltcp_device.rs`
+implements `smoltcp::phy::Device` as a thin adapter over `virtio.rs`'s
+`Virtqueue`/`VirtioNet` — deliberately its own module, not folded into
+`virtio.rs`, which stays pure hand-rolled register/virtqueue mechanics
+with zero smoltcp awareness. `RunixNetDevice` owns 8 RX + 4 TX buffers
+(grown from Phase 1's 4 RX + 1 TX — smoltcp needs more than one in-flight
+TX buffer at once, e.g. an ARP reply interleaved with the packet it's
+routing, unlike Phase 1's one hand-built frame at a time) and a small
+fixed-size in-use array for TX slot bookkeeping — no new dependency
+(`heapless`, `Vec`) needed for that, just a linear scan over
+`[bool; TX_BUFFER_COUNT]`. `RxToken`/`TxToken` map directly onto
+`Virtqueue::post`/`poll_used`, reusing `validate_rx_completion` verbatim
+for RX (still treating device-controlled `(desc_id, len)` as untrusted).
+Timekeeping is a simple monotonic loop-iteration counter
+(`Instant::from_millis(iteration)`), not a real clock — smoltcp only needs
+monotonically non-decreasing values for its RTT/backoff heuristics, not
+wall-clock accuracy, so this needed no new kernel syscall.
+
+**Supersedes, not supplements, Phase 1's hand-built ARP flow** —
+`kernel/tests/net_driver_arp.rs` is retired, replaced by
+`kernel/tests/net_driver_icmp.rs`. `net-driver-host/src/main.rs` no longer
+sends a hand-built ARP request directly; smoltcp's own neighbor-discovery
+cache performs the equivalent ARP resolution automatically as a
+prerequisite to routing the ICMP echo, exercising the *same* virtqueue
+mechanism Phase 1 proved by hand, plus real IPv4/ICMP checksums Phase 1
+never touched — a strictly stronger proof, not a different or weaker one.
+
+Verified end to end on the first real attempt, not just compiling:
+`net-driver-host` brings up an `Interface` with a static IP (`10.0.2.15/24`,
+matching SLIRP's own fixed DHCP-lease default — no DHCP negotiated),
+sends one ICMP Echo Request to SLIRP's gateway (`10.0.2.2`), and checks
+the reply byte-for-byte (`ident`, `seq_no`, and the exact payload
+`b"RUNIX-ICMP-PROOF"`) — the same "real round-trip, exact bytes checked"
+discipline `is_arp_reply` already established. `NetBootInfo`'s buffer-count
+fields grew accordingly (`rx_buffer_phys: [u64; 8]`, `tx_buffer_phys`
+from a single `u64` to `[u64; 4]`) across all three copies
+(`net-driver-host/src/main.rs`, `kernel/src/main.rs`,
+`kernel/tests/net_driver_icmp.rs`) in one atomic change — a breaking
+layout change to a struct with no shared-crate enforcement of its own, so
+all three had to move together or silently desync.
+
+Not done: Phase 2b (a real TCP client, needing QEMU's `guestfwd` mechanism
+plus a host-side listener process — SLIRP has no built-in TCP listener at
+all, confirmed during research, so connecting to the gateway proves
+nothing) is a deliberate, separate follow-up, not started here — same
+phase-split reasoning as Phase 1/2a: a `Device`/`Interface` bring-up bug
+is a different failure class than TCP's much larger stateful protocol
+correctness. Also still deferred: DHCP, multiple concurrent sockets, a
+sockets API/IPC surface for other ring 3 processes to use this stack,
+UDP, TX/RX interrupts, MSI-X/IOAPIC, real wall-clock timestamps, and
+fuzzing the ICMP/ARP-resolution parsing path (required per the
+testing-rigor commitment below, scoped as a fast-follow now that this
+parser actually exists — the property-testing work already done for
+`is_arp_reply`/`validate_rx_completion` is the template to extend).
 
 **The testing-rigor commitment, no longer just a commitment for later.**
 Everything verified in this kernel up to Phase 1 above was a hand-written

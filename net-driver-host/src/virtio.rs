@@ -125,10 +125,18 @@ impl VirtioNet {
             u32::from(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK),
         );
     }
+}
 
-    pub fn notify(&self, queue_index: u16) {
-        write_reg(self.io_base, REG_QUEUE_NOTIFY, 2, u32::from(queue_index));
-    }
+/// `QueueNotify` write, as a free function rather than a `VirtioNet`
+/// method: every caller that needs this (`smoltcp_device.rs`'s
+/// `RunixNetDevice`/token types) only ever has an `io_base` value in scope,
+/// not a whole borrowed `VirtioNet` — plumbing one through would mean
+/// either holding a long-lived `&VirtioNet` borrow across smoltcp's own
+/// token borrows (awkward lifetime entanglement) or copying the two-field
+/// struct around for no benefit over just copying the `u16` it actually
+/// needs.
+pub fn notify(io_base: u16, queue_index: u16) {
+    write_reg(io_base, REG_QUEUE_NOTIFY, 2, u32::from(queue_index));
 }
 
 #[repr(C)]
