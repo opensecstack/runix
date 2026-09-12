@@ -107,8 +107,18 @@ fn run_qemu(bios_path: &Path, exit_device: bool) -> ExitStatus {
         // Explicit `-netdev`/`-device` rather than relying on QEMU's
         // default NIC: the default is an e1000, not virtio-net, and
         // "whatever QEMU defaults to" isn't a stable thing to test against.
+        //
+        // The `-netdev` *value* itself is overridable via
+        // `RUNIX_NETDEV_ARG` — needed by `kernel/tests/net_driver_tcp.rs`
+        // (Phase 2b), which adds a `guestfwd` route so the guest can reach
+        // a real TCP listener the test harness runs on the host (SLIRP has
+        // no built-in TCP listener of its own to connect to instead — see
+        // docs/STATUS.md's network-stack section). An env var, not a new
+        // CLI flag: no args-passthrough mechanism existed here before this,
+        // and every other caller (plain `build`/`run`, every other test)
+        // leaves it unset and gets today's plain default unchanged.
         .arg("-netdev")
-        .arg("user,id=net0")
+        .arg(env::var("RUNIX_NETDEV_ARG").unwrap_or_else(|_| "user,id=net0".to_string()))
         .arg("-device")
         .arg("virtio-net-pci,netdev=net0");
     if exit_device {

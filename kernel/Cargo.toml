@@ -93,6 +93,10 @@ harness = false
 name = "net_driver_icmp"
 harness = false
 
+[[test]]
+name = "net_driver_tcp"
+harness = false
+
 [profile.dev]
 panic = "abort"
 

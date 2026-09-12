@@ -1,20 +1,25 @@
-//! Network stack, Phase 2a (see docs/STATUS.md's network-stack section):
-//! proves `smoltcp`'s `Device`/`Interface` bring-up actually works, not
-//! just that it compiles. Loads `net-driver-host` (a real compiled ELF,
-//! same mechanism `grid_sandbox_wasm.rs` already proved for
-//! `grid-sandbox-host`) as a capability-gated ring 3 process, and lets it
-//! bring up smoltcp on top of the virtio-net virtqueue transport (Phase 1)
-//! and exchange one real ICMP echo with QEMU/SLIRP's own gateway
-//! (10.0.2.2) — which SLIRP answers out of the box, needing no new QEMU/CI
-//! infrastructure.
+//! Network stack, Phase 2b (see docs/STATUS.md's network-stack section):
+//! proves a real TCP client works, not just the IP/ICMP layer Phase 2a
+//! already proved. Loads `net-driver-host` (a real compiled ELF, same
+//! mechanism `grid_sandbox_wasm.rs` already proved for `grid-sandbox-host`)
+//! as a capability-gated ring 3 process, sets `NetBootInfo::attempt_tcp`,
+//! and lets it connect out to a `guestfwd`-bridged host listener
+//! (`kernel/tests/support/tcp_proof_listener.py`), send a fixed payload,
+//! and check the exact reply.
 //!
-//! Supersedes `net_driver_arp.rs` (Phase 1's dedicated test, now retired):
-//! `net-driver-host`'s `_start` no longer sends a hand-built ARP request
-//! directly — smoltcp's own neighbor-discovery cache performs the
-//! equivalent ARP resolution automatically as a prerequisite to routing
-//! the ICMP echo, so this test still exercises the exact same virtqueue
-//! mechanism Phase 1 proved, plus real IPv4/ICMP checksums Phase 1 never
-//! touched.
+//! SLIRP (QEMU's `-netdev user` backend) has no built-in TCP listener at
+//! all -- connecting to the gateway would prove nothing. This test instead
+//! relies on the CI/test harness having already started
+//! `tcp_proof_listener.py` on `127.0.0.1:9001` and set
+//! `RUNIX_NETDEV_ARG=user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001`
+//! (`.github/workflows/ci.yml`'s `kernel-tests` job) before `xtask`'s
+//! `test-runner` boots this test in QEMU -- `xtask/src/main.rs::run_qemu`
+//! reads that env var to override its otherwise-hardcoded `-netdev` value.
+//! Running this file directly without that setup will simply time out
+//! waiting for a TCP reply that never arrives (result byte stays `2`/FAIL,
+//! not a fault) -- see the module doc comment in
+//! `kernel/tests/support/tcp_proof_listener.py` for the manual local
+//! invocation this needs.
 //!
 //! **Manual build step required when running this locally** (same
 //! requirement `grid_sandbox_wasm.rs` already has for its own payload):
@@ -23,16 +28,15 @@
 //! cd net-driver-host && cargo build --target x86_64-unknown-none --release
 //! ```
 //!
-//! CI does this automatically (`.github/workflows/ci.yml`'s `kernel-tests`
-//! job builds `net-driver-host` before running this test).
-//!
 //! Pass/fail is a real result code, not "didn't crash": `net-driver-host`
-//! writes a PASS/FAIL byte into the shared `NetBootInfo` page after its own
-//! bounded poll loop finishes (see that crate's own doc comment on
-//! `NET_RESULT_OFFSET`) — reaching the end of this test's yield budget
-//! without a fault only proves nothing crashed; reading back an actual
-//! PASS byte proves the ICMP echo round-trip through QEMU/SLIRP genuinely
-//! succeeded, with the exact payload bytes verified.
+//! writes a PASS/FAIL byte into the shared `NetBootInfo` page at
+//! `NET_TCP_RESULT_OFFSET` after its own bounded poll loop finishes --
+//! reaching the end of this test's yield budget without a fault only
+//! proves nothing crashed; reading back an actual PASS byte proves the TCP
+//! round-trip through QEMU's `guestfwd` bridge and the host listener
+//! genuinely succeeded, with the exact payload bytes verified on both
+//! ends (the guest checks the exact reply; `tcp_proof_listener.py`
+//! independently checks the exact request).
 
 #![no_std]
 #![no_main]
@@ -78,13 +82,11 @@ const NET_TXQ_VA: u64 = 0x_1111_5555_0000;
 const NET_RXBUF_VA: u64 = 0x_1111_6666_0000;
 const NET_TXBUF_VA: u64 = 0x_1111_7777_0000;
 const NET_QUEUE_ALIGN: u64 = 4096;
-// Grown from Phase 1's 4/1 -- see `net-driver-host/src/smoltcp_device.rs`'s
-// `RX_BUFFER_COUNT`/`TX_BUFFER_COUNT`.
 const NET_RX_BUFFER_COUNT: u64 = 8;
 const NET_TX_BUFFER_COUNT: u64 = 4;
 
-// Must match `net-driver-host/src/main.rs`'s `NET_RESULT_OFFSET`/`NET_RESULT_PASS`.
-const NET_RESULT_OFFSET: u64 = 128;
+// Must match `net-driver-host/src/main.rs`'s `NET_TCP_RESULT_OFFSET`/`NET_RESULT_PASS`.
+const NET_TCP_RESULT_OFFSET: u64 = 129;
 const NET_RESULT_PASS: u8 = 1;
 
 #[repr(C)]
@@ -95,9 +97,6 @@ struct NetBootInfo {
     tx_queue_phys: u64,
     rx_buffer_phys: [u64; 8],
     tx_buffer_phys: [u64; 4],
-    /// `0` -- this test has no `guestfwd` route or host listener for
-    /// net-driver-host's Phase 2b TCP attempt to reach; see
-    /// `net_driver_tcp.rs` for the test that sets this to `1`.
     attempt_tcp: u8,
 }
 
@@ -133,7 +132,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Some(io_base) => io_base,
         None => {
             serial_println!(
-                "net_driver_icmp: FAIL — no virtio-net I/O-space BAR0 found (is xtask's \
+                "net_driver_tcp: FAIL — no virtio-net I/O-space BAR0 found (is xtask's \
                  -device virtio-net-pci still wired into run_qemu?)"
             );
             exit_qemu(QemuExitCode::Failed);
@@ -142,21 +141,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     if let Err(e) = runix_kernel::citadel::demo_authorize("net-driver-host", NET_DRIVER_HOST_ELF) {
         serial_println!(
-            "net_driver_icmp: FAIL — CITADEL allowlist rejected net-driver-host: {:?}",
+            "net_driver_tcp: FAIL — CITADEL allowlist rejected net-driver-host: {:?}",
             e
         );
         exit_qemu(QemuExitCode::Failed);
     }
 
     serial_println!(
-        "net_driver_icmp: parsing net-driver-host ({} bytes)",
+        "net_driver_tcp: parsing net-driver-host ({} bytes)",
         NET_DRIVER_HOST_ELF.len()
     );
     let elf = match Elf64::parse(NET_DRIVER_HOST_ELF) {
         Ok(elf) => elf,
         Err(e) => {
             serial_println!(
-                "net_driver_icmp: FAIL — parse() rejected the binary: {:?}",
+                "net_driver_tcp: FAIL — parse() rejected the binary: {:?}",
                 e
             );
             exit_qemu(QemuExitCode::Failed);
@@ -167,11 +166,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let entry = match elf.load_segments(&mut space) {
         Ok(entry) => entry,
         Err(e) => {
-            serial_println!("net_driver_icmp: FAIL — load_segments() failed: {:?}", e);
+            serial_println!("net_driver_tcp: FAIL — load_segments() failed: {:?}", e);
             exit_qemu(QemuExitCode::Failed);
         }
     };
-    serial_println!("net_driver_icmp: loaded, entry point {:#x}", entry.as_u64());
+    serial_println!("net_driver_tcp: loaded, entry point {:#x}", entry.as_u64());
 
     let rw_user_flags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
@@ -218,7 +217,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         tx_queue_phys: txq_first_frame_phys,
         rx_buffer_phys,
         tx_buffer_phys,
-        attempt_tcp: 0,
+        attempt_tcp: 1,
     };
     unsafe {
         (info_content.as_mut_ptr() as *mut NetBootInfo).write(info);
@@ -226,7 +225,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Keep a raw pointer to the result byte -- reachable via the physical-
     // memory-offset mapping regardless of which `Cr3` is active, same as
     // `info_content` itself (see `map_private_page`'s doc comment).
-    let result_ptr = unsafe { info_content.as_mut_ptr().add(NET_RESULT_OFFSET as usize) };
+    let result_ptr = unsafe {
+        info_content
+            .as_mut_ptr()
+            .add(NET_TCP_RESULT_OFFSET as usize)
+    };
 
     let now = runix_kernel::interrupts::ticks();
     let signing_key = runix_kernel::capabilities::demo_signing_key();
@@ -245,11 +248,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     scheduler::spawn_ring3_process_with_capability(kernel_trampoline, space, Some(net_token));
 
-    // Same bound net-driver-host itself polls for internally (2,000,000
-    // iterations, yielding every 10,000) plus headroom -- a real reply
-    // arrives promptly in practice.
+    // Bigger budget than net_driver_icmp.rs's 3000: this run does the ICMP
+    // proof *first* (its own full poll bound before falling through) and
+    // only starts the TCP attempt afterward, so the TCP result byte can
+    // take longer to appear even on a successful run.
     let mut result = 0u8;
-    for _ in 0..3000 {
+    for _ in 0..6000 {
         scheduler::yield_now();
         result = unsafe { core::ptr::read_volatile(result_ptr) };
         if result != 0 {
@@ -259,15 +263,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     if result == NET_RESULT_PASS {
         serial_println!(
-            "net_driver_icmp: PASS — a real compiled binary brought up smoltcp on the virtio-net \
-             virtqueue and received a genuine ICMP echo reply from QEMU/SLIRP in an isolated \
-             ring 3 process"
+            "net_driver_tcp: PASS — a real compiled binary connected out over TCP through QEMU's \
+             guestfwd bridge and exchanged exact bytes with a real host listener, from an \
+             isolated ring 3 process"
         );
         exit_qemu(QemuExitCode::Success);
     } else {
         serial_println!(
-            "net_driver_icmp: FAIL — net-driver-host reported result byte {} (0 = never finished, \
-             2 = ICMP echo reply never arrived)",
+            "net_driver_tcp: FAIL — net-driver-host reported TCP result byte {} (0 = never \
+             finished -- is RUNIX_NETDEV_ARG/the host listener actually set up?, 2 = reply \
+             missing or wrong)",
             result
         );
         exit_qemu(QemuExitCode::Failed);
@@ -335,6 +340,6 @@ extern "C" fn kernel_trampoline() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    serial_println!("net_driver_icmp: PANIC: {}", info);
+    serial_println!("net_driver_tcp: PANIC: {}", info);
     exit_qemu(QemuExitCode::Failed);
 }

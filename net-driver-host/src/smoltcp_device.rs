@@ -132,6 +132,10 @@ pub struct RunixRxToken<'a> {
 
 pub struct RunixTxToken<'a> {
     tx_queue: &'a mut Virtqueue,
+    /// This slot's own in-use flag, marked `true` only inside [`Self::consume`]
+    /// -- see `receive`/`transmit`'s doc comments for why it must NOT be
+    /// marked at token-construction time.
+    tx_in_use: &'a mut bool,
     net_io_base: u16,
     tx_buffer_va: usize,
     tx_buffer_phys: [u64; TX_BUFFER_COUNT],
@@ -147,10 +151,24 @@ impl Device for RunixNetDevice {
         // together (it may need to reply, e.g. to an ARP request, while
         // processing the frame that prompted it) -- no RX without spare TX
         // capacity, matching smoltcp's own `Loopback`/real-device examples.
+        //
+        // Deliberately does NOT mark the paired TX slot in-use here: most
+        // inbound packets (e.g. a plain ARP *reply*, not a request) need no
+        // reply at all, and smoltcp simply drops an unused `TxToken`
+        // without ever calling `consume()` on it. Marking the slot in-use
+        // at this point, unconditionally, leaked one TX slot per such
+        // packet in an earlier version -- confirmed for real, not
+        // theoretical: with only `TX_BUFFER_COUNT` (4) slots total, this
+        // silently exhausted all of them after a handful of inbound ARP/
+        // ICMP replies, after which `receive()` could never again find a
+        // free slot to pair with -- the exact symptom observed (the guest
+        // kept re-sending ARP requests for the TCP peer forever, each one
+        // answered, but never progressing to an actual TCP SYN). Only
+        // `TxToken::consume` marks a slot in-use now, at the point it's
+        // actually posted to the device.
         let (desc_id, len) = self.rx_queue.poll_used()?;
         let (index, len) = validate_rx_completion(desc_id, len, RX_BUFFER_COUNT)?;
         let tx_slot = self.free_tx_slot()?;
-        self.tx_in_use[tx_slot] = true;
 
         let net_io_base = self.net_io_base;
         let rx_buffer_va = self.rx_buffer_va;
@@ -169,6 +187,7 @@ impl Device for RunixNetDevice {
             },
             RunixTxToken {
                 tx_queue: &mut self.tx_queue,
+                tx_in_use: &mut self.tx_in_use[tx_slot],
                 net_io_base,
                 tx_buffer_va,
                 tx_buffer_phys,
@@ -178,10 +197,12 @@ impl Device for RunixNetDevice {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        // Same reasoning as `receive()` above: the slot isn't marked
+        // in-use until `TxToken::consume` actually posts it.
         let slot = self.free_tx_slot()?;
-        self.tx_in_use[slot] = true;
         Some(RunixTxToken {
             tx_queue: &mut self.tx_queue,
+            tx_in_use: &mut self.tx_in_use[slot],
             net_io_base: self.net_io_base,
             tx_buffer_va: self.tx_buffer_va,
             tx_buffer_phys: self.tx_buffer_phys,
@@ -248,6 +269,9 @@ impl smoltcp::phy::TxToken for RunixTxToken<'_> {
                 false,
             );
         }
+        // Marked in-use only now that the slot is actually posted to the
+        // device -- see `receive`/`transmit`'s doc comments for why.
+        *self.tx_in_use = true;
         virtio::notify(self.net_io_base, TX_QUEUE_INDEX);
         result
     }

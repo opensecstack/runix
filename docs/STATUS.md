@@ -795,18 +795,80 @@ from a single `u64` to `[u64; 4]`) across all three copies
 layout change to a struct with no shared-crate enforcement of its own, so
 all three had to move together or silently desync.
 
-Not done: Phase 2b (a real TCP client, needing QEMU's `guestfwd` mechanism
-plus a host-side listener process — SLIRP has no built-in TCP listener at
-all, confirmed during research, so connecting to the gateway proves
-nothing) is a deliberate, separate follow-up, not started here — same
-phase-split reasoning as Phase 1/2a: a `Device`/`Interface` bring-up bug
-is a different failure class than TCP's much larger stateful protocol
-correctness. Also still deferred: DHCP, multiple concurrent sockets, a
-sockets API/IPC surface for other ring 3 processes to use this stack,
-UDP, TX/RX interrupts, MSI-X/IOAPIC, real wall-clock timestamps, and
-fuzzing the ICMP/ARP-resolution parsing path (required per the
-testing-rigor commitment below, scoped as a fast-follow now that this
-parser actually exists — the property-testing work already done for
+**Network stack, Phase 2b: a real TCP client, closing out the original
+"virtio-net driver + smoltcp TCP/IP" backlog item.** SLIRP has no built-in
+TCP listener at all — connecting to the gateway would prove nothing — so
+this needed two new pieces of test infrastructure: `xtask/src/main.rs`'s
+previously fully-hardcoded `-netdev user,id=net0` is now overridable via
+one env var (`RUNIX_NETDEV_ARG`, read once in `run_qemu`; every other
+caller leaves it unset and gets the unchanged default), and a real host-
+side listener (`kernel/tests/support/tcp_proof_listener.py`, plain
+dependency-free Python — `ubuntu-latest` already has it, no new CI install
+step) that QEMU's `guestfwd` bridges a guest-initiated connection to via
+`nc`. `net-driver-host` connects to `10.0.2.100:9000` (a `guestfwd`-only
+synthetic address — QEMU rejects reusing the gateway's own `10.0.2.2` for
+this outright: "Conflicting/invalid host:port in guest forwarding rule"),
+sends a fixed payload, and checks the exact reply — independently verified
+on *both* ends (the guest checks the exact reply bytes; the Python
+listener separately asserts it received the exact request bytes), not
+just one side's self-report. `NetBootInfo` grew one more field,
+`attempt_tcp: u8` — `0` on every path without a `guestfwd` route or
+listener (the real boot sequence, `net_driver_icmp.rs`), so a TCP connect
+to an address nothing answers doesn't sit in SYN-SENT for a full poll
+bound on every ICMP-only run.
+
+Two more real bugs found getting this working — both only surfaced once
+an actual second protocol ran after the first, something Phase 2a alone
+never exercised:
+
+- **Non-monotonic time silently stalled the whole TCP state machine.**
+  Both proof phases run in the same `_start`, each with its own bounded
+  `for` loop computing `Instant::from_millis(iteration)` from `iteration =
+  0`. `smoltcp::Interface` remembers the last `Instant` it was polled with
+  internally (retransmit/backoff timers are computed relative to it) — so
+  starting the TCP phase's loop at `0` handed it a timestamp *earlier*
+  than what it had already seen during the ICMP phase moments before.
+  Confirmed via packet capture, not guessed: with the reset-to-zero
+  counter, the guest never sent so much as an ARP request for the TCP
+  remote, let alone a SYN — smoltcp's internal state simply never
+  progressed. Fixed by threading one shared, always-increasing iteration
+  counter across both phases (the ICMP loop's final iteration + 1 seeds
+  the TCP loop's own counter).
+- **A real resource leak: an unconsumed `TxToken` silently leaked its TX
+  slot forever.** `Device::receive()` must return a paired `(RxToken,
+  TxToken)` per smoltcp's own contract (in case the inbound packet needs
+  an immediate reply, e.g. an ARP request) — but *most* inbound packets
+  (a plain ARP *reply*, an ICMP reply with nothing further to send) need
+  no reply at all, and smoltcp simply drops the unused `TxToken` without
+  ever calling `consume()` on it. The first version of `RunixNetDevice`
+  marked a TX slot "in use" the moment `receive()`/`transmit()` handed out
+  a token — meaning every inbound packet that *didn't* need a reply leaked
+  one of only `TX_BUFFER_COUNT` (4) slots, permanently, since nothing ever
+  posted or reaped it. Packet capture showed the exact resulting symptom:
+  the guest re-sent an ARP request for the TCP remote three times, each
+  one correctly answered by SLIRP, but the connection never progressed to
+  an actual SYN — after ~4 total inbound packets across both phases
+  (2 during ICMP, 2 during the TCP phase's own ARP resolution), every TX
+  slot was already leaked, so `receive()` could never again find a free
+  slot to pair with, silently blocking all further RX indefinitely. Fixed
+  by moving the "mark this slot in use" step out of `receive()`/
+  `transmit()` entirely and into `TxToken::consume()` itself, right where
+  the slot is actually posted to the device — a token that's dropped
+  unused now correctly leaves its slot untouched instead of leaking it.
+
+Verification for this phase relied on this session's WSL (Fedora) rather
+than only the Windows dev box, since the actual mechanism under test
+(QEMU spawning a host process via `guestfwd`'s `-cmd:`) is Linux-shell-
+specific and can't be rehearsed identically on Windows — packet capture
+(`-object filter-dump`) inside WSL is what actually diagnosed both bugs
+above, rather than guessing from symptoms alone.
+
+Also still deferred: DHCP, multiple concurrent sockets, a sockets API/IPC
+surface for other ring 3 processes to use this stack, UDP, TX/RX
+interrupts, MSI-X/IOAPIC, real wall-clock timestamps, TCP performance
+tuning, and fuzzing the ICMP/ARP-resolution/TCP parsing path (required
+per the testing-rigor commitment below, scoped as a fast-follow now that
+these parsers actually exist — the property-testing work already done for
 `is_arp_reply`/`validate_rx_completion` is the template to extend).
 
 **The testing-rigor commitment, no longer just a commitment for later.**

@@ -126,8 +126,8 @@ jobs:
       - name: build grid-sandbox-host (payload for grid_sandbox_wasm)
         working-directory: grid-sandbox-host
         run: cargo build --target x86_64-unknown-none --release
-      # Same requirement, same reasoning, for `net_driver_icmp` below.
-      - name: build net-driver-host (payload for net_driver_icmp)
+      # Same requirement, same reasoning, for `net_driver_icmp`/`net_driver_tcp` below.
+      - name: build net-driver-host (payload for net_driver_icmp/net_driver_tcp)
         working-directory: net-driver-host
         run: cargo build --target x86_64-unknown-none --release
       - name: cargo test (boots every kernel/tests/*.rs in QEMU)
@@ -153,6 +153,24 @@ jobs:
           cargo test --target x86_64-unknown-none --test grid_sandbox_wasm
           cargo test --target x86_64-unknown-none --test citadel_demo
           cargo test --target x86_64-unknown-none --test net_driver_icmp
+      # Phase 2b's real TCP client proof -- SLIRP has no built-in TCP
+      # listener to connect to (confirmed during design research), so this
+      # starts a real listener on the host first (kernel/tests/support/
+      # tcp_proof_listener.py) and points QEMU's `-netdev` at it via a
+      # `guestfwd` route (net-driver-host connects to 10.0.2.100:9000,
+      # which QEMU bridges to `nc 127.0.0.1 9001`, i.e. the listener).
+      # `RUNIX_NETDEV_ARG` is `xtask/src/main.rs::run_qemu`'s own override
+      # point for its otherwise-hardcoded `-netdev` value -- every other
+      # test above leaves it unset and gets today's plain default
+      # unchanged. `nc` (netcat-openbsd) is preinstalled on `ubuntu-latest`;
+      # `python3` needs no install step either.
+      - name: cargo test net_driver_tcp (real TCP client via guestfwd)
+        working-directory: kernel
+        run: |
+          python3 tests/support/tcp_proof_listener.py &
+          sleep 0.3
+          RUNIX_NETDEV_ARG="user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001" \
+            cargo test --target x86_64-unknown-none --test net_driver_tcp
 
   # Mobile L1 (aarch64/TrustZone), separate from the x86_64 `kernel` job
   # above — different target triple, different toolchain requirement (this

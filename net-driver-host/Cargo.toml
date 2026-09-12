@@ -1,6 +1,6 @@
 [package]
 name = "net-driver-host"
-description = "Network driver host: a freestanding ring 3 binary running the legacy virtio-net driver — Beta's 'user-space network stack' roadmap item, Phase 1 (virtqueue proof, no TCP/IP yet). Loaded via kernel/src/elf.rs and scheduler::spawn_ring3_process_with_capability, capability-gated port I/O only, never linked into the kernel itself."
+description = "Network driver host: a freestanding ring 3 binary running the legacy virtio-net driver plus smoltcp (ICMP + TCP client) — Beta's 'user-space network stack' roadmap item. Loaded via kernel/src/elf.rs and scheduler::spawn_ring3_process_with_capability, capability-gated port I/O only, never linked into the kernel itself."
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.75"
@@ -15,7 +15,7 @@ publish = false
 
 [dependencies]
 linked_list_allocator = "0.10"
-smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "alloc"] }
+smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-tcp", "alloc"] }
 
 [dev-dependencies]
 # Host-only (tests run on the host, never the x86_64-unknown-none target) —

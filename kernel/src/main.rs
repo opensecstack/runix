@@ -102,6 +102,12 @@ struct NetBootInfo {
     tx_queue_phys: u64,
     rx_buffer_phys: [u64; 8],
     tx_buffer_phys: [u64; 4],
+    /// `0` here on the real boot path -- no `guestfwd` route or host
+    /// listener exists for `net-driver-host`'s Phase 2b TCP proof to
+    /// reach outside a dedicated test (`kernel/tests/net_driver_tcp.rs`),
+    /// so attempting it here would just add a full poll-bound's worth of
+    /// wall-clock time to every boot for no benefit.
+    attempt_tcp: u8,
 }
 
 /// The default config doesn't map all of physical memory into the kernel's
@@ -671,6 +677,7 @@ fn load_and_run_net_driver_host(io_base: u16, now: u64, signing_key: &ed25519_da
         tx_queue_phys: txq_first_frame_phys,
         rx_buffer_phys,
         tx_buffer_phys,
+        attempt_tcp: 0,
     };
     unsafe {
         (info_content.as_mut_ptr() as *mut NetBootInfo).write(info);
