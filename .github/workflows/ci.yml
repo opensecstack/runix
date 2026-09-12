@@ -54,6 +54,7 @@ jobs:
           workspaces: |
             kernel
             grid-sandbox-host
+            net-driver-host
       - name: fmt check
         run: cargo fmt --check
       # main.rs `include_bytes!`s grid-sandbox-host's compiled output (Phase
@@ -62,6 +63,10 @@ jobs:
       # `boot` and `kernel-tests` jobs already have for the same reason.
       - name: build grid-sandbox-host (payload for Phase B7)
         working-directory: grid-sandbox-host
+        run: cargo build --target x86_64-unknown-none --release
+      # Same requirement, same reasoning, for net-driver-host (Phase B8).
+      - name: build net-driver-host (payload for Phase B8)
+        working-directory: net-driver-host
         run: cargo build --target x86_64-unknown-none --release
       - name: clippy (lib + bin only)
         run: cargo clippy --target x86_64-unknown-none --bins --lib -- -D warnings
@@ -287,6 +292,7 @@ jobs:
             kernel
             xtask
             grid-sandbox-host
+            net-driver-host
       # main.rs now `include_bytes!`s grid-sandbox-host's compiled output
       # directly (Phase B7 — see citadel.rs's doc comment), so the kernel
       # itself won't even compile without this built first, the same
@@ -294,6 +300,10 @@ jobs:
       # has for the same reason.
       - name: build grid-sandbox-host (payload for Phase B7)
         working-directory: grid-sandbox-host
+        run: cargo build --target x86_64-unknown-none --release
+      # Same requirement, same reasoning, for net-driver-host (Phase B8).
+      - name: build net-driver-host (payload for Phase B8)
+        working-directory: net-driver-host
         run: cargo build --target x86_64-unknown-none --release
       - name: install QEMU
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
