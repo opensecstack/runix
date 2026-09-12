@@ -649,6 +649,120 @@ kernel-side and deliberately narrow:
   giving the test the same heap-init sequence every other allocating test
   already uses. Wired into CI's `kernel-tests` job.
 
+**Network stack, Phase 1: the legacy virtio-net virtqueue mechanism proven
+end to end.** `net-driver-host` (a new standalone freestanding crate, same
+shape as `grid-sandbox-host`) drives virtio-net entirely from ring 3: it
+never gets raw port I/O privilege itself, only two new capability-gated
+syscalls (`SYS_PORT_IN`/`SYS_PORT_OUT`, `kernel/src/syscall.rs`) scoped by a
+single range-based capability (`capabilities::ioport_range_resource`,
+covering the device's whole BAR0 register block — chosen over a
+per-register-purpose scheme since it needs no new capability-manager
+mechanism, matching the granularity `port_resource` already uses for IPC).
+`kernel/src/pci.rs` grew BAR0 reading (`read_bar0_io_port`) to find that
+range in the first place — legacy virtio-net's control interface is
+I/O-space, not MMIO, so no MMIO-mapping infrastructure was needed. Polling
+the used ring (no interrupts) sidesteps this kernel's total lack of MSI-X/
+IOAPIC support — spec-valid and the same technique DPDK's own poll-mode
+virtio driver uses in production. Verified end to end, not just compiling:
+`net-driver-host` probes the device (real QEMU MAC,
+`52:54:00:12:34:56`), transmits one hand-built ARP request, and receives a
+genuine reply from QEMU/SLIRP via the RX virtqueue — checked byte-for-byte
+(Ethertype `0x0806`, ARP opcode `2`), a real round-trip through the host,
+not "no error was returned." `kernel/tests/net_driver_arp.rs` is the
+regression test, and its pass/fail is a real result code, not "didn't
+crash": `net-driver-host` writes a PASS/FAIL byte into the shared
+`NetBootInfo` page after its own bounded poll loop, since a silent "no
+reply, poll bound exceeded" failure wouldn't fault and needs to be
+distinguishable from success. Wired into CI's `kernel-tests` and `boot`
+jobs (both build `net-driver-host` first, same `include_bytes!` ordering
+requirement `grid-sandbox-host` already has).
+
+Three real bugs found getting here, each worth knowing before touching this
+class of code again:
+
+- **Physical frame contiguity, silently assumed and silently wrong.**
+  Legacy virtio's `QueueAddress` register carries *one* physical address;
+  the device computes the avail/used rings' addresses as fixed byte offsets
+  from it, so a queue's 3 pages (descriptor table, avail ring, used ring)
+  must land on physically *contiguous* frames, not just contiguous virtual
+  addresses. A first version just called `AddressSpace::map_private_page`
+  three times in a row and trusted `BootInfoFrameAllocator`'s bump
+  allocation to hand out consecutive frames — it doesn't, reliably:
+  `map_private_page`'s own `map_to` call can itself consume *extra* frames
+  for intermediate P1/P2/P3 page-table levels the first mapping in a fresh
+  region needs, interleaved with the leaf-frame allocations that actually
+  mattered (observed for real: frame 1 landed 2 frames past frame 0, not 1).
+  Fixed by allocating every leaf frame *first*, as one tight batch with
+  nothing else running in between (`map_zeroed_contiguous_region`, in both
+  `kernel/src/main.rs` and `kernel/tests/net_driver_arp.rs`), then mapping
+  each pre-allocated frame explicitly via `AddressSpace::map_existing_frame`
+  — whatever table frames *that* needs get allocated strictly *after* this
+  function's own leaf frames, never in between them. Kept the assertion
+  that contiguity actually held as a safety net, not a substitute for the
+  real fix.
+- **A P4-slot address collision, from picking an address without checking
+  existing fixed regions.** Every `net-driver-host`-related virtual address
+  originally used a `0x_3333_...` prefix — including `NET_INFO_VA`, which
+  turned out to be *exactly* `scheduler.rs`'s own
+  `KERNEL_ENTRY_STACK_REGION_START`. A P4 slot spans 512 GiB, so every
+  other `0x_3333_...` address (differing only in bits far below that span)
+  landed in the *same* slot too. Mapping `NET_INFO_VA` detached that P4
+  slot in `net-driver-host`'s own `AddressSpace` (see `map_frame`'s "detach
+  on first touch" doc comment in `process.rs`) — invisibly breaking that
+  same process's own kernel-entry stack, mapped into that same shared slot
+  moments earlier by `alloc_kernel_entry_stack`. The process double-faulted
+  the instant it first trapped into ring 0, with a stack pointer that
+  looked nonsensical until the P4-slot math was actually done by hand.
+  Fixed by moving every `net-driver-host` address to a `0x_1111_...`
+  prefix, the one leading nibble not already claimed by an existing fixed
+  region (`0x2`/`0x3`/`0x4`/`0x5`/`0x6`/`0x7` are all taken — see
+  `GRID_SANDBOX_*`, `KERNEL_ENTRY_STACK_REGION_START`, the kernel heap,
+  `STACK_REGION_START`, and the process-isolation test region).
+- **The RCX/R8-R11 register-clobber class of bug, this time on RDI/RSI/
+  RDX.** `int 0x80`'s round trip has bitten this exact ABI twice before
+  (RCX, then R8-R11 defensively) — this time a plain `in(reg) x` operand on
+  RDI/RSI/RDX in `net-driver-host/src/syscall.rs`'s copy of the syscall
+  wrapper. `in` only tells the compiler what a register holds *going in*;
+  it doesn't mark the register clobbered afterward, so the compiler
+  remained free to assume a cached value survived to a *later* call.
+  Confirmed for real: two back-to-back `port_out` calls in
+  `VirtioNet::probe`, both passing the literal `1` for `width`, had the
+  second one observed with `width=0` at the kernel's own dispatch —
+  `entry`'s remapping shim (`mov rcx, rdx; mov rdx, rsi; mov rsi, rdi; mov
+  rdi, rax`) unconditionally overwrites RDI/RSI/RDX on every trip through
+  `int 0x80`, and the compiler had no way to know not to cache a shared
+  literal across that boundary. Fixed with `inout(reg) x => _` instead of
+  `in(reg) x` for all three registers — applied to all three copies of this
+  wrapper in the codebase (`kernel/src/syscall.rs`, `grid-sandbox-host`,
+  `net-driver-host`) defensively, even where it hadn't yet been observed to
+  bite, matching this codebase's existing rule for this ABI: any `int 0x80`
+  call site needs the full clobber declaration, not just the registers a
+  given caller happens to have hit so far.
+
+Also worth remembering: an ELF that isn't `-C relocation-model=static`
+compiles fine and boots, but ring 3-faults on an instruction fetch from
+`0x0` almost immediately — `net-driver-host` initially lacked its own
+`.cargo/config.toml` (unlike `grid-sandbox-host`, which already has one for
+exactly this reason), so it built as a default position-independent (`ET_DYN`)
+executable. `kernel/src/elf.rs`'s loader does zero relocation processing,
+so a PIE binary's data-section function pointers (`format_args!`'s
+`Display::fmt` vtable entries, needed even for an `assert!`/`panic!`
+message that never actually fires) are never relocated, left as whatever
+raw placeholder the linker wrote for a dynamic loader that doesn't exist
+here — calling through one jumps to address 0. Fixed by giving
+`net-driver-host` the identical `.cargo/config.toml` `grid-sandbox-host`
+already has.
+
+Not done: Phase 2 (a real TCP/IP stack via `smoltcp`, built on top of the
+now-proven transport) is a deliberate, separate follow-up — see this
+section's own reasoning above for why the phase split matters: virtqueue/
+physical-addressing mechanics and TCP/IP protocol correctness are different
+classes of bug, best diagnosed separately. Also still deferred: DHCP,
+multiple concurrent sockets, a sockets API/IPC surface for other ring 3
+processes to use this stack, TX/RX interrupts, MSI-X/IOAPIC, and fuzzing
+the virtqueue/frame-parsing code (required per the testing-rigor commitment
+below, scoped as a fast-follow now that Phase 1's parser actually exists).
+
 **The testing-rigor commitment for what comes next.** Everything verified
 in this kernel so far — including every fix documented above — has been a
 hand-written scenario booted in QEMU and checked against an expected

@@ -89,6 +89,10 @@ harness = false
 name = "citadel_demo"
 harness = false
 
+[[test]]
+name = "net_driver_arp"
+harness = false
+
 [profile.dev]
 panic = "abort"
 

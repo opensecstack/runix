@@ -127,6 +127,23 @@ const VIRTIO_VENDOR_ID: u16 = 0x1AF4;
 /// modern-only virtio yet.
 const VIRTIO_NET_DEVICE_ID: u16 = 0x1000;
 
+/// Reads `device`'s BAR0 (config space offset 0x10) and, if it's an
+/// I/O-space BAR (bit 0 set), returns its base port. Returns `None` for an
+/// MMIO BAR (bit 0 clear) — nothing in this kernel maps device MMIO yet,
+/// and legacy virtio-net's control interface is always I/O-space, never
+/// MMIO, so that's the only case the network-stack driver needs.
+///
+/// No BAR-size probing (the usual write-all-ones-then-read-back dance) —
+/// legacy virtio-pci's I/O BAR size is a spec-fixed constant, not something
+/// that needs discovering from hardware.
+pub fn read_bar0_io_port(device: &PciDevice) -> Option<u16> {
+    let raw = unsafe { read_config_dword(device.bus, device.device, device.function, 0x10) };
+    if raw & 0x1 == 0 {
+        return None; // MMIO BAR, not I/O-space
+    }
+    Some((raw & 0xFFFC) as u16)
+}
+
 /// Finds the virtio-net device among already-scanned `devices`, if present.
 /// Takes a slice rather than re-scanning so callers that already have a
 /// `scan()` result (or want to look for more than one device kind) don't

@@ -17,7 +17,7 @@ use core::panic::PanicInfo;
 use runix_kernel::elf::Elf64;
 use runix_kernel::process::AddressSpace;
 use runix_kernel::serial_println;
-use x86_64::structures::paging::{Page, PageTableFlags};
+use x86_64::structures::paging::{FrameAllocator, Page, PageTableFlags, PhysFrame};
 use x86_64::VirtAddr;
 
 /// The real payload the CITADEL boot-authorization gate (Phase B7, below)
@@ -42,6 +42,60 @@ const GRID_SANDBOX_HEAP_START: u64 = 0x_2222_2222_0000;
 const GRID_SANDBOX_HEAP_SIZE: u64 = 256 * 1024;
 const GRID_SANDBOX_STACK_VA: u64 = 0x_2222_3333_0000;
 const GRID_SANDBOX_STACK_SIZE: u64 = 4096 * 4;
+
+/// `net-driver-host`, Phase B8's payload — see `citadel.rs`'s doc comment
+/// and `docs/STATUS.md`'s network-stack section. Same `include_bytes!`
+/// compile-time requirement as `GRID_SANDBOX_HOST_ELF` above: `cd
+/// net-driver-host && cargo build --target x86_64-unknown-none --release`
+/// must run before `main.rs` itself will compile.
+static NET_DRIVER_HOST_ELF: &[u8] =
+    include_bytes!("../../net-driver-host/target/x86_64-unknown-none/release/net-driver-host");
+
+// Leading nibble `0x1` -- deliberately *not* `0x3`: `scheduler.rs`'s
+// `KERNEL_ENTRY_STACK_REGION_START` is `0x_3333_3333_0000`, and a P4 slot
+// spans 512 GiB -- every address here originally used a `0x_3333_...`
+// prefix too, differing only in bits far below that span, so all of them
+// landed in the *same* P4 slot as the kernel-entry-stack region. Confirmed
+// as a real bug, not a theoretical one: `NET_INFO_VA` mapped a page there,
+// which detached that P4 slot in this process's own `AddressSpace` (see
+// `map_frame`'s "detach on first touch" doc comment) — invisibly breaking
+// *this same process's own* kernel-entry stack (mapped into that same
+// shared slot by `alloc_kernel_entry_stack`, before this process's private
+// copy of it got detached), which double-faulted the instant this process
+// first trapped into ring 0. `0x1` shares no P4 slot with any other fixed
+// region in this codebase (`0x2`/`0x4`/`0x5`/`0x6`/`0x7` are all taken —
+// see `GRID_SANDBOX_*`/kernel heap/`STACK_REGION_START`/test region).
+const NET_HEAP_START: u64 = 0x_1111_1111_0000;
+const NET_HEAP_SIZE: u64 = 256 * 1024;
+const NET_STACK_VA: u64 = 0x_1111_2222_0000;
+const NET_STACK_SIZE: u64 = 4096 * 4;
+/// Must match `net-driver-host/src/main.rs`'s own `NET_INFO_VA`/`NET_RXQ_VA`/
+/// `NET_TXQ_VA`/`NET_RXBUF_VA`/`NET_TXBUF_VA` constants exactly — this
+/// kernel maps each of these virtual regions in `net-driver-host`'s private
+/// `AddressSpace` and separately hands it the matching *physical* addresses
+/// via `NetBootInfo` (see that struct's doc comment on the other side for
+/// why this process needs to be told, rather than compute them itself).
+const NET_INFO_VA: u64 = 0x_1111_3333_0000;
+const NET_RXQ_VA: u64 = 0x_1111_4444_0000;
+const NET_TXQ_VA: u64 = 0x_1111_5555_0000;
+const NET_RXBUF_VA: u64 = 0x_1111_6666_0000;
+const NET_TXBUF_VA: u64 = 0x_1111_7777_0000;
+const NET_QUEUE_ALIGN: u64 = 4096;
+const NET_RX_BUFFER_COUNT: u64 = 4;
+
+/// Mirrors `net-driver-host/src/main.rs`'s own `NetBootInfo` — `repr(C)`,
+/// same field order, in both independently-compiled crates. The only
+/// contract connecting them for this struct, same as the syscall ABI itself
+/// (not a shared type) connects `syscall.rs` to any ring 3 caller.
+#[repr(C)]
+struct NetBootInfo {
+    io_base: u16,
+    _pad: u16,
+    rx_queue_phys: u64,
+    tx_queue_phys: u64,
+    rx_buffer_phys: [u64; 4],
+    tx_buffer_phys: u64,
+}
 
 /// The default config doesn't map all of physical memory into the kernel's
 /// address space — `memory::init`'s `OffsetPageTable` needs that mapping to
@@ -278,6 +332,37 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // Network stack, Phase B8 (see docs/STATUS.md's network-stack section):
+    // find virtio-net's I/O-space BAR0, CITADEL-authorize net-driver-host
+    // the same way grid-sandbox-host is above, then load and run it as a
+    // capability-gated ring 3 process — the driver never gets raw port I/O
+    // privilege itself, only what `ioport_range_resource` grants for
+    // exactly this device's register block.
+    let pci_devices = runix_kernel::pci::scan();
+    match runix_kernel::pci::find_virtio_net(&pci_devices)
+        .and_then(|dev| runix_kernel::pci::read_bar0_io_port(&dev))
+    {
+        Some(io_base) => {
+            match runix_kernel::citadel::demo_authorize("net-driver-host", NET_DRIVER_HOST_ELF) {
+                Ok(()) => {
+                    serial_println!(
+                        "Runix kernel: net-driver-host authorized by CITADEL allowlist (Phase B8)"
+                    );
+                    load_and_run_net_driver_host(io_base, now, &signing_key);
+                }
+                Err(e) => {
+                    serial_println!(
+                        "Runix kernel: net-driver-host REJECTED by CITADEL allowlist ({:?}) — not loaded (Phase B8)",
+                        e
+                    );
+                }
+            }
+        }
+        None => {
+            serial_println!("Runix kernel: no virtio-net I/O-space BAR0 found — Phase B8 skipped");
+        }
+    }
+
     // Ring 3: map a user-accessible stack, grant ring 3 access to the one
     // code page `user_hello` lives on, then spawn it as a real scheduler
     // thread (its own dedicated kernel-entry stack, so the timer can safely
@@ -408,6 +493,227 @@ extern "C" fn grid_sandbox_host_trampoline() -> ! {
         runix_kernel::userspace::enter_usermode(
             VirtAddr::new(entry),
             VirtAddr::new(GRID_SANDBOX_STACK_VA + GRID_SANDBOX_STACK_SIZE),
+        );
+    }
+}
+
+/// Computes the *physical* address backing a page `map_private_page` just
+/// mapped, from the `&'static mut [u8; 4096]` it returns -- that pointer is
+/// `physical_memory_offset() + frame.start_address()` by construction (see
+/// `map_private_page`'s own doc comment), so subtracting the offset back out
+/// recovers the frame's physical address without needing a kernel API
+/// change to hand the `PhysFrame` back directly. This is how
+/// `load_and_run_net_driver_host` bridges the gap `NetBootInfo`'s own doc
+/// comment describes: a ring 3 process has no way to learn its own physical
+/// addresses, but virtio's `QueueAddress`/descriptor `addr` fields need
+/// real ones.
+fn page_phys_addr(page: &mut [u8; 4096]) -> u64 {
+    let virt = VirtAddr::from_ptr(page.as_ptr());
+    virt - runix_kernel::memory::physical_memory_offset()
+}
+
+/// Maps `page_count` zeroed pages starting at `start_va`, all landing on
+/// physically *contiguous* frames, and returns the first page's physical
+/// address.
+///
+/// A first version of this tried to get contiguity "for free" by just
+/// calling `AddressSpace::map_private_page` `page_count` times in a row and
+/// trusting `BootInfoFrameAllocator`'s bump allocation to hand out
+/// consecutive frames -- it doesn't, reliably: `map_private_page`'s own
+/// `map_to` call can itself consume *extra* frames for intermediate P1/P2/P3
+/// page-table levels the first mapping in a fresh region needs, interleaved
+/// with the leaf-frame allocations this function actually cares about.
+/// Confirmed as a real bug, not a theoretical one: booting with this fixed
+/// layout hit `left: 3547136, right: 3538944` -- frame 1 landed 2 frames
+/// past frame 0, not 1, because mapping page 0 allocated a P1 table frame in
+/// between.
+///
+/// The fix: allocate every leaf frame *first*, as one tight batch with
+/// nothing else running in between (no page-table-building side effects can
+/// interleave with a call that never invokes `map_to`), then map each
+/// pre-allocated frame explicitly via `map_existing_frame` -- whatever table
+/// frames *that* needs get allocated strictly *after* this function's own
+/// leaf frames, never in between them.
+fn map_zeroed_contiguous_region(
+    space: &mut AddressSpace,
+    start_va: u64,
+    page_count: u64,
+    flags: PageTableFlags,
+) -> u64 {
+    let frames: Vec<PhysFrame> =
+        runix_kernel::memory::with_mapper_and_frame_allocator(|_mapper, frame_allocator| {
+            (0..page_count)
+                .map(|_| {
+                    frame_allocator
+                        .allocate_frame()
+                        .expect("out of physical memory for net-driver-host's virtqueue region")
+                })
+                .collect()
+        });
+
+    for (i, frame) in frames.iter().enumerate() {
+        if i > 0 {
+            assert_eq!(
+                frame.start_address().as_u64(),
+                frames[0].start_address().as_u64() + i as u64 * NET_QUEUE_ALIGN,
+                "net-driver-host's virtqueue region at {start_va:#x} landed on non-contiguous \
+                 physical frames even after batching the allocation ahead of any page-table \
+                 build -- BootInfoFrameAllocator's bump allocation crossed a usable-memory-region \
+                 boundary mid-batch, or something else allocated a frame concurrently"
+            );
+        }
+        let page = Page::containing_address(VirtAddr::new(start_va + i as u64 * NET_QUEUE_ALIGN));
+        unsafe {
+            space.map_existing_frame(page, *frame, flags);
+        }
+        let virt = runix_kernel::memory::physical_memory_offset() + frame.start_address().as_u64();
+        unsafe {
+            (*virt.as_mut_ptr::<[u8; 4096]>()).fill(0);
+        }
+    }
+    frames[0].start_address().as_u64()
+}
+
+/// Parses, loads, and runs `NET_DRIVER_HOST_ELF` as a real ring 3 process,
+/// capability-gated to exactly virtio-net's discovered I/O-port range --
+/// called only after Phase B8's CITADEL check authorizes it. Same load
+/// mechanism `load_and_run_grid_sandbox_host` already proved
+/// (`elf::Elf64` -> `process::AddressSpace` -> `scheduler::spawn_ring3_process_with_capability`),
+/// plus the virtqueue/packet-buffer regions and the `NetBootInfo` page that
+/// hands their physical addresses over -- see that struct's doc comment for
+/// why this process can't compute them itself.
+fn load_and_run_net_driver_host(io_base: u16, now: u64, signing_key: &ed25519_dalek::SigningKey) {
+    serial_println!(
+        "Runix kernel: parsing net-driver-host ({} bytes)",
+        NET_DRIVER_HOST_ELF.len()
+    );
+    let elf = Elf64::parse(NET_DRIVER_HOST_ELF)
+        .expect("net-driver-host failed to parse as a valid ELF64 binary");
+
+    let mut space = AddressSpace::new();
+    let entry = elf
+        .load_segments(&mut space)
+        .expect("net-driver-host failed to load its PT_LOAD segments");
+    serial_println!(
+        "Runix kernel: net-driver-host loaded, entry point {:#x}",
+        entry.as_u64()
+    );
+
+    let rw_user_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+
+    let map_zeroed_range = |space: &mut AddressSpace, start: u64, size: u64| {
+        let start_page = Page::containing_address(VirtAddr::new(start));
+        let end_page = Page::containing_address(VirtAddr::new(start + size - 1));
+        for page in Page::range_inclusive(start_page, end_page) {
+            space.map_private_page(page, rw_user_flags).fill(0);
+        }
+    };
+
+    // Heap and ring 3 stack: runtime-only regions with no PT_LOAD segment
+    // behind them, same as grid-sandbox-host's.
+    map_zeroed_range(&mut space, NET_HEAP_START, NET_HEAP_SIZE);
+    map_zeroed_range(&mut space, NET_STACK_VA, NET_STACK_SIZE);
+
+    // Virtqueue rings: must start zeroed -- `Virtqueue::new`'s safety
+    // contract requires it, since a stale avail/used index left over from
+    // whatever previously occupied this physical memory would
+    // desynchronize the ring from the device's own idea of it. The device
+    // only gets told *one* physical address (the descriptor table's, via
+    // `QueueAddress`) and computes the avail/used rings' addresses itself as
+    // fixed byte offsets from it -- so unlike the packet buffers below,
+    // these 3 pages per queue must land on physically *contiguous* frames,
+    // not just contiguous virtual addresses. `map_zeroed_contiguous_region`
+    // asserts that held rather than silently trusting it.
+    let rxq_first_frame_phys =
+        map_zeroed_contiguous_region(&mut space, NET_RXQ_VA, 3, rw_user_flags);
+    let txq_first_frame_phys =
+        map_zeroed_contiguous_region(&mut space, NET_TXQ_VA, 3, rw_user_flags);
+
+    // Packet buffers: one page each, individually mapped -- not guaranteed
+    // physically contiguous with each other, which is fine, since each
+    // descriptor only needs *its own* buffer to be one contiguous physical
+    // range (true by construction: each buffer fits in the one page backing
+    // it).
+    let mut rx_buffer_phys = [0u64; 4];
+    for i in 0..NET_RX_BUFFER_COUNT {
+        let page = Page::containing_address(VirtAddr::new(NET_RXBUF_VA + i * 4096));
+        let content = space.map_private_page(page, rw_user_flags);
+        content.fill(0);
+        rx_buffer_phys[i as usize] = page_phys_addr(content);
+    }
+    let tx_buffer_phys = {
+        let page = Page::containing_address(VirtAddr::new(NET_TXBUF_VA));
+        let content = space.map_private_page(page, rw_user_flags);
+        content.fill(0);
+        page_phys_addr(content)
+    };
+
+    // NetBootInfo itself: the one page net-driver-host reads at startup to
+    // learn the physical addresses above.
+    let info_page = Page::containing_address(VirtAddr::new(NET_INFO_VA));
+    let info_content = space.map_private_page(info_page, rw_user_flags);
+    info_content.fill(0);
+    let info = NetBootInfo {
+        io_base,
+        _pad: 0,
+        rx_queue_phys: rxq_first_frame_phys,
+        tx_queue_phys: txq_first_frame_phys,
+        rx_buffer_phys,
+        tx_buffer_phys,
+    };
+    unsafe {
+        (info_content.as_mut_ptr() as *mut NetBootInfo).write(info);
+    }
+
+    // Capability grant: one range covering the device's whole BAR0 register
+    // block (see `capabilities::ioport_range_resource`'s doc comment for why
+    // a range, not a per-register-purpose scheme) -- this process's only
+    // path to touching hardware at all is `SYS_PORT_IN`/`SYS_PORT_OUT`,
+    // gated against exactly this resource string.
+    let net_token = runix_capability_manager::CapabilityToken::issue(
+        "net-driver-host",
+        runix_kernel::capabilities::ioport_range_resource(io_base, 0x20),
+        now,
+        now + 1_000_000,
+        "demo-key",
+        signing_key,
+    );
+
+    #[allow(static_mut_refs)]
+    unsafe {
+        NET_DRIVER_HOST_ENTRY_POINT = entry.as_u64();
+    }
+    runix_kernel::scheduler::spawn_ring3_process_with_capability(
+        net_driver_host_trampoline,
+        space,
+        Some(net_token),
+    );
+
+    // Give it plenty of turns to probe the device, TX one ARP request, and
+    // poll for QEMU/SLIRP's reply before boot moves on -- its own success/
+    // failure marker (see net-driver-host/src/main.rs) prints via SYS_WRITE
+    // regardless of exactly how many of these land before boot's own final
+    // infinite yield loop picks up the slack.
+    for _ in 0..2000 {
+        runix_kernel::scheduler::yield_now();
+    }
+    serial_println!(
+        "Runix kernel: net-driver-host spawned as an isolated ring 3 process (Phase B8)"
+    );
+}
+
+static mut NET_DRIVER_HOST_ENTRY_POINT: u64 = 0;
+
+extern "C" fn net_driver_host_trampoline() -> ! {
+    #[allow(static_mut_refs)]
+    let entry = unsafe { NET_DRIVER_HOST_ENTRY_POINT };
+    unsafe {
+        runix_kernel::userspace::enter_usermode(
+            VirtAddr::new(entry),
+            VirtAddr::new(NET_STACK_VA + NET_STACK_SIZE),
         );
     }
 }

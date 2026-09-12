@@ -73,9 +73,24 @@ unsafe fn syscall(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         core::arch::asm!(
             "int 0x80",
             inout("rax") num => ret,
-            in("rdi") arg1,
-            in("rsi") arg2,
-            in("rdx") arg3,
+            // `inout(reg) x => _`, not `in(reg) x`: a plain `in` operand
+            // only tells the compiler what value the register holds *going
+            // in* — it does not mark it clobbered afterward, so the
+            // compiler may still assume a physical register keeps holding
+            // `arg1`/`arg2`/`arg3` across a *later* call, if it decides to
+            // cache a value shared between two nearby call sites. Found for
+            // real in `net-driver-host/src/syscall.rs` (see that file's
+            // longer account): two back-to-back syscalls both passing a
+            // literal argument value had the second one silently corrupted,
+            // because `entry`'s own remapping shim (`mov rcx, rdx; mov rdx,
+            // rsi; mov rsi, rdi; mov rdi, rax`, below) unconditionally
+            // overwrites RDI/RSI/RDX on every trip through `int 0x80`,
+            // exactly the same class of hazard as the RCX/R8-R11 clobber
+            // already documented here — just not yet observed to bite
+            // *this* crate's specific call pattern.
+            inout("rdi") arg1 => _,
+            inout("rsi") arg2 => _,
+            inout("rdx") arg3 => _,
             // `syscall::entry`'s remapping shim (kernel/src/syscall.rs)
             // does `mov rcx, rdx` before `call dispatch` — RCX is clobbered
             // on every trip through `int 0x80`, exactly like

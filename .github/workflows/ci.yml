@@ -98,6 +98,7 @@ jobs:
             kernel
             xtask
             grid-sandbox-host
+            net-driver-host
       - name: install QEMU
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
       # `grid_sandbox_wasm` below needs this binary already built on disk
@@ -108,6 +109,10 @@ jobs:
       # reasoning as `kernel`/`xtask` — see its `Cargo.toml`).
       - name: build grid-sandbox-host (payload for grid_sandbox_wasm)
         working-directory: grid-sandbox-host
+        run: cargo build --target x86_64-unknown-none --release
+      # Same requirement, same reasoning, for `net_driver_arp` below.
+      - name: build net-driver-host (payload for net_driver_arp)
+        working-directory: net-driver-host
         run: cargo build --target x86_64-unknown-none --release
       - name: cargo test (boots every kernel/tests/*.rs in QEMU)
         working-directory: kernel
@@ -131,6 +136,7 @@ jobs:
           cargo test --target x86_64-unknown-none --test ring3_cooperative
           cargo test --target x86_64-unknown-none --test grid_sandbox_wasm
           cargo test --target x86_64-unknown-none --test citadel_demo
+          cargo test --target x86_64-unknown-none --test net_driver_arp
 
   # Mobile L1 (aarch64/TrustZone), separate from the x86_64 `kernel` job
   # above — different target triple, different toolchain requirement (this
@@ -350,6 +356,17 @@ jobs:
           grep -q "Runix kernel: grid-sandbox-host loaded, entry point" /tmp/boot.log
           grep -q "^Hi" /tmp/boot.log
           grep -q "Runix kernel: grid-sandbox-host ran wasmi in an isolated ring 3 process" /tmp/boot.log
+          # Network stack, Phase 1 (B8): the same CITADEL-gate-then-load
+          # mechanism, this time for net-driver-host -- proves it probed the
+          # real virtio-net device (QEMU's default MAC) and got a real ARP
+          # reply back from QEMU/SLIRP through the virtqueue, all from
+          # inside a capability-gated ring 3 process with no raw port I/O
+          # privilege of its own.
+          grep -q "Runix kernel: net-driver-host authorized by CITADEL allowlist" /tmp/boot.log
+          grep -q "Runix kernel: net-driver-host loaded, entry point" /tmp/boot.log
+          grep -q "net-driver-host: virtio-net probed, MAC=52:54:00:12:34:56" /tmp/boot.log
+          grep -q "net-driver-host: ARP reply received (Phase 1 OK)" /tmp/boot.log
+          grep -q "Runix kernel: net-driver-host spawned as an isolated ring 3 process" /tmp/boot.log
           grep -q "Runix kernel: entering ring 3" /tmp/boot.log
           # Printed by user_hello() running at CPL 3, one byte per SYS_WRITE
           # syscall — proves the syscall gate's DPL actually admits a ring 3

@@ -61,6 +61,49 @@ pub fn check(token: &CapabilityToken, resource: &str, now: u64) -> Result<(), Ca
     token.verify(&demo_verifying_key(), resource, now)
 }
 
+/// The resource-string convention for port-I/O access: one capability
+/// covers a whole inclusive port range, not one token per port — matching
+/// the granularity `port_resource` already uses for IPC (one token per
+/// whole port, not per byte sent). Chosen over a per-register-purpose
+/// scheme so a device driver process needs exactly one token for its
+/// device's whole register block, with no new capability-manager mechanism
+/// (wildcard/prefix matching) required — see docs/STATUS.md's network-stack
+/// section for the reasoning.
+pub fn ioport_range_resource(base: u16, len: u16) -> String {
+    format!("ioport:{base}-{}", base + len - 1)
+}
+
+/// Parses a resource string produced by [`ioport_range_resource`] back into
+/// its `(base, end)` bounds (both inclusive). Returns `None` for anything
+/// that isn't in exactly that shape — including a token's `resource` field
+/// that was never an ioport range at all (e.g. a `port:<n>` IPC token
+/// presented to a port-I/O syscall by mistake).
+fn parse_ioport_range(resource: &str) -> Option<(u16, u16)> {
+    let rest = resource.strip_prefix("ioport:")?;
+    let (base, end) = rest.split_once('-')?;
+    Some((base.parse().ok()?, end.parse().ok()?))
+}
+
+/// Checks whether `token` is valid (signature, expiry — same checks
+/// [`check`] runs) *and* was issued for an ioport range that contains
+/// `port`. Unlike [`check`], the caller doesn't supply the expected
+/// resource string up front — it can't, since it doesn't know what range
+/// the token claims until the token itself is parsed. Instead this verifies
+/// the signature against the token's *own* `resource` field (confirming the
+/// token really was signed for whatever range it claims to cover, not a
+/// forged claim), then checks that range contains `port`.
+pub fn check_ioport_range(
+    token: &CapabilityToken,
+    port: u16,
+    now: u64,
+) -> Result<(), CapabilityError> {
+    token.verify(&demo_verifying_key(), &token.resource, now)?;
+    match parse_ioport_range(&token.resource) {
+        Some((base, end)) if base <= port && port <= end => Ok(()),
+        _ => Err(CapabilityError::WrongResource),
+    }
+}
+
 lazy_static! {
     static ref REVOCATIONS: Mutex<RevocationList> = Mutex::new(RevocationList::new());
 }
@@ -79,4 +122,14 @@ pub fn revoke(token: &CapabilityToken) {
 
 pub fn is_revoked(token: &CapabilityToken) -> bool {
     REVOCATIONS.lock().is_revoked(token)
+}
+
+/// The "look up caller's token, check not revoked, check the resource"
+/// sequence every capability-gated syscall needs — `SYS_IPC_SEND` inlines
+/// its own copy of this shape (see `syscall.rs::dispatch`); `SYS_PORT_IN`/
+/// `SYS_PORT_OUT` are the second and third callers, past the point where
+/// duplicating it a third time stopped being worth it.
+pub fn authorized_for_ioport(port: u16, now: u64) -> bool {
+    crate::scheduler::current_capability()
+        .is_some_and(|token| !is_revoked(&token) && check_ioport_range(&token, port, now).is_ok())
 }

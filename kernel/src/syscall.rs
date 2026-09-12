@@ -13,11 +13,14 @@
 use crate::ipc;
 use crate::serial_print;
 use core::arch::naked_asm;
+use x86_64::instructions::port::Port;
 
 pub const SYS_YIELD: u64 = 0;
 pub const SYS_WRITE: u64 = 1; // rdi = byte to write to serial
 pub const SYS_IPC_SEND: u64 = 2; // rdi = port, rsi = byte
 pub const SYS_IPC_RECV: u64 = 3; // rdi = port -> byte in rax, or u64::MAX if empty
+pub const SYS_PORT_IN: u64 = 4; // rdi = I/O port, rsi = width (1/2/4) -> value in rax, or u64::MAX if denied/bad width
+pub const SYS_PORT_OUT: u64 = 5; // rdi = I/O port, rsi = width (1/2/4), rdx = value -> 0 ok, u64::MAX if denied/bad width
 
 pub const VECTOR: u8 = 0x80;
 
@@ -54,7 +57,7 @@ pub unsafe extern "C" fn entry() {
     );
 }
 
-extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, _arg3: u64) -> u64 {
+extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     match num {
         SYS_YIELD => {
             crate::scheduler::yield_now();
@@ -84,6 +87,42 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, _arg3: u64) -> u64 {
             0
         }
         SYS_IPC_RECV => ipc::try_recv(arg1 as usize).map_or(u64::MAX, u64::from),
+        SYS_PORT_IN => {
+            let port = arg1 as u16;
+            let width = arg2 as u8;
+            if !crate::capabilities::authorized_for_ioport(port, crate::interrupts::ticks()) {
+                return u64::MAX;
+            }
+            // Same fail-closed convention as an unauthorized caller: a bad
+            // width is indistinguishable from "denied" to whoever called
+            // this, not a separate error a hostile caller could use to
+            // probe which check failed.
+            unsafe {
+                match width {
+                    1 => u64::from(Port::<u8>::new(port).read()),
+                    2 => u64::from(Port::<u16>::new(port).read()),
+                    4 => u64::from(Port::<u32>::new(port).read()),
+                    _ => u64::MAX,
+                }
+            }
+        }
+        SYS_PORT_OUT => {
+            let port = arg1 as u16;
+            let width = arg2 as u8;
+            let value = arg3;
+            if !crate::capabilities::authorized_for_ioport(port, crate::interrupts::ticks()) {
+                return u64::MAX;
+            }
+            unsafe {
+                match width {
+                    1 => Port::<u8>::new(port).write(value as u8),
+                    2 => Port::<u16>::new(port).write(value as u16),
+                    4 => Port::<u32>::new(port).write(value as u32),
+                    _ => return u64::MAX,
+                }
+            }
+            0
+        }
         _ => u64::MAX,
     }
 }
@@ -102,9 +141,25 @@ pub unsafe fn syscall(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         core::arch::asm!(
             "int 0x80",
             inout("rax") num => ret,
-            in("rdi") arg1,
-            in("rsi") arg2,
-            in("rdx") arg3,
+            // `inout(reg) x => _`, not `in(reg) x`, for RDI/RSI/RDX: a plain
+            // `in` operand tells the compiler what value the register holds
+            // *going in*, but not that it's clobbered afterward — leaving
+            // the compiler free to assume a value cached in one of these
+            // survives to a *later*, unrelated call. Confirmed as a real
+            // bug, not a theoretical one: `net-driver-host/src/syscall.rs`'s
+            // copy of this exact wrapper (no shared code between kernel and
+            // a separately-linked ring 3 binary — see its own doc comment)
+            // had this same gap, and two back-to-back syscalls sharing a
+            // literal argument value had the second one silently corrupted,
+            // because `entry`'s own remapping shim (below) unconditionally
+            // overwrites RDI/RSI/RDX on every trip through `int 0x80`. This
+            // kernel-side caller hasn't hit it yet only because nothing here
+            // happens to keep a cached value in one of these across two
+            // nearby calls — fixed defensively anyway, same reasoning as the
+            // RCX/R8-R11 fix below.
+            inout("rdi") arg1 => _,
+            inout("rsi") arg2 => _,
+            inout("rdx") arg3 => _,
             // `entry`'s own remapping shim above does `mov rcx, rdx` before
             // `call dispatch` — RCX is clobbered on every trip through this,
             // and `dispatch` is an ordinary SysV `extern "C"` function free

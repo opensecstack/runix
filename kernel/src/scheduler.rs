@@ -447,9 +447,24 @@ pub fn spawn_with_address_space(entry: extern "C" fn() -> !, address_space: Addr
 /// `kernel/tests/ring3_cooperative.rs` for two such threads proving they
 /// don't corrupt each other.
 pub fn spawn_ring3_process(entry: extern "C" fn() -> !, address_space: AddressSpace) {
+    spawn_ring3_process_with_capability(entry, address_space, None);
+}
+
+/// Same as [`spawn_ring3_process`], but the new thread also carries
+/// `capability` — checked by `syscall::dispatch` the same way
+/// `spawn_with_capability`'s does for `SYS_IPC_SEND`, now also consulted by
+/// `SYS_PORT_IN`/`SYS_PORT_OUT` for a ring 3 device-driver process (e.g. the
+/// network stack's virtio-net driver) that needs capability-gated port I/O
+/// without ever getting raw, ambient `in`/`out` privilege itself.
+pub fn spawn_ring3_process_with_capability(
+    entry: extern "C" fn() -> !,
+    address_space: AddressSpace,
+    capability: Option<CapabilityToken>,
+) {
     let mut thread = Thread::new(entry);
     thread.address_space = Some(address_space);
     thread.kernel_entry_stack_top = Some(alloc_kernel_entry_stack());
+    thread.capability = capability;
     push_thread(thread);
 }
 
