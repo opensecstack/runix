@@ -312,14 +312,21 @@ jobs:
         run: cargo run -- build --release
       - name: boot in QEMU and check for kernel serial output
         run: |
-          # 90s, not 20s: a legacy multi-stage BIOS boot (SeaBIOS -> this
+          # 150s, not 90: a legacy multi-stage BIOS boot (SeaBIOS -> this
           # crate's own stage 2/3/4 -> kernel ELF load) reading a
           # multi-megabyte payload has real, observed variance depending
           # on the runner's disk/CPU emulation path -- 20s was cutting it
           # close even before Phase B7 added a ~2 MB embedded binary to
-          # read.
-          timeout 90 qemu-system-x86_64 \
+          # read, and Phase B8 added a brute-force PCI config-space scan
+          # (65,536 port-I/O round trips, kernel/src/pci.rs::scan) to the
+          # main.rs boot path for the first time -- each trapped port I/O
+          # instruction has real per-trap overhead under (possibly nested)
+          # virtualization, and this run genuinely needed more than 90s to
+          # reach its final "USR" print, confirmed by the boot log ending
+          # mid-sequence at the timeout rather than failing a specific check.
+          timeout 150 qemu-system-x86_64 \
             -drive format=raw,file=target/runix-bios.img \
+            -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
             -serial stdio -display none -no-reboot -m 128M \
             | tee /tmp/boot.log || true
           grep -q "Runix kernel: boot OK" /tmp/boot.log
