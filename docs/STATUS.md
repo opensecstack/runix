@@ -927,8 +927,38 @@ exists yet (not installed/verified in this environment) — property-testing
 via `proptest` is the concrete instantiation of this commitment for now,
 not a placeholder for one; revisit if/when deeper coverage (corpus-driven
 fuzzing, not just randomized property generation) is worth the added CI
-complexity, likely once Phase 2's TCP/IP parsing exists and raises the
-stakes further.
+complexity.
+
+**Phase 2's smoltcp boundary — fuzzing the driver-stack interface, not the
+stack internals.** Phase 2a (smoltcp `Device`/`Interface` bring-up + ICMP
+echo) and Phase 2b (real TCP client via QEMU guestfwd) are now complete
+and CI-verified. The Ethernet/IP/TCP header parsing itself is handled by
+smoltcp (an independently-maintained third-party crate) — not by Runix
+code — which means forking and fuzzing smoltcp's internals is out of scope.
+What is newly covered: `net-driver-host/src/lib.rs` now has a `smoltcp_fuzz`
+property-test module (using `proptest`, the same harness as Phase 1) that
+feeds arbitrary/malformed byte sequences (0..1500 bytes, 1..8 frames per
+case) directly into a mock `smoltcp::phy::Device` wired into a real
+`smoltcp::iface::Interface`, configured identically to the actual bring-up
+in `main.rs` (static IP 10.0.2.15/24, default route 10.0.2.2, one ICMP
+socket, one TCP socket). The property is: `iface.poll()` never panics
+across many random "arbitrary bytes just arrived on the wire" inputs, and
+each property case runs across multiple poll iterations per input so
+partial TCP connection state (handshake in flight, data buffered in-flight,
+etc.) gets exercised, not just a cold single poll of empty state.
+Verified in WSL Fedora (this machine's Windows MSVC linker is currently
+unavailable — Visual Studio's build tools aren't installed, unrelated to
+this change): `cargo test --lib` passes 10/10, including
+`smoltcp_fuzz::smoltcp_never_panics_on_arbitrary_frames` at proptest's
+default 256 cases — no panic found on first run. Unlike
+`validate_rx_completion`'s property test in Phase 1, this one didn't turn
+up a live bug; that's a legitimate, expected outcome for a property test
+(it exists for regression protection going forward, not a guaranteed find
+every time it's written) and not a sign the test is too weak to be worth
+keeping. This tests the boundary Runix owns — the raw-bytes-to-smoltcp interface — which
+is narrower than "TCP parsing robustness" (that's smoltcp's own concern)
+but still load-bearing: a panic in this interface would crash the ring 3
+driver process, not corrupt it gracefully.
 
 ## Mobile L1: ARM/TrustZone boot bring-up (`kernel-arm/`)
 
