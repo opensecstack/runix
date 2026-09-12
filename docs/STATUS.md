@@ -763,24 +763,64 @@ processes to use this stack, TX/RX interrupts, MSI-X/IOAPIC, and fuzzing
 the virtqueue/frame-parsing code (required per the testing-rigor commitment
 below, scoped as a fast-follow now that Phase 1's parser actually exists).
 
-**The testing-rigor commitment for what comes next.** Everything verified
-in this kernel so far — including every fix documented above — has been a
-hand-written scenario booted in QEMU and checked against an expected
-outcome. That's been enough because nothing here has parsed a single byte
-that came from outside the machine; PCI config space, like everything
-before it, is trusted input. The virtio-net driver and the TCP/IP stack on
-top of it change that completely — Ethernet/IP/TCP headers are the first
-attacker-controlled bytes this kernel will ever touch, arriving directly
-into the same class of code (parsing fixed-layout binary structures,
-turning length fields into buffer bounds) that has caused a large fraction
-of every real-world kernel network stack's CVEs. `capability-manager`'s
-`hex::decode` over a signature field is exactly this kind of parsing too,
-and hasn't been fuzzed yet either — tracked as a "testing rigor" gap in our
-internal threat model. Fuzzing the packet-parsing code (and property-testing
-the parts of the driver/stack with real invariants, like the scheduler
-interaction once one exists) starts alongside the first parser that
-touches network bytes, not after — this section will be updated with the
-actual harness once that code exists, not left as an aspiration.
+**The testing-rigor commitment, no longer just a commitment for later.**
+Everything verified in this kernel up to Phase 1 above was a hand-written
+scenario booted in QEMU and checked against one expected outcome — enough
+while nothing here parsed a single byte from outside the machine. That
+stopped being true the moment `net-driver-host`'s `is_arp_reply` and
+`validate_rx_completion` (both `net-driver-host/src/lib.rs`) started
+inspecting bytes the emulated virtio-net *device* controls. Rather than
+defer property-testing until the real thing (arbitrary attacker bytes over
+an actual network) exists, both functions were split out of `main.rs`
+specifically so they could be property-tested on the host today —
+`#![cfg_attr(not(test), no_std)]`, the same split `capability-manager`
+already uses, so `cargo test --lib` runs real `proptest`-generated cases
+(256 per property by default) without needing the bare-metal target at
+all. Two properties actually mattered enough to write down, not just
+"doesn't crash": `is_arp_reply` must never panic regardless of buffer
+length or content, and `validate_rx_completion` must never hand back a
+buffer index at or past `buffer_count` or a length past the real
+4096-byte buffer size — the second property caught a real bug (see
+below), not a hypothetical one.
+
+**A real out-of-bounds-read bug, caught by writing the property test, not
+by code review.** The original RX poll loop in `main.rs` took `(desc_id,
+len)` straight from the device's used-ring entry and used them directly:
+`len` as a slice length, `desc_id` as a buffer index, with zero validation
+of either. Both fields come from the same "device" this driver's threat
+model already treats as untrusted (see docs/THREAT_MODEL.md) — a
+misbehaving or malicious device could report a `len` past the actual
+4096-byte buffer (an out-of-bounds slice, read directly into
+`is_arp_reply`) or a `desc_id` outside the four buffers this driver
+actually posted (an out-of-bounds array index into `rx_buffer_phys`, or a
+computed address far outside the intended RX buffer region entirely).
+Fixed by `validate_rx_completion`, called before either field is used for
+anything: a completion that fails validation is dropped outright (logged,
+not repaired or guessed at), not silently trusted.
+
+`capability-manager`'s `hex::decode` over the signature field — flagged
+unfuzzed here for a while — now has its own property-test coverage too
+(`capability-manager/src/lib.rs`'s `tests::properties` module): arbitrary
+signature strings, arbitrary resource strings, and a well-formed-but-wrong
+signature (valid hex, right length, not the real one) must all either be
+correctly rejected or, at minimum, never panic `verify()` — a reachable
+panic in signature-checking code would be a denial-of-service on the
+capability gate itself, in a `panic = "abort"` kernel (see CLAUDE.md's
+"unsafe Rust" rule) where that means killing the process outright.
+
+Both property-test suites run in CI without new infrastructure: `host`
+job's existing `cargo test --workspace` already picks up
+`capability-manager`'s (a normal workspace member), and a new `cargo test
+--lib` step covers `net-driver-host` (`--lib` only, not a bare `cargo
+test` — that crate's `#![no_std] #![no_main]` bin target has its own
+`panic_handler`, which collides with `std`'s the moment cargo tries to
+build a host test harness for it too). No `cargo-fuzz`/libFuzzer harness
+exists yet (not installed/verified in this environment) — property-testing
+via `proptest` is the concrete instantiation of this commitment for now,
+not a placeholder for one; revisit if/when deeper coverage (corpus-driven
+fuzzing, not just randomized property generation) is worth the added CI
+complexity, likely once Phase 2's TCP/IP parsing exists and raises the
+stakes further.
 
 ## Mobile L1: ARM/TrustZone boot bring-up (`kernel-arm/`)
 

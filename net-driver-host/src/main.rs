@@ -29,6 +29,7 @@ mod syscall;
 mod virtio;
 
 use linked_list_allocator::LockedHeap;
+use net_driver_host::{is_arp_reply, validate_rx_completion, VIRTIO_NET_HDR_LEN};
 use syscall::{write_all, write_byte, yield_now};
 use virtio::Virtqueue;
 
@@ -76,12 +77,6 @@ const NET_TXBUF_VA: usize = 0x_1111_7777_0000;
 const RX_QUEUE_INDEX: u16 = 0;
 const TX_QUEUE_INDEX: u16 = 1;
 const RX_BUFFER_COUNT: usize = 4;
-/// `virtio_net_hdr` with no optional features negotiated (see
-/// `VirtioNet::probe`'s doc comment: zero `GuestFeatures`) — no
-/// `num_buffers` field, since that only exists when `VIRTIO_NET_F_MRG_RXBUF`
-/// is negotiated. Every field is zero for a packet needing no
-/// offload/segmentation help, which every packet here is.
-const VIRTIO_NET_HDR_LEN: usize = 10;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -129,28 +124,37 @@ pub extern "C" fn _start() -> ! {
     let mut found = false;
     'poll: for iteration in 0..2_000_000u32 {
         if let Some((desc_id, len)) = rx_queue.poll_used() {
-            let buf = unsafe {
-                core::slice::from_raw_parts(
-                    (NET_RXBUF_VA + desc_id as usize * 4096) as *const u8,
-                    len as usize,
-                )
-            };
-            if is_arp_reply(buf) {
-                found = true;
-                break 'poll;
+            // Both fields come from the device's used-ring entry -- treated
+            // as untrusted input (see net_driver_host::validate_rx_completion's
+            // doc comment): an unchecked `len` past the real 4096-byte
+            // buffer, or an unchecked `desc_id` used directly as a buffer
+            // index/address offset, would be a real out-of-bounds read. A
+            // completion that fails this check is dropped outright, not
+            // repaired or guessed at.
+            match validate_rx_completion(desc_id, len, RX_BUFFER_COUNT) {
+                Some((index, len)) => {
+                    let buf = unsafe {
+                        core::slice::from_raw_parts(
+                            (NET_RXBUF_VA + index * 4096) as *const u8,
+                            len as usize,
+                        )
+                    };
+                    if is_arp_reply(buf) {
+                        found = true;
+                        break 'poll;
+                    }
+                    // Not what we were looking for (could be unrelated
+                    // broadcast traffic SLIRP itself generates) — repost the
+                    // same buffer and keep waiting.
+                    unsafe {
+                        rx_queue.post(index as u16, info.rx_buffer_phys[index], 4096, true);
+                    }
+                    net.notify(RX_QUEUE_INDEX);
+                }
+                None => {
+                    write_all(b"net-driver-host: WARNING ignoring out-of-range RX completion\n");
+                }
             }
-            // Not what we were looking for (could be unrelated broadcast
-            // traffic SLIRP itself generates) — repost the same buffer and
-            // keep waiting.
-            unsafe {
-                rx_queue.post(
-                    desc_id as u16,
-                    info.rx_buffer_phys[desc_id as usize],
-                    4096,
-                    true,
-                );
-            }
-            net.notify(RX_QUEUE_INDEX);
         }
         if iteration % 10_000 == 0 {
             yield_now();
@@ -241,23 +245,6 @@ fn send_arp_request(
         tx_queue.post(0, tx_buf_phys, frame_len as u32, false);
     }
     net.notify(TX_QUEUE_INDEX);
-}
-
-/// `buf` is a full RX buffer (`virtio_net_hdr` prefix + Ethernet frame).
-/// Checks Ethertype == ARP and ARP opcode == reply — the specific,
-/// falsifiable proof this phase exists to produce, not "some bytes arrived".
-fn is_arp_reply(buf: &[u8]) -> bool {
-    if buf.len() < VIRTIO_NET_HDR_LEN + 14 + 28 {
-        return false;
-    }
-    let eth = &buf[VIRTIO_NET_HDR_LEN..];
-    let ethertype = u16::from_be_bytes([eth[12], eth[13]]);
-    if ethertype != 0x0806 {
-        return false;
-    }
-    let arp = &eth[14..14 + 28];
-    let oper = u16::from_be_bytes([arp[6], arp[7]]);
-    oper == 2
 }
 
 #[panic_handler]

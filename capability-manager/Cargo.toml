@@ -28,6 +28,10 @@ sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 [dev-dependencies]
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+# Property-tests `CapabilityToken::verify`'s robustness against malformed/
+# tampered input — `hex::decode` over the signature field is flagged
+# unfuzzed in docs/THREAT_MODEL.md's testing-rigor gap.
+proptest = "1"
 
 [lib]
 name = "runix_capability_manager"

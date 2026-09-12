@@ -24,6 +24,17 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace
+      # net-driver-host isn't a workspace member (own [workspace], targets
+      # x86_64-unknown-none — see its Cargo.toml), so `cargo test --workspace`
+      # above never touches it. `--lib` only, not a bare `cargo test`: the
+      # crate also has a `#![no_std] #![no_main]` bin target (main.rs) whose
+      # own panic_handler conflicts with std's when cargo tries to build a
+      # host test harness for it too (E0152, duplicate `panic_impl`) — `--lib`
+      # runs exactly the property tests in lib.rs (is_arp_reply,
+      # validate_rx_completion) and nothing else.
+      - name: test net-driver-host (host-side property tests)
+        working-directory: net-driver-host
+        run: cargo test --lib
 
   # Freestanding x86_64-unknown-none build. Needs nightly from Phase 2
   # onward: exception handlers use `extern "x86-interrupt"`, which is still

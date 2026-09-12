@@ -264,4 +264,62 @@ mod tests {
         assert!(revocations.is_revoked(&token_a));
         assert!(!revocations.is_revoked(&token_b));
     }
+
+    // Property tests, not just hand-picked examples above: `verify()` parses
+    // a `signature` field that, for a real capability-gated syscall (see
+    // kernel/src/syscall.rs), can arrive from anywhere a token is presented
+    // — the `hex::decode` call in particular is exactly the class of
+    // parsing flagged unfuzzed in docs/THREAT_MODEL.md's testing-rigor gap.
+    // The property that actually matters: no byte pattern in `signature`,
+    // however malformed, may panic `verify()` — a reachable panic in
+    // signature-checking code would be a denial-of-service on the
+    // capability gate itself, in a `panic = "abort"` kernel (see
+    // CLAUDE.md's "unsafe Rust" rule) where that means killing the process.
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn verify_never_panics_on_arbitrary_signature_field(
+                signature in ".{0,300}",
+                resource in ".{0,50}",
+                now in any::<u64>(),
+            ) {
+                let (signing_key, verifying_key) = keypair();
+                let mut token = CapabilityToken::issue(
+                    "subject", "resource", 0, 100, "key:1", &signing_key,
+                );
+                token.signature = signature;
+                let _ = token.verify(&verifying_key, &resource, now);
+            }
+
+            #[test]
+            fn verify_rejects_any_signature_that_isnt_the_real_one(
+                fake_hex in "[0-9a-f]{128}",
+            ) {
+                let (signing_key, verifying_key) = keypair();
+                let mut token = CapabilityToken::issue(
+                    "subject", "res:disk0", 0, 100, "key:1", &signing_key,
+                );
+                // Overwrite with a well-formed (valid hex, right length) but
+                // essentially-certainly-wrong signature — must still be
+                // rejected, not accepted because it merely decodes cleanly.
+                token.signature = fake_hex;
+                prop_assert!(token.verify(&verifying_key, "res:disk0", 50).is_err());
+            }
+
+            #[test]
+            fn verify_never_panics_on_arbitrary_resource_string(
+                resource in ".{0,300}",
+                checked_resource in ".{0,300}",
+            ) {
+                let (signing_key, verifying_key) = keypair();
+                let token = CapabilityToken::issue(
+                    "subject", resource, 0, 100, "key:1", &signing_key,
+                );
+                let _ = token.verify(&verifying_key, &checked_resource, 50);
+            }
+        }
+    }
 }
