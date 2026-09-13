@@ -35,6 +35,13 @@ jobs:
       - name: test net-driver-host (host-side property tests)
         working-directory: net-driver-host
         run: cargo test --lib
+      # Same reasoning as net-driver-host above, for blk-driver-host's
+      # FAT32 parser (BootSectorInfo::parse/parse_short_dir_entry/
+      # fat_entry_at) — `--lib` only, same E0152 duplicate-`panic_impl`
+      # reason `main.rs`'s bin target can't share a host test harness.
+      - name: test blk-driver-host (host-side property tests)
+        working-directory: blk-driver-host
+        run: cargo test --lib
 
   # Freestanding x86_64-unknown-none build. Needs nightly from Phase 2
   # onward: exception handlers use `extern "x86-interrupt"`, which is still
