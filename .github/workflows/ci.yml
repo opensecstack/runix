@@ -392,7 +392,7 @@ jobs:
           # CITADEL (B6): demo call proves the allowlist gate itself works
           # — a module signed for its exact bytes is accepted, tampered
           # bytes are refused.
-          grep -q "Runix kernel: CITADEL boot authorization OK (Phase B6: authorized=Ok(())" /tmp/boot.log
+          grep -q "Runix kernel: CITADEL boot authorization OK (Phase B6: authorized=Ok(T2Trusted)" /tmp/boot.log
           # CITADEL (B7): the same gate, now actually deciding whether a
           # real binary (grid-sandbox-host) gets loaded and run at all —
           # authorized, then parsed/loaded/run as an isolated ring 3
