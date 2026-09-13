@@ -60,13 +60,23 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 /// that binary has no privilege to map its own memory (ring 3 code can't
 /// touch page tables at all), so whoever loads it has to set this up.
 const PAYLOAD_HEAP_START: u64 = 0x_2222_2222_0000;
-const PAYLOAD_HEAP_SIZE: u64 = 256 * 1024;
+/// 8 MiB, not 256 KiB — see `grid-sandbox-host/src/main.rs`'s own
+/// `HEAP_SIZE` doc comment: the boot-level tier-correctness probe below
+/// needs this process's real allocator to back a real `memory.grow`, not
+/// just a limiter that abstractly permits it.
+const PAYLOAD_HEAP_SIZE: u64 = 8 * 1024 * 1024;
 const PAYLOAD_STACK_VA: u64 = 0x_2222_3333_0000;
 const PAYLOAD_STACK_SIZE: u64 = 4096 * 4;
 /// Must match `kernel/src/main.rs`'s own `GRID_INFO_VA` — this test doesn't
 /// import that private const, so it's redefined here, same as
 /// `PAYLOAD_HEAP_START` etc. above already mirror `main.rs`'s constants.
 const GRID_INFO_VA: u64 = 0x_2222_4444_0000;
+/// Must match `kernel/src/main.rs`'s own `GRID_GROW_RESULT_OFFSET` and
+/// `grid-sandbox-host/src/main.rs`'s own constants of the same names —
+/// same "kernel writes the request, ring-3 process writes the result"
+/// convention `net_driver_icmp.rs` already uses for `NET_RESULT_OFFSET`.
+const GRID_GROW_RESULT_OFFSET: usize = 128;
+const GRID_GROW_RESULT_FAILED: u8 = 2;
 
 /// Mirrors `kernel/src/main.rs`'s own `GridBootInfo` — `repr(C)`, same field
 /// order, agreed ABI convention only (see that struct's doc comment).
@@ -192,6 +202,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             GridBootInfo { tier: 1 },
         );
     }
+    // Same pointer-into-the-shared-page trick `net_driver_icmp.rs` uses for
+    // `NetBootInfo`'s result byte — reachable via the physical-memory-offset
+    // mapping regardless of which `Cr3` is active.
+    let grow_result_ptr = unsafe { info_content.as_mut_ptr().add(GRID_GROW_RESULT_OFFSET) };
 
     #[allow(static_mut_refs)]
     unsafe {
@@ -199,16 +213,37 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     scheduler::spawn_ring3_process(kernel_trampoline, space);
 
-    // The payload writes 'H', 'i', then yields forever — a handful of
-    // round trips is plenty; a fault or corruption aborts immediately
-    // regardless, from the payload's own panic handler or a kernel fault.
+    // The payload writes 'H', 'i', runs the tier-correctness grow probe,
+    // then yields forever — a handful of round trips is plenty; a fault or
+    // corruption aborts immediately regardless, from the payload's own
+    // panic handler or a kernel fault.
+    let mut grow_result = 0u8;
     for _ in 0..20 {
         scheduler::yield_now();
+        grow_result = unsafe { core::ptr::read_volatile(grow_result_ptr) };
+        if grow_result != 0 {
+            break;
+        }
+    }
+
+    // This tier (T2Trusted, 64-page/4 MiB cap) must reject the same
+    // 70-page growth request `grid_sandbox_tier_t1.rs` proves T1Critical
+    // allows — see `grid-sandbox-host`'s `GROW_PROBE_DELTA_PAGES` doc
+    // comment for why this one request size distinguishes all three tiers.
+    if grow_result != GRID_GROW_RESULT_FAILED {
+        serial_println!(
+            "grid_sandbox_wasm: FAIL — expected the T2Trusted-tier grow probe to fail \
+             (byte {}), got {}",
+            GRID_GROW_RESULT_FAILED,
+            grow_result
+        );
+        exit_qemu(QemuExitCode::Failed);
     }
 
     serial_println!(
         "grid_sandbox_wasm: PASS — a real compiled binary ran wasmi in an isolated ring 3 \
-         process and called back through the syscall gate"
+         process, called back through the syscall gate, and its T2Trusted tier correctly \
+         rejected a real memory.grow past its 4 MiB ceiling"
     );
     exit_qemu(QemuExitCode::Success);
 }

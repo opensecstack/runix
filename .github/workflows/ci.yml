@@ -151,6 +151,8 @@ jobs:
           cargo test --target x86_64-unknown-none --test scheduler_address_space
           cargo test --target x86_64-unknown-none --test ring3_cooperative
           cargo test --target x86_64-unknown-none --test grid_sandbox_wasm
+          cargo test --target x86_64-unknown-none --test grid_sandbox_tier_t1
+          cargo test --target x86_64-unknown-none --test grid_sandbox_tier_t3
           cargo test --target x86_64-unknown-none --test citadel_demo
           cargo test --target x86_64-unknown-none --test net_driver_icmp
       # Phase 2b's real TCP client proof -- SLIRP has no built-in TCP

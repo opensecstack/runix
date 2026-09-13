@@ -86,6 +86,14 @@ name = "grid_sandbox_wasm"
 harness = false
 
 [[test]]
+name = "grid_sandbox_tier_t1"
+harness = false
+
+[[test]]
+name = "grid_sandbox_tier_t3"
+harness = false
+
+[[test]]
 name = "citadel_demo"
 harness = false
 

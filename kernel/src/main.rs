@@ -39,13 +39,30 @@ static GRID_SANDBOX_HOST_ELF: &[u8] =
 /// table, entirely separate from `user_hello`'s (mapped directly into the
 /// boot thread's own address space, not a fresh `AddressSpace`).
 const GRID_SANDBOX_HEAP_START: u64 = 0x_2222_2222_0000;
-const GRID_SANDBOX_HEAP_SIZE: u64 = 256 * 1024;
+/// Must match `grid-sandbox-host/src/main.rs`'s own `HEAP_SIZE` exactly --
+/// see that constant's doc comment for why it's 8 MiB, not the original
+/// 256 KiB: a real `T1Critical`-tier `memory.grow` (the boot-level
+/// tier-correctness probe, see `GridBootInfo`'s doc comment below) needs
+/// this process's actual allocator to back the growth it permits, not just
+/// a limiter that abstractly says "allowed".
+const GRID_SANDBOX_HEAP_SIZE: u64 = 8 * 1024 * 1024;
 const GRID_SANDBOX_STACK_VA: u64 = 0x_2222_3333_0000;
 const GRID_SANDBOX_STACK_SIZE: u64 = 4096 * 4;
 /// The one page `grid-sandbox-host` reads at startup to learn its CITADEL-
 /// assigned sandbox tier -- same `0x_2222_...` VA family as the heap/stack
 /// constants above. See [`GridBootInfo`]'s doc comment for the ABI contract.
 const GRID_INFO_VA: u64 = 0x_2222_4444_0000;
+/// Offset into the `GRID_INFO_VA` page `grid-sandbox-host` writes its own
+/// boot-level tier-correctness result to (whether a real `memory.grow`
+/// sized to succeed only under `T1Critical` actually did) -- same
+/// convention `net-driver-host`'s `NET_RESULT_OFFSET` already established
+/// (kernel writes the request into the page, the ring-3 process writes its
+/// result back into the same page). Only read by
+/// `kernel/tests/grid_sandbox_wasm.rs`/`grid_sandbox_tier_t1.rs`/`_t3.rs`
+/// -- the real boot path never checks it, same as `NET_RESULT_OFFSET`
+/// isn't checked outside `net_driver_icmp.rs`.
+#[allow(dead_code)]
+const GRID_GROW_RESULT_OFFSET: usize = 128;
 
 /// The tier byte `grid-sandbox-host` reads at [`GRID_INFO_VA`] to select its
 /// `wasm-runtime` resource limits. Not a shared type with

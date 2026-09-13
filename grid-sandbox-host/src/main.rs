@@ -44,12 +44,17 @@ use runix_wasm_runtime::{SandboxLimits, WasmRuntime};
 /// here and the kernel's `0x4444` heap coexist in entirely separate
 /// address spaces regardless.
 pub const HEAP_START: usize = 0x_2222_2222_0000;
-/// Generous for one tiny embedded module — `wasmi`'s engine, module, and
-/// store all live here alongside the module's own linear memory. No
-/// principled sizing yet, same as the kernel's own heap wasn't either
-/// until something real needed more (see `allocator::HEAP_SIZE`'s history
-/// in the README).
-pub const HEAP_SIZE: usize = 256 * 1024;
+/// 8 MiB — bumped from the original 256 KiB specifically so a real
+/// `T1Critical`-tier `memory.grow` (up to ~4.375 MiB, see `GROW_PROBE_WASM`
+/// below) can actually be satisfied by this process's own allocator, not
+/// just permitted in the abstract by `SandboxLimits`' limiter check. A
+/// `wasmi::Store::limiter` saying "yes" to a growth request that this
+/// heap can't actually back would fail for an unrelated reason (real
+/// allocator exhaustion), which would make the tier-correctness boot
+/// tests (`kernel/tests/grid_sandbox_tier_t1.rs`) meaningless — this size
+/// isn't tuned any further than "comfortably above what that one proof
+/// needs plus `wasmi` engine/module/store overhead".
+pub const HEAP_SIZE: usize = 8 * 1024 * 1024;
 
 /// One fixed page `kernel/src/main.rs` (`load_and_run_grid_sandbox_host`)
 /// and `kernel/tests/grid_sandbox_wasm.rs` both write before spawning this
@@ -61,6 +66,21 @@ pub const HEAP_SIZE: usize = 256 * 1024;
 /// crate has zero `citadel-integration` dependency and adding one just for
 /// a 3-value tag isn't worth the coupling.
 const GRID_INFO_VA: usize = 0x_2222_4444_0000;
+
+/// Offset into the `GRID_INFO_VA` page this process writes its own
+/// boot-level tier-correctness result to — same "kernel writes the
+/// request, ring-3 process writes the result, both in one shared page"
+/// convention `NetBootInfo`/`NET_RESULT_OFFSET` already established.
+/// Matches `NET_RESULT_OFFSET`'s own offset (128) since the two pages are
+/// never both mapped into the same process, so there's no collision to
+/// avoid. `0` (the page's own zero-fill from the loader) means "not yet
+/// run" — deliberately distinct from every real outcome below, so a test
+/// that reads this before the probe actually runs can't mistake "never
+/// wrote" for a specific result.
+const GRID_GROW_RESULT_OFFSET: usize = 128;
+const GRID_GROW_RESULT_SUCCEEDED: u8 = 1;
+const GRID_GROW_RESULT_FAILED: u8 = 2;
+const GRID_GROW_RESULT_ERROR: u8 = 3;
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
@@ -142,6 +162,23 @@ fn yield_now() {
 /// hand-encoded byte array.
 static HELLO_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.wasm"));
 
+/// Compiled from `src/grow_probe.wat` — see that file's doc comment for
+/// what it proves: whether this live process's tier-selected
+/// `SandboxLimits` actually changes what a real `memory.grow` can do, not
+/// just whether the limiter *object* is configured differently.
+static GROW_PROBE_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/grow_probe.wasm"));
+
+/// Requests growing `GROW_PROBE_WASM`'s memory by this many pages (64 KiB
+/// each) on top of its declared starting 1 page — chosen so all three
+/// tiers give a genuinely different, meaningful outcome at this one
+/// request size: `SandboxLimits::t1_critical()`'s 128-page cap allows the
+/// resulting 70 pages through; `t2_trusted()`'s 64-page cap and
+/// `t3_untrusted()`'s 8-page cap both reject it. Exact numeric boundaries
+/// are already precisely pinned down at the host level by
+/// `wasm-runtime/tests/tier_isolation.rs`; this constant only needs to
+/// land on the T1-vs-{T2,T3} side of that line, not re-derive it.
+const GROW_PROBE_DELTA_PAGES: i32 = 69;
+
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     unsafe {
@@ -170,6 +207,27 @@ pub extern "C" fn _start() -> ! {
         // channel this slice has. A real one needs a syscall bridge with
         // more than one byte of bandwidth, not built yet.
         Err(_) => write_byte(b'!'),
+    }
+
+    // Boot-level tier-correctness proof: the same tier-selected `runtime`
+    // (so this is exercising the exact limits this live process was
+    // actually constructed with, not a fresh one) attempts a real
+    // `memory.grow` sized to succeed only under T1Critical -- see
+    // `GROW_PROBE_DELTA_PAGES`'s doc comment. Written to the shared
+    // `GridBootInfo` page, not just a serial byte, so
+    // `kernel/tests/grid_sandbox_tier_t1.rs`/`_t3.rs`/`grid_sandbox_wasm.rs`
+    // can assert a real result code rather than grepping text.
+    let grow_result_byte =
+        match runtime.call_i32_to_i32(GROW_PROBE_WASM, "try_grow", GROW_PROBE_DELTA_PAGES) {
+            Ok(n) if n >= 0 => GRID_GROW_RESULT_SUCCEEDED,
+            Ok(_) => GRID_GROW_RESULT_FAILED,
+            Err(_) => GRID_GROW_RESULT_ERROR,
+        };
+    unsafe {
+        core::ptr::write_volatile(
+            (GRID_INFO_VA + GRID_GROW_RESULT_OFFSET) as *mut u8,
+            grow_result_byte,
+        );
     }
 
     loop {

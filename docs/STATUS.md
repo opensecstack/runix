@@ -198,6 +198,47 @@ confirmed it still passes, producing the same `"Hi"` output as before,
 proving T2's limits are generous enough not to regress the one real
 workload that exists today.
 
+**Boot-verified for all three tiers, not just T2 — the gap
+`tier_isolation.rs` alone couldn't close.** That test proves the *limiter
+logic* is tier-differentiated, but runs on the host, backed by however
+much memory the dev/CI machine happens to have — it can't prove a real
+ring-3 `grid-sandbox-host` process, with its own tiny private heap, can
+actually satisfy a permitted growth request, only that the limiter object
+says yes in the abstract. Two new kernel tests
+(`kernel/tests/grid_sandbox_tier_t1.rs`/`_t3.rs`) boot the same real
+`grid-sandbox-host` binary at `T1Critical`/`T3Untrusted` instead of the
+real boot path's `T2Trusted`, and a new embedded probe module
+(`grid-sandbox-host/src/grow_probe.wat`, compiled by `build.rs` alongside
+the existing `hello.wat`) requests growing its own linear memory by 69
+pages (→ 70 total, ~4.375 MiB) — a size chosen so all three tiers give a
+genuinely different, meaningful outcome: allowed under `t1_critical()`'s
+128-page/8 MiB cap, rejected under `t2_trusted()`'s 64-page and
+`t3_untrusted()`'s 8-page caps. The result (grow succeeded / failed /
+errored) is written back into the same `GridBootInfo` page at a second,
+new offset (`GRID_GROW_RESULT_OFFSET`, matching `NET_RESULT_OFFSET`'s own
+convention — `0` means "not yet run", never mistaken for a real outcome),
+so all three tests assert a real result *code*, not grepped serial text.
+Confirmed: `grid_sandbox_tier_t1` shows the grow succeeding,
+`grid_sandbox_tier_t3` and the updated `grid_sandbox_wasm` (T2) both show
+it failing — the same real memory.grow request, three real ring-3 boots,
+three tier-correct outcomes.
+
+This surfaced a real, load-bearing constraint that had to be designed
+around, not just tested past: `grid-sandbox-host`'s original 256 KiB heap
+backs *everything* in that process — the `wasmi` engine, module, store,
+**and** any real linear-memory growth a module actually performs. A
+limiter permitting T1's ~4.375 MiB growth request means nothing if the
+process's own allocator can't back that many real bytes — that's a
+different failure (real allocator exhaustion) than the tier mechanism
+being wrong, and would have made the T1 boot test meaningless (or
+flaky/crash-prone) if left unaddressed. `HEAP_SIZE` (both
+`grid-sandbox-host/src/main.rs` and `kernel/src/main.rs`'s
+`GRID_SANDBOX_HEAP_SIZE`, which must match it) was bumped to 8 MiB
+specifically to make that real allocation succeed, with slack for
+`wasmi`'s own overhead — not tuned any further than that, same "arbitrary
+initial default, not tuned against a real workload" honesty as
+`SandboxLimits`' own numbers.
+
 What this doesn't claim: no live MARSHAL Gate evaluation exists (still
 SDK-blocked, and not attempted here); T3's "evidence-gated" tier is
 approximated purely by resource strictness, not real VIGIL/WORM evidence
