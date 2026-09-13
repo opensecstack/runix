@@ -6,10 +6,10 @@
 //! sector, read it back, check the exact bytes. Phase 2 builds a read-only
 //! FAT32 walk on top of that transport (`lib.rs`'s pure, property-tested
 //! parser — see that file's doc comment for the testing-rigor reasoning):
-//! locate one file by its 8.3 name in the root directory, walk its cluster
-//! chain, read its exact contents. Neither phase writes to the filesystem,
-//! and Phase 2 never touches subdirectories or long filenames — see
-//! `lib.rs`'s doc comment for the full scope statement.
+//! locate one file by its 8.3 or long (VFAT LFN) name in the root
+//! directory or one level of subdirectory, walk its cluster chain, read
+//! its exact contents. No writes anywhere in this crate — see `lib.rs`'s
+//! doc comment for the full scope statement.
 //!
 //! This process never gets raw port-I/O privilege itself — every register
 //! access goes through the capability-gated `SYS_PORT_IN`/`SYS_PORT_OUT`
@@ -30,7 +30,10 @@
 mod syscall;
 mod virtio;
 
-use blk_driver_host::{fat_entry_at, is_end_of_chain, parse_short_dir_entry, BootSectorInfo};
+use blk_driver_host::{
+    fat_entry_at, is_end_of_chain, parse_lfn_fragment, parse_short_dir_entry, short_name_checksum,
+    BootSectorInfo,
+};
 use linked_list_allocator::LockedHeap;
 use syscall::{write_all, write_byte, yield_now};
 use virtio::{VirtioBlk, Virtqueue};
@@ -172,6 +175,31 @@ const BIG_FILE_NAME: [u8; 11] = *b"BIG     TXT";
 const BIG_FILE_LEN: usize = 3000;
 fn expected_big_file_byte(i: usize) -> u8 {
     b'0' + (i % 10) as u8
+}
+
+/// Filesystem driver, Phase 4: long filenames. `long-filename-test.txt`
+/// (22 ASCII characters) doesn't fit 8.3, so `make_fat32_image.sh`'s
+/// `mcopy` wrote it as real VFAT LFN entries plus a short-name fallback
+/// (`LONG-F~1.TXT`) — this driver locates it by its *real* name, not the
+/// fallback. ASCII-only matching, named as this slice's explicit limit
+/// (see `find_entry_by_long_name`'s own doc comment for why that's
+/// enough for now).
+const LONG_FILE_NAME_ASCII: &[u8] = b"long-filename-test.txt";
+const LONG_FILE_EXPECTED_CONTENTS: &[u8] =
+    b"RUNIX-FAT32-PROOF: located via a real long filename, not 8.3.\n";
+
+/// Filesystem driver, Phase 5: a first real write. Deliberately the
+/// smallest write that means anything: `WRITE.TXT` is exactly 512 bytes
+/// (one sector, one cluster on this fixture), so overwriting its content
+/// needs zero free-cluster allocation, zero FAT chain modification, zero
+/// directory-entry size-field update, and zero partial-sector
+/// read-modify-write — each of those is a distinct way a bug could
+/// actually corrupt a real filesystem, and each is explicitly the next
+/// slice after this one, not attempted here (see `run_write_proof`'s own
+/// doc comment).
+const WRITE_FILE_NAME: [u8; 11] = *b"WRITE   TXT";
+fn write_pattern_byte(i: usize) -> u8 {
+    b'Z' - (i % 26) as u8
 }
 
 /// A single request's worth of scratch state plus the virtqueue it posts
@@ -405,8 +433,10 @@ fn run_fat32_proof(dev: &mut BlkDevice) -> bool {
 
     let subdir_pass = run_subdir_proof(dev, &info);
     let big_file_pass = run_big_file_proof(dev, &info);
+    let long_name_pass = run_long_name_proof(dev, &info);
+    let write_pass = run_write_proof(dev, &info);
 
-    let pass = contents_match && subdir_pass && big_file_pass;
+    let pass = contents_match && subdir_pass && big_file_pass && long_name_pass && write_pass;
     if pass {
         write_all(b"blk-driver-host: FAT32 file located and read correctly (Phase 2 PASS)\n");
     } else {
@@ -471,6 +501,206 @@ fn run_big_file_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
     write_byte(if matches { b'1' } else { b'0' });
     write_byte(b'\n');
     matches
+}
+
+/// Locates `long-filename-test.txt` by its real name (not the `LONG-F~1.TXT`
+/// short-name fallback `mkfs.fat` also wrote) and reads it back.
+fn run_long_name_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
+    let Some(entry) = find_entry_by_long_name(dev, info, info.root_cluster, LONG_FILE_NAME_ASCII)
+    else {
+        write_all(
+            b"blk-driver-host: FAT32 FAIL - long-filename-test.txt not found by its real name\n",
+        );
+        return false;
+    };
+
+    let mut buf = [0u8; MAX_FILE_BYTES];
+    let written = read_file_contents(dev, info, &entry, &mut buf);
+    let matches = written >= LONG_FILE_EXPECTED_CONTENTS.len()
+        && &buf[..LONG_FILE_EXPECTED_CONTENTS.len()] == LONG_FILE_EXPECTED_CONTENTS;
+
+    write_all(b"blk-driver-host: FAT32 long_name_bytes_read=");
+    write_decimal(written as u64);
+    write_all(b" contents_match=");
+    write_byte(if matches { b'1' } else { b'0' });
+    write_byte(b'\n');
+    matches
+}
+
+/// Locates `WRITE.TXT`, overwrites its one sector with a fixed pattern
+/// (`write_pattern_byte`), and reads that same sector back via a *fresh*
+/// `dev.read_sector` call — not a cached buffer; `read_sector` always
+/// re-issues a real virtio-blk request, so this is a genuine round trip
+/// through the device emulation, the same rigor Phase 1's own sector
+/// round-trip already established, just at a FAT32-located sector instead
+/// of a hardcoded one.
+///
+/// Deliberately does **not** assert anything about the file's *prior*
+/// content — only "write X, read back X" — so this stays correct and
+/// idempotent even run twice against the same fixture image without
+/// regenerating it (a second run's "prior content" would already be `X`
+/// from the first run, which is fine, not a failure condition worth
+/// encoding).
+///
+/// What this does **not** attempt, on purpose: this fixture file is
+/// exactly one cluster, so there is exactly one sector to locate and
+/// overwrite — a general write path would need to walk the *whole* chain
+/// the way `read_file_contents` does for a multi-cluster file. Also out
+/// of scope here: growing or shrinking the file (free-cluster allocation,
+/// FAT chain extension/truncation), updating the directory entry's size
+/// field, creating or deleting entries, and read-modify-write for a
+/// partial (non-sector-aligned) final sector. Each is a distinct way a
+/// bug could actually corrupt a real filesystem rather than just fail a
+/// read — each is the next real slice, not this one.
+fn run_write_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
+    let Some(entry) = find_entry_in_directory(dev, info, info.root_cluster, &WRITE_FILE_NAME)
+    else {
+        write_all(b"blk-driver-host: FAT32 FAIL - WRITE.TXT not found in root directory\n");
+        return false;
+    };
+    let Some(sector) = info.cluster_to_sector(entry.first_cluster) else {
+        write_all(
+            b"blk-driver-host: FAT32 FAIL - WRITE.TXT's cluster did not resolve to a sector\n",
+        );
+        return false;
+    };
+
+    let mut new_content = [0u8; SECTOR_SIZE];
+    for (i, byte) in new_content.iter_mut().enumerate() {
+        *byte = write_pattern_byte(i);
+    }
+
+    let (write_completed, write_status) = dev.write_sector(u64::from(sector), &new_content);
+    let read_back = dev.read_sector(u64::from(sector));
+    let matches = read_back == Some(new_content);
+
+    write_all(b"blk-driver-host: FAT32 write completed=");
+    write_byte(if write_completed { b'1' } else { b'0' });
+    write_all(b" status=");
+    write_decimal(write_status as u64);
+    write_all(b" read_back_matches=");
+    write_byte(if matches { b'1' } else { b'0' });
+    write_byte(b'\n');
+
+    let pass = write_completed && write_status == VIRTIO_BLK_S_OK && matches;
+    if pass {
+        write_all(b"blk-driver-host: FAT32 write proof OK (Phase 5 PASS)\n");
+    } else {
+        write_all(b"blk-driver-host: FAT32 write proof FAILED (Phase 5 FAIL)\n");
+    }
+    pass
+}
+
+/// Maximum LFN fragments this driver reconstructs across — 5 fragments *
+/// 13 UTF-16 code units = 65, comfortably past `long-filename-test.txt`'s
+/// 22 characters. A name needing more than this is treated as "not
+/// matched" (fail closed), not a buffer overrun — see the bounds check on
+/// `idx` below.
+const MAX_LFN_FRAGMENTS: usize = 5;
+
+/// Same scan shape as [`find_entry_in_directory`], but matching a real
+/// long name instead of an 8.3 short one — walks 32-byte entries,
+/// accumulating consecutive LFN fragments (in whatever order they arrive;
+/// they're stored highest-sequence-first, so fragments are collected into
+/// a fixed array indexed by `sequence - 1` and read back out in ascending
+/// order once complete) until hitting the short entry they describe.
+/// Fragments are only trusted if every sequence `1..=is_last.sequence` was
+/// actually seen *and* the short entry's own checksum
+/// ([`short_name_checksum`]) matches what every fragment claimed — an
+/// incomplete or orphaned run (e.g. left behind by a deletion that only
+/// removed the short entry) is never silently accepted.
+///
+/// ASCII-only comparison: `target_ascii` is zero-extended to `u16` and
+/// compared directly against the reconstructed UTF-16, which is correct
+/// for any real ASCII name (this driver's whole fixture set) but not a
+/// general Unicode-aware match — real LFN names can hold any UTF-16, this
+/// slice only ever needs to *find* one it already knows the ASCII spelling
+/// of.
+fn find_entry_by_long_name(
+    dev: &mut BlkDevice,
+    info: &BootSectorInfo,
+    dir_cluster: u32,
+    target_ascii: &[u8],
+) -> Option<blk_driver_host::ShortDirEntry> {
+    let mut cluster = dir_cluster;
+    let mut fragments = [[0u16; 13]; MAX_LFN_FRAGMENTS];
+    let mut have = [false; MAX_LFN_FRAGMENTS];
+    let mut pending_checksum: Option<u8> = None;
+    let mut fragment_count = 0usize;
+
+    for _ in 0..1024u32 {
+        let sector0 = info.cluster_to_sector(cluster)?;
+        for s in 0..u32::from(info.sectors_per_cluster) {
+            let sector = dev.read_sector(u64::from(sector0) + u64::from(s))?;
+            for chunk in sector.chunks_exact(32) {
+                if chunk[0] == 0x00 {
+                    return None; // end of directory
+                }
+                let entry_bytes: [u8; 32] = chunk.try_into().unwrap();
+
+                if let Some(fragment) = parse_lfn_fragment(&entry_bytes) {
+                    let idx = (fragment.sequence - 1) as usize;
+                    if idx < MAX_LFN_FRAGMENTS {
+                        fragments[idx] = fragment.chars;
+                        have[idx] = true;
+                        if fragment.is_last {
+                            fragment_count = fragment.sequence as usize;
+                            pending_checksum = Some(fragment.checksum);
+                        }
+                    }
+                    continue;
+                }
+
+                if let Some(entry) = parse_short_dir_entry(&entry_bytes) {
+                    if let Some(expected_checksum) = pending_checksum {
+                        let complete = fragment_count > 0 && (0..fragment_count).all(|i| have[i]);
+                        let checksum_ok = expected_checksum == short_name_checksum(&entry.name);
+                        if complete
+                            && checksum_ok
+                            && long_name_matches(&fragments[..fragment_count], target_ascii)
+                        {
+                            return Some(entry);
+                        }
+                    }
+                }
+                // A short entry (matched or not) always ends whatever LFN
+                // run preceded it -- reset for the next one.
+                pending_checksum = None;
+                fragment_count = 0;
+                have = [false; MAX_LFN_FRAGMENTS];
+            }
+        }
+        let next = next_cluster_in_chain(dev, info, cluster)?;
+        if is_end_of_chain(next) {
+            return None;
+        }
+        cluster = next;
+    }
+    None
+}
+
+/// Reconstructs the UTF-16 name from `fragments` (ascending sequence
+/// order — index 0 is sequence 1, the *start* of the name) and compares
+/// it against `target_ascii`, zero-extended to `u16`. Stops at the first
+/// `0x0000` terminator, same as the spec requires readers to.
+fn long_name_matches(fragments: &[[u16; 13]], target_ascii: &[u8]) -> bool {
+    let mut target = target_ascii.iter();
+    for fragment in fragments {
+        for &c in fragment {
+            if c == 0x0000 {
+                return target.next().is_none();
+            }
+            match target.next() {
+                Some(&expected) if c == u16::from(expected) => continue,
+                _ => return false,
+            }
+        }
+    }
+    // Ran out of fragments without hitting a terminator -- only a match if
+    // the target was also fully consumed (an exact multiple-of-13-chars
+    // name with no trailing NUL fragment, which this fixture never
+    // produces, but correctness shouldn't depend on that).
+    target.next().is_none()
 }
 
 /// Fixed-size read buffer -- no `alloc` linked in this crate (see

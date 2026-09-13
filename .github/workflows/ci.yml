@@ -198,6 +198,24 @@ jobs:
         run: |
           RUNIX_BLK_IMG="$(pwd)/target/runix-fat32-test.img" \
             cargo test --target x86_64-unknown-none --test blk_fat32_read
+      # Filesystem driver, Phase 5's own write proof runs as part of the
+      # test above (folded into the same `attempt_fat32` boot mode, same
+      # judgment call Phase 3/4 made for subdirectories/multi-cluster/long
+      # filenames) -- this step is an *independent* confirmation the write
+      # actually landed on the real disk image, not just trusting
+      # blk-driver-host's own self-report (the same "don't just trust the
+      # thing under test to grade itself" instinct that made this fixture
+      # real `mkfs.fat` output in the first place). `mtype`'s output must
+      # be the `write_pattern_byte` pattern (`b'Z' - (i % 26)`), not the
+      # fixture's original `b'A' + (i % 26)` content.
+      - name: verify WRITE.TXT was actually overwritten on disk
+        working-directory: kernel
+        run: |
+          actual="$(mtype -i target/runix-fat32-test.img ::WRITE.TXT | head -c 5)"
+          if [ "$actual" != "ZYXWV" ]; then
+            echo "expected WRITE.TXT to start with ZYXWV after blk_fat32_read's write proof, got: $actual" >&2
+            exit 1
+          fi
       # Filesystem driver, Phase 3 -- the real IPC/capability-scoping proof
       # (see docs/STATUS.md's filesystem-driver narrative): a second
       # process asks blk-driver-host for a file over capability-gated

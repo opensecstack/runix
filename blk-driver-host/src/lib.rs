@@ -14,12 +14,12 @@
 //! an out-of-bounds read here, the same property `validate_rx_completion`
 //! exists to prove for virtio-net's device-reported fields.
 //!
-//! Scope: read-only FAT32, 8.3 short names only (no LFN reconstruction —
-//! an LFN entry is recognized and skipped, never misread as a short
-//! entry, but this driver never assembles a long name from one), no
-//! subdirectory traversal (the caller only ever walks the root directory's
-//! own entries). See `docs/STATUS.md`'s filesystem-driver section for the
-//! full scope statement.
+//! Scope: read-only FAT32. Short (8.3) and long (VFAT LFN, ASCII-only
+//! matching) names are both supported; one level of subdirectory
+//! traversal is proven (`kernel/tests/blk_fat32_read.rs`'s `SUBDIR` case).
+//! No writes anywhere in this crate. See `docs/STATUS.md`'s
+//! filesystem-driver section for the full scope statement and what's
+//! still deferred.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -166,8 +166,8 @@ const ATTR_LONG_NAME_MASK: u8 = 0x3F;
 ///   stop scanning entirely, not just skip this one (see the doc comment
 ///   on whatever caller loop uses this),
 /// - a deleted entry (`entry[0] == 0xE5`),
-/// - a long-file-name entry (this driver never reconstructs LFNs — see
-///   this module's doc comment),
+/// - a long-file-name entry (parsed separately by [`parse_lfn_fragment`]
+///   — this function only ever returns the *short* 8.3 form),
 ///
 /// each collapsing to the same `None` here since a caller scanning for a
 /// specific short name treats all three identically ("not a match, keep
@@ -199,6 +199,100 @@ pub fn parse_short_dir_entry(entry: &[u8; 32]) -> Option<ShortDirEntry> {
         file_size,
         is_dir: attr & ATTR_DIRECTORY != 0,
     })
+}
+
+/// One VFAT long-filename (LFN) directory entry — a normal 32-byte entry
+/// with `attr & ATTR_LONG_NAME_MASK == ATTR_LONG_NAME`, holding up to 13
+/// UTF-16 code units of a name too long for the 8.3 short form. Several of
+/// these precede the short entry they describe, stored in *descending*
+/// sequence order (highest first) — reconstructing the real name means
+/// concatenating them in *ascending* order instead (sequence 1 first),
+/// the reverse of directory scan order. Confirmed against a real
+/// `mkfs.fat`/`mcopy`-produced image, not just the spec text: for
+/// `long-filename-test.txt`, the entry with `sequence == 2` (containing
+/// `"-test.txt"`, the *end* of the name) is stored first in the
+/// directory, immediately followed by `sequence == 1` (containing
+/// `"long-filename"`, the *start*) and then the short entry
+/// (`LONG-F~1.TXT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LfnFragment {
+    /// 1-based chunk index (chunk `N` covers UTF-16 code units
+    /// `(N-1)*13 .. N*13` of the full name) — the low 5 bits of the
+    /// entry's first byte.
+    pub sequence: u8,
+    /// Set on the entry closest to the *end* of the name (the highest
+    /// sequence number in the run) — the entry's first byte's `0x40` bit.
+    pub is_last: bool,
+    /// Checksum of the associated short entry's 11-byte name (see
+    /// [`short_name_checksum`]) — every fragment in a run carries the
+    /// same value, which must match the short entry that follows for the
+    /// run to be trusted at all (an orphaned LFN run — e.g. left behind
+    /// by a deletion that only removed the short entry — must never be
+    /// silently accepted).
+    pub checksum: u8,
+    /// Up to 13 UTF-16 code units, in name order. `0x0000` marks the true
+    /// end of the name (mid-fragment, if the name doesn't exactly fill
+    /// every fragment); `0xFFFF` after that is unused padding, per spec.
+    pub chars: [u16; 13],
+}
+
+const ATTR_LONG_NAME_SEQUENCE_MASK: u8 = 0x1F;
+const ATTR_LONG_NAME_LAST_FLAG: u8 = 0x40;
+
+/// Parses one 32-byte directory entry as an LFN fragment. Returns `None`
+/// if it isn't one (`attr & ATTR_LONG_NAME_MASK != ATTR_LONG_NAME`) or if
+/// its sequence number is `0` (the low 5 bits of a real LFN entry's first
+/// byte are never zero — a zero here means either a deleted LFN entry
+/// (first byte `0xE5`, whose low 5 bits happen to be `0x05`... still
+/// nonzero, so this specifically catches a genuinely malformed/corrupt
+/// entry, not the ordinary deleted case) or a hostile/corrupt byte
+/// pattern, either way not a fragment this driver can trust enough to use
+/// as an array index).
+pub fn parse_lfn_fragment(entry: &[u8; 32]) -> Option<LfnFragment> {
+    let attr = entry[11];
+    if attr & ATTR_LONG_NAME_MASK != ATTR_LONG_NAME {
+        return None;
+    }
+    let sequence = entry[0] & ATTR_LONG_NAME_SEQUENCE_MASK;
+    if sequence == 0 {
+        return None;
+    }
+    let is_last = entry[0] & ATTR_LONG_NAME_LAST_FLAG != 0;
+    let checksum = entry[13];
+
+    let mut chars = [0u16; 13];
+    for i in 0..5 {
+        chars[i] = u16::from_le_bytes([entry[1 + 2 * i], entry[2 + 2 * i]]);
+    }
+    for i in 0..6 {
+        chars[5 + i] = u16::from_le_bytes([entry[14 + 2 * i], entry[15 + 2 * i]]);
+    }
+    for i in 0..2 {
+        chars[11 + i] = u16::from_le_bytes([entry[28 + 2 * i], entry[29 + 2 * i]]);
+    }
+
+    Some(LfnFragment {
+        sequence,
+        is_last,
+        checksum,
+        chars,
+    })
+}
+
+/// The standard VFAT short-name checksum — every LFN fragment in a run
+/// carries this value, computed from the associated short entry's 11-byte
+/// name, so a reader can confirm the run really belongs to the short
+/// entry that follows it (not left behind by some earlier, unrelated
+/// entry). Fixed algorithm, not invented — same one every real FAT32
+/// implementation uses, verified here against a checksum actually read
+/// back from a real `mkfs.fat`/`mcopy`-produced image (`0xd0`, for
+/// `LONG-F~1.TXT`), not just trusted from the spec text.
+pub fn short_name_checksum(name: &[u8; 11]) -> u8 {
+    let mut sum: u8 = 0;
+    for &byte in name.iter() {
+        sum = ((sum & 1) << 7).wrapping_add(sum >> 1).wrapping_add(byte);
+    }
+    sum
 }
 
 /// FAT32 end-of-chain markers are any value `>= 0x0FFF_FFF8` (the exact
@@ -375,6 +469,107 @@ mod tests {
         assert!(is_end_of_chain(0x0FFF_FFFF));
     }
 
+    /// `0xd0` was read directly out of a real `mkfs.fat -F 32` +
+    /// `mcopy`-produced image's `LONG-F~1.TXT` short entry, not assumed
+    /// from the spec text — the actual ground truth this whole checksum
+    /// exists to reproduce.
+    #[test]
+    fn short_name_checksum_matches_a_real_short_entry() {
+        assert_eq!(short_name_checksum(b"LONG-F~1TXT"), 0xd0);
+    }
+
+    /// Built from the exact bytes of the two real LFN entries a
+    /// `mkfs.fat`/`mcopy`-produced image wrote for `long-filename-test.txt`
+    /// (dumped and hand-decoded from the actual fixture, not synthesized
+    /// from the spec alone): `sequence == 1` holds `"long-filename"`
+    /// (the *start* of the name, stored second in the directory,
+    /// immediately before the short entry), `sequence == 2` (with
+    /// `is_last` set) holds `"-test.txt"` (the *end*, stored first).
+    #[test]
+    fn parses_a_real_lfn_fragment_pair() {
+        let seq1 = {
+            let mut e = [0u8; 32];
+            e[0] = 0x01;
+            e[11] = 0x0F;
+            e[13] = 0xd0;
+            let text: [u16; 13] = [
+                b'l' as u16,
+                b'o' as u16,
+                b'n' as u16,
+                b'g' as u16,
+                b'-' as u16,
+                b'f' as u16,
+                b'i' as u16,
+                b'l' as u16,
+                b'e' as u16,
+                b'n' as u16,
+                b'a' as u16,
+                b'm' as u16,
+                b'e' as u16,
+            ];
+            write_lfn_chars(&mut e, &text);
+            e
+        };
+        let fragment = parse_lfn_fragment(&seq1).expect("valid LFN entry should parse");
+        assert_eq!(fragment.sequence, 1);
+        assert!(!fragment.is_last);
+        assert_eq!(fragment.checksum, 0xd0);
+        assert_eq!(fragment.chars[0], b'l' as u16);
+        assert_eq!(fragment.chars[12], b'e' as u16);
+
+        let seq2 = {
+            let mut e = [0u8; 32];
+            e[0] = 0x42; // sequence 2, last-entry flag set
+            e[11] = 0x0F;
+            e[13] = 0xd0;
+            let mut text = [0xFFFFu16; 13];
+            for (i, c) in b"-test.txt".iter().enumerate() {
+                text[i] = *c as u16;
+            }
+            text[9] = 0x0000; // NUL terminator right after ".txt"
+            write_lfn_chars(&mut e, &text);
+            e
+        };
+        let fragment = parse_lfn_fragment(&seq2).expect("valid LFN entry should parse");
+        assert_eq!(fragment.sequence, 2);
+        assert!(fragment.is_last);
+        assert_eq!(fragment.checksum, 0xd0);
+        assert_eq!(fragment.chars[0], b'-' as u16);
+        assert_eq!(fragment.chars[9], 0x0000);
+    }
+
+    #[test]
+    fn non_lfn_entry_is_rejected() {
+        let mut entry = [0u8; 32];
+        entry[0..11].copy_from_slice(b"HELLO   TXT");
+        entry[11] = 0x20; // ARCHIVE, not LFN
+        assert_eq!(parse_lfn_fragment(&entry), None);
+    }
+
+    #[test]
+    fn zero_sequence_lfn_entry_is_rejected() {
+        let mut entry = [0u8; 32];
+        entry[11] = 0x0F;
+        entry[0] = 0x40; // last-flag set, but low 5 bits (sequence) are 0
+        assert_eq!(parse_lfn_fragment(&entry), None);
+    }
+
+    /// Writes 13 UTF-16 code units into an LFN entry's three fragmented
+    /// char regions — the inverse of `parse_lfn_fragment`'s own extraction,
+    /// used only by these tests to build realistic fixtures without
+    /// hand-writing every byte offset twice.
+    fn write_lfn_chars(entry: &mut [u8; 32], chars: &[u16; 13]) {
+        for i in 0..5 {
+            entry[1 + 2 * i..3 + 2 * i].copy_from_slice(&chars[i].to_le_bytes());
+        }
+        for i in 0..6 {
+            entry[14 + 2 * i..16 + 2 * i].copy_from_slice(&chars[5 + i].to_le_bytes());
+        }
+        for i in 0..2 {
+            entry[28 + 2 * i..30 + 2 * i].copy_from_slice(&chars[11 + i].to_le_bytes());
+        }
+    }
+
     proptest! {
         // The actual regression class this whole module exists to catch:
         // no byte pattern, however malformed, may make any of these three
@@ -394,6 +589,23 @@ mod tests {
             let mut entry = [0u8; 32];
             entry.copy_from_slice(&bytes);
             let _ = parse_short_dir_entry(&entry);
+        }
+
+        #[test]
+        fn lfn_fragment_parse_never_panics(bytes in proptest::collection::vec(any::<u8>(), 32..=32)) {
+            let mut entry = [0u8; 32];
+            entry.copy_from_slice(&bytes);
+            let _ = parse_lfn_fragment(&entry);
+        }
+
+        // Same "no panic on arbitrary input" property as every other
+        // parser here, applied to the one function that runs once per
+        // *byte* of an 11-byte name rather than once per directory entry.
+        #[test]
+        fn short_name_checksum_never_panics(name in proptest::collection::vec(any::<u8>(), 11..=11)) {
+            let mut buf = [0u8; 11];
+            buf.copy_from_slice(&name);
+            let _ = short_name_checksum(&buf);
         }
 
         // Pins the exact property a real cluster-chain walker depends on:

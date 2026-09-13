@@ -1310,6 +1310,67 @@ Confirmed: `nested_bytes_read=59 contents_match=1`,
 unlike several earlier phases this session, a legitimate outcome given how
 directly this code was already exercised getting Phase 2 working.
 
+**Filesystem driver, Phase 4: long filenames, verified against real
+on-disk bytes, not just the spec text.** The last two gaps left after
+Phase 3, each with its own dedicated slice as promised. Before writing any
+parser code, the actual VFAT LFN layout was confirmed by dumping and
+hand-decoding the raw 32-byte directory entries a real `mkfs.fat`/`mcopy`
+run produced for `long-filename-test.txt` — not assumed from the spec
+alone. That surfaced the exact, easy-to-get-backwards ordering: LFN
+entries are stored in *descending* sequence order (the entry covering the
+*end* of the name comes first in the directory), so reconstructing the
+name means concatenating fragments in the *reverse* of scan order.
+`blk-driver-host/src/lib.rs` gained `LfnFragment::parse` and
+`short_name_checksum` (the standard algorithm every real FAT32
+implementation uses to bind an LFN run to its short entry) — both pure,
+property-tested (6 new tests, 24 total), and `short_name_checksum`'s own
+unit test asserts against `0xd0`, the checksum actually read back from
+that same real fixture's `LONG-F~1.TXT` entry, not an assumed-correct
+value. `find_entry_by_long_name` (`main.rs`) walks a directory the same
+way `find_entry_in_directory` does, but accumulates LFN fragments and
+only trusts a complete run whose checksum matches the short entry that
+follows — an incomplete or orphaned run is never silently accepted.
+ASCII-only matching is this slice's explicit, named limit (real LFN names
+can hold any UTF-16; this driver only ever needs to find names it already
+knows the ASCII spelling of). Confirmed: `long_name_bytes_read=62
+contents_match=1`, worked on the first real attempt — a direct result of
+verifying the byte layout against reality before writing the reconstruction
+logic, not after.
+
+**Filesystem driver, Phase 5: a first real write — small on purpose.**
+The last of the six original gaps, and the one flagged from the start as
+"a different risk class" needing its own dedicated pass. This slice is
+that pass's *first* increment, not its completion: it overwrites
+`WRITE.TXT`'s content, but only because that fixture file is exactly one
+512-byte sector on one cluster — meaning zero free-cluster allocation,
+zero FAT chain modification, zero directory-entry size-field update, and
+zero partial-sector read-modify-write were needed. Each of those remains
+explicitly deferred (see `docs/THREAT_MODEL.md`), not silently assumed
+solved by this slice. Mechanically, nothing new was needed at the
+transport level — `BlkDevice::write_sector` has existed and been proven
+since Phase 1; what's new is locating *which* sector to write via the
+FAT32 parser instead of a hardcoded sector 0. Verified two independent
+ways: `blk-driver-host` itself writes a fixed pattern
+(`write_pattern_byte`, `b'Z' - (i % 26)`) and reads it back via a *fresh*
+`read_sector` call (a genuine round trip through the device emulation, not
+a cached buffer), and CI separately runs `mtype` against the actual
+backing image file afterward to confirm the new content really landed on
+disk — not just trusting the driver under test to grade its own work, the
+same instinct that made this fixture real `mkfs.fat` output rather than a
+hand-rolled byte array from the start. Confirmed:
+`write completed=1 status=0 read_back_matches=1`, `mtype` independently
+showing `ZYXWV...` — worked on the first real attempt.
+
+With Phase 5, all six gaps identified after Phase 2 are addressed — four
+closed in earlier phases (syscall/IPC surface, capability scoping,
+subdirectories, multi-cluster coverage), two closed here (long filenames,
+a first real write). What remains deliberately open, named rather than
+implied-done: growing/shrinking files, creating/deleting entries,
+free-cluster allocation and tracking, partial-sector read-modify-write,
+and a real syscall/IPC surface for *writes* (Phase 3's IPC surface is
+read-only) — each its own future slice, not a gap hiding behind "write
+support" now reading as finished.
+
 ## Mobile L1: ARM/TrustZone boot bring-up (`kernel-arm/`)
 
 Started from nothing to a real, QEMU-verified boot path in one push, in a
