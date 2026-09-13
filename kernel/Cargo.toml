@@ -109,6 +109,10 @@ harness = false
 name = "blk_driver_rw"
 harness = false
 
+[[test]]
+name = "blk_fat32_read"
+harness = false
+
 [profile.dev]
 panic = "abort"
 

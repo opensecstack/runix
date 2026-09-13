@@ -123,6 +123,14 @@ jobs:
             blk-driver-host
       - name: install QEMU
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+      # `dosfstools` (mkfs.fat) and `mtools` (mcopy) aren't part of
+      # `ubuntu-latest`'s preinstalled image (unlike `nc`/`python3` for
+      # net_driver_tcp below) -- confirmed rather than assumed, same
+      # "confirm rather than assume" discipline that check got. Needed by
+      # `tests/support/make_fat32_image.sh` to build a real FAT32 fixture
+      # for `blk_fat32_read` below.
+      - name: install dosfstools and mtools (FAT32 fixture image tooling)
+        run: sudo apt-get update && sudo apt-get install -y dosfstools mtools
       # `grid_sandbox_wasm` below needs this binary already built on disk
       # (`include_bytes!` embeds it at kernel-test compile time) — see
       # `kernel/tests/grid_sandbox_wasm.rs`'s own doc comment. Built here,
@@ -140,6 +148,12 @@ jobs:
       - name: build blk-driver-host (payload for blk_driver_rw)
         working-directory: blk-driver-host
         run: cargo build --target x86_64-unknown-none --release
+      # Filesystem driver, Phase 2's fixture -- a real FAT32 image built by
+      # real tooling (mkfs.fat/mtools), not a hand-rolled byte fixture. See
+      # tests/support/make_fat32_image.sh's own doc comment.
+      - name: build FAT32 test fixture image
+        working-directory: kernel
+        run: bash tests/support/make_fat32_image.sh target/runix-fat32-test.img
       - name: cargo test (boots every kernel/tests/*.rs in QEMU)
         working-directory: kernel
         # `--test basic_boot`, not a bare `cargo test`: with no target
@@ -166,6 +180,17 @@ jobs:
           cargo test --target x86_64-unknown-none --test citadel_demo
           cargo test --target x86_64-unknown-none --test net_driver_icmp
           cargo test --target x86_64-unknown-none --test blk_driver_rw
+      # Filesystem driver, Phase 2 -- points xtask's virtio-blk `-drive` at
+      # the real FAT32 fixture built above instead of the plain zero-filled
+      # scratch image every test above gets by default. `RUNIX_BLK_IMG` is
+      # `xtask/src/main.rs::run_qemu`'s own override point for its
+      # otherwise-hardcoded blk backing file -- same override-point shape
+      # `RUNIX_NETDEV_ARG` already is for `-netdev`, used just below.
+      - name: cargo test blk_fat32_read (real FAT32 image via virtio-blk)
+        working-directory: kernel
+        run: |
+          RUNIX_BLK_IMG="$(pwd)/target/runix-fat32-test.img" \
+            cargo test --target x86_64-unknown-none --test blk_fat32_read
       # Phase 2b's real TCP client proof -- SLIRP has no built-in TCP
       # listener to connect to (confirmed during design research), so this
       # starts a real listener on the host first (kernel/tests/support/

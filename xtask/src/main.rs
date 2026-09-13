@@ -111,7 +111,18 @@ fn ensure_blk_test_image(root: &Path) -> PathBuf {
 }
 
 fn run_qemu(root: &Path, bios_path: &Path, exit_device: bool) -> ExitStatus {
-    let blk_img_path = ensure_blk_test_image(root);
+    // The virtio-blk backing file is overridable via `RUNIX_BLK_IMG` — same
+    // override-point shape as `RUNIX_NETDEV_ARG` below. Needed by
+    // `kernel/tests/blk_fat32_read.rs` (filesystem driver, Phase 2), which
+    // points the drive at a real FAT32 image (`make_fat32_image.sh`)
+    // instead of the plain zero-filled scratch image every other
+    // caller (`build`, `run`, `blk_driver_rw.rs`) still gets unchanged.
+    // When set, the caller is responsible for the image already existing —
+    // skip the "ensure it exists, create if missing" scratch-image logic.
+    let blk_img_path = match env::var("RUNIX_BLK_IMG") {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => ensure_blk_test_image(root),
+    };
     let mut cmd = qemu_command();
     cmd.arg("-drive")
         .arg(format!("format=raw,file={}", bios_path.display()))

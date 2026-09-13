@@ -1173,6 +1173,78 @@ sequentially (one request in flight at a time — `post_chain` always
 reuses descriptor indices `0..3`, safe only because the previous chain's
 completion is always consumed before the next is posted).
 
+**Filesystem driver, Phase 2: read-only FAT32, locate one file, read its
+exact contents — the testing-rigor commitment applied from day one, not
+retrofitted.** Closes the revisit trigger Phase 1's own writeup named:
+disk bytes now genuinely are parsed as untrusted input, and the parser
+(`blk-driver-host/src/lib.rs`, new) landed with `proptest` coverage in the
+same commit, the same discipline `net-driver-host`'s parsers established
+for network bytes. Scope, matching the size of every prior phase: 8.3
+short names only (an LFN entry is recognized and skipped, never
+misread — no long-name reconstruction), no subdirectories (only the root
+directory is ever walked), read-only (no writes anywhere), no syscall/IPC
+surface exposing this to other processes yet.
+
+`BootSectorInfo::parse`, `parse_short_dir_entry`, and `fat_entry_at` are
+pure functions — no device I/O, so `cargo test --lib` runs real
+`proptest`-generated cases on the host, same split `net-driver-host`'s own
+lib/bin division already established. Every arithmetic step that touches
+an on-disk field uses checked operations, never a bare `+`/`*`: a hostile
+or corrupt `fat_size_32` making `reserved_sector_count + num_fats *
+fat_size_32` wrap is exactly the class of bug `validate_rx_completion`
+was written to catch for virtio-net's device-reported fields, now applied
+here — `fat_entry_at` in particular is bounds-checked against whatever FAT
+sector bytes it's actually given, returning `None` rather than indexing
+past the buffer for an out-of-range cluster number (a cluster number that
+reached it came from a directory entry or a previous FAT entry, both
+on-disk, both exactly as untrusted as a network header field). 18
+property + unit tests, all passing: never-panics properties for all three
+parsing functions against arbitrary bytes, plus hand-built fixtures for
+the signature check, zero-`sectors_per_cluster`/zero-`num_fats` rejection,
+the FAT-region-overflow rejection, and the LFN/deleted/end-of-directory
+skip logic.
+
+**A real bug, found by testing the actual interaction, not either half in
+isolation.** The first end-to-end attempt against a real FAT32 image
+failed with "boot sector did not parse as FAT32" — even though the
+fixture image was genuinely valid (confirmed independently with `mtools`'
+own `mdir`/`mtype` before trusting the kernel test's result). Cause:
+Phase 1's own sector round-trip proof unconditionally writes a test
+pattern to sector 0 before Phase 2 ever runs — harmless on the zero-filled
+scratch image `blk_driver_rw.rs` uses, but sector 0 *is* the FAT32 boot
+sector on a real volume, so Phase 1 was silently destroying the exact
+sector Phase 2 was about to parse, in the same boot. Fixed by making the
+two proofs mutually exclusive per boot (`attempt_fat32` selects one or the
+other, never both) — `blk_driver_rw.rs` already proves Phase 1
+independently on its own scratch image, so there was nothing to gain from
+re-running it against an image it would only corrupt. The kind of bug this
+session's "verify the real interaction, not just each piece" discipline
+exists to catch: neither the parser's own property tests nor Phase 1's own
+already-passing test would ever have surfaced this on their own.
+
+**The fixture is a real FAT32 image, not a hand-rolled byte array.**
+`kernel/tests/support/make_fat32_image.sh` builds one with actual tooling
+(`mkfs.fat -F 32`, `mtools`' `mcopy` — writes into a FAT image directly,
+no mount/loop-device/root privilege needed, matching every other
+CI-runnable fixture in this codebase), containing one root-directory file,
+`HELLO.TXT`, with a fixed known content string shared verbatim between
+the fixture script and `blk-driver-host`'s own expected-bytes constant (one
+definition, not independently duplicated on each side, to avoid a silent
+drift the tests would never catch). `xtask` gained a `RUNIX_BLK_IMG`
+override for its virtio-blk `-drive`, same override-point shape
+`RUNIX_NETDEV_ARG` already established for `-netdev`. Confirmed end to
+end in QEMU: `capacity=131072 sectors`, `FAT32 file_size=68 bytes_read=68
+contents_match=1` — the real boot sector parsed, the real root directory
+walked, the real file located and its exact 68 bytes read back over the
+same virtio-blk transport Phase 1 proved.
+
+What this doesn't claim: no writes anywhere (create, delete, truncate,
+extend — none of it); no long filenames; no subdirectory traversal (only
+the root directory is ever scanned); no syscall or IPC surface yet
+exposing any of this to another process — `blk-driver-host` is still the
+only thing that can read a file, and only the one fixed name it's told to
+look for at that.
+
 ## Mobile L1: ARM/TrustZone boot bring-up (`kernel-arm/`)
 
 Started from nothing to a real, QEMU-verified boot path in one push, in a

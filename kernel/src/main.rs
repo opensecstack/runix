@@ -191,6 +191,11 @@ struct BlkBootInfo {
     _pad: u16,
     queue_phys: u64,
     reqbuf_phys: u64,
+    /// `0` on the real boot path -- no FAT32 image is attached there, and
+    /// attempting the locate-and-read walk would just add wall-clock time
+    /// to every real boot for no benefit. Same exact reasoning
+    /// `NetBootInfo::attempt_tcp`'s own doc comment already gives.
+    attempt_fat32: u8,
 }
 
 /// Offset into the `BLK_INFO_VA` page `blk-driver-host` writes its own
@@ -204,6 +209,14 @@ const BLK_RESULT_OFFSET: usize = 128;
 const BLK_RESULT_PASS: u8 = 1;
 #[allow(dead_code)]
 const BLK_RESULT_FAIL: u8 = 2;
+
+/// Offset for the FAT32 locate-and-read outcome (filesystem driver, Phase
+/// 2) -- one past `BLK_RESULT_OFFSET`, same "room to spare, documented
+/// offset convention" `NET_TCP_RESULT_OFFSET` already established relative
+/// to `NET_RESULT_OFFSET`. Only read by `kernel/tests/blk_fat32_read.rs` --
+/// the real boot path never checks it (`attempt_fat32` is always `0` there).
+#[allow(dead_code)]
+const BLK_FAT32_RESULT_OFFSET: usize = 129;
 
 /// The default config doesn't map all of physical memory into the kernel's
 /// address space — `memory::init`'s `OffsetPageTable` needs that mapping to
@@ -508,7 +521,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     serial_println!(
                         "Runix kernel: blk-driver-host authorized by CITADEL allowlist (Phase B9)"
                     );
-                    load_and_run_blk_driver_host(io_base, now, &signing_key);
+                    load_and_run_blk_driver_host(io_base, now, &signing_key, false);
                 }
                 Err(e) => {
                     serial_println!(
@@ -908,7 +921,16 @@ extern "C" fn net_driver_host_trampoline() -> ! {
 /// mechanism `load_and_run_net_driver_host` already proved, minus the
 /// RX/TX-buffer-array plumbing (virtio-blk needs one virtqueue and one
 /// request-buffer page, not paired queues and several packet buffers).
-fn load_and_run_blk_driver_host(io_base: u16, now: u64, signing_key: &ed25519_dalek::SigningKey) {
+///
+/// `attempt_fat32` is written straight into `BlkBootInfo` -- `false` on the
+/// real boot path (see that field's own doc comment), `true` only for
+/// `kernel/tests/blk_fat32_read.rs`.
+fn load_and_run_blk_driver_host(
+    io_base: u16,
+    now: u64,
+    signing_key: &ed25519_dalek::SigningKey,
+    attempt_fat32: bool,
+) {
     serial_println!(
         "Runix kernel: parsing blk-driver-host ({} bytes)",
         BLK_DRIVER_HOST_ELF.len()
@@ -967,6 +989,7 @@ fn load_and_run_blk_driver_host(io_base: u16, now: u64, signing_key: &ed25519_da
         _pad: 0,
         queue_phys: queue_first_frame_phys,
         reqbuf_phys,
+        attempt_fat32: attempt_fat32 as u8,
     };
     unsafe {
         (info_content.as_mut_ptr() as *mut BlkBootInfo).write(info);

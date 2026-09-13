@@ -17,6 +17,17 @@ publish = false
 [dependencies]
 linked_list_allocator = "0.10"
 
+[dev-dependencies]
+# Host-only (tests run on the host, never the x86_64-unknown-none target) —
+# property-tests the pure parsing logic in lib.rs. See that file's
+# `#![cfg_attr(not(test), no_std)]` split, same convention net-driver-host
+# already uses for the same reason.
+proptest = "1"
+
+[lib]
+name = "blk_driver_host"
+path = "src/lib.rs"
+
 [[bin]]
 name = "blk-driver-host"
 path = "src/main.rs"
