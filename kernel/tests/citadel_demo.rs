@@ -48,7 +48,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let module_bytes = b"demo module bytes - not a real loaded module yet";
 
     serial_println!("citadel_demo: authorizing a module signed for the demo allowlist");
-    if let Err(e) = runix_kernel::citadel::demo_authorize("demo-module", module_bytes) {
+    if let Err(e) = runix_kernel::citadel::demo_authorize(
+        "demo-module",
+        module_bytes,
+        runix_kernel::citadel::SandboxTier::T2Trusted,
+    ) {
         serial_println!(
             "citadel_demo: FAIL — expected authorization to succeed, got {}",
             e
@@ -57,8 +61,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     serial_println!("citadel_demo: checking tampered bytes are refused");
-    match runix_kernel::citadel::demo_reject_tampered("demo-module", module_bytes) {
-        Ok(()) => {
+    match runix_kernel::citadel::demo_reject_tampered(
+        "demo-module",
+        module_bytes,
+        runix_kernel::citadel::SandboxTier::T2Trusted,
+    ) {
+        Ok(_) => {
             serial_println!("citadel_demo: FAIL — tampered bytes were accepted");
             exit_qemu(QemuExitCode::Failed);
         }

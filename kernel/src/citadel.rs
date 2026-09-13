@@ -19,6 +19,12 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use runix_citadel_integration::{BootAllowlist, CitadelError, ModuleManifestEntry};
 use sha2::Digest;
 
+// Re-exported so callers (e.g. `main.rs`) can name the tier they're
+// authorizing without depending on `runix_citadel_integration` directly —
+// same pattern as this module's own re-use of `CitadelError` in its public
+// function signatures below.
+pub use runix_citadel_integration::SandboxTier;
+
 // Arbitrary fixed bytes, distinct from `capabilities.rs`'s demo seed —
 // CITADEL's boot-authorization trust root and the capability-manager's
 // token trust root are conceptually separate roots in a real deployment
@@ -42,28 +48,37 @@ fn demo_verifying_key() -> VerifyingKey {
 /// the demo trust root, signing the entry with the same demo key the check
 /// verifies against — standing in for CITADEL's real, offline release-time
 /// signing step (see `ModuleManifestEntry::issue`'s doc comment).
-fn demo_allowlist(module_id: &str, module_bytes: &[u8]) -> BootAllowlist {
+fn demo_allowlist(module_id: &str, module_bytes: &[u8], tier: SandboxTier) -> BootAllowlist {
     let signing_key = demo_signing_key();
     let sha256_hex = hex::encode(sha2::Sha256::digest(module_bytes));
-    let entry = ModuleManifestEntry::issue(module_id, sha256_hex, "demo-key", &signing_key);
+    let entry = ModuleManifestEntry::issue(module_id, sha256_hex, tier, "demo-key", &signing_key);
     let mut allowlist = BootAllowlist::new();
     allowlist.insert(entry);
     allowlist
 }
 
 /// Runs the demo boot-time authorization gate against `module_id`/
-/// `module_bytes`, under an allowlist that authorizes exactly that module —
-/// proving the crate's own `authorize_module_load` accepts what it should.
-pub fn demo_authorize(module_id: &str, module_bytes: &[u8]) -> Result<(), CitadelError> {
-    let allowlist = demo_allowlist(module_id, module_bytes);
+/// `module_bytes`, under an allowlist that authorizes exactly that module at
+/// `tier` — proving the crate's own `authorize_module_load` accepts what it
+/// should, and returns the tier a successful authorization carries.
+pub fn demo_authorize(
+    module_id: &str,
+    module_bytes: &[u8],
+    tier: SandboxTier,
+) -> Result<SandboxTier, CitadelError> {
+    let allowlist = demo_allowlist(module_id, module_bytes, tier);
     allowlist.authorize_module_load(&demo_verifying_key(), module_id, module_bytes)
 }
 
 /// Same gate, but against tampered bytes the allowlist entry wasn't issued
 /// for — proving the *rejection* path works too, not just the happy path
 /// (an allowlist that only ever says "yes" would be worthless).
-pub fn demo_reject_tampered(module_id: &str, module_bytes: &[u8]) -> Result<(), CitadelError> {
-    let allowlist = demo_allowlist(module_id, module_bytes);
+pub fn demo_reject_tampered(
+    module_id: &str,
+    module_bytes: &[u8],
+    tier: SandboxTier,
+) -> Result<SandboxTier, CitadelError> {
+    let allowlist = demo_allowlist(module_id, module_bytes, tier);
     let mut tampered = module_bytes.to_vec();
     if let Some(first) = tampered.first_mut() {
         *first ^= 0xff;

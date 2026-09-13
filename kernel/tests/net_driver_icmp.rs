@@ -140,7 +140,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     };
 
-    if let Err(e) = runix_kernel::citadel::demo_authorize("net-driver-host", NET_DRIVER_HOST_ELF) {
+    if let Err(e) = runix_kernel::citadel::demo_authorize(
+        "net-driver-host",
+        NET_DRIVER_HOST_ELF,
+        runix_kernel::citadel::SandboxTier::T1Critical,
+    ) {
         serial_println!(
             "net_driver_icmp: FAIL — CITADEL allowlist rejected net-driver-host: {:?}",
             e

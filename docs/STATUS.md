@@ -45,8 +45,9 @@ fails (returns `-1`, per spec — it doesn't trap) rather than silently
 growing past it, and an in-bounds store/load round-trips exactly the value
 written — the last one matters because a bounds check that (wrongly)
 rejected *everything* would make the OOB test pass for the wrong reason
-(`wasm-runtime/tests/memory_isolation.rs`). No sandbox tiers or MARSHAL
-channel permits yet; those land with Beta's grid sandbox work.
+(`wasm-runtime/tests/memory_isolation.rs`). Sandbox tiers now exist — see
+"Grid sandbox isolation tiers" below for what "MARSHAL channel permits"
+concretely means today and what it still doesn't.
 
 **Architecture decision: `wasm-runtime` stays host-side through Alpha, not
 kernel-hosted.** There are two ways it could eventually run under Runix:
@@ -119,9 +120,96 @@ leaving the actual stack pointer 3 pages past what was mapped and
 page-faulting on first use — fixed by looping over the full page range,
 same pattern the heap mapping already used; and a fresh heap page isn't
 guaranteed zeroed by the allocator, only its own free-list header is,
-so newly mapped heap pages are now explicitly zeroed. No sandbox tiers
-or MARSHAL channel permits yet — this proves the mechanism, not the
-full Beta-scope Grid Sandbox policy layer.
+so newly mapped heap pages are now explicitly zeroed. At the time this
+proved the mechanism, there were no sandbox tiers or MARSHAL channel
+permits yet — the next section is that policy layer's starting slice.
+
+**Grid sandbox isolation tiers (T1/T2/T3) — a signed permit, and a real
+host-imposed enforcement mechanism, not just a label.** Until now the only
+isolation distinction anywhere in this codebase was ring 0 vs. ring 3 —
+every module `grid-sandbox-host` might ever run got identical treatment.
+CLAUDE.md already defines the tier vocabulary (T1 Critical → MARSHAL
+real-time <300ms, T2 Trusted → MARSHAL standard, T3 Untrusted → MARSHAL
+evidence-gated); this closes the gap between that policy statement and any
+code enforcing it, without needing the still-open `opensecstack/sdk/rust`
+blocker (see ROADMAP.md) — that blocks a *live* MARSHAL Gate evaluation
+client, which `citadel-integration`'s own doc comment already explains
+isn't reachable from boot-time kernel code anyway (no network stack
+reachable that early, no Separation-of-Duties principal). What Beta could
+start immediately instead: a signed tier assignment (the "permit") flowing
+from CITADEL's existing boot-time allowlist into a real, host-enforced
+resource-limit difference inside the WASM engine (the "isolation").
+
+The permit: `citadel-integration::ModuleManifestEntry` gained a
+`tier: SandboxTier` field, folded into the same signed canonical string
+that already authenticates `module_id`/`sha256_hex` (bumped to `v2`:
+`v2|module_id|sha256_hex|tier`) — a validly-signed entry authenticates its
+tier the same way it already authenticated the module's identity and
+content hash, with no separate check needed. Verified the way every prior
+tamper-resistance property in this codebase is verified: a test
+(`rejects_tampered_tier`) signs an entry as `T2Trusted`, mutates the
+in-memory `tier` field to `T1Critical` *without re-signing*, and confirms
+`authorize_module_load` now returns `InvalidSignature` — the same
+"tampered field, not just tampered bytes" property `rejects_tampered_bytes`
+already proved for module content, now proved for the tier assignment too.
+`BootAllowlist::authorize_module_load` returns `Result<SandboxTier, ...>`
+instead of `Result<(), ...>` — the tier is the actual value a successful
+authorization now hands back, not a discarded unit.
+
+The isolation: confirmed by reading `wasmi` 0.32.3's own source
+(`limits.rs`, `store.rs`) that `StoreLimits`/`StoreLimitsBuilder` +
+`Store::limiter(...)` let a host cap a module's linear-memory/table growth
+**regardless of what the module itself declares** — a real, new ceiling,
+not the weaker property `memory_isolation.rs`'s existing tests already
+proved (that a module's *own declared* maximum is honored, which a hostile
+module could simply declare much larger, or not declare at all).
+`wasm-runtime` gained `SandboxLimits` (three constructors —
+`t1_critical()`: 8 MiB memory / 4096 table elements, `t2_trusted()`: 4 MiB
+/ 2048 (also `WasmRuntime::new()`'s default, so every existing call site
+and test keeps compiling unchanged), `t3_untrusted()`: 512 KiB / 256 —
+arbitrary initial defaults, not tuned against any real workload) and
+`WasmRuntime::new_with_limits(...)`, which installs the limits via
+`Store::limiter` before instantiating. Deliberately kept tier-agnostic:
+this crate only knows "what are my limits", not "what tier am I" — CITADEL
+vocabulary stays out of `wasm-runtime` entirely. Verified by
+`wasm-runtime/tests/tier_isolation.rs`: the *same* module, declaring **no**
+memory maximum of its own, is allowed to grow to 100 pages under
+`t1_critical()`'s limit but capped (returns `-1`, per `memory.grow`'s spec —
+it doesn't trap) under `t3_untrusted()`'s, proving the enforcement is
+actually tier-driven and not an artifact of the module or the engine.
+
+The wiring end to end: `kernel/src/main.rs`'s Phase B7 authorizes
+`grid-sandbox-host` as `T2Trusted` (CLAUDE.md: "first-party apps" — exactly
+what the embedded `hello.wat` demo is) and writes the resulting tier into
+one new fixed boot-info page (`GridBootInfo { tier: u8 }` at
+`GRID_INFO_VA`, `0x_2222_4444_0000` — same "no shared type, just an agreed
+ABI" convention `NetBootInfo` already established for the net-driver-host
+boundary, deliberately not a shared Rust type since `grid-sandbox-host` has
+zero `citadel-integration` dependency and adding one for a 3-value tag
+isn't worth the coupling). `grid-sandbox-host/src/main.rs` reads that byte
+at `_start`, maps it to a `SandboxLimits` (falling back to the *tightest*
+tier, T3, on any unrecognized byte — fail-closed, matching
+`authorize_module_load`'s own stance on an unrecognized module, not
+fail-open to the most generous tier), and calls
+`WasmRuntime::new_with_limits(limits)` in place of the old `WasmRuntime::new()`.
+`kernel/tests/grid_sandbox_wasm.rs` (the existing QEMU boot test) needed
+the same `GridBootInfo` page mapped and written to keep working at all —
+confirmed it still passes, producing the same `"Hi"` output as before,
+proving T2's limits are generous enough not to regress the one real
+workload that exists today.
+
+What this doesn't claim: no live MARSHAL Gate evaluation exists (still
+SDK-blocked, and not attempted here); T3's "evidence-gated" tier is
+approximated purely by resource strictness, not real VIGIL/WORM evidence
+collection (neither exists yet); still exactly one `grid-sandbox-host`
+instance, spawned once at boot — this makes that one instance's tier real
+and enforced, not multi-tenant; and `grid-sandbox-host` still has no
+capability-manager token the way `net-driver-host` does for port I/O — its
+only syscalls today (`SYS_YIELD`/`SYS_WRITE`) don't need kernel-mediated
+tier-gating, since enforcement happens inside the WASM engine itself,
+in-process. Revisit that last point if/when `grid-sandbox-host` gains a
+syscall that plausibly needs tier-gating (e.g. an IPC channel to a T1
+service).
 
 **`capability-manager`** is no longer a stub either: `CapabilityToken`
 issuance and verification are real (Ed25519 over a canonical, pipe-joined

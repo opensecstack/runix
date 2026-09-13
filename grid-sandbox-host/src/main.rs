@@ -10,11 +10,12 @@
 //!
 //! Deliberately minimal: no allocator tuning, no dynamic module loading (the
 //! guest module is a fixed, build-time-compiled `.wasm`, embedded via
-//! `build.rs` — see `src/hello.wat`), no argument/config parsing. This
-//! exists to prove the chain works at all — host allocator -> `wasmi`
-//! engine -> module instantiation -> host-function import -> guest
-//! bytecode execution -> syscall gate back to whatever loaded it — not to
-//! be a general-purpose sandbox host yet.
+//! `build.rs` — see `src/hello.wat`). The one piece of config this process
+//! does read is its own CITADEL-authorized isolation tier (see
+//! `GRID_INFO_VA` below) — everything else about the chain works exactly
+//! as before: host allocator -> `wasmi` engine -> module instantiation ->
+//! host-function import -> guest bytecode execution -> syscall gate back to
+//! whatever loaded it — not a general-purpose sandbox host yet.
 //!
 //! # Heap coordination with whoever loads this
 //!
@@ -31,7 +32,7 @@
 extern crate alloc;
 
 use linked_list_allocator::LockedHeap;
-use runix_wasm_runtime::WasmRuntime;
+use runix_wasm_runtime::{SandboxLimits, WasmRuntime};
 
 /// Arbitrary, fixed private heap region for this process — canonical
 /// (leading nibble's top bit clear, same reasoning as every other
@@ -49,6 +50,17 @@ pub const HEAP_START: usize = 0x_2222_2222_0000;
 /// until something real needed more (see `allocator::HEAP_SIZE`'s history
 /// in the README).
 pub const HEAP_SIZE: usize = 256 * 1024;
+
+/// One fixed page `kernel/src/main.rs` (`load_and_run_grid_sandbox_host`)
+/// and `kernel/tests/grid_sandbox_wasm.rs` both write before spawning this
+/// process — the CITADEL-authorized isolation tier this instance was
+/// granted, as a plain `u8` (0 = T1 Critical, 1 = T2 Trusted, 2 = T3
+/// Untrusted). No shared type with the kernel side, deliberately: same "no
+/// shared type, just an agreed ABI" approach `net-driver-host`'s
+/// `NetBootInfo` already uses across its own kernel/ring-3 boundary — this
+/// crate has zero `citadel-integration` dependency and adding one just for
+/// a 3-value tag isn't worth the coupling.
+const GRID_INFO_VA: usize = 0x_2222_4444_0000;
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
@@ -136,7 +148,21 @@ pub extern "C" fn _start() -> ! {
         ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
     }
 
-    let runtime = WasmRuntime::new();
+    // Unknown/out-of-range tier bytes fall back to the tightest limits
+    // (T3) rather than the most generous -- a boot-info page holding
+    // garbage (a loader bug, not a byte this process has any way to have
+    // produced itself) should never silently grant more trust than
+    // intended. This mirrors the fail-closed stance
+    // `BootAllowlist::authorize_module_load` already takes for an
+    // unrecognized module.
+    let tier_byte = unsafe { core::ptr::read_volatile(GRID_INFO_VA as *const u8) };
+    let limits = match tier_byte {
+        0 => SandboxLimits::t1_critical(),
+        1 => SandboxLimits::t2_trusted(),
+        _ => SandboxLimits::t3_untrusted(),
+    };
+
+    let runtime = WasmRuntime::new_with_limits(limits);
     match runtime.call_and_capture_output(HELLO_WASM, "run") {
         Ok(output) => write_all(&output),
         // No serial/stderr equivalent reachable from ring 3 today — a

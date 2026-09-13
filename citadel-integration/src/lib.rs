@@ -54,10 +54,35 @@ use sha2::{Digest, Sha256};
 /// Canonical-form version prefix — same convention as
 /// `capability-manager::CapabilityToken`. Bump if the signed field set or
 /// order ever changes.
-const CANONICAL_VERSION: &str = "v1";
+const CANONICAL_VERSION: &str = "v2";
+
+/// Grid sandbox isolation tier assigned to a module by its signed manifest
+/// entry — see CLAUDE.md's "Sandbox tiers" architecture rule (T1 Critical →
+/// MARSHAL real-time <300ms, T2 Trusted → MARSHAL standard, T3 Untrusted →
+/// MARSHAL evidence-gated). Because this is part of [`ModuleManifestEntry`]'s
+/// signed canonical string, a validly-signed entry authenticates its tier
+/// the same way it authenticates `module_id`/`sha256_hex` — no separate
+/// tier check is needed anywhere signature verification already happens.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SandboxTier {
+    T1Critical,
+    T2Trusted,
+    T3Untrusted,
+}
+
+impl SandboxTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SandboxTier::T1Critical => "t1",
+            SandboxTier::T2Trusted => "t2",
+            SandboxTier::T3Untrusted => "t3",
+        }
+    }
+}
 
 /// A single boot-time authorization: "this exact module, identified by
-/// `module_id` and content hash `sha256_hex`, was signed off in advance."
+/// `module_id` and content hash `sha256_hex`, was signed off in advance,
+/// with sandbox isolation tier `tier`."
 ///
 /// Produced offline (at build/release time, by whatever holds the trust
 /// root's `SigningKey` — CITADEL's release process, not the kernel), then
@@ -68,6 +93,8 @@ pub struct ModuleManifestEntry {
     pub module_id: String,
     /// Lowercase hex-encoded SHA-256 of the module's exact bytes.
     pub sha256_hex: String,
+    /// The sandbox isolation tier this module is authorized to run at.
+    pub tier: SandboxTier,
     /// Which signing key produced [`Self::signature`], so a verifier knows
     /// which [`VerifyingKey`] to check against — deliberately not looked up
     /// by this crate itself, same split `capability-manager` uses for
@@ -78,25 +105,32 @@ pub struct ModuleManifestEntry {
 }
 
 impl ModuleManifestEntry {
-    /// The exact bytes that get signed: `v1|module_id|sha256_hex`.
+    /// The exact bytes that get signed: `v2|module_id|sha256_hex|tier`.
     fn canonical_string(&self) -> String {
-        format!("{CANONICAL_VERSION}|{}|{}", self.module_id, self.sha256_hex)
+        format!(
+            "{CANONICAL_VERSION}|{}|{}|{}",
+            self.module_id,
+            self.sha256_hex,
+            self.tier.as_str()
+        )
     }
 
-    /// Builds and signs a manifest entry for `module_id`/`sha256_hex` with
-    /// `signing_key`. Not meant to run inside the kernel — this is the
+    /// Builds and signs a manifest entry for `module_id`/`sha256_hex`/`tier`
+    /// with `signing_key`. Not meant to run inside the kernel — this is the
     /// release-time signing step, exposed here mainly so tests (and a
     /// future release-tooling binary) don't have to reimplement the
     /// canonical-string format by hand.
     pub fn issue(
         module_id: impl Into<String>,
         sha256_hex: impl Into<String>,
+        tier: SandboxTier,
         key_id: impl Into<String>,
         signing_key: &SigningKey,
     ) -> Self {
         let mut entry = ModuleManifestEntry {
             module_id: module_id.into(),
             sha256_hex: sha256_hex.into(),
+            tier,
             key_id: key_id.into(),
             signature: String::new(),
         };
@@ -177,10 +211,11 @@ impl BootAllowlist {
         verifying_key: &VerifyingKey,
         module_id: &str,
         module_bytes: &[u8],
-    ) -> Result<(), CitadelError> {
+    ) -> Result<SandboxTier, CitadelError> {
         let entry = self.find(module_id).ok_or(CitadelError::NotAllowlisted)?;
         let computed = hex::encode(Sha256::digest(module_bytes));
-        entry.verify(verifying_key, module_id, &computed)
+        entry.verify(verifying_key, module_id, &computed)?;
+        Ok(entry.tier)
     }
 }
 
@@ -230,13 +265,22 @@ mod tests {
         let bytes = b"fake kernel module bytes";
         let hash = hex::encode(Sha256::digest(bytes));
 
-        let entry = ModuleManifestEntry::issue("net-driver", hash, "release-2027-q1", &signing_key);
+        let entry = ModuleManifestEntry::issue(
+            "net-driver",
+            hash,
+            SandboxTier::T2Trusted,
+            "release-2027-q1",
+            &signing_key,
+        );
         let mut allowlist = BootAllowlist::new();
         allowlist.insert(entry);
 
-        assert!(allowlist
-            .authorize_module_load(&verifying_key, "net-driver", bytes)
-            .is_ok());
+        assert_eq!(
+            allowlist
+                .authorize_module_load(&verifying_key, "net-driver", bytes)
+                .unwrap(),
+            SandboxTier::T2Trusted
+        );
     }
 
     #[test]
@@ -258,7 +302,13 @@ mod tests {
         let real_bytes = b"real module bytes";
         let hash = hex::encode(Sha256::digest(real_bytes));
 
-        let entry = ModuleManifestEntry::issue("net-driver", hash, "release-2027-q1", &signing_key);
+        let entry = ModuleManifestEntry::issue(
+            "net-driver",
+            hash,
+            SandboxTier::T2Trusted,
+            "release-2027-q1",
+            &signing_key,
+        );
         let mut allowlist = BootAllowlist::new();
         allowlist.insert(entry);
 
@@ -277,8 +327,13 @@ mod tests {
         let hash = hex::encode(Sha256::digest(bytes));
 
         // Entry signed by an attacker's key, not the trusted release key.
-        let entry =
-            ModuleManifestEntry::issue("net-driver", hash, "release-2027-q1", &attacker_key);
+        let entry = ModuleManifestEntry::issue(
+            "net-driver",
+            hash,
+            SandboxTier::T2Trusted,
+            "release-2027-q1",
+            &attacker_key,
+        );
         let mut allowlist = BootAllowlist::new();
         allowlist.insert(entry);
 
@@ -297,7 +352,13 @@ mod tests {
         let hash = hex::encode(Sha256::digest(bytes));
 
         // Validly signed for "net-driver"...
-        let entry = ModuleManifestEntry::issue("net-driver", hash, "release-2027-q1", &signing_key);
+        let entry = ModuleManifestEntry::issue(
+            "net-driver",
+            hash,
+            SandboxTier::T2Trusted,
+            "release-2027-q1",
+            &signing_key,
+        );
         let mut allowlist = BootAllowlist::new();
         allowlist.insert(entry);
 
@@ -306,5 +367,33 @@ mod tests {
             .authorize_module_load(&verifying_key, "disk-driver", bytes)
             .unwrap_err();
         assert!(matches!(err, CitadelError::NotAllowlisted));
+    }
+
+    #[test]
+    fn rejects_tampered_tier() {
+        let signing_key = test_key();
+        let verifying_key = signing_key.verifying_key();
+        let bytes = b"module bytes for tier tamper test";
+        let hash = hex::encode(Sha256::digest(bytes));
+
+        let mut entry = ModuleManifestEntry::issue(
+            "net-driver",
+            hash,
+            SandboxTier::T2Trusted,
+            "release-2027-q1",
+            &signing_key,
+        );
+        // Mutate the tier post-signing, without re-signing — the signature
+        // was computed over the original (signed) tier, so this must be
+        // caught the same way `rejects_tampered_bytes` catches tampered
+        // module content.
+        entry.tier = SandboxTier::T1Critical;
+        let mut allowlist = BootAllowlist::new();
+        allowlist.insert(entry);
+
+        let err = allowlist
+            .authorize_module_load(&verifying_key, "net-driver", bytes)
+            .unwrap_err();
+        assert!(matches!(err, CitadelError::InvalidSignature));
     }
 }

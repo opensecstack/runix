@@ -63,6 +63,17 @@ const PAYLOAD_HEAP_START: u64 = 0x_2222_2222_0000;
 const PAYLOAD_HEAP_SIZE: u64 = 256 * 1024;
 const PAYLOAD_STACK_VA: u64 = 0x_2222_3333_0000;
 const PAYLOAD_STACK_SIZE: u64 = 4096 * 4;
+/// Must match `kernel/src/main.rs`'s own `GRID_INFO_VA` — this test doesn't
+/// import that private const, so it's redefined here, same as
+/// `PAYLOAD_HEAP_START` etc. above already mirror `main.rs`'s constants.
+const GRID_INFO_VA: u64 = 0x_2222_4444_0000;
+
+/// Mirrors `kernel/src/main.rs`'s own `GridBootInfo` — `repr(C)`, same field
+/// order, agreed ABI convention only (see that struct's doc comment).
+#[repr(C)]
+struct GridBootInfo {
+    tier: u8,
+}
 
 static GRID_SANDBOX_HOST_ELF: &[u8] =
     include_bytes!("../../grid-sandbox-host/target/x86_64-unknown-none/release/grid-sandbox-host");
@@ -162,6 +173,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         | PageTableFlags::NO_EXECUTE;
     for page in Page::range_inclusive(stack_start_page, stack_end_page) {
         space.map_private_page(page, stack_flags);
+    }
+
+    // GridBootInfo: the one page grid-sandbox-host reads at startup to learn
+    // its sandbox tier — same pattern `net_driver_icmp.rs` uses for
+    // `NetBootInfo`. T2Trusted here, matching the real boot path's choice
+    // for grid-sandbox-host.
+    let info_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+    let info_page = Page::containing_address(VirtAddr::new(GRID_INFO_VA));
+    let info_content = space.map_private_page(info_page, info_flags);
+    info_content.fill(0);
+    unsafe {
+        core::ptr::write_volatile(
+            info_content.as_mut_ptr() as *mut GridBootInfo,
+            GridBootInfo { tier: 1 },
+        );
     }
 
     #[allow(static_mut_refs)]

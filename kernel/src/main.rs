@@ -42,6 +42,22 @@ const GRID_SANDBOX_HEAP_START: u64 = 0x_2222_2222_0000;
 const GRID_SANDBOX_HEAP_SIZE: u64 = 256 * 1024;
 const GRID_SANDBOX_STACK_VA: u64 = 0x_2222_3333_0000;
 const GRID_SANDBOX_STACK_SIZE: u64 = 4096 * 4;
+/// The one page `grid-sandbox-host` reads at startup to learn its CITADEL-
+/// assigned sandbox tier -- same `0x_2222_...` VA family as the heap/stack
+/// constants above. See [`GridBootInfo`]'s doc comment for the ABI contract.
+const GRID_INFO_VA: u64 = 0x_2222_4444_0000;
+
+/// The tier byte `grid-sandbox-host` reads at [`GRID_INFO_VA`] to select its
+/// `wasm-runtime` resource limits. Not a shared type with
+/// `grid-sandbox-host/src/main.rs` -- that crate has no
+/// `citadel-integration` dependency (see that crate's own doc comment for
+/// why) -- so, same as `NetBootInfo`'s own "no shared type, just an agreed
+/// ABI" note, both sides just agree on this plain-`u8` convention:
+/// `0` = T1Critical, `1` = T2Trusted, `2` = T3Untrusted.
+#[repr(C)]
+struct GridBootInfo {
+    tier: u8,
+}
 
 /// `net-driver-host`, Phase B8's payload — see `citadel.rs`'s doc comment
 /// and `docs/STATUS.md`'s network-stack section. Same `include_bytes!`
@@ -304,10 +320,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // bytes here, not a real module — Phase B7 below is what actually gates
     // a real load with this same mechanism, on `grid-sandbox-host`.
     let demo_module_bytes = b"demo module bytes - not a real loaded module yet";
-    let citadel_authorized =
-        runix_kernel::citadel::demo_authorize("demo-module", demo_module_bytes);
-    let citadel_tampered_rejected =
-        runix_kernel::citadel::demo_reject_tampered("demo-module", demo_module_bytes);
+    let citadel_authorized = runix_kernel::citadel::demo_authorize(
+        "demo-module",
+        demo_module_bytes,
+        runix_kernel::citadel::SandboxTier::T2Trusted,
+    );
+    let citadel_tampered_rejected = runix_kernel::citadel::demo_reject_tampered(
+        "demo-module",
+        demo_module_bytes,
+        runix_kernel::citadel::SandboxTier::T2Trusted,
+    );
     serial_println!(
         "Runix kernel: CITADEL boot authorization OK (Phase B6: authorized={:?}, tampered rejected={:?})",
         citadel_authorized,
@@ -324,12 +346,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // is exactly what `kernel/tests/grid_sandbox_wasm.rs` already proved
     // works; what's new here is a real boot path actually depending on the
     // gate in front of it, not a test calling both pieces independently.
-    match runix_kernel::citadel::demo_authorize("grid-sandbox-host", GRID_SANDBOX_HOST_ELF) {
-        Ok(()) => {
+    match runix_kernel::citadel::demo_authorize(
+        "grid-sandbox-host",
+        GRID_SANDBOX_HOST_ELF,
+        runix_kernel::citadel::SandboxTier::T2Trusted,
+    ) {
+        Ok(tier) => {
             serial_println!(
                 "Runix kernel: grid-sandbox-host authorized by CITADEL allowlist (Phase B7)"
             );
-            load_and_run_grid_sandbox_host();
+            load_and_run_grid_sandbox_host(tier);
         }
         Err(e) => {
             // Fail-closed: an unauthorized module is never parsed, loaded,
@@ -356,8 +382,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         .and_then(|dev| runix_kernel::pci::read_bar0_io_port(&dev))
     {
         Some(io_base) => {
-            match runix_kernel::citadel::demo_authorize("net-driver-host", NET_DRIVER_HOST_ELF) {
-                Ok(()) => {
+            match runix_kernel::citadel::demo_authorize(
+                "net-driver-host",
+                NET_DRIVER_HOST_ELF,
+                runix_kernel::citadel::SandboxTier::T1Critical,
+            ) {
+                // The returned tier is plumbed here for signature-uniformity
+                // with grid-sandbox-host's Phase B7 authorization, but
+                // net-driver-host doesn't yet read a `GridBootInfo`-style
+                // tier page or otherwise consume it downstream this slice —
+                // not hidden, just not built out yet (see `docs/ROADMAP.md`).
+                Ok(_tier) => {
                     serial_println!(
                         "Runix kernel: net-driver-host authorized by CITADEL allowlist (Phase B8)"
                     );
@@ -427,7 +462,7 @@ extern "C" fn user_hello_trampoline() -> ! {
 /// bugs -- stack under-mapping, an unzeroed heap page -- found getting
 /// this working the first time); this is that same proven path, just
 /// reached from the real boot sequence instead of a standalone test.
-fn load_and_run_grid_sandbox_host() {
+fn load_and_run_grid_sandbox_host(tier: runix_kernel::citadel::SandboxTier) {
     serial_println!(
         "Runix kernel: parsing grid-sandbox-host ({} bytes)",
         GRID_SANDBOX_HOST_ELF.len()
@@ -472,6 +507,28 @@ fn load_and_run_grid_sandbox_host() {
         | PageTableFlags::NO_EXECUTE;
     for page in Page::range_inclusive(stack_start_page, stack_end_page) {
         space.map_private_page(page, stack_flags);
+    }
+
+    // GridBootInfo: the one page grid-sandbox-host reads at startup to learn
+    // its CITADEL-assigned sandbox tier -- same pattern
+    // `load_and_run_net_driver_host` uses for `NetBootInfo`.
+    let info_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+    let info_page = Page::containing_address(VirtAddr::new(GRID_INFO_VA));
+    let info_content = space.map_private_page(info_page, info_flags);
+    info_content.fill(0);
+    let tier_byte = match tier {
+        runix_kernel::citadel::SandboxTier::T1Critical => 0u8,
+        runix_kernel::citadel::SandboxTier::T2Trusted => 1u8,
+        runix_kernel::citadel::SandboxTier::T3Untrusted => 2u8,
+    };
+    unsafe {
+        core::ptr::write_volatile(
+            info_content.as_mut_ptr() as *mut GridBootInfo,
+            GridBootInfo { tier: tier_byte },
+        );
     }
 
     #[allow(static_mut_refs)]
