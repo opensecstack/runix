@@ -216,6 +216,23 @@ jobs:
             echo "expected WRITE.TXT to start with ZYXWV after blk_fat32_read's write proof, got: $actual" >&2
             exit 1
           fi
+      # Filesystem driver, Phase 6's own independent confirmation --
+      # checks both the *size* (via `mdir`, not just content) and the
+      # exact new content, the same "don't just trust the thing under
+      # test to grade itself" instinct as the WRITE.TXT check above.
+      - name: verify PARTIAL.TXT was actually resized and overwritten on disk
+        working-directory: kernel
+        run: |
+          size="$(mdir -i target/runix-fat32-test.img ::PARTIAL.TXT | grep PARTIAL | tr -s ' ' | cut -d' ' -f3)"
+          if [ "$size" != "300" ]; then
+            echo "expected PARTIAL.TXT to be 300 bytes after blk_fat32_read's partial-write proof, got: $size" >&2
+            exit 1
+          fi
+          actual="$(mtype -i target/runix-fat32-test.img ::PARTIAL.TXT | head -c 5)"
+          if [ "$actual" != "01234" ]; then
+            echo "expected PARTIAL.TXT to start with 01234, got: $actual" >&2
+            exit 1
+          fi
       # Filesystem driver, Phase 3 -- the real IPC/capability-scoping proof
       # (see docs/STATUS.md's filesystem-driver narrative): a second
       # process asks blk-driver-host for a file over capability-gated

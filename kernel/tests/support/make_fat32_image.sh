@@ -31,6 +31,14 @@
 #     file's one sector and reads it back; the *initial* pattern here only
 #     needs to be real, non-zero content, not anything the test itself
 #     asserts against (see that test's own doc comment for why).
+#   - PARTIAL.TXT, root directory, exactly 512 bytes of a deterministic
+#     lowercase-letter pattern (`b'a' + (i % 26)`) -- visually distinct
+#     from every other fixture pattern here on purpose (a bug reading the
+#     wrong file's sector is easy to spot). Phase 6's partial-write/resize
+#     proof overwrites only the *first* 300 bytes and shrinks `file_size`
+#     to 300, using real read-modify-write -- bytes 300..512 must survive
+#     unchanged, which this initial pattern makes independently checkable
+#     (a naive full-sector-overwrite bug would clobber them).
 # Every content string here lives in exactly one place (this script), not
 # duplicated independently on the driver side.
 
@@ -61,12 +69,14 @@ nested_tmpfile="$(mktemp)"
 big_tmpfile="$(mktemp)"
 long_name_tmpfile="$(mktemp)"
 write_tmpfile="$(mktemp)"
-trap 'rm -f "$tmpfile" "$nested_tmpfile" "$big_tmpfile" "$long_name_tmpfile" "$write_tmpfile"' EXIT
+partial_tmpfile="$(mktemp)"
+trap 'rm -f "$tmpfile" "$nested_tmpfile" "$big_tmpfile" "$long_name_tmpfile" "$write_tmpfile" "$partial_tmpfile"' EXIT
 printf '%s\n' "$content" >"$tmpfile"
 printf '%s\n' "$nested_content" >"$nested_tmpfile"
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i % 10) + 0x30 for i in range(3000)))" >"$big_tmpfile"
 printf '%s\n' "$long_name_content" >"$long_name_tmpfile"
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i % 26) + 0x41 for i in range(512)))" >"$write_tmpfile"
+python3 -c "import sys; sys.stdout.buffer.write(bytes((i % 26) + 0x61 for i in range(512)))" >"$partial_tmpfile"
 
 # `mcopy`/`mmd` (mtools) write into a FAT image without mounting it — no
 # loop-device/root privilege needed, same reasoning `mkfs.fat` above.
@@ -76,3 +86,4 @@ mmd -i "$img_path" ::SUBDIR
 mcopy -i "$img_path" "$nested_tmpfile" ::SUBDIR/NESTED.TXT
 mcopy -i "$img_path" "$long_name_tmpfile" "::long-filename-test.txt"
 mcopy -i "$img_path" "$write_tmpfile" ::WRITE.TXT
+mcopy -i "$img_path" "$partial_tmpfile" ::PARTIAL.TXT

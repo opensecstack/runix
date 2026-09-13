@@ -219,10 +219,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // No network wait needed here -- a virtio-blk write-then-read-back round
     // trip is local to QEMU, not dependent on an external reply arriving.
-    // ~50-100 iterations, yielding each time, is plenty; break early once
-    // the result byte goes non-zero.
+    // Bumped from 100 as Phase 3-6 each added more sequential virtio
+    // requests to this one boot's combined proof (subdirectory, big
+    // file, long name, case-insensitive match, write, partial write) --
+    // same "the poll bound needs to grow as the work it's waiting for
+    // grows" adjustment the `boot` job's own QEMU timeout already needed
+    // (90s -> 150s) for the same underlying reason. Still bounded, not
+    // infinite; breaks early once the result byte goes non-zero.
     let mut result = 0u8;
-    for _ in 0..100 {
+    for _ in 0..2000 {
         scheduler::yield_now();
         result = unsafe { core::ptr::read_volatile(result_ptr) };
         if result != 0 {

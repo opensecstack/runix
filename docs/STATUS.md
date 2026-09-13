@@ -1361,15 +1361,67 @@ hand-rolled byte array from the start. Confirmed:
 `write completed=1 status=0 read_back_matches=1`, `mtype` independently
 showing `ZYXWV...` — worked on the first real attempt.
 
-With Phase 5, all six gaps identified after Phase 2 are addressed — four
-closed in earlier phases (syscall/IPC surface, capability scoping,
-subdirectories, multi-cluster coverage), two closed here (long filenames,
-a first real write). What remains deliberately open, named rather than
-implied-done: growing/shrinking files, creating/deleting entries,
-free-cluster allocation and tracking, partial-sector read-modify-write,
-and a real syscall/IPC surface for *writes* (Phase 3's IPC surface is
-read-only) — each its own future slice, not a gap hiding behind "write
-support" now reading as finished.
+With Phase 5, all six gaps identified after Phase 2 have at least a first
+real increment — four closed in earlier phases (syscall/IPC surface,
+capability scoping, subdirectories, multi-cluster coverage), two given
+their first slice here (long filenames, a first real write). What remains
+deliberately open, named rather than implied-done: growing/shrinking
+files, creating/deleting entries, free-cluster allocation and tracking,
+partial-sector read-modify-write, and a real syscall/IPC surface for
+*writes* (Phase 3's IPC surface is read-only) — Phase 6, below, closes two
+of these (partial-sector RMW, a first size update); the rest stay open.
+
+**Filesystem driver, Phase 6: case-insensitive long-name matching, and a
+real partial write + resize — still no allocation.** Two more named
+deferrals get their own scoped slice, each still avoiding the
+free-cluster-allocation risk the write-support revisit trigger
+specifically calls out. **Still not attempted, unchanged**: free-cluster
+allocation/tracking, FAT chain extension or truncation (true
+growth/shrink across cluster boundaries), create/delete of directory
+entries — tightly coupled, highest-corruption-risk items that get their
+own dedicated planning pass, not a rushed bundle here.
+
+*Part A — case folding.* Real FAT/VFAT lookups are case-insensitive (LFN
+preserves *display* case; matching isn't case-sensitive) — Phase 4's
+`long_name_matches` did a strict comparison, so searching for
+`LONG-FILENAME-TEST.TXT` would have failed to find the real, lowercase
+`long-filename-test.txt`. `ascii_case_insensitive_eq` folds `'A'..='Z'`
+and `'a'..='z'` together on both sides — ASCII-only, named as this
+function's own limit; a general Unicode-aware fold (accented characters,
+locale-specific rules) is a separate, still-open non-goal. Verified
+against the *same* real fixture file Phase 4 already validated, searched
+with an all-uppercase target — no new fixture needed. Confirmed:
+`case_insensitive_long_name_match=1`.
+
+*Part B — partial-sector write + file-size update.* `PARTIAL.TXT` starts
+at exactly 512 bytes of a lowercase-letter pattern (deliberately visually
+distinct from every other fixture pattern, so a bug reading the wrong
+file's sector is easy to spot). This phase overwrites only the *first*
+300 bytes with a new pattern — genuine read-modify-write, not a
+full-sector clobber — and shrinks the directory entry's `file_size` to
+300, then confirms both through the *ordinary, unmodified read path*
+(`find_entry_in_directory` + `read_file_contents`), not just an isolated
+field mutated in isolation. `find_entry_with_location` (new, additive —
+`find_entry_in_directory` itself is untouched) returns where the short
+entry lives so its `file_size` field can be patched directly.
+Independently confirmed via `mdir`/`mtype` in CI, not just the driver's
+own self-report: file size shows `300`, not `512`, and content starts
+`01234...`. A second, low-level check (bypassing `file_size` entirely)
+confirms bytes `300..512` of the sector still hold the *original*
+pattern — the exact check a naive full-sector-overwrite bug would fail
+even though the first check alone could still pass by coincidence.
+
+Confirmed: `size_write_ok=1 size_visible=1 contents_match=1
+tail_preserved=1`. A real finding while wiring this up, worth remembering
+as a class but not a logic bug: the kernel test's own outer poll bound
+(`kernel/tests/blk_fat32_read.rs`, 100 iterations) had never been revised
+as Phases 3-6 each added more sequential virtio requests to one boot's
+combined proof — by Phase 6 the total legitimately needed more real
+scheduling turns than 100 iterations allowed, so the test reported "never
+finished" even though nothing was actually wrong. Bumped to 2000 (still
+bounded, not infinite) — the same "the poll bound needs to grow as the
+work it's waiting for grows" adjustment the `boot` job's own QEMU timeout
+already needed once, for the same underlying reason.
 
 ## Mobile L1: ARM/TrustZone boot bring-up (`kernel-arm/`)
 

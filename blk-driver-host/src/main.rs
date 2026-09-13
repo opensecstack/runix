@@ -202,6 +202,22 @@ fn write_pattern_byte(i: usize) -> u8 {
     b'Z' - (i % 26) as u8
 }
 
+/// Filesystem driver, Phase 6, part B: a real partial-sector write plus a
+/// `file_size` update — still no free-cluster allocation, no FAT chain
+/// modification, no create/delete (see `run_partial_write_proof`'s own
+/// doc comment for the full list of what's still deferred and why).
+/// `PARTIAL.TXT` starts at exactly 512 bytes of `partial_initial_byte`;
+/// this phase overwrites only the first `PARTIAL_NEW_LEN` bytes with
+/// `partial_new_byte` and shrinks the visible file size to match.
+const PARTIAL_FILE_NAME: [u8; 11] = *b"PARTIAL TXT";
+const PARTIAL_NEW_LEN: usize = 300;
+fn partial_initial_byte(i: usize) -> u8 {
+    b'a' + (i % 26) as u8
+}
+fn partial_new_byte(i: usize) -> u8 {
+    b'0' + (i % 10) as u8
+}
+
 /// A single request's worth of scratch state plus the virtqueue it posts
 /// to — bundles what Phase 1's write/read-back proof and Phase 2's FAT32
 /// walk both need (many sector reads, one request in flight at a time) so
@@ -435,8 +451,14 @@ fn run_fat32_proof(dev: &mut BlkDevice) -> bool {
     let big_file_pass = run_big_file_proof(dev, &info);
     let long_name_pass = run_long_name_proof(dev, &info);
     let write_pass = run_write_proof(dev, &info);
+    let partial_write_pass = run_partial_write_proof(dev, &info);
 
-    let pass = contents_match && subdir_pass && big_file_pass && long_name_pass && write_pass;
+    let pass = contents_match
+        && subdir_pass
+        && big_file_pass
+        && long_name_pass
+        && write_pass
+        && partial_write_pass;
     if pass {
         write_all(b"blk-driver-host: FAT32 file located and read correctly (Phase 2 PASS)\n");
     } else {
@@ -524,7 +546,24 @@ fn run_long_name_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
     write_all(b" contents_match=");
     write_byte(if matches { b'1' } else { b'0' });
     write_byte(b'\n');
-    matches
+
+    let case_insensitive_match = run_case_insensitive_long_name_proof(dev, info);
+    matches && case_insensitive_match
+}
+
+/// Same real fixture file Phase 4 already proved locating by its exact
+/// case — this searches for it with an all-uppercase target instead,
+/// proving `long_name_matches`'s ASCII case-folding actually works,
+/// against the exact same on-disk bytes, no new fixture needed.
+const LONG_FILE_NAME_ASCII_UPPER: &[u8] = b"LONG-FILENAME-TEST.TXT";
+
+fn run_case_insensitive_long_name_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
+    let found =
+        find_entry_by_long_name(dev, info, info.root_cluster, LONG_FILE_NAME_ASCII_UPPER).is_some();
+    write_all(b"blk-driver-host: FAT32 case_insensitive_long_name_match=");
+    write_byte(if found { b'1' } else { b'0' });
+    write_byte(b'\n');
+    found
 }
 
 /// Locates `WRITE.TXT`, overwrites its one sector with a fixed pattern
@@ -587,6 +626,118 @@ fn run_write_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
         write_all(b"blk-driver-host: FAT32 write proof OK (Phase 5 PASS)\n");
     } else {
         write_all(b"blk-driver-host: FAT32 write proof FAILED (Phase 5 FAIL)\n");
+    }
+    pass
+}
+
+/// Overwrites `PARTIAL.TXT`'s first `PARTIAL_NEW_LEN` bytes with a new
+/// pattern (real read-modify-write — bytes `PARTIAL_NEW_LEN..512` must
+/// survive unchanged) and shrinks its directory entry's `file_size` to
+/// match, then confirms both through the *ordinary, unmodified read
+/// path* (`find_entry_in_directory` + `read_file_contents`) — not just an
+/// isolated field mutated in isolation.
+///
+/// What this does **not** attempt, on purpose, same as `run_write_proof`:
+/// no free-cluster allocation (the new content still fits within the
+/// file's one already-allocated cluster), no FAT chain modification, no
+/// creating or deleting directory entries. Each is its own way a bug
+/// could actually corrupt a real filesystem rather than just fail a read
+/// — each is the next real slice, not this one.
+fn run_partial_write_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
+    let Some((entry, dir_sector, dir_offset)) =
+        find_entry_with_location(dev, info, info.root_cluster, &PARTIAL_FILE_NAME)
+    else {
+        write_all(b"blk-driver-host: FAT32 FAIL - PARTIAL.TXT not found in root directory\n");
+        return false;
+    };
+    let Some(data_sector) = info.cluster_to_sector(entry.first_cluster) else {
+        write_all(
+            b"blk-driver-host: FAT32 FAIL - PARTIAL.TXT's cluster did not resolve to a sector\n",
+        );
+        return false;
+    };
+
+    // Real read-modify-write: read the existing sector, splice in the new
+    // pattern for bytes [0..PARTIAL_NEW_LEN), leave the rest untouched.
+    let Some(mut sector_buf) = dev.read_sector(u64::from(data_sector)) else {
+        write_all(b"blk-driver-host: FAT32 FAIL - could not read PARTIAL.TXT's data sector\n");
+        return false;
+    };
+    for (i, byte) in sector_buf.iter_mut().enumerate().take(PARTIAL_NEW_LEN) {
+        *byte = partial_new_byte(i);
+    }
+    let (write_completed, write_status) = dev.write_sector(u64::from(data_sector), &sector_buf);
+
+    // Patch just the file_size field (bytes 28..32 of the 32-byte entry)
+    // in the *directory's* sector -- read-modify-write again, for the
+    // same reason: every other entry already in that sector must survive
+    // untouched.
+    let size_write_ok = match dev.read_sector(u64::from(dir_sector)) {
+        Some(mut dir_buf) => {
+            let size_offset = dir_offset + 28;
+            dir_buf[size_offset..size_offset + 4]
+                .copy_from_slice(&(PARTIAL_NEW_LEN as u32).to_le_bytes());
+            let (completed, status) = dev.write_sector(u64::from(dir_sector), &dir_buf);
+            completed && status == VIRTIO_BLK_S_OK
+        }
+        None => false,
+    };
+
+    // Verification 1: through the ordinary, unmodified read path -- a
+    // fresh lookup must now report the new size and content.
+    let mut read_buf = [0u8; MAX_FILE_BYTES];
+    let (size_visible, contents_match) =
+        match find_entry_in_directory(dev, info, info.root_cluster, &PARTIAL_FILE_NAME) {
+            Some(fresh_entry) => {
+                let written = read_file_contents(dev, info, &fresh_entry, &mut read_buf);
+                let size_ok = fresh_entry.file_size as usize == PARTIAL_NEW_LEN;
+                let contents_ok = written == PARTIAL_NEW_LEN
+                    && read_buf[..PARTIAL_NEW_LEN]
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &b)| b == partial_new_byte(i));
+                (size_ok, contents_ok)
+            }
+            None => (false, false),
+        };
+
+    // Verification 2: the untouched tail of the sector, read directly
+    // (bypassing file_size) -- must still be the *original* pattern, not
+    // zeroed or clobbered by a naive full-sector overwrite. This is the
+    // check a full-sector-overwrite bug would fail even though check 1
+    // above could still pass.
+    let tail_preserved = match dev.read_sector(u64::from(data_sector)) {
+        Some(fresh_sector) => fresh_sector[PARTIAL_NEW_LEN..SECTOR_SIZE]
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| b == partial_initial_byte(PARTIAL_NEW_LEN + i)),
+        None => false,
+    };
+
+    write_all(b"blk-driver-host: FAT32 partial write completed=");
+    write_byte(if write_completed { b'1' } else { b'0' });
+    write_all(b" status=");
+    write_decimal(write_status as u64);
+    write_all(b" size_write_ok=");
+    write_byte(if size_write_ok { b'1' } else { b'0' });
+    write_all(b" size_visible=");
+    write_byte(if size_visible { b'1' } else { b'0' });
+    write_all(b" contents_match=");
+    write_byte(if contents_match { b'1' } else { b'0' });
+    write_all(b" tail_preserved=");
+    write_byte(if tail_preserved { b'1' } else { b'0' });
+    write_byte(b'\n');
+
+    let pass = write_completed
+        && write_status == VIRTIO_BLK_S_OK
+        && size_write_ok
+        && size_visible
+        && contents_match
+        && tail_preserved;
+    if pass {
+        write_all(b"blk-driver-host: FAT32 partial write/resize proof OK (Phase 6 PASS)\n");
+    } else {
+        write_all(b"blk-driver-host: FAT32 partial write/resize proof FAILED (Phase 6 FAIL)\n");
     }
     pass
 }
@@ -691,7 +842,7 @@ fn long_name_matches(fragments: &[[u16; 13]], target_ascii: &[u8]) -> bool {
                 return target.next().is_none();
             }
             match target.next() {
-                Some(&expected) if c == u16::from(expected) => continue,
+                Some(&expected) if ascii_case_insensitive_eq(c, expected) => continue,
                 _ => return false,
             }
         }
@@ -701,6 +852,24 @@ fn long_name_matches(fragments: &[[u16; 13]], target_ascii: &[u8]) -> bool {
     // name with no trailing NUL fragment, which this fixture never
     // produces, but correctness shouldn't depend on that).
     target.next().is_none()
+}
+
+/// Real FAT/VFAT lookups are case-insensitive (LFN preserves *display*
+/// case, but matching isn't case-sensitive) — folds `'A'..='Z'` and
+/// `'a'..='z'` together on both sides before comparing. ASCII-only, named
+/// as this function's own limit: a general Unicode-aware fold (accented
+/// characters, locale-specific rules like Turkish dotless i) is a
+/// separate, still-open non-goal, not something this driver's fixture set
+/// (or its real use case — matching a name this driver already knows the
+/// ASCII spelling of) needs.
+fn ascii_case_insensitive_eq(utf16_char: u16, ascii_byte: u8) -> bool {
+    let folded_ascii = ascii_byte.to_ascii_lowercase();
+    let folded_utf16 = if (u16::from(b'A')..=u16::from(b'Z')).contains(&utf16_char) {
+        utf16_char + 0x20
+    } else {
+        utf16_char
+    };
+    folded_utf16 == u16::from(folded_ascii)
 }
 
 /// Fixed-size read buffer -- no `alloc` linked in this crate (see
@@ -840,6 +1009,45 @@ fn find_entry_in_directory(
                 if let Some(entry) = parse_short_dir_entry(&entry_bytes) {
                     if entry.name == *target_name {
                         return Some(entry);
+                    }
+                }
+            }
+        }
+        let next = next_cluster_in_chain(dev, info, cluster)?;
+        if is_end_of_chain(next) {
+            return None;
+        }
+        cluster = next;
+    }
+    None
+}
+
+/// Same scan as [`find_entry_in_directory`], but also returns *where* the
+/// short entry itself lives (`(sector, offset_in_sector)`) — needed only
+/// by a caller that intends to patch a field of the entry in place (Phase
+/// 6's `file_size` update), which `find_entry_in_directory` itself never
+/// needs to know. A new function rather than a changed return type on the
+/// existing one, so every current caller keeps compiling unchanged.
+fn find_entry_with_location(
+    dev: &mut BlkDevice,
+    info: &BootSectorInfo,
+    dir_cluster: u32,
+    target_name: &[u8; 11],
+) -> Option<(blk_driver_host::ShortDirEntry, u32, usize)> {
+    let mut cluster = dir_cluster;
+    for _ in 0..1024u32 {
+        let sector0 = info.cluster_to_sector(cluster)?;
+        for s in 0..u32::from(info.sectors_per_cluster) {
+            let sector_num = u64::from(sector0) + u64::from(s);
+            let sector = dev.read_sector(sector_num)?;
+            for (index, chunk) in sector.chunks_exact(32).enumerate() {
+                if chunk[0] == 0x00 {
+                    return None;
+                }
+                let entry_bytes: [u8; 32] = chunk.try_into().unwrap();
+                if let Some(entry) = parse_short_dir_entry(&entry_bytes) {
+                    if entry.name == *target_name {
+                        return Some((entry, sector_num as u32, index * 32));
                     }
                 }
             }
