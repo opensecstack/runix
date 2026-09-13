@@ -198,6 +198,15 @@ jobs:
         run: |
           RUNIX_BLK_IMG="$(pwd)/target/runix-fat32-test.img" \
             cargo test --target x86_64-unknown-none --test blk_fat32_read
+      # Filesystem driver, Phase 3 -- the real IPC/capability-scoping proof
+      # (see docs/STATUS.md's filesystem-driver narrative): a second
+      # process asks blk-driver-host for a file over capability-gated
+      # SYS_IPC_SEND/SYS_IPC_RECV. Same FAT32 fixture as blk_fat32_read.
+      - name: cargo test blk_fs_ipc (filesystem IPC surface via virtio-blk)
+        working-directory: kernel
+        run: |
+          RUNIX_BLK_IMG="$(pwd)/target/runix-fat32-test.img" \
+            cargo test --target x86_64-unknown-none --test blk_fs_ipc
       # Phase 2b's real TCP client proof -- SLIRP has no built-in TCP
       # listener to connect to (confirmed during design research), so this
       # starts a real listener on the host first (kernel/tests/support/

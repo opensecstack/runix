@@ -69,12 +69,25 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         }
         SYS_IPC_SEND => {
             let port = arg1 as usize;
-            let authorized = crate::scheduler::current_capability().is_some_and(|token| {
-                let resource = crate::capabilities::port_resource(port);
-                !crate::capabilities::is_revoked(&token)
-                    && crate::capabilities::check(&token, &resource, crate::interrupts::ticks())
-                        .is_ok()
-            });
+            let resource = crate::capabilities::port_resource(port);
+            let now = crate::interrupts::ticks();
+            let token_authorizes = |token: &runix_capability_manager::CapabilityToken| {
+                !crate::capabilities::is_revoked(token)
+                    && crate::capabilities::check(token, &resource, now).is_ok()
+            };
+            // Most threads carry exactly one capability
+            // (`current_capability()`) — `current_extra_capabilities()` is
+            // only ever non-empty for a thread spawned via
+            // `spawn_ring3_process_with_capabilities` (e.g.
+            // `blk-driver-host`, authorized for both its own device I/O
+            // *and* the reply port it serves filesystem requests over), so
+            // checking it is a no-op allocation-and-empty-scan for every
+            // other thread in this kernel.
+            let authorized = crate::scheduler::current_capability()
+                .is_some_and(|token| token_authorizes(&token))
+                || crate::scheduler::current_extra_capabilities()
+                    .iter()
+                    .any(token_authorizes);
             if !authorized {
                 // Denied: the send never reaches the channel — a thread
                 // with no (or an invalid/expired/wrong-resource) capability

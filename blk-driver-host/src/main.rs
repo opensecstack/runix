@@ -73,7 +73,21 @@ struct BlkBootInfo {
     /// `kernel/tests/blk_fat32_read.rs`, which alone attaches a real FAT32
     /// image.
     attempt_fat32: u8,
+    /// Filesystem driver, Phase 3: whether this run should enter the
+    /// request-serving loop after locating [`TARGET_FILE_NAME`], instead
+    /// of running Phase 1's or Phase 2's own self-contained proof. `0` on
+    /// the real boot path and every earlier test; `1` only in
+    /// `kernel/tests/blk_fs_ipc.rs`, which alone spawns a second process
+    /// to actually send a request over [`FS_REQUEST_PORT`].
+    serve_fs_requests: u8,
 }
+
+/// Filesystem driver, Phase 3's fixed IPC ports — must match
+/// `kernel/src/main.rs`'s own `BLK_FS_REQUEST_PORT`/`BLK_FS_RESPONSE_PORT`
+/// constants exactly (same "no shared type, just an agreed ABI/protocol"
+/// convention as every other kernel/ring-3 boundary in this codebase).
+const FS_REQUEST_PORT: usize = 8;
+const FS_RESPONSE_PORT: usize = 9;
 
 const BLK_INFO_VA: usize = 0x_0999_3333_0000;
 const BLK_QUEUE_VA: usize = 0x_0999_4444_0000;
@@ -136,6 +150,29 @@ const TARGET_FILE_NAME: [u8; 11] = *b"HELLO   TXT";
 /// catch).
 const EXPECTED_FILE_CONTENTS: &[u8] =
     b"RUNIX-FAT32-PROOF: this file was read from a real FAT32 filesystem.\n";
+
+/// Filesystem driver, Phase 2 extension: subdirectory traversal.
+/// `find_entry_in_directory` already takes any starting cluster — this is
+/// the first proof it actually works one level deep, not just at the
+/// root. Names must match `make_fat32_image.sh`'s fixture byte-for-byte,
+/// same convention as [`TARGET_FILE_NAME`].
+const SUBDIR_NAME: [u8; 11] = *b"SUBDIR     ";
+const NESTED_FILE_NAME: [u8; 11] = *b"NESTED  TXT";
+const NESTED_EXPECTED_CONTENTS: &[u8] =
+    b"RUNIX-FAT32-PROOF: nested file inside a real subdirectory.\n";
+
+/// Filesystem driver, Phase 2 extension: multi-cluster coverage.
+/// `HELLO.TXT` (68 bytes) fits in the fixture's single 512-byte cluster —
+/// never exercising `next_cluster_in_chain`/`is_end_of_chain` beyond one
+/// cluster. `BIG.TXT` is sized to span several. Its content is generated,
+/// not stored as a 3000-byte literal, identically on both sides (this
+/// function and `make_fat32_image.sh`'s own `python3` one-liner) — one
+/// formula, not two copies that could quietly drift apart.
+const BIG_FILE_NAME: [u8; 11] = *b"BIG     TXT";
+const BIG_FILE_LEN: usize = 3000;
+fn expected_big_file_byte(i: usize) -> u8 {
+    b'0' + (i % 10) as u8
+}
 
 /// A single request's worth of scratch state plus the virtqueue it posts
 /// to — bundles what Phase 1's write/read-back proof and Phase 2's FAT32
@@ -255,7 +292,15 @@ pub extern "C" fn _start() -> ! {
     // already proves Phase 1 independently on its own scratch image, so
     // there's nothing to gain from re-running it here against a FAT32
     // image it would only corrupt.
-    if info.attempt_fat32 != 0 {
+    if info.serve_fs_requests != 0 {
+        // Same sector-0 corruption hazard `attempt_fat32`'s branch already
+        // documents: this mode reads (never writes) the boot sector, so it
+        // shares that branch's exclusivity with Phase 1's write proof.
+        match dev.read_sector(0).and_then(|s| BootSectorInfo::parse(&s)) {
+            Some(boot_info) => run_fs_ipc_server(&mut dev, &boot_info),
+            None => write_all(b"blk-driver-host: FS server FAIL - boot sector did not parse\n"),
+        }
+    } else if info.attempt_fat32 != 0 {
         let phase2_pass = run_fat32_proof(&mut dev);
         unsafe {
             core::ptr::write_volatile(
@@ -344,49 +389,8 @@ fn run_fat32_proof(dev: &mut BlkDevice) -> bool {
         return false;
     }
 
-    // Fixed-size read buffer -- no `alloc` linked in this crate (see
-    // `HEAP_SIZE`'s doc comment). Big enough for this phase's fixed test
-    // fixture with headroom; a file larger than this is a test-fixture
-    // bug, not something this proof needs to handle generically yet.
-    const MAX_FILE_BYTES: usize = 4096;
     let mut file_buf = [0u8; MAX_FILE_BYTES];
-    let read_len = (entry.file_size as usize).min(MAX_FILE_BYTES);
-
-    let mut cluster = entry.first_cluster;
-    let mut written = 0usize;
-    // Same defensive iteration cap every cluster-chain walk in this
-    // function uses -- a corrupt or cyclic FAT must make this driver
-    // report failure, not spin forever.
-    for _ in 0..1024u32 {
-        if written >= read_len {
-            break;
-        }
-        let Some(sector0) = info.cluster_to_sector(cluster) else {
-            break;
-        };
-        for s in 0..u32::from(info.sectors_per_cluster) {
-            if written >= read_len {
-                break;
-            }
-            let Some(sector) = dev.read_sector(u64::from(sector0) + u64::from(s)) else {
-                write_all(b"blk-driver-host: FAT32 FAIL - could not read file data sector\n");
-                return false;
-            };
-            let take = (read_len - written).min(SECTOR_SIZE);
-            file_buf[written..written + take].copy_from_slice(&sector[..take]);
-            written += take;
-        }
-        if written >= read_len {
-            break;
-        }
-        let Some(next) = next_cluster_in_chain(dev, &info, cluster) else {
-            break;
-        };
-        if is_end_of_chain(next) {
-            break;
-        }
-        cluster = next;
-    }
+    let written = read_file_contents(dev, &info, &entry, &mut file_buf);
 
     let contents_match = written >= EXPECTED_FILE_CONTENTS.len()
         && &file_buf[..EXPECTED_FILE_CONTENTS.len()] == EXPECTED_FILE_CONTENTS;
@@ -399,12 +403,183 @@ fn run_fat32_proof(dev: &mut BlkDevice) -> bool {
     write_byte(if contents_match { b'1' } else { b'0' });
     write_byte(b'\n');
 
-    if contents_match {
+    let subdir_pass = run_subdir_proof(dev, &info);
+    let big_file_pass = run_big_file_proof(dev, &info);
+
+    let pass = contents_match && subdir_pass && big_file_pass;
+    if pass {
         write_all(b"blk-driver-host: FAT32 file located and read correctly (Phase 2 PASS)\n");
     } else {
         write_all(b"blk-driver-host: FAT32 file contents did not match (Phase 2 FAIL)\n");
     }
-    contents_match
+    pass
+}
+
+/// Walks one level into [`SUBDIR_NAME`] and reads [`NESTED_FILE_NAME`] back
+/// — the first proof `find_entry_in_directory`'s already-generic
+/// `dir_cluster` parameter actually works one level deep, not just at the
+/// root.
+fn run_subdir_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
+    let Some(subdir) = find_entry_in_directory(dev, info, info.root_cluster, &SUBDIR_NAME) else {
+        write_all(b"blk-driver-host: FAT32 FAIL - SUBDIR not found in root directory\n");
+        return false;
+    };
+    if !subdir.is_dir {
+        write_all(b"blk-driver-host: FAT32 FAIL - SUBDIR is not actually a directory\n");
+        return false;
+    }
+    let Some(nested) = find_entry_in_directory(dev, info, subdir.first_cluster, &NESTED_FILE_NAME)
+    else {
+        write_all(b"blk-driver-host: FAT32 FAIL - NESTED.TXT not found inside SUBDIR\n");
+        return false;
+    };
+
+    let mut buf = [0u8; MAX_FILE_BYTES];
+    let written = read_file_contents(dev, info, &nested, &mut buf);
+    let matches = written >= NESTED_EXPECTED_CONTENTS.len()
+        && &buf[..NESTED_EXPECTED_CONTENTS.len()] == NESTED_EXPECTED_CONTENTS;
+
+    write_all(b"blk-driver-host: FAT32 subdir nested_bytes_read=");
+    write_decimal(written as u64);
+    write_all(b" contents_match=");
+    write_byte(if matches { b'1' } else { b'0' });
+    write_byte(b'\n');
+    matches
+}
+
+/// Reads [`BIG_FILE_NAME`] back in full and checks every byte against
+/// [`expected_big_file_byte`] — the first real exercise of
+/// `next_cluster_in_chain`/`is_end_of_chain` beyond a single cluster (the
+/// fixture's 512-byte clusters mean this file's 3000 bytes span several).
+fn run_big_file_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
+    let Some(entry) = find_entry_in_directory(dev, info, info.root_cluster, &BIG_FILE_NAME) else {
+        write_all(b"blk-driver-host: FAT32 FAIL - BIG.TXT not found in root directory\n");
+        return false;
+    };
+
+    let mut buf = [0u8; MAX_FILE_BYTES];
+    let written = read_file_contents(dev, info, &entry, &mut buf);
+    let matches = written == BIG_FILE_LEN
+        && buf[..written]
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| b == expected_big_file_byte(i));
+
+    write_all(b"blk-driver-host: FAT32 big_file_bytes_read=");
+    write_decimal(written as u64);
+    write_all(b" contents_match=");
+    write_byte(if matches { b'1' } else { b'0' });
+    write_byte(b'\n');
+    matches
+}
+
+/// Fixed-size read buffer -- no `alloc` linked in this crate (see
+/// `HEAP_SIZE`'s doc comment). Big enough for this phase's fixed test
+/// fixtures with headroom; a file larger than this is a test-fixture bug,
+/// not something this driver needs to handle generically yet.
+const MAX_FILE_BYTES: usize = 4096;
+
+/// Walks `entry`'s cluster chain, copying up to `buf.len()` (or
+/// `entry.file_size`, whichever is smaller) bytes into `buf`, and returns
+/// how many bytes were actually written. Shared by Phase 2's own
+/// self-contained proof (`run_fat32_proof`) and Phase 3's request-serving
+/// loop (`run_fs_ipc_server`) — extracted specifically so both go through
+/// the exact same chain-walking code, not two copies that could quietly
+/// drift apart.
+fn read_file_contents(
+    dev: &mut BlkDevice,
+    info: &BootSectorInfo,
+    entry: &blk_driver_host::ShortDirEntry,
+    buf: &mut [u8],
+) -> usize {
+    let read_len = (entry.file_size as usize).min(buf.len());
+    let mut cluster = entry.first_cluster;
+    let mut written = 0usize;
+    // Same defensive iteration cap every cluster-chain walk in this
+    // module uses -- a corrupt or cyclic FAT must make this driver report
+    // failure, not spin forever.
+    for _ in 0..1024u32 {
+        if written >= read_len {
+            break;
+        }
+        let Some(sector0) = info.cluster_to_sector(cluster) else {
+            break;
+        };
+        for s in 0..u32::from(info.sectors_per_cluster) {
+            if written >= read_len {
+                break;
+            }
+            let Some(sector) = dev.read_sector(u64::from(sector0) + u64::from(s)) else {
+                write_all(b"blk-driver-host: FAIL - could not read file data sector\n");
+                return written;
+            };
+            let take = (read_len - written).min(SECTOR_SIZE);
+            buf[written..written + take].copy_from_slice(&sector[..take]);
+            written += take;
+        }
+        if written >= read_len {
+            break;
+        }
+        let Some(next) = next_cluster_in_chain(dev, info, cluster) else {
+            break;
+        };
+        if is_end_of_chain(next) {
+            break;
+        }
+        cluster = next;
+    }
+    written
+}
+
+/// Filesystem driver, Phase 3: locates [`TARGET_FILE_NAME`] once, then
+/// serves at most one request over the fixed IPC ports (see
+/// `FS_REQUEST_PORT`/`FS_RESPONSE_PORT`) -- one trigger byte in, a 2-byte
+/// little-endian length header plus that many content bytes out. "At most
+/// one" matches every other phase's "prove it once" scope; a real
+/// multi-request service is future work once there's more than one
+/// process that might ever ask.
+fn run_fs_ipc_server(dev: &mut BlkDevice, info: &BootSectorInfo) {
+    let Some(entry) = find_entry_in_directory(dev, info, info.root_cluster, &TARGET_FILE_NAME)
+    else {
+        write_all(b"blk-driver-host: FS server FAIL - target file not found\n");
+        return;
+    };
+
+    let mut file_buf = [0u8; MAX_FILE_BYTES];
+    let written = read_file_contents(dev, info, &entry, &mut file_buf);
+
+    write_all(b"blk-driver-host: FS server ready, waiting for a request\n");
+
+    // Same poll-bound discipline as every other wait loop in this
+    // codebase: a real request arrives promptly in practice, so this bound
+    // exists purely to make "nobody ever asked" report as a clean timeout
+    // instead of hanging the boot forever.
+    let mut got_request = false;
+    for i in 0..2_000_000u32 {
+        if syscall::ipc_try_recv(FS_REQUEST_PORT).is_some() {
+            got_request = true;
+            break;
+        }
+        if i % 10_000 == 0 {
+            yield_now();
+        }
+    }
+
+    if !got_request {
+        write_all(b"blk-driver-host: FS server FAIL - no request received within poll bound\n");
+        return;
+    }
+
+    write_all(b"blk-driver-host: FS server got a request, replying with ");
+    write_decimal(written as u64);
+    write_all(b" bytes\n");
+
+    let len_bytes = (written as u16).to_le_bytes();
+    let _ = syscall::ipc_send(FS_RESPONSE_PORT, len_bytes[0]);
+    let _ = syscall::ipc_send(FS_RESPONSE_PORT, len_bytes[1]);
+    for &byte in &file_buf[..written] {
+        let _ = syscall::ipc_send(FS_RESPONSE_PORT, byte);
+    }
 }
 
 /// Scans every 32-byte entry of `dir_cluster`'s cluster chain for

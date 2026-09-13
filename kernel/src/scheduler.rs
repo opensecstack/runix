@@ -44,6 +44,7 @@
 use crate::memory;
 use crate::process::AddressSpace;
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 use core::arch::naked_asm;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -184,6 +185,17 @@ struct Thread {
     /// were never granted one, which any check treats as "denied," not
     /// "unrestricted."
     capability: Option<CapabilityToken>,
+    /// Additional capabilities beyond `capability` — needed the moment a
+    /// single thread must be authorized for more than one distinct
+    /// resource at once (e.g. `blk-driver-host` serving filesystem IPC
+    /// requests: one token for its own virtio-blk io-port range, a second
+    /// for the reply port it sends responses on). Kept as a separate,
+    /// empty-by-default `Vec` rather than turning `capability` itself into
+    /// a `Vec` everywhere — every existing single-capability call site
+    /// (`net-driver-host`, `grid-sandbox-host`, every kernel test) keeps
+    /// compiling and behaving identically; only a thread that actually
+    /// needs a second capability ever populates this.
+    extra_capabilities: Vec<CapabilityToken>,
     /// `Some` for a thread that owns its own private address space (a
     /// "process," in the sense `process.rs` means it) — [`reschedule`]
     /// switches `Cr3` to it right before resuming this thread. `None`
@@ -284,6 +296,7 @@ impl Thread {
             guard_page_base,
             stack_pointer: frame_ptr as usize,
             capability: None,
+            extra_capabilities: Vec::new(),
             address_space: None,
             kernel_entry_stack_top: None,
         }
@@ -298,6 +311,7 @@ impl Thread {
             guard_page_base: VirtAddr::new(0),
             stack_pointer: 0,
             capability: None,
+            extra_capabilities: Vec::new(),
             address_space: None,
             kernel_entry_stack_top: None,
         }
@@ -468,6 +482,29 @@ pub fn spawn_ring3_process_with_capability(
     push_thread(thread);
 }
 
+/// Same as [`spawn_ring3_process_with_capability`], but for a thread that
+/// needs to be authorized for more than one distinct resource at once —
+/// today, exactly `blk-driver-host` serving filesystem IPC requests: one
+/// capability for its own virtio-blk io-port range (checked by
+/// `SYS_PORT_IN`/`SYS_PORT_OUT`), a second for the reply port it sends
+/// responses on (checked by `SYS_IPC_SEND`). `capability` keeps meaning
+/// exactly what it already does everywhere else; `extra_capabilities` is
+/// consulted by `syscall::dispatch`'s `SYS_IPC_SEND` check as an
+/// additional set of tokens to search, never required to be non-empty.
+pub fn spawn_ring3_process_with_capabilities(
+    entry: extern "C" fn() -> !,
+    address_space: AddressSpace,
+    capability: Option<CapabilityToken>,
+    extra_capabilities: Vec<CapabilityToken>,
+) {
+    let mut thread = Thread::new(entry);
+    thread.address_space = Some(address_space);
+    thread.kernel_entry_stack_top = Some(alloc_kernel_entry_stack());
+    thread.capability = capability;
+    thread.extra_capabilities = extra_capabilities;
+    push_thread(thread);
+}
+
 /// Same as [`spawn_ring3_process`], but the new thread runs in the kernel's
 /// own shared address space instead of a private [`AddressSpace`] — for
 /// ring 3 code that lives on a page carved out of the kernel's existing
@@ -539,6 +576,21 @@ pub fn current_capability() -> Option<CapabilityToken> {
             .as_ref()
             .and_then(|sched| sched.current.as_ref())
             .and_then(|thread| thread.capability.clone())
+    })
+}
+
+/// The current thread's *additional* capabilities beyond
+/// [`current_capability`] — see [`spawn_ring3_process_with_capabilities`]'s
+/// doc comment for why a thread would ever hold more than one. Empty for
+/// every thread spawned through any other `spawn*` function.
+pub fn current_extra_capabilities() -> Vec<CapabilityToken> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        SCHEDULER
+            .lock()
+            .as_ref()
+            .and_then(|sched| sched.current.as_ref())
+            .map(|thread| thread.extra_capabilities.clone())
+            .unwrap_or_default()
     })
 }
 

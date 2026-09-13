@@ -196,7 +196,23 @@ struct BlkBootInfo {
     /// to every real boot for no benefit. Same exact reasoning
     /// `NetBootInfo::attempt_tcp`'s own doc comment already gives.
     attempt_fat32: u8,
+    /// Filesystem driver, Phase 3: `0` on the real boot path and every
+    /// earlier test -- no other process asks for a file there, so entering
+    /// a receive-loop would just add an unused, never-satisfied wait to
+    /// every other boot/test. `1` only in `kernel/tests/blk_fs_ipc.rs`,
+    /// which alone spawns a second process to actually send a request.
+    serve_fs_requests: u8,
 }
+
+/// Filesystem driver, Phase 3's fixed IPC ports -- request (a requester
+/// sends one trigger byte here) and response (`blk-driver-host` replies
+/// with a 2-byte little-endian length header, then that many content
+/// bytes) -- distinct from the transient demo ports (`0`-`2`) Phase
+/// B4/B5's own capability-gate proof already uses during boot, though
+/// those never stay live long enough to actually collide with these.
+#[allow(dead_code)]
+const BLK_FS_REQUEST_PORT: usize = 8;
+const BLK_FS_RESPONSE_PORT: usize = 9;
 
 /// Offset into the `BLK_INFO_VA` page `blk-driver-host` writes its own
 /// write-then-read-back result byte to -- same convention `NET_RESULT_OFFSET`
@@ -521,7 +537,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     serial_println!(
                         "Runix kernel: blk-driver-host authorized by CITADEL allowlist (Phase B9)"
                     );
-                    load_and_run_blk_driver_host(io_base, now, &signing_key, false);
+                    load_and_run_blk_driver_host(io_base, now, &signing_key, false, false);
                 }
                 Err(e) => {
                     serial_println!(
@@ -922,14 +938,17 @@ extern "C" fn net_driver_host_trampoline() -> ! {
 /// RX/TX-buffer-array plumbing (virtio-blk needs one virtqueue and one
 /// request-buffer page, not paired queues and several packet buffers).
 ///
-/// `attempt_fat32` is written straight into `BlkBootInfo` -- `false` on the
-/// real boot path (see that field's own doc comment), `true` only for
-/// `kernel/tests/blk_fat32_read.rs`.
+/// `attempt_fat32`/`serve_fs_requests` are written straight into
+/// `BlkBootInfo` -- both `false` on the real boot path (see those fields'
+/// own doc comments), `attempt_fat32` alone `true` for
+/// `kernel/tests/blk_fat32_read.rs`, `serve_fs_requests` alone `true` for
+/// `kernel/tests/blk_fs_ipc.rs`.
 fn load_and_run_blk_driver_host(
     io_base: u16,
     now: u64,
     signing_key: &ed25519_dalek::SigningKey,
     attempt_fat32: bool,
+    serve_fs_requests: bool,
 ) {
     serial_println!(
         "Runix kernel: parsing blk-driver-host ({} bytes)",
@@ -990,6 +1009,7 @@ fn load_and_run_blk_driver_host(
         queue_phys: queue_first_frame_phys,
         reqbuf_phys,
         attempt_fat32: attempt_fat32 as u8,
+        serve_fs_requests: serve_fs_requests as u8,
     };
     unsafe {
         (info_content.as_mut_ptr() as *mut BlkBootInfo).write(info);
@@ -1010,11 +1030,35 @@ fn load_and_run_blk_driver_host(
     unsafe {
         BLK_DRIVER_HOST_ENTRY_POINT = entry.as_u64();
     }
-    runix_kernel::scheduler::spawn_ring3_process_with_capability(
-        blk_driver_host_trampoline,
-        space,
-        Some(blk_token),
-    );
+
+    // Filesystem driver, Phase 3: only when actually serving requests does
+    // this process need a second capability (the reply port) -- every
+    // other boot/test keeps using the single-capability spawn path
+    // unchanged, same "additive, not a behavior change for existing
+    // callers" reasoning `Thread::extra_capabilities`'s own doc comment
+    // gives.
+    if serve_fs_requests {
+        let response_token = runix_capability_manager::CapabilityToken::issue(
+            "blk-driver-host",
+            runix_kernel::capabilities::port_resource(BLK_FS_RESPONSE_PORT),
+            now,
+            now + 1_000_000,
+            "demo-key",
+            signing_key,
+        );
+        runix_kernel::scheduler::spawn_ring3_process_with_capabilities(
+            blk_driver_host_trampoline,
+            space,
+            Some(blk_token),
+            alloc::vec![response_token],
+        );
+    } else {
+        runix_kernel::scheduler::spawn_ring3_process_with_capability(
+            blk_driver_host_trampoline,
+            space,
+            Some(blk_token),
+        );
+    }
 
     // Give it plenty of turns to probe the device and complete a
     // write-then-read-back round trip on sector 0 before boot moves on --

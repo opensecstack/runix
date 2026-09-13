@@ -1238,12 +1238,77 @@ contents_match=1` — the real boot sector parsed, the real root directory
 walked, the real file located and its exact 68 bytes read back over the
 same virtio-blk transport Phase 1 proved.
 
-What this doesn't claim: no writes anywhere (create, delete, truncate,
-extend — none of it); no long filenames; no subdirectory traversal (only
-the root directory is ever scanned); no syscall or IPC surface yet
-exposing any of this to another process — `blk-driver-host` is still the
-only thing that can read a file, and only the one fixed name it's told to
-look for at that.
+What this doesn't claim (at the time Phase 2 landed): no writes anywhere;
+no long filenames; no subdirectory traversal; no syscall or IPC surface
+yet exposing any of this to another process. Phase 3, below, closes three
+of those.
+
+**Filesystem driver, Phase 3: a real IPC surface, capability-scoped both
+ways, plus the two coverage gaps Phase 2 left open.** Before this, nothing
+outside `blk-driver-host` itself could ask it for a file — Phase 2 was a
+self-contained proof, not a service. Closed here: the syscall/IPC surface,
+capability-manager scoping (falls out of the same design, not bolted on),
+subdirectory traversal, and multi-cluster/larger-file coverage. Deferred,
+named rather than silently dropped: long filenames (real VFAT LFN
+reconstruction is a meaningfully-sized parser addition on its own) and
+write support (a different risk class entirely — a bug there can corrupt
+a real filesystem, not just fail a read; needs its own dedicated design
+pass).
+
+Reading `kernel/src/syscall.rs`/`kernel/src/ipc.rs`/`kernel/src/scheduler.rs`
+directly (not assuming) surfaced the actual starting point: no multi-byte
+or process-to-process IPC mechanism exists in this kernel at all —
+`SYS_IPC_SEND`/`SYS_IPC_RECV` move one byte at a time through one of 16
+fixed 32-byte queues, and the `runix-ipc` workspace crate (`Envelope`) is
+genuinely dead code, zero consumers anywhere. The filesystem service is
+built entirely on that existing generic mechanism — no new syscalls. Two
+fixed ports (`8` request, `9` response, distinct from Phase B4/B5's
+transient boot-time demo ports `0`-`2`): a requester sends one trigger
+byte to port 8, authorized by a capability scoped to `port_resource(8)`
+(the *existing* `port:<n>` convention, unchanged); `blk-driver-host`
+replies on port 9 with a 2-byte little-endian length header followed by
+that many content bytes.
+
+**One real architectural constraint this surfaced**: `scheduler::Thread`
+held exactly one `Option<CapabilityToken>`. Serving requests means
+`blk-driver-host` needs a *second* capability — its existing virtio-blk
+io-port token, plus a new one authorizing it to send on the reply port.
+Rather than turn every existing single-capability call site into a `Vec`
+everywhere, `Thread` gained an additive `extra_capabilities: Vec<CapabilityToken>`
+field (empty by default) alongside the untouched `capability` field, and
+a new `spawn_ring3_process_with_capabilities` alongside the existing
+single-capability function — every other call site in `net-driver-host`/
+`grid-sandbox-host`/every existing kernel test keeps compiling and
+behaving identically, confirmed by re-running the *entire* existing test
+suite, not just the new tests, since this touches shared scheduler/syscall
+code every capability-gated test depends on.
+
+Verified in `kernel/tests/blk_fs_ipc.rs` with both directions of the gate,
+not just the happy path: a thread holding no capability at all is denied
+(`u64::MAX`) when it tries to send the request trigger — mirroring
+`kernel/src/main.rs`'s own Phase B4 `thread_sender_unauthorized` demo —
+and confirmed nothing leaks to the response port from a denied send
+either. A second thread, holding a capability scoped to exactly port 8,
+gets the exact 68 bytes of `HELLO.TXT` back over real, capability-gated
+IPC between two independently-scheduled contexts. Worked on the first
+real boot attempt.
+
+**Subdirectories and multi-cluster files, closed together as an extension
+of Phase 2's own proof** (not a new phase — they're the same "locate and
+read a file" capability, just exercised more thoroughly): `find_entry_in_directory`
+already took any starting cluster, so a `SUBDIR/NESTED.TXT` fixture entry
+proves it actually works one level deep, not just at the root. Separately,
+`HELLO.TXT`'s 68 bytes fit inside the fixture's single 512-byte cluster
+(confirmed by actually inspecting the formatted image's own BPB, not
+assumed) — meaning `next_cluster_in_chain`/`is_end_of_chain` had never
+been exercised past one cluster. A new `BIG.TXT`, exactly 3000 bytes of a
+deterministic pattern generated identically by the fixture script and the
+driver's own expectation (one formula, not two copies to drift apart),
+spans several clusters and is read back and checked byte-for-byte.
+Confirmed: `nested_bytes_read=59 contents_match=1`,
+`big_file_bytes_read=3000 contents_match=1` — no bugs found in either,
+unlike several earlier phases this session, a legitimate outcome given how
+directly this code was already exercised getting Phase 2 working.
 
 ## Mobile L1: ARM/TrustZone boot bring-up (`kernel-arm/`)
 
