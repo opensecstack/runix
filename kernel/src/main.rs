@@ -143,6 +143,68 @@ struct NetBootInfo {
     attempt_tcp: u8,
 }
 
+/// `blk-driver-host`, Phase B9's payload (filesystem driver, Phase 1 —
+/// virtio-blk transport). Same `include_bytes!` compile-time requirement as
+/// `NET_DRIVER_HOST_ELF` above: `cd blk-driver-host && cargo build --target
+/// x86_64-unknown-none --release` must run before `main.rs` itself will
+/// compile.
+static BLK_DRIVER_HOST_ELF: &[u8] =
+    include_bytes!("../../blk-driver-host/target/x86_64-unknown-none/release/blk-driver-host");
+
+// New VA family, leading group `0x0999` -- deliberately not any of the
+// families already in use here (`0x1111`=net, `0x2222`=grid,
+// `0x3333`=kernel-entry-stack-region, `0x4444`/`0x5555`/`0x6666`=kernel
+// heap/stack/etc, `0x7777`=test-only regions). A P4 slot spans 512 GiB and
+// is determined by a 16-bit group's top 9 bits, so any two groups differing
+// only below `0x80` collide -- `0x0999` sits comfortably clear of every one
+// of those. Also deliberately not `0x0000`: `AddressSpace::new()`'s doc
+// comment leaves open the possibility slot 0 carries something from
+// whatever table a process was seeded from, and an unused alternative is
+// equally cheap to pick instead of gambling on it being empty.
+const BLK_HEAP_START: u64 = 0x_0999_1111_0000;
+const BLK_HEAP_SIZE: u64 = 256 * 1024;
+const BLK_STACK_VA: u64 = 0x_0999_2222_0000;
+const BLK_STACK_SIZE: u64 = 4096 * 4;
+/// Must match `blk-driver-host/src/main.rs`'s own `BLK_INFO_VA`/`BLK_QUEUE_VA`/
+/// `BLK_REQBUF_VA` constants exactly -- same "kernel maps the VA, hands over
+/// the matching physical address via a boot-info page" contract
+/// `NET_INFO_VA` established (see that constant's doc comment).
+const BLK_INFO_VA: u64 = 0x_0999_3333_0000;
+/// virtio-blk legacy has exactly one request queue (unlike virtio-net's
+/// RX/TX pair), so only one virtqueue region is needed -- 3 pages
+/// (`NET_QUEUE_ALIGN`-sized, reusing that same alignment constant) for the
+/// descriptor table + avail ring + used ring.
+const BLK_QUEUE_VA: u64 = 0x_0999_4444_0000;
+/// One 4 KiB page: header (offset 0, 16 bytes) + one 512-byte sector +
+/// device-written status byte (offset 528) -- reused sequentially for both
+/// the write and the read-back request, no concurrency needed for this
+/// slice.
+const BLK_REQBUF_VA: u64 = 0x_0999_5555_0000;
+
+/// Mirrors `blk-driver-host/src/main.rs`'s own `BlkBootInfo` -- `repr(C)`,
+/// same field order, in both independently-compiled crates. Not a shared
+/// type, same "no shared type, just an agreed ABI" note as `NetBootInfo`'s
+/// own doc comment.
+#[repr(C)]
+struct BlkBootInfo {
+    io_base: u16,
+    _pad: u16,
+    queue_phys: u64,
+    reqbuf_phys: u64,
+}
+
+/// Offset into the `BLK_INFO_VA` page `blk-driver-host` writes its own
+/// write-then-read-back result byte to -- same convention `NET_RESULT_OFFSET`
+/// already established (kernel writes the request into the page, the ring-3
+/// process writes its result back into the same page). Only read by
+/// `kernel/tests/blk_driver_rw.rs` -- the real boot path never checks it.
+#[allow(dead_code)]
+const BLK_RESULT_OFFSET: usize = 128;
+#[allow(dead_code)]
+const BLK_RESULT_PASS: u8 = 1;
+#[allow(dead_code)]
+const BLK_RESULT_FAIL: u8 = 2;
+
 /// The default config doesn't map all of physical memory into the kernel's
 /// address space — `memory::init`'s `OffsetPageTable` needs that mapping to
 /// exist (it translates physical frame addresses to virtual ones by adding
@@ -425,6 +487,39 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
         None => {
             serial_println!("Runix kernel: no virtio-net I/O-space BAR0 found — Phase B8 skipped");
+        }
+    }
+
+    // Filesystem driver, Phase 1: virtio-blk transport (Phase B9, see
+    // docs/STATUS.md's "Filesystem driver, Phase 1" section). Same
+    // find-device -> CITADEL-authorize -> load-and-run shape as Phase B8,
+    // reusing the same `pci_devices` scan (no need to re-scan PCI config
+    // space for a second device class).
+    match runix_kernel::pci::find_virtio_blk(&pci_devices)
+        .and_then(|dev| runix_kernel::pci::read_bar0_io_port(&dev))
+    {
+        Some(io_base) => {
+            match runix_kernel::citadel::demo_authorize(
+                "blk-driver-host",
+                BLK_DRIVER_HOST_ELF,
+                runix_kernel::citadel::SandboxTier::T1Critical,
+            ) {
+                Ok(_tier) => {
+                    serial_println!(
+                        "Runix kernel: blk-driver-host authorized by CITADEL allowlist (Phase B9)"
+                    );
+                    load_and_run_blk_driver_host(io_base, now, &signing_key);
+                }
+                Err(e) => {
+                    serial_println!(
+                        "Runix kernel: blk-driver-host REJECTED by CITADEL allowlist ({:?}) — not loaded (Phase B9)",
+                        e
+                    );
+                }
+            }
+        }
+        None => {
+            serial_println!("Runix kernel: no virtio-blk I/O-space BAR0 found — Phase B9 skipped");
         }
     }
 
@@ -803,6 +898,122 @@ extern "C" fn net_driver_host_trampoline() -> ! {
         runix_kernel::userspace::enter_usermode(
             VirtAddr::new(entry),
             VirtAddr::new(NET_STACK_VA + NET_STACK_SIZE),
+        );
+    }
+}
+
+/// Parses, loads, and runs `BLK_DRIVER_HOST_ELF` as a real ring 3 process,
+/// capability-gated to exactly virtio-blk's discovered I/O-port range --
+/// called only after Phase B9's CITADEL check authorizes it. Same load
+/// mechanism `load_and_run_net_driver_host` already proved, minus the
+/// RX/TX-buffer-array plumbing (virtio-blk needs one virtqueue and one
+/// request-buffer page, not paired queues and several packet buffers).
+fn load_and_run_blk_driver_host(io_base: u16, now: u64, signing_key: &ed25519_dalek::SigningKey) {
+    serial_println!(
+        "Runix kernel: parsing blk-driver-host ({} bytes)",
+        BLK_DRIVER_HOST_ELF.len()
+    );
+    let elf = Elf64::parse(BLK_DRIVER_HOST_ELF)
+        .expect("blk-driver-host failed to parse as a valid ELF64 binary");
+
+    let mut space = AddressSpace::new();
+    let entry = elf
+        .load_segments(&mut space)
+        .expect("blk-driver-host failed to load its PT_LOAD segments");
+    serial_println!(
+        "Runix kernel: blk-driver-host loaded, entry point {:#x}",
+        entry.as_u64()
+    );
+
+    let rw_user_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+
+    let map_zeroed_range = |space: &mut AddressSpace, start: u64, size: u64| {
+        let start_page = Page::containing_address(VirtAddr::new(start));
+        let end_page = Page::containing_address(VirtAddr::new(start + size - 1));
+        for page in Page::range_inclusive(start_page, end_page) {
+            space.map_private_page(page, rw_user_flags).fill(0);
+        }
+    };
+
+    // Heap and ring 3 stack: runtime-only regions with no PT_LOAD segment
+    // behind them, same as net-driver-host's.
+    map_zeroed_range(&mut space, BLK_HEAP_START, BLK_HEAP_SIZE);
+    map_zeroed_range(&mut space, BLK_STACK_VA, BLK_STACK_SIZE);
+
+    // The one virtqueue: 3 physically-contiguous pages (descriptor table +
+    // avail ring + used ring), same reasoning `map_zeroed_contiguous_region`'s
+    // own doc comment gives for net-driver-host's RX/TX queues.
+    let queue_first_frame_phys =
+        map_zeroed_contiguous_region(&mut space, BLK_QUEUE_VA, 3, rw_user_flags);
+
+    // The one request-buffer page: header + sector data + status byte, all
+    // within a single page, so no contiguity concern beyond what one page
+    // already guarantees.
+    let reqbuf_page = Page::containing_address(VirtAddr::new(BLK_REQBUF_VA));
+    let reqbuf_content = space.map_private_page(reqbuf_page, rw_user_flags);
+    reqbuf_content.fill(0);
+    let reqbuf_phys = page_phys_addr(reqbuf_content);
+
+    // BlkBootInfo itself: the one page blk-driver-host reads at startup to
+    // learn the physical addresses above.
+    let info_page = Page::containing_address(VirtAddr::new(BLK_INFO_VA));
+    let info_content = space.map_private_page(info_page, rw_user_flags);
+    info_content.fill(0);
+    let info = BlkBootInfo {
+        io_base,
+        _pad: 0,
+        queue_phys: queue_first_frame_phys,
+        reqbuf_phys,
+    };
+    unsafe {
+        (info_content.as_mut_ptr() as *mut BlkBootInfo).write(info);
+    }
+
+    // Capability grant: one range covering the device's whole BAR0 register
+    // block, same granularity net-driver-host's own token uses.
+    let blk_token = runix_capability_manager::CapabilityToken::issue(
+        "blk-driver-host",
+        runix_kernel::capabilities::ioport_range_resource(io_base, 0x20),
+        now,
+        now + 1_000_000,
+        "demo-key",
+        signing_key,
+    );
+
+    #[allow(static_mut_refs)]
+    unsafe {
+        BLK_DRIVER_HOST_ENTRY_POINT = entry.as_u64();
+    }
+    runix_kernel::scheduler::spawn_ring3_process_with_capability(
+        blk_driver_host_trampoline,
+        space,
+        Some(blk_token),
+    );
+
+    // Give it plenty of turns to probe the device and complete a
+    // write-then-read-back round trip on sector 0 before boot moves on --
+    // its own result byte (see `BLK_RESULT_OFFSET`) is only checked by
+    // `kernel/tests/blk_driver_rw.rs`, not the real boot path.
+    for _ in 0..2000 {
+        runix_kernel::scheduler::yield_now();
+    }
+    serial_println!(
+        "Runix kernel: blk-driver-host spawned as an isolated ring 3 process (Phase B9)"
+    );
+}
+
+static mut BLK_DRIVER_HOST_ENTRY_POINT: u64 = 0;
+
+extern "C" fn blk_driver_host_trampoline() -> ! {
+    #[allow(static_mut_refs)]
+    let entry = unsafe { BLK_DRIVER_HOST_ENTRY_POINT };
+    unsafe {
+        runix_kernel::userspace::enter_usermode(
+            VirtAddr::new(entry),
+            VirtAddr::new(BLK_STACK_VA + BLK_STACK_SIZE),
         );
     }
 }

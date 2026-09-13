@@ -105,6 +105,10 @@ harness = false
 name = "net_driver_tcp"
 harness = false
 
+[[test]]
+name = "blk_driver_rw"
+harness = false
+
 [profile.dev]
 panic = "abort"
 

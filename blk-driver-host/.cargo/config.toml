@@ -1,0 +1,15 @@
+# No `[build] target = ...` default here — same "don't leak an ambient
+# target into a nested host-side invocation" reasoning as
+# kernel/.cargo/config.toml and net-driver-host/.cargo/config.toml.
+
+[target.x86_64-unknown-none]
+# Without this, rustc's default for this target produces a position-
+# independent (ET_DYN) executable, breaking `kernel/src/elf.rs`'s loader
+# (it treats every segment's `p_vaddr` as an absolute address with zero
+# relocation processing) — confirmed as a real bug for both
+# `net-driver-host` and `grid-sandbox-host` (see their own
+# `.cargo/config.toml` comments for the exact symptom: a ring 3 fault on an
+# instruction fetch from address `0x0`, a null never-relocated function
+# pointer). Applied here from the start rather than re-discovering it a
+# third time.
+rustflags = ["-C", "relocation-model=static"]

@@ -91,7 +91,27 @@ fn qemu_command() -> Command {
     Command::new("qemu-system-x86_64") // let the real invocation's error speak
 }
 
-fn run_qemu(bios_path: &Path, exit_device: bool) -> ExitStatus {
+/// Ensures a backing raw disk file exists at `root/target/runix-blk-test.img`
+/// (1 MiB, zero-filled) for `-drive if=none,id=blk0` to attach to — every
+/// boot/test gets one, same "every boot/test gets one" precedent
+/// `-device virtio-net-pci` already set. No committed binary fixture: this
+/// crate already creates `target/` output, so the file is created on demand
+/// instead.
+fn ensure_blk_test_image(root: &Path) -> PathBuf {
+    let out_dir = root.join("target");
+    std::fs::create_dir_all(&out_dir).expect("failed to create target/ output dir");
+    let img_path = out_dir.join("runix-blk-test.img");
+    if !img_path.exists() {
+        let file = std::fs::File::create(&img_path)
+            .unwrap_or_else(|e| panic!("failed to create {img_path:?}: {e}"));
+        file.set_len(1024 * 1024)
+            .unwrap_or_else(|e| panic!("failed to size {img_path:?} to 1 MiB: {e}"));
+    }
+    img_path
+}
+
+fn run_qemu(root: &Path, bios_path: &Path, exit_device: bool) -> ExitStatus {
+    let blk_img_path = ensure_blk_test_image(root);
     let mut cmd = qemu_command();
     cmd.arg("-drive")
         .arg(format!("format=raw,file={}", bios_path.display()))
@@ -120,7 +140,17 @@ fn run_qemu(bios_path: &Path, exit_device: bool) -> ExitStatus {
         .arg("-netdev")
         .arg(env::var("RUNIX_NETDEV_ARG").unwrap_or_else(|_| "user,id=net0".to_string()))
         .arg("-device")
-        .arg("virtio-net-pci,netdev=net0");
+        .arg("virtio-net-pci,netdev=net0")
+        // Same "every boot/test gets one" precedent as virtio-net above —
+        // gives `kernel/src/pci.rs::find_virtio_blk` and `blk-driver-host`
+        // a real virtio-blk device to find (filesystem driver, Phase 1).
+        .arg("-drive")
+        .arg(format!(
+            "if=none,id=blk0,file={},format=raw",
+            blk_img_path.display()
+        ))
+        .arg("-device")
+        .arg("virtio-blk-pci,drive=blk0");
     if exit_device {
         cmd.arg("-device")
             .arg("isa-debug-exit,iobase=0xf4,iosize=0x04");
@@ -183,7 +213,7 @@ fn main() {
         }
         "run" => {
             let bios_path = build_image(&root, release);
-            let status = run_qemu(&bios_path, false);
+            let status = run_qemu(&root, &bios_path, false);
             std::process::exit(status.code().unwrap_or(1));
         }
         "test-runner" => {
@@ -202,7 +232,7 @@ fn main() {
                 std::process::exit(1);
             });
             let bios_path = image_from_binary(&root, Path::new(test_binary), "test-bios.img");
-            let status = run_qemu(&bios_path, true);
+            let status = run_qemu(&root, &bios_path, true);
             std::process::exit(exit_code_from_qemu(status));
         }
         other => {

@@ -126,6 +126,10 @@ const VIRTIO_VENDOR_ID: u16 = 0x1AF4;
 /// present 0x1041; not matched here since nothing in this kernel assumes
 /// modern-only virtio yet.
 const VIRTIO_NET_DEVICE_ID: u16 = 0x1000;
+/// virtio-blk's legacy/transitional device ID — what QEMU's `-device
+/// virtio-blk-pci` exposes by default, same "transitional, not modern-only"
+/// reasoning as `VIRTIO_NET_DEVICE_ID` above.
+const VIRTIO_BLK_DEVICE_ID: u16 = 0x1001;
 
 /// Reads `device`'s BAR0 (config space offset 0x10) and, if it's an
 /// I/O-space BAR (bit 0 set), returns its base port. Returns `None` for an
@@ -153,4 +157,13 @@ pub fn find_virtio_net(devices: &[PciDevice]) -> Option<PciDevice> {
         .iter()
         .copied()
         .find(|d| d.vendor_id == VIRTIO_VENDOR_ID && d.device_id == VIRTIO_NET_DEVICE_ID)
+}
+
+/// Finds the virtio-blk device among already-scanned `devices`, if present
+/// — same reasoning and shape as [`find_virtio_net`].
+pub fn find_virtio_blk(devices: &[PciDevice]) -> Option<PciDevice> {
+    devices
+        .iter()
+        .copied()
+        .find(|d| d.vendor_id == VIRTIO_VENDOR_ID && d.device_id == VIRTIO_BLK_DEVICE_ID)
 }

@@ -66,6 +66,7 @@ jobs:
             kernel
             grid-sandbox-host
             net-driver-host
+            blk-driver-host
       - name: fmt check
         run: cargo fmt --check
       # main.rs `include_bytes!`s grid-sandbox-host's compiled output (Phase
@@ -78,6 +79,10 @@ jobs:
       # Same requirement, same reasoning, for net-driver-host (Phase B8).
       - name: build net-driver-host (payload for Phase B8)
         working-directory: net-driver-host
+        run: cargo build --target x86_64-unknown-none --release
+      # Same requirement, same reasoning, for blk-driver-host (Phase B9).
+      - name: build blk-driver-host (payload for Phase B9)
+        working-directory: blk-driver-host
         run: cargo build --target x86_64-unknown-none --release
       - name: clippy (lib + bin only)
         run: cargo clippy --target x86_64-unknown-none --bins --lib -- -D warnings
@@ -115,6 +120,7 @@ jobs:
             xtask
             grid-sandbox-host
             net-driver-host
+            blk-driver-host
       - name: install QEMU
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
       # `grid_sandbox_wasm` below needs this binary already built on disk
@@ -129,6 +135,10 @@ jobs:
       # Same requirement, same reasoning, for `net_driver_icmp`/`net_driver_tcp` below.
       - name: build net-driver-host (payload for net_driver_icmp/net_driver_tcp)
         working-directory: net-driver-host
+        run: cargo build --target x86_64-unknown-none --release
+      # Same requirement, same reasoning, for `blk_driver_rw` below.
+      - name: build blk-driver-host (payload for blk_driver_rw)
+        working-directory: blk-driver-host
         run: cargo build --target x86_64-unknown-none --release
       - name: cargo test (boots every kernel/tests/*.rs in QEMU)
         working-directory: kernel
@@ -155,6 +165,7 @@ jobs:
           cargo test --target x86_64-unknown-none --test grid_sandbox_tier_t3
           cargo test --target x86_64-unknown-none --test citadel_demo
           cargo test --target x86_64-unknown-none --test net_driver_icmp
+          cargo test --target x86_64-unknown-none --test blk_driver_rw
       # Phase 2b's real TCP client proof -- SLIRP has no built-in TCP
       # listener to connect to (confirmed during design research), so this
       # starts a real listener on the host first (kernel/tests/support/
@@ -324,6 +335,7 @@ jobs:
             xtask
             grid-sandbox-host
             net-driver-host
+            blk-driver-host
       # main.rs now `include_bytes!`s grid-sandbox-host's compiled output
       # directly (Phase B7 — see citadel.rs's doc comment), so the kernel
       # itself won't even compile without this built first, the same
@@ -335,6 +347,10 @@ jobs:
       # Same requirement, same reasoning, for net-driver-host (Phase B8).
       - name: build net-driver-host (payload for Phase B8)
         working-directory: net-driver-host
+        run: cargo build --target x86_64-unknown-none --release
+      # Same requirement, same reasoning, for blk-driver-host (Phase B9).
+      - name: build blk-driver-host (payload for Phase B9)
+        working-directory: blk-driver-host
         run: cargo build --target x86_64-unknown-none --release
       - name: install QEMU
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
@@ -355,9 +371,12 @@ jobs:
           # virtualization, and this run genuinely needed more than 90s to
           # reach its final "USR" print, confirmed by the boot log ending
           # mid-sequence at the timeout rather than failing a specific check.
+          truncate -s 1M target/runix-blk-test.img
           timeout 150 qemu-system-x86_64 \
             -drive format=raw,file=target/runix-bios.img \
             -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+            -drive if=none,id=blk0,file=target/runix-blk-test.img,format=raw \
+            -device virtio-blk-pci,drive=blk0 \
             -serial stdio -display none -no-reboot -m 128M \
             | tee /tmp/boot.log || true
           grep -q "Runix kernel: boot OK" /tmp/boot.log
@@ -418,6 +437,13 @@ jobs:
           grep -q "net-driver-host: virtio-net probed, MAC=52:54:00:12:34:56" /tmp/boot.log
           grep -q "net-driver-host: ICMP echo reply received (Phase 2a OK)" /tmp/boot.log
           grep -q "Runix kernel: net-driver-host spawned as an isolated ring 3 process" /tmp/boot.log
+          # Filesystem driver, Phase 1 (B9): the same CITADEL-gate-then-load
+          # mechanism, this time for blk-driver-host -- proves it probed the
+          # real virtio-blk device and was spawned as a capability-gated
+          # ring 3 process with no raw port I/O privilege of its own.
+          grep -q "Runix kernel: blk-driver-host authorized by CITADEL allowlist" /tmp/boot.log
+          grep -q "Runix kernel: blk-driver-host loaded, entry point" /tmp/boot.log
+          grep -q "Runix kernel: blk-driver-host spawned as an isolated ring 3 process" /tmp/boot.log
           grep -q "Runix kernel: entering ring 3" /tmp/boot.log
           # Printed by user_hello() running at CPL 3, one byte per SYS_WRITE
           # syscall — proves the syscall gate's DPL actually admits a ring 3

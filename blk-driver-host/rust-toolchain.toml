@@ -1,0 +1,9 @@
+[toolchain]
+# This crate needs no nightly-only feature — same reasoning as
+# net-driver-host/rust-toolchain.toml, which this file is a direct copy of
+# the shape of. It still needs its OWN toolchain file (not to inherit the
+# root's plain "stable" with no target declared) — see that file's doc
+# comment for the exact `E0463: can't find crate for 'core'` bug this
+# prevents.
+channel = "stable"
+targets = ["x86_64-unknown-none"]

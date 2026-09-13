@@ -1089,6 +1089,90 @@ is narrower than "TCP parsing robustness" (that's smoltcp's own concern)
 but still load-bearing: a panic in this interface would crash the ring 3
 driver process, not corrupt it gracefully.
 
+**Filesystem driver, Phase 1: the legacy virtio-blk transport, proven with
+a real sector round trip — no filesystem format yet.** Beta backlog item
+4, previously unstarted. Sequenced the same way the network stack was:
+prove the *transport* with a real hardware round trip, ring 3-first,
+before any filesystem format (FAT32 or otherwise) parses a single byte on
+top of it — keeps a transport bug and a parser bug from ever being
+confused with each other, the same reasoning that kept `net-driver-host`'s
+Phase 1/2a/2b bugs each isolated to one layer.
+
+`blk-driver-host` (a new freestanding crate, own `[workspace]`, same
+pattern as `net-driver-host`/`grid-sandbox-host`) reuses
+`net-driver-host/src/virtio.rs`'s virtqueue mechanics verbatim in spirit —
+same legacy virtio-pci descriptor/avail/used ring layout, same
+`QUEUE_ALIGN`/one-page-per-part fixed layout — but as its own copy, not a
+shared dependency (this codebase's established convention: each ring-3
+binary is independently compiled and linked). The one genuinely new piece:
+**descriptor chaining**. Virtio-net's RX/TX buffers are always exactly one
+descriptor each; virtio-blk's request format needs three linked
+descriptors (a 16-byte header, a 512-byte data buffer, a device-written
+status byte) submitted as a single chain via `next`/`VIRTQ_DESC_F_NEXT` —
+`Virtqueue::post_chain` writes each descriptor with `next` pointing at the
+following one and publishes only the head to the avail ring, same
+fence-then-publish discipline `post` already used for one descriptor.
+
+`kernel/src/pci.rs` gained `find_virtio_blk` (device ID `0x1001`, mirroring
+`find_virtio_net`'s `0x1000`). Wired into the real boot path as **Phase
+B9**, right after Phase B8 (net-driver-host): CITADEL-authorizes
+`blk-driver-host` at `T1Critical` (a system driver, same tier
+net-driver-host got), issues an `ioport_range_resource`-scoped capability
+token at the same `0x20`-byte granularity net's token uses, and spawns it
+as a capability-gated ring 3 process with no raw port I/O privilege of its
+own — identical isolation shape to every prior driver here.
+
+**A new fixed VA family, chosen carefully, not just incrementally.**
+`blk-driver-host`'s private regions (heap, queue, request buffer, the
+`BlkBootInfo` boot-info page — same "no shared type, just an agreed ABI"
+convention `NetBootInfo`/`GridBootInfo` established) needed their own P4
+slot, distinct from every existing one. Grepping every `0x_XXXX_XXXX_0000`
+constant across `kernel/src` and `kernel/tests` showed nibbles 1
+(net-driver-host), 2 (grid-sandbox-host), 3 (the kernel's own
+`KERNEL_ENTRY_STACK_REGION_START` — the exact collision that caused a real,
+previously-documented double fault), 4/5/6 (kernel heap/stack/etc.), and 7
+(test-only regions) were *all* already taken. Rather than gamble on P4
+slot 0 being empty in a process's private table (`AddressSpace::new()`
+clones every top-level entry from whatever table was active at creation
+time — slot 0 could plausibly carry something worth keeping reachable),
+`0x_0999_...` was picked instead: comfortably clear of every existing
+family's slot (P4 index is determined by a 16-bit group's top 9 bits, so
+anything differing by 128 or more from `0x1111`/`0x2222`/etc. lands in a
+genuinely different slot) without needing to reason about slot 0's
+contents at all. Verified the way the two prior real P4-slot bugs in this
+codebase were both actually caught — by booting it for real, not by the
+arithmetic alone: `kernel/tests/blk_driver_rw.rs` passed on the first real
+attempt, no double fault at ring 3 entry.
+
+**The proof itself: write sector 0, read it back, check the exact bytes —
+and it worked, no bugs found this time.** `blk-driver-host` writes a fixed
+33-byte pattern (padded to a full 512-byte sector) to sector 0
+(`VIRTIO_BLK_T_OUT`), polls to completion and checks the status byte,
+*zeros its own data buffer* (so a passing read can't be a false positive
+from leftover memory), then reads sector 0 back (`VIRTIO_BLK_T_IN`) and
+checks both the status byte and exact byte equality against the original
+pattern. Confirmed in QEMU: `capacity=2048 sectors`, `write completed=1
+status=0`, `read completed=1 status=0 bytes_match=1` — a real write, a
+real read, from a real (if QEMU-emulated) block device, through a
+capability-gated ring 3 process. Unlike every prior phase in this
+session's network-stack work, this one didn't turn up a real bug on the
+first attempt — a legitimate outcome, not a sign the verification was
+shallow (the VA-family collision risk above was the one place a real bug
+plausibly could have hidden, and boot-testing ruled it out directly).
+
+What this doesn't claim: no filesystem format is parsed anywhere yet (no
+FAT32, no directory structure, nothing beyond raw sector I/O) — that's
+Phase 2, explicitly out of scope here. This slice's disk content is
+self-written by this same driver in the same boot, not yet
+attacker-controlled the way network bytes are; `docs/THREAT_MODEL.md`
+flags this as a named revisit trigger (once Phase 2 actually parses a
+filesystem format, disk bytes become untrusted input needing the same
+fuzzing/property-testing rigor already applied to `net-driver-host`'s
+parsers), not a closed question. Only sector 0 is ever touched, and only
+sequentially (one request in flight at a time — `post_chain` always
+reuses descriptor indices `0..3`, safe only because the previous chain's
+completion is always consumed before the next is posted).
+
 ## Mobile L1: ARM/TrustZone boot bring-up (`kernel-arm/`)
 
 Started from nothing to a real, QEMU-verified boot path in one push, in a
