@@ -60,6 +60,16 @@ if [ $# -ne 1 ]; then
 fi
 
 img_path="$1"
+
+# On a fresh checkout with no cached `kernel/target/` yet (this script's
+# own output lives under it), `dd` below would fail outright with "No such
+# file or directory" -- confirmed for real in CI once `rust-cache`'s
+# incidental target-dir restore stopped masking it. Every step before this
+# one in `kernel-tests` builds a *different* crate's own target dir
+# (working-directory: net-driver-host/blk-driver-host/etc.), so nothing
+# guarantees `kernel/target/` exists yet by the time this script runs.
+mkdir -p "$(dirname "$img_path")"
+
 content="RUNIX-FAT32-PROOF: this file was read from a real FAT32 filesystem."
 nested_content="RUNIX-FAT32-PROOF: nested file inside a real subdirectory."
 long_name_content="RUNIX-FAT32-PROOF: located via a real long filename, not 8.3."
