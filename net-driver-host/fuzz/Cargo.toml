@@ -1,0 +1,25 @@
+[package]
+name = "net-driver-host-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone, NOT swept into net-driver-host's own `[workspace]` (which is
+# itself standalone, not a root-workspace member — see net-driver-host/
+# Cargo.toml) — same "declare it as its own workspace so cargo doesn't walk
+# up and merge it" reasoning as capability-manager/fuzz/Cargo.toml.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-tcp", "alloc"] }
+
+[[bin]]
+name = "smoltcp_fuzz"
+path = "fuzz_targets/smoltcp_fuzz.rs"
+test = false
+doc = false
+bench = false

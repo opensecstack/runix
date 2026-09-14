@@ -1,0 +1,28 @@
+[package]
+name = "capability-manager-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone, NOT swept into the root workspace `capability-manager` itself
+# is a member of — same reasoning `net-driver-host`/`blk-driver-host`'s own
+# Cargo.toml comments give for their `[workspace]` stanza: without this,
+# cargo would try to walk up from here and merge this crate into the parent
+# workspace it's nested inside, rather than treating it as its own
+# self-contained package the way `cargo fuzz` expects.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+runix-capability-manager = { path = ".." }
+
+[[bin]]
+name = "verify_fuzz"
+path = "fuzz_targets/verify_fuzz.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,5 @@
+[toolchain]
+# Same reasoning as capability-manager/fuzz/rust-toolchain.toml: `cargo-fuzz`
+# needs nightly for its sanitizer/instrumentation flags, on the host triple
+# — not net-driver-host's own x86_64-unknown-none target.
+channel = "nightly"

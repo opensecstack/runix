@@ -1051,12 +1051,12 @@ job's existing `cargo test --workspace` already picks up
 --lib` step covers `net-driver-host` (`--lib` only, not a bare `cargo
 test` — that crate's `#![no_std] #![no_main]` bin target has its own
 `panic_handler`, which collides with `std`'s the moment cargo tries to
-build a host test harness for it too). No `cargo-fuzz`/libFuzzer harness
-exists yet (not installed/verified in this environment) — property-testing
-via `proptest` is the concrete instantiation of this commitment for now,
-not a placeholder for one; revisit if/when deeper coverage (corpus-driven
-fuzzing, not just randomized property generation) is worth the added CI
-complexity.
+build a host test harness for it too). At the time this paragraph was
+written, no `cargo-fuzz`/libFuzzer harness existed yet — property-testing
+via `proptest` was the concrete instantiation of this commitment, not a
+placeholder for one. That gap is now closed; see the "Real
+`cargo-fuzz`/libFuzzer harnesses" section further down this document for
+what exists today.
 
 **Phase 2's smoltcp boundary — fuzzing the driver-stack interface, not the
 stack internals.** Phase 2a (smoltcp `Device`/`Interface` bring-up + ICMP
@@ -1586,6 +1586,67 @@ types. `docs/THREAT_MODEL.md`'s revisit trigger for this surface is
 updated to reflect exactly this — closed on "one request only" and "one
 file only," still open on "arbitrary path" and "path-scoped capability
 convention."
+
+**Real `cargo-fuzz`/libFuzzer harnesses — closing the gap this document
+named above ("No `cargo-fuzz`/libFuzzer harness exists yet").**
+`docs/THREAT_MODEL.md` commits to fuzzing landing "alongside the first
+network parser"; until now that commitment was only met by `proptest`
+(randomized property tests, not corpus-driven coverage-guided fuzzing).
+Two standalone `cargo fuzz init`-shaped crates now exist, same
+"declare its own empty `[workspace]` so cargo doesn't walk it into the
+parent" convention `net-driver-host`/`blk-driver-host` already use for
+their own standalone-ness, plus a `channel = "nightly"` toolchain file
+(`cargo-fuzz` needs nightly for its sanitizer/instrumentation flags,
+unlike either target crate's own toolchain):
+
+- `capability-manager/fuzz/` (`capability-manager-fuzz`, target
+  `verify_fuzz`): feeds arbitrary bytes at the actual public entry point,
+  `CapabilityToken::verify()`, split into a `now` timestamp, a `resource`
+  string, and a `signature` string set directly onto a token issued with a
+  fixed deterministic keypair — covering `hex::decode(&self.signature)`,
+  the exact call this document already named as the fuzzing-rigor gap when
+  it was still only proptested.
+- `net-driver-host/fuzz/` (`net-driver-host-fuzz`, target
+  `smoltcp_fuzz`): duplicates the existing `#[cfg(test)] mod smoltcp_fuzz`
+  harness from `net-driver-host/src/lib.rs` (`FuzzDevice` /
+  `build_iface_and_sockets`, credited in the fuzz target's own doc
+  comment) rather than exposing it from the library — same boundary the
+  proptest module already exercises (arbitrary bytes into a real
+  `smoltcp::iface::Interface::poll`, split on `0xff` into up to 8 frames
+  polled across several timestamps each, so multi-poll state like a
+  half-open TCP handshake gets exercised, not just a cold single frame).
+
+Both verified in WSL Fedora (this machine's own constraint — libFuzzer/ASan
+need nightly + a real C++ toolchain, poor fit for Windows/MSVC; `cargo-fuzz`
+and a C++ compiler were installed there for this): `cargo +nightly fuzz
+build` succeeds for both crates, and `cargo +nightly fuzz run <target> --
+-max_total_time=20` ran each for its full 20 seconds with no crash,
+timeout, or sanitizer report — `verify_fuzz` completed 107,242 runs,
+`smoltcp_fuzz` ran until its time budget was interrupted at over 474,000
+runs; both are legitimate "harness builds and runs clean" results, not
+evidence of exhaustive coverage. No CI wiring yet: `cargo-fuzz` needs
+nightly and, in CI, likely ASan support whose availability on
+`ubuntu-latest` runners hasn't been confirmed, and a fuzz run is exactly
+the kind of open-ended, potentially-flaky job that shouldn't gate every
+merge — so for now this stays a documented local-run workflow (`cd
+capability-manager/fuzz && cargo +nightly fuzz run verify_fuzz`, similarly
+for `net-driver-host/fuzz`'s `smoltcp_fuzz`), revisited if/when a
+`workflow_dispatch`-triggered smoke job is worth the added CI surface.
+
+**Explicitly still NOT fuzzed**: `blk-driver-host`'s FAT32 parser
+(`boot_sector_parse`, directory-entry parsing, LFN fragment reassembly,
+short-name checksums — all in `blk-driver-host/src/lib.rs`) has only the
+`proptest` coverage described in this document's Filesystem-driver Phase 2
+section above, no `cargo-fuzz` harness of its own yet, despite parsing
+genuinely disk-resident (if not yet attacker-network-controlled) bytes.
+Also unfuzzed: `net-driver-host`'s virtio-net completion validation
+(`validate_rx_completion`, covered by its own `proptest` suite only) and
+anything in `kernel/` itself (no parser there takes fully untrusted input
+today). None of this is a regression — it's the same "proptest first,
+`cargo-fuzz` where the corpus-driven, coverage-guided difference actually
+matters" prioritization this document has used throughout — but it means
+"fuzzing exists in this repo" should not be read as "the FAT32 parser is
+fuzzed."
 
 ## Mobile L1: ARM/TrustZone boot bring-up (`kernel-arm/`)
 
