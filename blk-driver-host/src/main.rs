@@ -91,6 +91,17 @@ struct BlkBootInfo {
 /// convention as every other kernel/ring-3 boundary in this codebase).
 const FS_REQUEST_PORT: usize = 8;
 const FS_RESPONSE_PORT: usize = 9;
+/// Filesystem driver, Phase 8: a second, independently capability-gated
+/// port for write requests against [`WRITE_FILE_NAME`] — a caller needs a
+/// capability scoped to `port_resource(FS_WRITE_REQUEST_PORT)` specifically,
+/// separate from whatever authorizes reading [`TARGET_FILE_NAME`] on
+/// [`FS_REQUEST_PORT`]. One port per file, reusing the existing
+/// `port_resource` convention exactly as `SYS_IPC_SEND` already enforces
+/// it — not a new resource-string kind (a real path-scoped capability
+/// convention for arbitrary/dynamic filenames stays open, see
+/// `docs/THREAT_MODEL.md`). Must match `kernel/src/main.rs`'s own
+/// `BLK_FS_WRITE_REQUEST_PORT` constant exactly.
+const FS_WRITE_REQUEST_PORT: usize = 10;
 
 const BLK_INFO_VA: usize = 0x_0999_3333_0000;
 const BLK_QUEUE_VA: usize = 0x_0999_4444_0000;
@@ -621,6 +632,23 @@ fn run_case_insensitive_long_name_proof(dev: &mut BlkDevice, info: &BootSectorIn
     found
 }
 
+/// Locates `target_name` and resolves its first (and, for every file this
+/// helper is used against, only) cluster to a sector — shared by
+/// `run_write_proof` (Phase 5's self-contained proof) and Phase 8's IPC
+/// write handler (`handle_write_request`), so both go through the exact
+/// same lookup, not two copies that could quietly drift apart. Only valid
+/// for a whole-single-sector file, same limit `run_write_proof` already
+/// documented; a general write path would need to walk the whole chain
+/// the way `read_file_contents` does.
+fn resolve_single_sector_file(
+    dev: &mut BlkDevice,
+    info: &BootSectorInfo,
+    target_name: &[u8; 11],
+) -> Option<u32> {
+    let entry = find_entry_in_directory(dev, info, info.root_cluster, target_name)?;
+    info.cluster_to_sector(entry.first_cluster)
+}
+
 /// Locates `WRITE.TXT`, overwrites its one sector with a fixed pattern
 /// (`write_pattern_byte`), and reads that same sector back via a *fresh*
 /// `dev.read_sector` call — not a cached buffer; `read_sector` always
@@ -647,14 +675,9 @@ fn run_case_insensitive_long_name_proof(dev: &mut BlkDevice, info: &BootSectorIn
 /// bug could actually corrupt a real filesystem rather than just fail a
 /// read — each is the next real slice, not this one.
 fn run_write_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
-    let Some(entry) = find_entry_in_directory(dev, info, info.root_cluster, &WRITE_FILE_NAME)
-    else {
-        write_all(b"blk-driver-host: FAT32 FAIL - WRITE.TXT not found in root directory\n");
-        return false;
-    };
-    let Some(sector) = info.cluster_to_sector(entry.first_cluster) else {
+    let Some(sector) = resolve_single_sector_file(dev, info, &WRITE_FILE_NAME) else {
         write_all(
-            b"blk-driver-host: FAT32 FAIL - WRITE.TXT's cluster did not resolve to a sector\n",
+            b"blk-driver-host: FAT32 FAIL - WRITE.TXT not found or its cluster did not resolve to a sector\n",
         );
         return false;
     };
@@ -1392,13 +1415,39 @@ fn read_file_contents(
     written
 }
 
+/// Filesystem driver, Phase 8 status byte written on [`FS_RESPONSE_PORT`]
+/// after a write request, before any read-style length header (a read
+/// reply has no status byte at all, unchanged from Phase 3 -- the two
+/// reply shapes were never ambiguous to begin with, since each port's
+/// capability already tells a caller which one it's going to get).
+const FS_WRITE_STATUS_OK: u8 = 0;
+const FS_WRITE_STATUS_BAD_LENGTH: u8 = 1;
+const FS_WRITE_STATUS_DEVICE_FAILED: u8 = 2;
+
 /// Filesystem driver, Phase 3: locates [`TARGET_FILE_NAME`] once, then
 /// serves at most one request over the fixed IPC ports (see
 /// `FS_REQUEST_PORT`/`FS_RESPONSE_PORT`) -- one trigger byte in, a 2-byte
-/// little-endian length header plus that many content bytes out. "At most
-/// one" matches every other phase's "prove it once" scope; a real
-/// multi-request service is future work once there's more than one
-/// process that might ever ask.
+/// little-endian length header plus that many content bytes out.
+///
+/// Filesystem driver, Phase 8: rewritten from "serve at most one request,
+/// then idle forever" into a real loop serving both this read path *and*
+/// a second, independently capability-gated write path against
+/// [`WRITE_FILE_NAME`] over [`FS_WRITE_REQUEST_PORT`] -- the first real
+/// multi-request, multi-file IPC surface this driver has had. Still no
+/// arbitrary/dynamic filename in the request itself (each file gets its
+/// own fixed port, decided at spawn time, not named in the payload) --
+/// that needs a path-scoped capability convention that doesn't exist yet
+/// (see `docs/THREAT_MODEL.md`), and stays explicitly out of scope here.
+///
+/// Write wire format (caller -> [`FS_WRITE_REQUEST_PORT`]): a 2-byte
+/// little-endian length, then that many payload bytes. Deliberately
+/// narrow for this slice: the length must be exactly `SECTOR_SIZE` (one
+/// sector, `WRITE.TXT`'s entire capacity, matching Phase 5's
+/// already-proven single-sector overwrite) -- anything else is rejected,
+/// not truncated or padded. No resize, no allocation, no filename in the
+/// payload. Reply is a single status byte on [`FS_RESPONSE_PORT`]
+/// ([`FS_WRITE_STATUS_OK`]/[`FS_WRITE_STATUS_BAD_LENGTH`]/
+/// [`FS_WRITE_STATUS_DEVICE_FAILED`]).
 fn run_fs_ipc_server(dev: &mut BlkDevice, info: &BootSectorInfo) {
     let Some(entry) = find_entry_in_directory(dev, info, info.root_cluster, &TARGET_FILE_NAME)
     else {
@@ -1409,38 +1458,105 @@ fn run_fs_ipc_server(dev: &mut BlkDevice, info: &BootSectorInfo) {
     let mut file_buf = [0u8; MAX_FILE_BYTES];
     let written = read_file_contents(dev, info, &entry, &mut file_buf);
 
-    write_all(b"blk-driver-host: FS server ready, waiting for a request\n");
+    write_all(b"blk-driver-host: FS server ready, serving read/write requests\n");
 
     // Same poll-bound discipline as every other wait loop in this
-    // codebase: a real request arrives promptly in practice, so this bound
-    // exists purely to make "nobody ever asked" report as a clean timeout
-    // instead of hanging the boot forever.
-    let mut got_request = false;
+    // codebase: real requests arrive promptly in practice, so this bound
+    // exists purely to make "a test that sends N requests" report a clean
+    // result instead of hanging the boot forever waiting for an N+1th
+    // request that was never going to come.
+    let mut requests_served = 0u32;
     for i in 0..2_000_000u32 {
         if syscall::ipc_try_recv(FS_REQUEST_PORT).is_some() {
-            got_request = true;
-            break;
+            write_all(b"blk-driver-host: FS server got a read request, replying with ");
+            write_decimal(written as u64);
+            write_all(b" bytes\n");
+            let len_bytes = (written as u16).to_le_bytes();
+            let _ = syscall::ipc_send(FS_RESPONSE_PORT, len_bytes[0]);
+            let _ = syscall::ipc_send(FS_RESPONSE_PORT, len_bytes[1]);
+            for &byte in &file_buf[..written] {
+                let _ = syscall::ipc_send(FS_RESPONSE_PORT, byte);
+            }
+            requests_served += 1;
         }
+
+        if let Some(len_lo) = syscall::ipc_try_recv(FS_WRITE_REQUEST_PORT) {
+            let status = handle_write_ipc_request(dev, info, len_lo);
+            write_all(b"blk-driver-host: FS server got a write request, status=");
+            write_decimal(status as u64);
+            write_byte(b'\n');
+            let _ = syscall::ipc_send(FS_RESPONSE_PORT, status);
+            requests_served += 1;
+        }
+
         if i % 10_000 == 0 {
             yield_now();
         }
     }
 
-    if !got_request {
-        write_all(b"blk-driver-host: FS server FAIL - no request received within poll bound\n");
-        return;
+    write_all(b"blk-driver-host: FS server served ");
+    write_decimal(requests_served as u64);
+    write_all(b" request(s) total (Phase 8)\n");
+}
+
+/// Receives the rest of a write request whose first byte (`len_lo`, the
+/// little-endian length header's low byte) has already been consumed by
+/// `run_fs_ipc_server`'s own poll loop -- the write path has no separate
+/// opcode byte, since the destination port itself already names the
+/// operation, same simplicity the read path's single trigger byte
+/// already has. Receives the length's high byte, and if the resulting
+/// length is exactly `SECTOR_SIZE`, receives that many payload bytes and
+/// overwrites [`WRITE_FILE_NAME`]'s one sector with them via
+/// [`resolve_single_sector_file`], the same lookup `run_write_proof`
+/// uses. Returns the status byte the caller should reply with; never
+/// panics on a malformed/incomplete request, same "untrusted input fails
+/// closed, not loudly" posture every parser in this crate already has.
+fn handle_write_ipc_request(dev: &mut BlkDevice, info: &BootSectorInfo, len_lo: u8) -> u8 {
+    let Some(len_hi) = poll_recv_byte(FS_WRITE_REQUEST_PORT) else {
+        return FS_WRITE_STATUS_BAD_LENGTH;
+    };
+    let len = u16::from_le_bytes([len_lo, len_hi]) as usize;
+    if len != SECTOR_SIZE {
+        return FS_WRITE_STATUS_BAD_LENGTH;
     }
 
-    write_all(b"blk-driver-host: FS server got a request, replying with ");
-    write_decimal(written as u64);
-    write_all(b" bytes\n");
-
-    let len_bytes = (written as u16).to_le_bytes();
-    let _ = syscall::ipc_send(FS_RESPONSE_PORT, len_bytes[0]);
-    let _ = syscall::ipc_send(FS_RESPONSE_PORT, len_bytes[1]);
-    for &byte in &file_buf[..written] {
-        let _ = syscall::ipc_send(FS_RESPONSE_PORT, byte);
+    let mut payload = [0u8; SECTOR_SIZE];
+    for slot in payload.iter_mut() {
+        let Some(byte) = poll_recv_byte(FS_WRITE_REQUEST_PORT) else {
+            return FS_WRITE_STATUS_BAD_LENGTH;
+        };
+        *slot = byte;
     }
+
+    let Some(sector) = resolve_single_sector_file(dev, info, &WRITE_FILE_NAME) else {
+        return FS_WRITE_STATUS_DEVICE_FAILED;
+    };
+    let (completed, status) = dev.write_sector(u64::from(sector), &payload);
+    if completed && status == VIRTIO_BLK_S_OK {
+        FS_WRITE_STATUS_OK
+    } else {
+        FS_WRITE_STATUS_DEVICE_FAILED
+    }
+}
+
+/// Polls `port` for one byte using the same bounded-iteration idiom every
+/// wait loop in this module uses -- `None` if nothing arrives within the
+/// bound, never blocks forever. There is no blocking-receive syscall in
+/// this codebase (`kernel/src/syscall.rs`'s own `SYS_IPC_RECV` dispatch
+/// calls `ipc::try_recv`, not `ipc::recv` -- confirmed, not assumed), so
+/// receiving "the rest of" a multi-byte message that a well-behaved
+/// sender posts byte-by-byte in a tight loop still has to poll, same as
+/// the request-detection loop that calls this.
+fn poll_recv_byte(port: usize) -> Option<u8> {
+    for i in 0..200_000u32 {
+        if let Some(byte) = syscall::ipc_try_recv(port) {
+            return Some(byte);
+        }
+        if i % 10_000 == 0 {
+            yield_now();
+        }
+    }
+    None
 }
 
 /// Scans every 32-byte entry of `dir_cluster`'s cluster chain for

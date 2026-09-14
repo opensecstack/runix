@@ -1528,8 +1528,64 @@ call, the FSInfo sector's free-cluster-count/next-free hint (this driver
 always scans from cluster 2, so its own correctness doesn't depend on it,
 but a real OS reading this volume afterward would see a stale hint), any
 concurrency/locking around allocation (single-writer, same as every other
-write this driver performs), and the still-fully-open syscall/IPC surface
-for writes (Phase 3's IPC surface remains read-only).
+write this driver performs).
+
+**Filesystem driver, Phase 8: a first write-capable, multi-request IPC
+surface — Phase 3's syscall/IPC gap finally gets a real increment.**
+Until now the IPC surface was exactly what Phase 3 left it: one hardcoded
+read-only lookup, served **at most once** per boot, then the driver idled
+forever. `docs/THREAT_MODEL.md`'s own revisit trigger for this named the
+next step explicitly — "an arbitrary path sent at request time instead of
+one fixed target name, or more than one file/process served at once" —
+while separately noting that a real multi-file surface needs a
+path-scoped capability convention that doesn't exist yet
+(`capabilities::check` is exact-string match only, no wildcards). This
+phase closes the two things that don't require inventing that convention
+yet, and deliberately leaves the rest open.
+
+`run_fs_ipc_server` is rewritten from "find file → wait for one trigger →
+reply → idle forever" into a real loop serving **both** the existing
+read path (`HELLO.TXT`, unchanged, backward-compatible) and a **new
+write path** against `WRITE.TXT` over a second, independently
+capability-gated port (`FS_WRITE_REQUEST_PORT = 10`) — one port per file,
+reusing the *existing* `capabilities::port_resource` convention exactly
+as `SYS_IPC_SEND` already enforces it, not a new resource-string kind.
+Write wire format: a 2-byte little-endian length (must be exactly 512,
+`WRITE.TXT`'s whole one-sector capacity — anything else is rejected, not
+truncated or padded) then that many payload bytes; reply is a single
+status byte on the existing shared response port. A real finding while
+designing this, corrected before any code was written: `blk-driver-host`
+itself needs **no new capability** for the write port — it only ever
+*receives* on ports 8/10 (unauthenticated, same as every receive in this
+codebase) and *sends* on port 9 (already covered by its existing reply
+token); the new capability is granted to the *client* thread allowed to
+send a write request, the exact same shape the read path's
+`request_token` already has.
+
+Verified via a real QEMU boot of an extended `kernel/tests/blk_fs_ipc.rs`,
+all in one boot, proving the server loop genuinely serves more than one
+request for the first time: unauthorized read denied (existing,
+unchanged), authorized read OK (existing, unchanged), unauthorized write
+denied (new — same capability gate, now covering the write path too),
+authorized write OK (new). Independently confirmed via `mtype` in CI
+against the real disk image afterward, not just the round trip through
+this still-young protocol: `WRITE.TXT` shows the IPC write's own
+`zyxwv...` pattern (deliberately distinct from Phase 5's direct-write
+`ZYXWV...` pattern, so the two are never confused), landed *after* Phase
+5/6's own checks already ran against the same file earlier in the same
+CI run. Passed on the first genuinely correct attempt, no debugging
+detours this time.
+
+**Still not attempted, explicitly**: arbitrary/dynamic filenames in the
+request (still one port per file, statically issued at spawn time — a
+real path-scoped resource string is the next trigger, not this one);
+create/delete/grow over IPC (Phase 7's riskier primitives stay
+internal-only); per-caller dynamic authorization (capabilities are still
+issued once at spawn time, not on demand); more than two files/requests
+types. `docs/THREAT_MODEL.md`'s revisit trigger for this surface is
+updated to reflect exactly this — closed on "one request only" and "one
+file only," still open on "arbitrary path" and "path-scoped capability
+convention."
 
 ## Mobile L1: ARM/TrustZone boot bring-up (`kernel-arm/`)
 

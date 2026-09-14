@@ -17,6 +17,19 @@
 //! one scoped to the response port it replies on), which is exactly the
 //! scenario that field exists for.
 //!
+//! Filesystem driver, Phase 8 extends this same boot with a second,
+//! independently capability-gated port (`FS_WRITE_REQUEST_PORT`) for
+//! write requests against `WRITE.TXT` — proving both directions again for
+//! the write path (unauthorized denied, authorized succeeds) and, unlike
+//! Phase 3's "serves at most one request, then idles forever," that the
+//! *same* server loop actually serves more than one request in a single
+//! boot (a read, then two write attempts). `blk-driver-host` itself needs
+//! no new capability for this — it only ever *receives* on ports 8/10
+//! (unauthenticated, same as before) and *sends* on port 9 (already
+//! covered by `response_token`); the new capability is granted to the
+//! *client* thread that's allowed to send a write request, same shape as
+//! `request_token` already is for reads.
+//!
 //! **Requires the same real FAT32 fixture image** `blk_fat32_read.rs`
 //! does, via `RUNIX_BLK_IMG` — `blk-driver-host` locates the same
 //! `HELLO.TXT` before ever entering its receive loop.
@@ -69,9 +82,19 @@ const BLK_REQBUF_VA: u64 = 0x_0999_5555_0000;
 const BLK_QUEUE_ALIGN: u64 = 4096;
 
 // Must match `blk-driver-host/src/main.rs`'s own `FS_REQUEST_PORT`/
-// `FS_RESPONSE_PORT`.
+// `FS_RESPONSE_PORT`/`FS_WRITE_REQUEST_PORT`.
 const FS_REQUEST_PORT: usize = 8;
 const FS_RESPONSE_PORT: usize = 9;
+const FS_WRITE_REQUEST_PORT: usize = 10;
+
+// Must match `blk-driver-host/src/main.rs`'s own
+// `FS_WRITE_STATUS_OK`/`FS_WRITE_STATUS_BAD_LENGTH`.
+const FS_WRITE_STATUS_OK: u8 = 0;
+
+const IPC_WRITE_LEN: usize = 512;
+fn ipc_write_pattern_byte(i: usize) -> u8 {
+    b'z' - (i % 26) as u8
+}
 
 // Must match `blk-driver-host/src/main.rs`'s own `EXPECTED_FILE_CONTENTS`
 // and `kernel/tests/support/make_fat32_image.sh`'s fixture byte-for-byte.
@@ -315,24 +338,91 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    let pass = match expected_len {
+    let read_pass = match expected_len {
         Some(len) if response.len() >= 2 + len => &response[2..2 + len] == EXPECTED_FILE_CONTENTS,
         _ => false,
     };
 
-    if pass {
+    if read_pass {
         serial_println!(
-            "blk_fs_ipc: PASS — an authorized ring-0 requester asked a real ring-3 \
-             blk-driver-host process for a file over capability-gated IPC and got the exact \
-             bytes back"
+            "blk_fs_ipc: authorized read got the exact file bytes back over capability-gated IPC"
+        );
+    } else {
+        serial_println!(
+            "blk_fs_ipc: FAIL — authorized read did not produce the expected response \
+             (expected_len={:?}, got {} bytes)",
+            expected_len,
+            response.len()
+        );
+        exit_qemu(QemuExitCode::Failed);
+    }
+
+    // Filesystem driver, Phase 8, negative case: same shape as the
+    // unauthorized-read check above, now for the write port -- this
+    // thread holds no capability for `FS_WRITE_REQUEST_PORT` either, so
+    // even a well-formed write request must never reach the channel.
+    let write_denied = unsafe {
+        runix_kernel::syscall::syscall(
+            runix_kernel::syscall::SYS_IPC_SEND,
+            FS_WRITE_REQUEST_PORT as u64,
+            (IPC_WRITE_LEN as u16).to_le_bytes()[0] as u64,
+            0,
+        )
+    };
+    if write_denied != u64::MAX {
+        serial_println!(
+            "blk_fs_ipc: FAIL — an unauthorized send to the write port was not denied \
+             (returned {}, expected u64::MAX)",
+            write_denied
+        );
+        exit_qemu(QemuExitCode::Failed);
+    }
+    serial_println!("blk_fs_ipc: unauthorized write correctly denied (capability gate OK)");
+
+    // Positive case: a thread holding a capability scoped to exactly the
+    // write port sends a real 512-byte payload — the same "one port, one
+    // capability, one file" scoping the read path already has, now
+    // proven for a second, independently-gated file operation in the
+    // same running server loop (Phase 8's actual point: more than one
+    // request, more than one file, in a single boot).
+    let write_token = runix_capability_manager::CapabilityToken::issue(
+        "test-writer",
+        runix_kernel::capabilities::port_resource(FS_WRITE_REQUEST_PORT),
+        now,
+        now + 1_000_000,
+        "demo-key",
+        &signing_key,
+    );
+    scheduler::spawn_with_capability(authorized_writer_thread, Some(write_token));
+
+    let mut write_status: Option<u8> = None;
+    for _ in 0..4000 {
+        scheduler::yield_now();
+        let ret = unsafe {
+            runix_kernel::syscall::syscall(
+                runix_kernel::syscall::SYS_IPC_RECV,
+                FS_RESPONSE_PORT as u64,
+                0,
+                0,
+            )
+        };
+        if ret != u64::MAX {
+            write_status = Some(ret as u8);
+            break;
+        }
+    }
+
+    let write_pass = write_status == Some(FS_WRITE_STATUS_OK);
+    if write_pass {
+        serial_println!(
+            "blk_fs_ipc: PASS — an authorized writer overwrote WRITE.TXT over capability-gated \
+             IPC, and the same server loop served a read and a write in one boot (Phase 8)"
         );
         exit_qemu(QemuExitCode::Success);
     } else {
         serial_println!(
-            "blk_fs_ipc: FAIL — authorized request did not produce the expected response \
-             (expected_len={:?}, got {} bytes)",
-            expected_len,
-            response.len()
+            "blk_fs_ipc: FAIL — authorized write did not report success (status={:?})",
+            write_status
         );
         exit_qemu(QemuExitCode::Failed);
     }
@@ -346,6 +436,40 @@ extern "C" fn authorized_requester_thread() -> ! {
             1,
             0,
         );
+    }
+    loop {
+        scheduler::yield_now();
+    }
+}
+
+/// Sends a real write request: 2-byte little-endian length header, then
+/// `IPC_WRITE_LEN` payload bytes, one `SYS_IPC_SEND` per byte — matching
+/// `blk-driver-host`'s `handle_write_ipc_request` wire format exactly
+/// (the destination port already names the operation, so there's no
+/// separate opcode byte).
+extern "C" fn authorized_writer_thread() -> ! {
+    let len_bytes = (IPC_WRITE_LEN as u16).to_le_bytes();
+    unsafe {
+        runix_kernel::syscall::syscall(
+            runix_kernel::syscall::SYS_IPC_SEND,
+            FS_WRITE_REQUEST_PORT as u64,
+            len_bytes[0] as u64,
+            0,
+        );
+        runix_kernel::syscall::syscall(
+            runix_kernel::syscall::SYS_IPC_SEND,
+            FS_WRITE_REQUEST_PORT as u64,
+            len_bytes[1] as u64,
+            0,
+        );
+        for i in 0..IPC_WRITE_LEN {
+            runix_kernel::syscall::syscall(
+                runix_kernel::syscall::SYS_IPC_SEND,
+                FS_WRITE_REQUEST_PORT as u64,
+                ipc_write_pattern_byte(i) as u64,
+                0,
+            );
+        }
     }
     loop {
         scheduler::yield_now();

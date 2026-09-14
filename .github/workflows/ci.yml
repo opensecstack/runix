@@ -272,6 +272,25 @@ jobs:
         run: |
           RUNIX_BLK_IMG="$(pwd)/target/runix-fat32-test.img" \
             cargo test --target x86_64-unknown-none --test blk_fs_ipc
+      # Filesystem driver, Phase 8's own independent confirmation -- same
+      # "don't just trust the thing under test to grade itself" instinct
+      # as every write-adjacent phase since 5, now for a write that
+      # traveled over capability-gated IPC instead of being driven
+      # directly by blk-driver-host's own internal proof code.
+      # `ipc_write_pattern_byte` (`b'z' - (i % 26)`) is deliberately
+      # distinct from Phase 5's own direct-write pattern (`b'Z' - ...`,
+      # uppercase) -- this step runs after blk_fs_ipc, which itself runs
+      # after blk_fat32_read's own WRITE.TXT check above, so this is
+      # confirming the *second*, IPC-driven overwrite landed on top of
+      # the first.
+      - name: verify WRITE.TXT reflects the IPC-driven write on disk
+        working-directory: kernel
+        run: |
+          actual="$(mtype -i target/runix-fat32-test.img ::WRITE.TXT | head -c 5)"
+          if [ "$actual" != "zyxwv" ]; then
+            echo "expected WRITE.TXT to start with zyxwv after blk_fs_ipc's IPC write proof, got: $actual" >&2
+            exit 1
+          fi
       # Phase 2b's real TCP client proof -- SLIRP has no built-in TCP
       # listener to connect to (confirmed during design research), so this
       # starts a real listener on the host first (kernel/tests/support/

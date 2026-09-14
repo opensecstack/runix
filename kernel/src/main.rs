@@ -223,6 +223,13 @@ struct BlkBootInfo {
 #[allow(dead_code)]
 const BLK_FS_REQUEST_PORT: usize = 8;
 const BLK_FS_RESPONSE_PORT: usize = 9;
+/// Filesystem driver, Phase 8: a second, independently capability-gated
+/// port for write requests -- a caller needs a capability scoped to
+/// `port_resource(BLK_FS_WRITE_REQUEST_PORT)` specifically, separate from
+/// whatever authorizes a read trigger on `BLK_FS_REQUEST_PORT`. Must match
+/// `blk-driver-host/src/main.rs`'s own `FS_WRITE_REQUEST_PORT` constant.
+#[allow(dead_code)]
+const BLK_FS_WRITE_REQUEST_PORT: usize = 10;
 
 /// Offset into the `BLK_INFO_VA` page `blk-driver-host` writes its own
 /// write-then-read-back result byte to -- same convention `NET_RESULT_OFFSET`
