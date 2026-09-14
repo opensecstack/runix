@@ -60,7 +60,16 @@ static BLK_DRIVER_HOST_ELF: &[u8] =
 const BLK_HEAP_START: u64 = 0x_0999_1111_0000;
 const BLK_HEAP_SIZE: u64 = 256 * 1024;
 const BLK_STACK_VA: u64 = 0x_0999_2222_0000;
-const BLK_STACK_SIZE: u64 = 4096 * 4;
+// Bumped from `4096 * 4` (16 KiB) for Phase 7: `run_grow_proof`/
+// `run_create_proof` each add another `[u8; 4096]`-sized local buffer to
+// the same sequential call chain Phase 6's `run_partial_write_proof`
+// already used most of this budget on. Confirmed for real, not guessed:
+// the unbumped size produced a genuine ring-3 stack-overflow page fault
+// (`CAUSED_BY_WRITE | USER_MODE`) during the very first FAT32 lookup —
+// this test defines its own independent copy of this constant (does not
+// share `kernel/src/main.rs`'s), so that file's own matching bump has no
+// effect here on its own.
+const BLK_STACK_SIZE: u64 = 4096 * 8;
 const BLK_INFO_VA: u64 = 0x_0999_3333_0000;
 const BLK_QUEUE_VA: u64 = 0x_0999_4444_0000;
 const BLK_REQBUF_VA: u64 = 0x_0999_5555_0000;
@@ -219,15 +228,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // No network wait needed here -- a virtio-blk write-then-read-back round
     // trip is local to QEMU, not dependent on an external reply arriving.
-    // Bumped from 100 as Phase 3-6 each added more sequential virtio
-    // requests to this one boot's combined proof (subdirectory, big
-    // file, long name, case-insensitive match, write, partial write) --
-    // same "the poll bound needs to grow as the work it's waiting for
-    // grows" adjustment the `boot` job's own QEMU timeout already needed
-    // (90s -> 150s) for the same underlying reason. Still bounded, not
-    // infinite; breaks early once the result byte goes non-zero.
+    // Bumped from 100, then 2000, as Phase 3-7 each added more sequential
+    // virtio requests to this one boot's combined proof (subdirectory, big
+    // file, long name, case-insensitive match, write, partial write, chain
+    // growth, delete, create) -- same "the poll bound needs to grow as the
+    // work it's waiting for grows" adjustment the `boot` job's own QEMU
+    // timeout already needed (90s -> 150s) for the same underlying reason.
+    // Still bounded, not infinite; breaks early once the result byte goes
+    // non-zero.
     let mut result = 0u8;
-    for _ in 0..2000 {
+    for _ in 0..4000 {
         scheduler::yield_now();
         result = unsafe { core::ptr::read_volatile(result_ptr) };
         if result != 0 {

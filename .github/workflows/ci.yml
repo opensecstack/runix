@@ -233,6 +233,36 @@ jobs:
             echo "expected PARTIAL.TXT to start with 01234, got: $actual" >&2
             exit 1
           fi
+      # Filesystem driver, Phase 7's own independent confirmation -- same
+      # "don't just trust the thing under test to grade itself" instinct as
+      # the WRITE.TXT/PARTIAL.TXT checks above, now covering allocation
+      # (GROW.TXT's new size and appended content), delete (DELETE_M.TXT
+      # must no longer appear in the listing at all), and create
+      # (CREATED.TXT exists with the exact content a driver-created file
+      # should have, in a slot that didn't exist in the fixture until this
+      # boot ran).
+      - name: verify GROW.TXT/DELETE_M.TXT/CREATED.TXT reflect Phase 7's writes on disk
+        working-directory: kernel
+        run: |
+          grow_size="$(mdir -i target/runix-fat32-test.img :: | grep '^GROW' | tr -s ' ' | cut -d' ' -f3)"
+          if [ "$grow_size" != "712" ]; then
+            echo "expected GROW.TXT to be 712 bytes after blk_fat32_read's chain-growth proof, got: $grow_size" >&2
+            exit 1
+          fi
+          grow_tail="$(mtype -i target/runix-fat32-test.img ::GROW.TXT | tail -c 10)"
+          if [ "$grow_tail" != "0123456789" ]; then
+            echo "expected GROW.TXT's appended tail to be the 0-9 digit cycle, got: $grow_tail" >&2
+            exit 1
+          fi
+          if mdir -i target/runix-fat32-test.img :: | grep -q DELETE_M; then
+            echo "expected DELETE_M.TXT to no longer appear in the root directory after blk_fat32_read's delete proof" >&2
+            exit 1
+          fi
+          created_actual="$(mtype -i target/runix-fat32-test.img ::CREATED.TXT | head -c 5)"
+          if [ "$created_actual" != "ABCDE" ]; then
+            echo "expected CREATED.TXT to start with ABCDE, got: $created_actual" >&2
+            exit 1
+          fi
       # Filesystem driver, Phase 3 -- the real IPC/capability-scoping proof
       # (see docs/STATUS.md's filesystem-driver narrative): a second
       # process asks blk-driver-host for a file over capability-gated

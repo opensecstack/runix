@@ -1423,6 +1423,114 @@ bounded, not infinite) — the same "the poll bound needs to grow as the
 work it's waiting for grows" adjustment the `boot` job's own QEMU timeout
 already needed once, for the same underlying reason.
 
+**Filesystem driver, Phase 7: free-cluster allocation, chain growth,
+delete, and create — the three highest-corruption-risk items named after
+Phase 6 all get a first real, narrowly-scoped slice.** Tied together in
+one coherent narrative rather than three disconnected pokes: grow an
+existing file into a newly allocated cluster, delete a file (freeing its
+cluster and directory slot), then create a brand-new file that reuses
+exactly that freed slot and cluster.
+
+Ground truth was confirmed by reading the real fixture's actual FAT bytes
+before writing any code, not assumed from spec: clusters 2-14 are the
+existing fixture files, clusters 15+ read as `0x00000000` (free), and the
+volume's two FAT copies (`num_fats=2`) start out byte-identical — meaning
+a correct writer has to update *both*, not just the first, or leave a
+real, silent inconsistency behind.
+
+*Shared primitives.* `write_fat_entry` patches one cluster's entry via
+real read-modify-write (preserving the top 4 reserved bits, same
+discipline as Phase 6's directory-entry patch) in **every** FAT copy, not
+just the one this driver's own reads consult. `allocate_free_cluster`
+scans the FAT sector-by-sector from cluster 2 upward for the first entry
+that reads `0`, bounded the same defensive way every chain walk in this
+module is.
+
+*Part A — chain growth.* `GROW.TXT` starts at exactly one full cluster
+(512 bytes, no existing slack) on purpose, isolating "link a genuinely new
+cluster" from Phase 6's already-proven "fill a partial final cluster."
+`run_grow_proof` walks to the file's current last cluster (generic, not
+assuming single-cluster), allocates a new one, writes 200 new bytes into
+it, links it in — the new cluster's own EOC marker is written *before*
+the old last cluster is repointed at it, so a crash between the two
+writes leaves either an unlinked orphan cluster or an already-extended
+chain, never a chain pointing at a half-initialized cluster — then
+patches `file_size` to 712. Verified through the ordinary,
+unmodified read path: reading the full 712 bytes back requires walking
+across the freshly-created link, exercising exactly the code this slice
+exists to prove.
+
+*Part B — delete.* `run_delete_proof` walks `DELETE_M.TXT`'s chain,
+zeroing every cluster's FAT entry via `write_fat_entry`, then marks its
+directory entry's first byte `0xE5` (the standard deleted marker).
+Verified two ways: `find_entry_in_directory` no longer finds it (proving
+`0xE5` is honored by the *write* side, not just the already-proven
+parsing side), and `allocate_free_cluster` immediately afterward returns
+exactly the cluster just freed — not just "some free cluster exists
+somewhere," but proof this specific cluster is genuinely reusable.
+
+*Part C — create.* `run_create_proof` scans the root directory for a
+`0xE5`-marked slot (the one part B just freed — this phase's create only
+ever reuses an *already-deleted* slot; if none exists it fails closed
+rather than growing the directory into a new cluster, which stays
+explicitly out of scope), allocates a cluster, writes content into it,
+marks it EOC, and writes a complete new short entry (`CREATED.TXT`) into
+the reused slot.
+
+Confirmed: `chain growth proof OK (Phase 7a PASS)`, `delete proof OK
+(Phase 7b PASS)`, `create proof OK (Phase 7c PASS)` — all three passed on
+the first genuinely correct attempt. Independently confirmed via
+`mdir`/`mtype` in CI against the real backing image, not just the
+driver's own self-report: `GROW.TXT` shows 712 bytes ending in the
+expected digit cycle, `DELETE_M.TXT` no longer appears in the directory
+listing at all, `CREATED.TXT` exists with the exact expected content.
+Directly inspecting the image's own FAT bytes afterward also confirmed
+both FAT copies stayed byte-identical through every write this phase
+made, and that `CREATED.TXT` really did land on the exact cluster
+`DELETE_M.TXT` had just given up.
+
+Two real, non-logic bugs found by actually booting this, both fixed
+before any of the above is meaningful:
+
+- **A genuine ring-3 stack overflow**, first misdiagnosed as needing more
+  investigation before the actual cause was clear: `run_grow_proof`/
+  `run_create_proof` each add another `[u8; 4096]`-sized local buffer to
+  the same sequential call chain Phase 6's own proof already used most of
+  the existing 16 KiB ring-3 stack on. The page fault
+  (`CAUSED_BY_WRITE | USER_MODE`, faulting a few dozen bytes past the live
+  stack pointer, in `find_entry_in_directory`'s own prologue) reproduced
+  identically across three separate rebuilds — including one full `cargo
+  clean` — before the real cause surfaced: `kernel/tests/blk_fat32_read.rs`
+  defines its **own independent copy** of `BLK_STACK_SIZE` (it doesn't
+  share `kernel/src/main.rs`'s), so bumping the latter alone had zero
+  effect on the test that actually exercises this path. Fixed by bumping
+  the test file's own constant from `4096 * 4` to `4096 * 8`, plus a
+  matching bump in `kernel/src/main.rs` for the real boot path, which will
+  need it too once the real syscall surface (Phase 3's still-open gap)
+  ever calls these code paths directly.
+- **A self-inflicted false regression, not a code bug**: an ad hoc
+  regression run pointed `RUNIX_BLK_IMG` at the real FAT32 fixture for
+  *every* kernel test, including `blk_driver_rw` — whose Phase 1 proof
+  intentionally overwrites sector 0 (the boot sector on a real FAT32
+  volume), the exact hazard `run_fat32_proof`'s own doc comment already
+  names. Corrupted the fixture's boot sector (signature bytes read back
+  as `0x00 0x00` instead of `0x55 0xAA`), which then made the *next* test
+  in the run report a spurious "boot sector did not parse" failure.
+  Fixed by rebuilding the fixture and re-scoping which tests get
+  `RUNIX_BLK_IMG` — not a driver bug, but a reminder that this fixture is
+  shared, mutable state across a test run, same as every other
+  write-adjacent phase's fixture-handling care already assumes.
+
+**Still not attempted, unchanged from Phase 6's own list**: growing the
+*directory* itself (create still only ever reuses an existing deleted
+slot), allocating or linking more than one cluster in a single grow/create
+call, the FSInfo sector's free-cluster-count/next-free hint (this driver
+always scans from cluster 2, so its own correctness doesn't depend on it,
+but a real OS reading this volume afterward would see a stale hint), any
+concurrency/locking around allocation (single-writer, same as every other
+write this driver performs), and the still-fully-open syscall/IPC surface
+for writes (Phase 3's IPC surface remains read-only).
+
 ## Mobile L1: ARM/TrustZone boot bring-up (`kernel-arm/`)
 
 Started from nothing to a real, QEMU-verified boot path in one push, in a

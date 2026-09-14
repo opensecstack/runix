@@ -39,6 +39,16 @@
 #     to 300, using real read-modify-write -- bytes 300..512 must survive
 #     unchanged, which this initial pattern makes independently checkable
 #     (a naive full-sector-overwrite bug would clobber them).
+#   - GROW.TXT, root directory, exactly 512 bytes (one full cluster, no
+#     slack) of a deterministic `X`/`Y`/`Z` cycle -- Phase 7's chain-growth
+#     proof allocates and links a genuinely new cluster to append 200 more
+#     bytes, isolated on purpose from Phase 6's already-proven partial-fill
+#     case (there's no existing slack to fill here).
+#   - DELETE_M.TXT (8.3-length name on purpose, so `mcopy` preserves it
+#     exactly rather than generating a numeric-tail short name), root
+#     directory, a small single-cluster file whose only purpose is to be
+#     deleted by Phase 7's delete proof, freeing its cluster and directory
+#     slot for the same phase's create proof to reuse.
 # Every content string here lives in exactly one place (this script), not
 # duplicated independently on the driver side.
 
@@ -70,13 +80,17 @@ big_tmpfile="$(mktemp)"
 long_name_tmpfile="$(mktemp)"
 write_tmpfile="$(mktemp)"
 partial_tmpfile="$(mktemp)"
-trap 'rm -f "$tmpfile" "$nested_tmpfile" "$big_tmpfile" "$long_name_tmpfile" "$write_tmpfile" "$partial_tmpfile"' EXIT
+grow_tmpfile="$(mktemp)"
+delete_tmpfile="$(mktemp)"
+trap 'rm -f "$tmpfile" "$nested_tmpfile" "$big_tmpfile" "$long_name_tmpfile" "$write_tmpfile" "$partial_tmpfile" "$grow_tmpfile" "$delete_tmpfile"' EXIT
 printf '%s\n' "$content" >"$tmpfile"
 printf '%s\n' "$nested_content" >"$nested_tmpfile"
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i % 10) + 0x30 for i in range(3000)))" >"$big_tmpfile"
 printf '%s\n' "$long_name_content" >"$long_name_tmpfile"
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i % 26) + 0x41 for i in range(512)))" >"$write_tmpfile"
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i % 26) + 0x61 for i in range(512)))" >"$partial_tmpfile"
+python3 -c "import sys; sys.stdout.buffer.write(bytes(b'XYZ'[i % 3] for i in range(512)))" >"$grow_tmpfile"
+printf 'disposable\n' >"$delete_tmpfile"
 
 # `mcopy`/`mmd` (mtools) write into a FAT image without mounting it — no
 # loop-device/root privilege needed, same reasoning `mkfs.fat` above.
@@ -87,3 +101,5 @@ mcopy -i "$img_path" "$nested_tmpfile" ::SUBDIR/NESTED.TXT
 mcopy -i "$img_path" "$long_name_tmpfile" "::long-filename-test.txt"
 mcopy -i "$img_path" "$write_tmpfile" ::WRITE.TXT
 mcopy -i "$img_path" "$partial_tmpfile" ::PARTIAL.TXT
+mcopy -i "$img_path" "$grow_tmpfile" ::GROW.TXT
+mcopy -i "$img_path" "$delete_tmpfile" ::DELETE_M.TXT

@@ -164,7 +164,17 @@ static BLK_DRIVER_HOST_ELF: &[u8] =
 const BLK_HEAP_START: u64 = 0x_0999_1111_0000;
 const BLK_HEAP_SIZE: u64 = 256 * 1024;
 const BLK_STACK_VA: u64 = 0x_0999_2222_0000;
-const BLK_STACK_SIZE: u64 = 4096 * 4;
+/// Bumped from `4096 * 4` (16 KiB) to `4096 * 8` (32 KiB) for Phase 7:
+/// `run_grow_proof`/`run_create_proof` each add another `[u8; 4096]`-sized
+/// local buffer to the same sequential call chain Phase 6's
+/// `run_partial_write_proof` already used most of this budget on —
+/// confirmed for real, not guessed: the unbumped size produced a genuine
+/// ring-3 stack-overflow page fault (`CAUSED_BY_WRITE | USER_MODE`, faulting
+/// address a few dozen bytes past the live stack pointer) partway through
+/// Phase 7's proofs, the same class of "a real bug found by actually
+/// booting it" this codebase's docs/STATUS.md always calls out rather than
+/// silently working around.
+const BLK_STACK_SIZE: u64 = 4096 * 8;
 /// Must match `blk-driver-host/src/main.rs`'s own `BLK_INFO_VA`/`BLK_QUEUE_VA`/
 /// `BLK_REQBUF_VA` constants exactly -- same "kernel maps the VA, hands over
 /// the matching physical address via a boot-info page" contract
