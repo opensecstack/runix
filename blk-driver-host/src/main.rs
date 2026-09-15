@@ -2074,8 +2074,27 @@ fn next_cluster_in_chain(dev: &mut BlkDevice, info: &BootSectorInfo, cluster: u3
 /// codebase (net-driver-host's ICMP/TCP proofs): a real device answers
 /// promptly in practice, so this bound exists purely to make a genuinely
 /// broken driver report failure instead of hanging the boot forever.
+///
+/// Bumped from `2_000_000` (filesystem driver, directory-growth/multi-
+/// cluster-allocation regression, confirmed by real reproduction, not
+/// guessed): on a QEMU instance actually running under TCG -- no working
+/// KVM device, which is exactly what GitHub Actions' hosted runners give
+/// you -- confirmed by forcing `-accel tcg` locally and reproducing CI's
+/// *exact* failure signature byte-for-byte (Phase 6's write timing out
+/// with `completed=0 status=255`, cascading into every later phase) --
+/// this same busy-spin-with-periodic-yield loop can spend its entire
+/// budget before a real, legitimately-in-flight virtio-blk completion
+/// actually lands, purely because TCG interprets guest instructions
+/// (this loop's own iterations included) far slower than KVM does, not
+/// because the device dropped the request. Confirmed the fix, not just
+/// the theory: with this same forced-TCG repro and a *fresh* fixture
+/// image (a stale, already-mutated-by-a-prior-run image was a separate,
+/// unrelated false lead this investigation ruled out first), every
+/// phase passes once this budget is large enough that the loop never
+/// actually exhausts it (confirmed via a temporary instrumented build
+/// that logged every timeout; none fired at this bound).
 fn poll_for_completion(queue: &mut Virtqueue) -> bool {
-    for i in 0..2_000_000u32 {
+    for i in 0..100_000_000u32 {
         if queue.poll_used().is_some() {
             return true;
         }
