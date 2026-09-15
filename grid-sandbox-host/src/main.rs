@@ -17,6 +17,28 @@
 //! host-function import -> guest bytecode execution -> syscall gate back to
 //! whatever loaded it — not a general-purpose sandbox host yet.
 //!
+//! # Multi-tenancy: still exactly one instance, but no longer missing the
+//! # authorization primitive it would need
+//!
+//! Still exactly one `grid-sandbox-host` process is spawned, once, at boot
+//! — nothing here changed that. What did change is that
+//! `citadel-integration` gained `InstanceManifestEntry`/`InstanceAllowlist`:
+//! a boot-time authorization scoped to `(module_id, instance_id)` instead of
+//! just `module_id`, so a future kernel-side spawn loop that runs N copies
+//! of *this* binary (one per app, say) can authorize and tier-assign each
+//! instance independently — never one module-wide grant reused across every
+//! instance, which would be ambient authority the moment more than one
+//! instance exists. Actually spawning N instances (a loop over
+//! `elf::Elf64` -> `process::AddressSpace` -> `scheduler::spawn_ring3_process`,
+//! each with its own `AddressSpace` and its own capability grant) is
+//! kernel-side wiring, out of this crate's scope; nothing in this file
+//! changed to anticipate it, since a fixed `GRID_INFO_VA`/`HEAP_START` pair
+//! read from *this* process's own private address space needs no per-
+//! instance parameterization here — two concurrently-running instances of
+//! this exact binary, each in its own `AddressSpace`, already don't collide
+//! on these constants today, the same way two `ring3_cooperative.rs`
+//! processes already don't collide on their own private mappings.
+//!
 //! # Heap coordination with whoever loads this
 //!
 //! `HEAP_START`/`HEAP_SIZE` below must already be mapped
