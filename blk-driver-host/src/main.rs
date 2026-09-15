@@ -264,6 +264,39 @@ fn create_content_byte(i: usize) -> u8 {
 }
 const CREATE_FILE_LEN: usize = 64;
 
+/// Filesystem driver, structural gap closed: multi-cluster allocation.
+/// `MULTI.TXT` starts at exactly one full cluster (512 bytes, same
+/// no-existing-slack setup as [`GROW_FILE_NAME`]) — `run_multi_cluster_grow_proof`
+/// appends [`MULTI_APPEND_LEN`] bytes (spanning two more clusters) in a
+/// *single* [`allocate_cluster_chain`] call, isolated on purpose from
+/// Phase 7a's `run_grow_proof` (one new cluster per call).
+const MULTI_FILE_NAME: [u8; 11] = *b"MULTI   TXT";
+const MULTI_INITIAL_LEN: usize = 512;
+const MULTI_APPEND_LEN: usize = 700;
+fn multi_initial_byte(i: usize) -> u8 {
+    b'm' + (i % 5) as u8
+}
+fn multi_append_byte(i: usize) -> u8 {
+    b'0' + (i % 10) as u8
+}
+
+/// Filesystem driver, structural gap closed: directory growth.
+/// `GROWDIR.TXT` is never present in the fixture image itself — it's
+/// created entirely at runtime by `run_directory_growth_proof`, once
+/// `make_fat32_image.sh`'s filler entries plus Phase 7's own delete+create
+/// have left the root directory's one existing cluster with no reusable
+/// slot anywhere in it, forcing a genuine, first-of-its-kind
+/// directory-chain extension.
+const GROWDIR_FILE_NAME: [u8; 11] = *b"GROWDIR TXT";
+const GROWDIR_FILE_LEN: usize = 40;
+fn growdir_content_byte(i: usize) -> u8 {
+    if i % 2 == 0 {
+        b'G'
+    } else {
+        b'D'
+    }
+}
+
 /// FAT directory-entry attribute byte for a plain read/write file —
 /// written into the new short entry `run_create_proof` builds from
 /// scratch. `0x20` = `ATTR_ARCHIVE`, the same bit `mkfs.fat`/`mcopy` set on
@@ -513,8 +546,10 @@ fn run_fat32_proof(dev: &mut BlkDevice) -> bool {
     let write_pass = run_write_proof(dev, &info);
     let partial_write_pass = run_partial_write_proof(dev, &info);
     let grow_pass = run_grow_proof(dev, &info);
+    let multi_grow_pass = run_multi_cluster_grow_proof(dev, &info);
     let delete_pass = run_delete_proof(dev, &info);
     let create_pass = run_create_proof(dev, &info);
+    let directory_growth_pass = run_directory_growth_proof(dev, &info);
 
     let pass = contents_match
         && subdir_pass
@@ -523,8 +558,10 @@ fn run_fat32_proof(dev: &mut BlkDevice) -> bool {
         && write_pass
         && partial_write_pass
         && grow_pass
+        && multi_grow_pass
         && delete_pass
-        && create_pass;
+        && create_pass
+        && directory_growth_pass;
     if pass {
         write_all(b"blk-driver-host: FAT32 file located and read correctly (Phase 2 PASS)\n");
     } else {
@@ -868,6 +905,84 @@ fn write_fat_entry(dev: &mut BlkDevice, info: &BootSectorInfo, cluster: u32, val
     true
 }
 
+/// Writes `0` (free) into every entry in `clusters` — the rollback half of
+/// [`allocate_cluster_chain`]: if that function can't reserve as many
+/// clusters as it was asked for, every cluster it *did* reserve so far in
+/// that same call must be freed back, not left permanently claimed but
+/// unused by anything. Best-effort: a write failure partway through a
+/// rollback is already a device-level fault this driver has no clean way
+/// to recover from either way, so this doesn't itself report success or
+/// failure — the caller that triggered the rollback is already reporting
+/// its own failure regardless.
+fn free_clusters(dev: &mut BlkDevice, info: &BootSectorInfo, clusters: &[u32]) {
+    for &cluster in clusters {
+        let _ = write_fat_entry(dev, info, cluster, 0);
+    }
+}
+
+/// Filesystem driver, structural gap closed: allocates `count` fresh,
+/// mutually linked clusters in a single call — the multi-cluster
+/// generalization of [`allocate_free_cluster`] (still used internally, once
+/// per new cluster) that Phase 7's own doc comment named as "not attempted,
+/// unchanged" ("allocating or linking more than one cluster in a single
+/// grow/create call"). On success, `out[..count]` holds the reserved
+/// cluster numbers in chain order (`out[0]` is the new chain's head) and
+/// every one of them already has its own correct FAT entry written (link
+/// to its successor, or [`blk_driver_host::CHAIN_EOC_MARKER`] for the last)
+/// — the caller can splice this whole chain onto an existing one with a
+/// single further link write, the same "new chain fully initialized before
+/// anything points at it" precondition `run_grow_proof` already established
+/// for the single-cluster case.
+///
+/// Two-pass by necessity: [`allocate_free_cluster`] only ever finds a
+/// cluster currently reading as `0x00000000` in the FAT, so each
+/// newly-found cluster must be marked non-zero (reserved, temporarily as
+/// its own EOC marker) *before* scanning for the next one — otherwise a
+/// second scan in the same call would find and "reserve" the exact same
+/// cluster already claimed a moment earlier (no concurrency exists in this
+/// driver to race against, but a single call reserving the same cluster
+/// twice would be a correctness bug regardless). Once all `count` clusters
+/// are reserved this way, a second pass rewrites every entry via
+/// [`blk_driver_host::chain_link_values`] — the last cluster's rewrite
+/// happens to write back the same EOC value its reservation step already
+/// gave it, harmless and simpler than special-casing it.
+///
+/// Fails closed on any error (not enough free clusters, or a write
+/// failure): every cluster reserved so far in *this* call is freed back via
+/// [`free_clusters`] before returning `false` — never half-committed.
+fn allocate_cluster_chain(
+    dev: &mut BlkDevice,
+    info: &BootSectorInfo,
+    count: usize,
+    out: &mut [u32],
+) -> bool {
+    if count == 0 || out.len() < count {
+        return false;
+    }
+
+    let mut reserved = 0usize;
+    while reserved < count {
+        let Some(cluster) = allocate_free_cluster(dev, info) else {
+            free_clusters(dev, info, &out[..reserved]);
+            return false;
+        };
+        if !write_fat_entry(dev, info, cluster, blk_driver_host::CHAIN_EOC_MARKER) {
+            free_clusters(dev, info, &out[..reserved]);
+            return false;
+        }
+        out[reserved] = cluster;
+        reserved += 1;
+    }
+
+    for (cluster, value) in blk_driver_host::chain_link_values(&out[..count]) {
+        if !write_fat_entry(dev, info, cluster, value) {
+            free_clusters(dev, info, &out[..count]);
+            return false;
+        }
+    }
+    true
+}
+
 /// Scans the FAT sequentially from cluster 2 upward for the first entry
 /// that reads as `0x00000000` (free), reading one sector at a time and
 /// checking every entry it holds before moving to the next sector — not a
@@ -1098,16 +1213,22 @@ fn run_delete_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
 }
 
 /// Filesystem driver, Phase 7, part C: creates `CREATED.TXT` from scratch,
-/// reusing the directory slot `run_delete_proof` just freed — this phase's
-/// create only ever reuses an *already-deleted* slot; if none exists, it
-/// fails closed rather than growing the directory into a new cluster
-/// (explicitly out of scope, named up front). Allocates a cluster via
-/// [`allocate_free_cluster`] (expected, though not required for
+/// reusing the directory slot `run_delete_proof` just freed. Allocates a
+/// cluster via [`allocate_free_cluster`] (expected, though not required for
 /// correctness, to be the exact cluster part B just freed), writes content
 /// into it, marks it EOC, and writes a complete new 32-byte short entry
 /// into the reused slot.
+///
+/// Slot lookup goes through [`find_or_grow_create_slot`] (structural gap
+/// closed: this used to be `find_deleted_slot`, which only ever considered
+/// an already-deleted slot and failed closed otherwise, never growing the
+/// directory) — here it's still expected to find `DELETE_M.TXT`'s
+/// just-freed slot without needing to grow anything; `run_directory_growth_proof`
+/// is what actually exercises this same function's growth branch, once the
+/// fixture's root directory has no reusable slot left anywhere in it.
 fn run_create_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
-    let Some((deleted_sector, deleted_offset)) = find_deleted_slot(dev, info, info.root_cluster)
+    let Some((deleted_sector, deleted_offset)) =
+        find_or_grow_create_slot(dev, info, info.root_cluster)
     else {
         write_all(b"blk-driver-host: FAT32 FAIL - no deleted slot available to reuse for create\n");
         return false;
@@ -1191,14 +1312,264 @@ fn run_create_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
     pass
 }
 
-/// Scans `dir_cluster`'s cluster chain for the first entry whose first
-/// byte is [`DELETED_ENTRY_MARKER`], returning its on-disk location — used
-/// only by `run_create_proof`'s "reuse a deleted slot" path. Deliberately
-/// distinct from `find_entry_in_directory`'s `chunk[0] == 0x00` check
-/// (end-of-directory): a deleted slot is a live, reusable hole *within*
-/// the directory, not the end of it, so scanning continues past it either
-/// way — this function just also remembers the first one seen.
-fn find_deleted_slot(
+/// Filesystem driver, structural gap closed: grows `MULTI.TXT` (starting at
+/// exactly one full cluster, no existing slack — same setup as
+/// [`run_grow_proof`]'s `GROW.TXT`) by [`MULTI_APPEND_LEN`] bytes, spanning
+/// *two* brand-new clusters allocated and linked together in a single
+/// [`allocate_cluster_chain`] call — Phase 7's own "not attempted,
+/// unchanged" item ("allocating or linking more than one cluster in a
+/// single grow/create call"), isolated from `run_grow_proof`'s
+/// one-cluster-at-a-time case the same way that function was isolated from
+/// Phase 6's partial-fill case.
+///
+/// Ordering safety: both new clusters have their content written and their
+/// mutual FAT links already correct (via `allocate_cluster_chain`, which
+/// itself writes each new cluster's link before returning) *before* the
+/// existing last cluster of `MULTI.TXT`'s current chain is repointed at the
+/// new chain's head — the same "fully initialize, then splice in" sequence
+/// `run_grow_proof` proved for one new cluster, now proved for two written
+/// and linked together in the same call.
+fn run_multi_cluster_grow_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
+    let Some((entry, dir_sector, dir_offset)) =
+        find_entry_with_location(dev, info, info.root_cluster, &MULTI_FILE_NAME)
+    else {
+        write_all(b"blk-driver-host: FAT32 FAIL - MULTI.TXT not found in root directory\n");
+        return false;
+    };
+
+    let mut last_cluster = entry.first_cluster;
+    let mut walk_ok = true;
+    for _ in 0..1024u32 {
+        match next_cluster_in_chain(dev, info, last_cluster) {
+            Some(next) if !is_end_of_chain(next) => last_cluster = next,
+            Some(_) => break,
+            None => {
+                walk_ok = false;
+                break;
+            }
+        }
+    }
+    if !walk_ok {
+        write_all(b"blk-driver-host: FAT32 FAIL - could not walk MULTI.TXT's existing chain\n");
+        return false;
+    }
+
+    let mut new_clusters = [0u32; 2];
+    if !allocate_cluster_chain(dev, info, 2, &mut new_clusters) {
+        write_all(
+            b"blk-driver-host: FAT32 FAIL - could not allocate two clusters for MULTI.TXT in one call\n",
+        );
+        return false;
+    }
+
+    let mut data_writes_ok = true;
+    for (k, &cluster) in new_clusters.iter().enumerate() {
+        let Some(sector) = info.cluster_to_sector(cluster) else {
+            data_writes_ok = false;
+            break;
+        };
+        let mut content = [0u8; SECTOR_SIZE];
+        let base = k * SECTOR_SIZE;
+        for (i, byte) in content.iter_mut().enumerate() {
+            let global_i = base + i;
+            if global_i >= MULTI_APPEND_LEN {
+                break;
+            }
+            *byte = multi_append_byte(global_i);
+        }
+        let (completed, status) = dev.write_sector(u64::from(sector), &content);
+        if !completed || status != VIRTIO_BLK_S_OK {
+            data_writes_ok = false;
+            break;
+        }
+    }
+
+    // Both new clusters fully initialized (content written, mutual FAT
+    // links already correct) before the existing chain is repointed at the
+    // new chain's head.
+    let link_ok = write_fat_entry(dev, info, last_cluster, new_clusters[0]);
+
+    let new_size = (MULTI_INITIAL_LEN + MULTI_APPEND_LEN) as u32;
+    let size_write_ok = match dev.read_sector(u64::from(dir_sector)) {
+        Some(mut dir_buf) => {
+            let size_offset = dir_offset + 28;
+            dir_buf[size_offset..size_offset + 4].copy_from_slice(&new_size.to_le_bytes());
+            let (completed, status) = dev.write_sector(u64::from(dir_sector), &dir_buf);
+            completed && status == VIRTIO_BLK_S_OK
+        }
+        None => false,
+    };
+
+    let mut read_buf = [0u8; MAX_FILE_BYTES];
+    let (size_visible, contents_match) =
+        match find_entry_in_directory(dev, info, info.root_cluster, &MULTI_FILE_NAME) {
+            Some(fresh_entry) => {
+                let written = read_file_contents(dev, info, &fresh_entry, &mut read_buf);
+                let size_ok = fresh_entry.file_size == new_size;
+                let contents_ok = written == new_size as usize
+                    && read_buf[..MULTI_INITIAL_LEN]
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &b)| b == multi_initial_byte(i))
+                    && read_buf[MULTI_INITIAL_LEN..written]
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &b)| b == multi_append_byte(i));
+                (size_ok, contents_ok)
+            }
+            None => (false, false),
+        };
+
+    write_all(b"blk-driver-host: FAT32 multi-cluster grow data_writes_ok=");
+    write_byte(if data_writes_ok { b'1' } else { b'0' });
+    write_all(b" link_ok=");
+    write_byte(if link_ok { b'1' } else { b'0' });
+    write_all(b" size_write_ok=");
+    write_byte(if size_write_ok { b'1' } else { b'0' });
+    write_all(b" size_visible=");
+    write_byte(if size_visible { b'1' } else { b'0' });
+    write_all(b" contents_match=");
+    write_byte(if contents_match { b'1' } else { b'0' });
+    write_byte(b'\n');
+
+    let pass =
+        data_writes_ok && link_ok && size_write_ok && size_visible && contents_match;
+    if pass {
+        write_all(b"blk-driver-host: FAT32 multi-cluster grow proof OK\n");
+    } else {
+        write_all(b"blk-driver-host: FAT32 multi-cluster grow proof FAILED\n");
+    }
+    pass
+}
+
+/// Filesystem driver, structural gap closed: creates `GROWDIR.TXT` when the
+/// root directory's already-allocated cluster chain is genuinely full.
+/// `make_fat32_image.sh`'s filler entries size the fixture's root directory
+/// so that, after Phase 7's own delete + create leave it at exactly the
+/// same occupancy as before (one slot freed, the same slot immediately
+/// reused), there is no deleted or end-of-directory sentinel slot anywhere
+/// left in it — the first real exercise of [`find_or_grow_create_slot`]'s
+/// growth branch (`grow_directory`), not just its "reuse an existing slot"
+/// one (already exercised, unchanged, by `run_create_proof` reusing
+/// `DELETE_M.TXT`'s freed slot).
+fn run_directory_growth_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
+    let Some((slot_sector, slot_offset)) = find_or_grow_create_slot(dev, info, info.root_cluster)
+    else {
+        write_all(b"blk-driver-host: FAT32 FAIL - directory growth did not produce a usable slot\n");
+        return false;
+    };
+
+    let Some(new_cluster) = allocate_free_cluster(dev, info) else {
+        write_all(b"blk-driver-host: FAT32 FAIL - no free cluster available for GROWDIR.TXT\n");
+        return false;
+    };
+    let Some(new_sector) = info.cluster_to_sector(new_cluster) else {
+        write_all(
+            b"blk-driver-host: FAT32 FAIL - GROWDIR.TXT's new cluster did not resolve to a sector\n",
+        );
+        return false;
+    };
+
+    let mut content = [0u8; SECTOR_SIZE];
+    for (i, byte) in content.iter_mut().enumerate().take(GROWDIR_FILE_LEN) {
+        *byte = growdir_content_byte(i);
+    }
+    let (data_write_completed, data_write_status) =
+        dev.write_sector(u64::from(new_sector), &content);
+    let eoc_ok = write_fat_entry(dev, info, new_cluster, 0x0FFF_FFFF);
+
+    let entry_write_ok = match dev.read_sector(u64::from(slot_sector)) {
+        Some(mut dir_buf) => {
+            let mut new_entry = [0u8; 32];
+            new_entry[0..11].copy_from_slice(&GROWDIR_FILE_NAME);
+            new_entry[11] = ATTR_ARCHIVE;
+            let cluster_hi = ((new_cluster >> 16) & 0xFFFF) as u16;
+            let cluster_lo = (new_cluster & 0xFFFF) as u16;
+            new_entry[20..22].copy_from_slice(&cluster_hi.to_le_bytes());
+            new_entry[26..28].copy_from_slice(&cluster_lo.to_le_bytes());
+            new_entry[28..32].copy_from_slice(&(GROWDIR_FILE_LEN as u32).to_le_bytes());
+            dir_buf[slot_offset..slot_offset + 32].copy_from_slice(&new_entry);
+            let (completed, status) = dev.write_sector(u64::from(slot_sector), &dir_buf);
+            completed && status == VIRTIO_BLK_S_OK
+        }
+        None => false,
+    };
+
+    let mut read_buf = [0u8; MAX_FILE_BYTES];
+    let (found_and_correct_size, contents_match) =
+        match find_entry_in_directory(dev, info, info.root_cluster, &GROWDIR_FILE_NAME) {
+            Some(fresh_entry) => {
+                let written = read_file_contents(dev, info, &fresh_entry, &mut read_buf);
+                let size_ok = fresh_entry.file_size as usize == GROWDIR_FILE_LEN;
+                let contents_ok = written == GROWDIR_FILE_LEN
+                    && read_buf[..GROWDIR_FILE_LEN]
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &b)| b == growdir_content_byte(i));
+                (size_ok, contents_ok)
+            }
+            None => (false, false),
+        };
+
+    // The real point of this phase: confirm the *directory itself* actually
+    // grew a new cluster -- not just that the file happened to get created
+    // somehow. The root directory's chain must now be more than one
+    // cluster long.
+    let root_chain_grew = match next_cluster_in_chain(dev, info, info.root_cluster) {
+        Some(next) => !is_end_of_chain(next),
+        None => false,
+    };
+
+    write_all(b"blk-driver-host: FAT32 directory growth data_write_completed=");
+    write_byte(if data_write_completed { b'1' } else { b'0' });
+    write_all(b" status=");
+    write_decimal(data_write_status as u64);
+    write_all(b" eoc_ok=");
+    write_byte(if eoc_ok { b'1' } else { b'0' });
+    write_all(b" entry_write_ok=");
+    write_byte(if entry_write_ok { b'1' } else { b'0' });
+    write_all(b" found_and_correct_size=");
+    write_byte(if found_and_correct_size { b'1' } else { b'0' });
+    write_all(b" contents_match=");
+    write_byte(if contents_match { b'1' } else { b'0' });
+    write_all(b" root_chain_grew=");
+    write_byte(if root_chain_grew { b'1' } else { b'0' });
+    write_byte(b'\n');
+
+    let pass = data_write_completed
+        && data_write_status == VIRTIO_BLK_S_OK
+        && eoc_ok
+        && entry_write_ok
+        && found_and_correct_size
+        && contents_match
+        && root_chain_grew;
+    if pass {
+        write_all(b"blk-driver-host: FAT32 directory growth proof OK\n");
+    } else {
+        write_all(b"blk-driver-host: FAT32 directory growth proof FAILED\n");
+    }
+    pass
+}
+
+/// Filesystem driver, structural gap closed: locates a slot in
+/// `dir_cluster`'s chain a new short entry can be written into, growing the
+/// directory by one cluster (via [`grow_directory`]) if every
+/// already-allocated cluster in the chain is genuinely full — no deleted
+/// (`0xE5`) and no end-of-directory (`0x00`) sentinel slot anywhere in it.
+/// Named as Phase 7's own "not attempted, unchanged" item ("growing the
+/// *directory* itself").
+///
+/// Per-sector decision goes through [`blk_driver_host::find_reusable_slot`]
+/// — the same pure logic tested on the host in `lib.rs` — rather than
+/// re-deriving "is this slot reusable" inline. This closes a second gap
+/// along the way, not just the multi-cluster one: the function this
+/// replaced (`find_deleted_slot`) only ever considered an *already-deleted*
+/// slot and failed closed the moment it hit a `0x00` sentinel, meaning a
+/// directory that had simply never had anything deleted from it could
+/// never create past its first still-unused sentinel slot even when there
+/// was obviously room. This function tries the sentinel too before ever
+/// concluding growth is needed.
+fn find_or_grow_create_slot(
     dev: &mut BlkDevice,
     info: &BootSectorInfo,
     dir_cluster: u32,
@@ -1209,22 +1580,66 @@ fn find_deleted_slot(
         for s in 0..u32::from(info.sectors_per_cluster) {
             let sector_num = u64::from(sector0) + u64::from(s);
             let sector = dev.read_sector(sector_num)?;
-            for (index, chunk) in sector.chunks_exact(32).enumerate() {
-                if chunk[0] == 0x00 {
-                    return None; // end of directory, no deleted slot found
-                }
-                if chunk[0] == DELETED_ENTRY_MARKER {
-                    return Some((sector_num as u32, index * 32));
-                }
+            if let Some(index) = blk_driver_host::find_reusable_slot(&sector) {
+                return Some((sector_num as u32, index * 32));
             }
         }
         let next = next_cluster_in_chain(dev, info, cluster)?;
         if is_end_of_chain(next) {
-            return None;
+            return grow_directory(dev, info, cluster);
         }
         cluster = next;
     }
     None
+}
+
+/// Allocates and links exactly one new cluster onto `last_cluster` (the
+/// last cluster of a directory chain already confirmed, by
+/// [`find_or_grow_create_slot`], to have no reusable slot anywhere in it),
+/// zeroes every byte of it, and returns its first slot — `(sector, 0)` —
+/// for the caller to write a new short entry into. An all-zero cluster is
+/// already a valid, empty directory cluster on its own: entry `0` at offset
+/// `0` reads as the end-of-directory sentinel, the same as any other
+/// cluster's trailing unused entries.
+///
+/// Ordering safety, same discipline `run_grow_proof`'s own doc comment
+/// established for a file chain: [`allocate_cluster_chain`] reserves the
+/// new cluster and gives it its own EOC marker *before* this function
+/// zeroes its content, and only once the zero-fill write has itself
+/// completed does this link `last_cluster` onto it — a crash at any point
+/// before that final link leaves the new cluster an unreferenced (harmless)
+/// orphan, never a directory chain pointing at a half-initialized cluster.
+fn grow_directory(
+    dev: &mut BlkDevice,
+    info: &BootSectorInfo,
+    last_cluster: u32,
+) -> Option<(u32, usize)> {
+    let mut new_clusters = [0u32; 1];
+    if !allocate_cluster_chain(dev, info, 1, &mut new_clusters) {
+        return None;
+    }
+    let new_cluster = new_clusters[0];
+    let sector0 = info.cluster_to_sector(new_cluster)?;
+
+    let zeroed = [0u8; SECTOR_SIZE];
+    for s in 0..u32::from(info.sectors_per_cluster) {
+        let sector_num = u64::from(sector0) + u64::from(s);
+        let (completed, status) = dev.write_sector(sector_num, &zeroed);
+        if !completed || status != VIRTIO_BLK_S_OK {
+            // Leave the reserved-but-unlinked cluster as an orphan rather
+            // than risk linking a half-zeroed cluster into the directory
+            // chain -- a future allocation scan can't reclaim it (its FAT
+            // entry still reads as EOC, not free), but a device write
+            // failing this deep is already a fault this driver has no
+            // clean way to recover from either way.
+            return None;
+        }
+    }
+
+    if !write_fat_entry(dev, info, last_cluster, new_cluster) {
+        return None;
+    }
+    Some((sector0, 0))
 }
 
 /// Maximum LFN fragments this driver reconstructs across — 5 fragments *

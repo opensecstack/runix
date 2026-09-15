@@ -327,6 +327,67 @@ pub fn fat_entry_at(fat_bytes: &[u8], cluster: u32) -> Option<u32> {
     Some(raw & 0x0FFF_FFFF)
 }
 
+/// Looks for the first directory-entry slot in `sector` (a whole on-disk
+/// sector's worth of 32-byte entries, in on-disk order) that a `create`
+/// caller can write a brand-new short entry into *without* growing the
+/// directory: either a genuinely deleted slot (`entry[0] == 0xE5`) or the
+/// first end-of-directory sentinel slot (`entry[0] == 0x00`) — reusing the
+/// sentinel in place is safe because every slot after it is itself always
+/// `0x00`/unused, the same invariant every reader (this crate's own
+/// `find_entry_in_directory`-shaped scans) already relies on to know when
+/// to stop scanning. Returns `None` if every entry in `sector` is live —
+/// the caller must then check the *next* cluster in the chain, or (if
+/// there is none) grow the directory before it can create anything.
+///
+/// Pure and hardware-independent, same "split out of `main.rs`
+/// specifically so it's testable on the host" reasoning this whole module
+/// exists for (see this file's own doc comment) — `main.rs`'s own
+/// `find_or_grow_create_slot` is responsible for actually reading `sector`
+/// off the real device and deciding what to do with `None`.
+///
+/// `sector.len()` need not be an exact multiple of 32 — any trailing
+/// partial entry (never the case for a real on-disk sector, whose
+/// `bytes_per_sector` is always itself a multiple of 32 for every value
+/// [`VALID_BYTES_PER_SECTOR`] allows) is simply not examined, not a panic.
+pub fn find_reusable_slot(sector: &[u8]) -> Option<usize> {
+    for (index, chunk) in sector.chunks_exact(32).enumerate() {
+        if chunk[0] == 0x00 || chunk[0] == 0xE5 {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// The fixed FAT32 end-of-chain value this driver writes whenever *it* is
+/// the one marking a cluster as a chain's last one (reads still accept the
+/// whole `>= 0x0FFF_FFF8` range via [`is_end_of_chain`] — a real
+/// implementation elsewhere might have written a different value in that
+/// range, but this driver only ever needs to write one consistent value of
+/// its own).
+pub const CHAIN_EOC_MARKER: u32 = 0x0FFF_FFFF;
+
+/// Computes, for each cluster in `clusters` (a freshly-allocated,
+/// not-yet-linked chain, in chain order), the FAT value it should be
+/// written to: every cluster but the last points at its successor; the
+/// last gets [`CHAIN_EOC_MARKER`]. Pure and hardware-independent — the
+/// multi-cluster generalization of the single "new cluster's own EOC
+/// marker, then the link" pair `main.rs`'s `run_grow_proof` already proved
+/// safe for one cluster at a time; `main.rs`'s own `allocate_cluster_chain`
+/// is responsible for actually reserving these cluster numbers and writing
+/// each value via `write_fat_entry`, in whatever order it chooses (unlike
+/// the single-cluster case, no two clusters in a *freshly allocated,
+/// not-yet-externally-linked* chain can be observed by anything else mid-way,
+/// so there is no "half-initialized" hazard to order against here — the
+/// hazard `run_grow_proof` guards against is splicing this whole finished
+/// chain onto the *existing* file/directory chain before it's fully built,
+/// which `allocate_cluster_chain`'s own doc comment covers separately).
+pub fn chain_link_values(clusters: &[u32]) -> impl Iterator<Item = (u32, u32)> + '_ {
+    clusters.iter().enumerate().map(move |(i, &cluster)| {
+        let value = clusters.get(i + 1).copied().unwrap_or(CHAIN_EOC_MARKER);
+        (cluster, value)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,6 +631,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn find_reusable_slot_prefers_the_first_deleted_or_sentinel_entry() {
+        let mut sector = [0xFFu8; 512]; // never a valid first byte on its own
+        // Slot 0: a live entry (first byte 0x41 is a plausible short-name
+        // char, not 0x00/0xE5).
+        sector[0] = 0x41;
+        // Slot 1: deleted -- the first reusable slot, must win over slot 3's
+        // sentinel even though it comes later in scan order.
+        sector[32] = 0xE5;
+        // Slot 3: the end-of-directory sentinel.
+        sector[96] = 0x00;
+        assert_eq!(find_reusable_slot(&sector), Some(1));
+    }
+
+    #[test]
+    fn find_reusable_slot_finds_a_bare_sentinel_with_no_deleted_entry() {
+        let mut sector = [0x41u8; 512]; // every slot "live"
+        sector[64] = 0x00; // slot 2 is the end-of-directory sentinel
+        assert_eq!(find_reusable_slot(&sector), Some(2));
+    }
+
+    #[test]
+    fn find_reusable_slot_returns_none_when_every_entry_is_live() {
+        let sector = [0x41u8; 512];
+        assert_eq!(find_reusable_slot(&sector), None);
+    }
+
+    #[test]
+    fn chain_link_values_points_every_cluster_at_its_successor_and_ends_in_eoc() {
+        let clusters = [10u32, 11, 12];
+        let links: Vec<(u32, u32)> = chain_link_values(&clusters).collect();
+        assert_eq!(links, vec![(10, 11), (11, 12), (12, CHAIN_EOC_MARKER)]);
+    }
+
+    #[test]
+    fn chain_link_values_of_a_single_cluster_is_just_its_own_eoc() {
+        let clusters = [7u32];
+        let links: Vec<(u32, u32)> = chain_link_values(&clusters).collect();
+        assert_eq!(links, vec![(7, CHAIN_EOC_MARKER)]);
+    }
+
     proptest! {
         // The actual regression class this whole module exists to catch:
         // no byte pattern, however malformed, may make any of these three
@@ -622,6 +724,16 @@ mod tests {
                 let byte_offset = (cluster as usize) * 4;
                 prop_assert!(byte_offset + 4 <= fat_bytes.len());
             }
+        }
+
+        // `find_reusable_slot` must never panic on arbitrary bytes,
+        // regardless of length -- same "no byte pattern makes this crash"
+        // property as every other parser in this module.
+        #[test]
+        fn find_reusable_slot_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..2048),
+        ) {
+            let _ = find_reusable_slot(&bytes);
         }
 
         #[test]

@@ -69,7 +69,15 @@ const BLK_STACK_VA: u64 = 0x_0999_2222_0000;
 // this test defines its own independent copy of this constant (does not
 // share `kernel/src/main.rs`'s), so that file's own matching bump has no
 // effect here on its own.
-const BLK_STACK_SIZE: u64 = 4096 * 8;
+//
+// Bumped again from `4096 * 8` (32 KiB) for the directory-growth/
+// multi-cluster-allocation proofs (`run_multi_cluster_grow_proof`,
+// `run_directory_growth_proof`): same "another `[u8; 4096]`-sized local
+// buffer added to the same sequential call chain" reasoning as the Phase 7
+// bump above, not re-measured from scratch — kept generous rather than
+// tuned to the exact byte, same honesty every other fixed-size constant
+// bump in this codebase already applies.
+const BLK_STACK_SIZE: u64 = 4096 * 10;
 const BLK_INFO_VA: u64 = 0x_0999_3333_0000;
 const BLK_QUEUE_VA: u64 = 0x_0999_4444_0000;
 const BLK_REQBUF_VA: u64 = 0x_0999_5555_0000;
