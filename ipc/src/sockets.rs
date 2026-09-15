@@ -66,7 +66,9 @@ pub enum SocketRequest {
 pub enum SocketResponse {
     Connected,
     OpenFailed(SocketError),
-    Sent { len: u16 },
+    Sent {
+        len: u16,
+    },
     SendFailed(SocketError),
     /// Zero or more bytes actually available right now. Empty is a normal,
     /// non-error result ("nothing arrived yet"), not

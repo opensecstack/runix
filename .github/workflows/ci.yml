@@ -244,7 +244,7 @@ jobs:
       - name: verify GROW.TXT/DELETE_M.TXT/CREATED.TXT reflect Phase 7's writes on disk
         working-directory: kernel
         run: |
-          grow_size="$(mdir -i target/runix-fat32-test.img :: | grep '^GROW' | tr -s ' ' | cut -d' ' -f3)"
+          grow_size="$(mdir -i target/runix-fat32-test.img :: | grep '^GROW\.TXT ' | tr -s ' ' | cut -d' ' -f3)"
           if [ "$grow_size" != "712" ]; then
             echo "expected GROW.TXT to be 712 bytes after blk_fat32_read's chain-growth proof, got: $grow_size" >&2
             exit 1

@@ -396,7 +396,11 @@ impl WormLog {
         reason: Option<String>,
     ) {
         let seq = self.entries.len() as u64;
-        let prev_hash = self.entries.last().map(|e| e.entry_hash).unwrap_or([0u8; 32]);
+        let prev_hash = self
+            .entries
+            .last()
+            .map(|e| e.entry_hash)
+            .unwrap_or([0u8; 32]);
         let entry_hash = WormEntry::compute_hash(
             &prev_hash,
             seq,

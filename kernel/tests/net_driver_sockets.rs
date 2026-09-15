@@ -150,7 +150,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let elf = match Elf64::parse(NET_DRIVER_HOST_ELF) {
         Ok(elf) => elf,
         Err(e) => {
-            serial_println!("net_driver_sockets: FAIL — parse() rejected the binary: {:?}", e);
+            serial_println!(
+                "net_driver_sockets: FAIL — parse() rejected the binary: {:?}",
+                e
+            );
             exit_qemu(QemuExitCode::Failed);
         }
     };
@@ -163,7 +166,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             exit_qemu(QemuExitCode::Failed);
         }
     };
-    serial_println!("net_driver_sockets: loaded, entry point {:#x}", entry.as_u64());
+    serial_println!(
+        "net_driver_sockets: loaded, entry point {:#x}",
+        entry.as_u64()
+    );
 
     let rw_user_flags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
