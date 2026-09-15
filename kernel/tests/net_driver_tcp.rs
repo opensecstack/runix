@@ -98,6 +98,10 @@ struct NetBootInfo {
     rx_buffer_phys: [u64; 8],
     tx_buffer_phys: [u64; 4],
     attempt_tcp: u8,
+    /// `0` -- this test never spawns a second process to send socket
+    /// requests; see `net_driver_sockets.rs` for the test that sets this
+    /// to `1`.
+    serve_sockets: u8,
 }
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
@@ -222,6 +226,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         rx_buffer_phys,
         tx_buffer_phys,
         attempt_tcp: 1,
+        serve_sockets: 0,
     };
     unsafe {
         (info_content.as_mut_ptr() as *mut NetBootInfo).write(info);

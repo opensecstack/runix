@@ -99,6 +99,10 @@ struct NetBootInfo {
     /// net-driver-host's Phase 2b TCP attempt to reach; see
     /// `net_driver_tcp.rs` for the test that sets this to `1`.
     attempt_tcp: u8,
+    /// `0` -- this test never spawns a second process to send socket
+    /// requests; see `net_driver_sockets.rs` for the test that sets this
+    /// to `1`.
+    serve_sockets: u8,
 }
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
@@ -223,6 +227,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         rx_buffer_phys,
         tx_buffer_phys,
         attempt_tcp: 0,
+        serve_sockets: 0,
     };
     unsafe {
         (info_content.as_mut_ptr() as *mut NetBootInfo).write(info);

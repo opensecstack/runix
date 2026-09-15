@@ -256,6 +256,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "runix-ipc"
+version = "0.0.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "runix-kernel"
 version = "0.0.1"
 dependencies = [
@@ -267,6 +274,7 @@ dependencies = [
  "pic8259",
  "runix-capability-manager",
  "runix-citadel-integration",
+ "runix-ipc",
  "sha2",
  "spin",
  "x86_64",

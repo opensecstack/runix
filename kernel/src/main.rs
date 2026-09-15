@@ -141,6 +141,12 @@ struct NetBootInfo {
     /// so attempting it here would just add a full poll-bound's worth of
     /// wall-clock time to every boot for no benefit.
     attempt_tcp: u8,
+    /// `0` on the real boot path -- no other process asks this driver for
+    /// a socket here, so entering `net-driver-host`'s sockets IPC server
+    /// loop would just add an unused wait to every boot, same reasoning
+    /// `BlkBootInfo::serve_fs_requests`'s own doc comment already gives.
+    /// `1` only in `kernel/tests/net_driver_sockets.rs`.
+    serve_sockets: u8,
 }
 
 /// `blk-driver-host`, Phase B9's payload (filesystem driver, Phase 1 —
@@ -893,6 +899,7 @@ fn load_and_run_net_driver_host(io_base: u16, now: u64, signing_key: &ed25519_da
         rx_buffer_phys,
         tx_buffer_phys,
         attempt_tcp: 0,
+        serve_sockets: 0,
     };
     unsafe {
         (info_content.as_mut_ptr() as *mut NetBootInfo).write(info);

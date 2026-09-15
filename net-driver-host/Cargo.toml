@@ -16,6 +16,12 @@ publish = false
 [dependencies]
 linked_list_allocator = "0.10"
 smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-tcp", "alloc"] }
+# `default-features = false`: skips `runix-ipc`'s `std` feature (and
+# transitively `serde_json`, a hard-`std` dependency) -- this crate targets
+# `x86_64-unknown-none` with no `std` at all. Only the `sockets` module
+# (typed wire format for the sockets IPC surface, `sockets.rs`) is usable
+# under that configuration; see `runix-ipc/src/lib.rs`'s own doc comment.
+runix-ipc = { path = "../ipc", default-features = false }
 
 [dev-dependencies]
 # Host-only (tests run on the host, never the x86_64-unknown-none target) —

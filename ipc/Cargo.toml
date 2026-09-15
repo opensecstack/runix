@@ -9,8 +9,31 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-serde.workspace = true
-serde_json.workspace = true
+# `default-features = false` + explicit `alloc` (not `.workspace = true`, same
+# reasoning as `capability-manager/Cargo.toml`'s own comment): the `sockets`
+# module must stay `no_std` + `alloc` so `net-driver-host` (a freestanding
+# `x86_64-unknown-none` ring 3 binary with no `std` at all) can depend on
+# this crate directly (`default-features = false`) for its typed wire
+# format, instead of hand-rolling one. `Envelope` (this crate's other,
+# pre-existing type) stays std-only, gated behind the `std` feature default
+# consumers get automatically.
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", optional = true }
+
+[features]
+default = ["std"]
+# Pulls in `serde_json` (a hard std dependency) and `serde`'s own `std`
+# feature -- needed for `Envelope`, not for `sockets` (see that module's doc
+# comment). A consumer that only needs `sockets` (e.g. `net-driver-host`)
+# depends on this crate with `default-features = false` and skips all of it.
+std = ["serde/std", "dep:serde_json"]
+
+[dev-dependencies]
+# Property-tests `sockets`'s `decode` functions against arbitrary/truncated
+# byte input — same rigor `net-driver-host`'s own `lib.rs` already applies
+# to device-controlled bytes (see docs/THREAT_MODEL.md's testing-rigor
+# commitment).
+proptest = "1"
 
 [lib]
 name = "runix_ipc"

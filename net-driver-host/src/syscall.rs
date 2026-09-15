@@ -7,6 +7,8 @@
 
 const SYS_YIELD: u64 = 0;
 const SYS_WRITE: u64 = 1;
+const SYS_IPC_SEND: u64 = 2;
+const SYS_IPC_RECV: u64 = 3;
 const SYS_PORT_IN: u64 = 4;
 const SYS_PORT_OUT: u64 = 5;
 
@@ -91,4 +93,27 @@ pub fn port_in(port: u16, width: u8) -> Option<u32> {
 pub fn port_out(port: u16, width: u8, value: u32) -> bool {
     let ret = unsafe { syscall(SYS_PORT_OUT, port as u64, width as u64, value as u64) };
     ret != u64::MAX
+}
+
+/// Sockets IPC surface (see `main.rs`'s `run_socket_ipc_server`): sends one
+/// byte on IPC `port`, gated by whatever capability this process was spawned
+/// with for that port (same `Thread::extra_capabilities` shape
+/// `blk-driver-host/src/syscall.rs`'s own `ipc_send` already documents).
+/// Returns `false` if denied.
+pub fn ipc_send(port: usize, byte: u8) -> bool {
+    let ret = unsafe { syscall(SYS_IPC_SEND, port as u64, byte as u64, 0) };
+    ret != u64::MAX
+}
+
+/// Reads one byte off IPC `port`, non-blocking — `None` if the port is
+/// currently empty. No capability check on the receive side (matching
+/// `kernel/src/syscall.rs`'s real behavior today, same as
+/// `blk-driver-host/src/syscall.rs`'s `ipc_try_recv`).
+pub fn ipc_try_recv(port: usize) -> Option<u8> {
+    let ret = unsafe { syscall(SYS_IPC_RECV, port as u64, 0, 0) };
+    if ret == u64::MAX {
+        None
+    } else {
+        Some(ret as u8)
+    }
 }

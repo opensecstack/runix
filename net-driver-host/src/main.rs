@@ -51,13 +51,15 @@ mod syscall;
 mod virtio;
 
 use alloc::vec;
+use alloc::vec::Vec;
 use linked_list_allocator::LockedHeap;
+use runix_ipc::sockets::{SocketError, SocketRequest, SocketResponse};
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::socket::{icmp, tcp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address};
 use smoltcp_device::{RunixNetDevice, RX_BUFFER_COUNT, TX_BUFFER_COUNT};
-use syscall::{write_all, write_byte, yield_now};
+use syscall::{ipc_send, ipc_try_recv, write_all, write_byte, yield_now};
 
 /// Must match `kernel/src/main.rs`'s own `NET_HEAP_START`/`NET_HEAP_SIZE` —
 /// same "the loader sets this up, this binary has no privilege to map its
@@ -108,6 +110,15 @@ struct NetBootInfo {
     /// `kernel/tests/net_driver_tcp.rs`, which alone configures the
     /// `guestfwd` route and host listener this needs).
     attempt_tcp: u8,
+    /// Sockets IPC surface (see `run_socket_ipc_server`'s doc comment):
+    /// `0` on every path above — no other process asks for a socket there,
+    /// so entering the server loop would just add an unused wait to every
+    /// other boot/test, same reasoning `blk-driver-host/src/main.rs`'s own
+    /// `BlkBootInfo::serve_fs_requests` doc comment already gives for the
+    /// filesystem driver's IPC surface. `1` only in
+    /// `kernel/tests/net_driver_sockets.rs`, which alone spawns a second
+    /// process to actually send socket requests.
+    serve_sockets: u8,
 }
 
 const NET_INFO_VA: usize = 0x_1111_3333_0000;
@@ -134,6 +145,14 @@ const TCP_REMOTE_PORT: u16 = 9000;
 const TCP_LOCAL_PORT: u16 = 49152;
 const TCP_PING: &[u8] = b"RUNIX-TCP-PROOF-PING";
 const TCP_PONG: &[u8] = b"RUNIX-TCP-PROOF-PONG";
+
+/// Sockets IPC surface's fixed ports (see `run_socket_ipc_server`'s doc
+/// comment) — same "one fixed port per purpose, decided at spawn time, not
+/// negotiated in-band" convention `blk-driver-host/src/main.rs`'s
+/// `FS_REQUEST_PORT`/`FS_RESPONSE_PORT` already established. Must match
+/// `kernel/tests/net_driver_sockets.rs`'s own constants exactly.
+const SOCK_REQUEST_PORT: usize = 11;
+const SOCK_RESPONSE_PORT: usize = 12;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -289,6 +308,19 @@ pub extern "C" fn _start() -> ! {
         run_tcp_proof(&mut iface, &mut device, final_iteration + 1);
     }
 
+    if info.serve_sockets != 0 {
+        // Well past any timestamp either phase above could have already
+        // handed `iface` (ICMP's own bound is 2,000,000; Phase 2b's TCP
+        // proof starts at `final_iteration + 1` and runs at most 2,000,000
+        // more) — restarting from a timestamp `iface` has already seen
+        // internally would silently stall its retransmit/backoff timers,
+        // the exact real bug `run_tcp_proof`'s caller-side doc comment
+        // already found once for the ICMP -> TCP transition. Cheaper than
+        // threading the exact final iteration back out of `run_tcp_proof`
+        // for what's already a generous, one-off constant.
+        run_socket_ipc_server(&mut iface, &mut device, 5_000_000);
+    }
+
     loop {
         yield_now();
     }
@@ -387,6 +419,189 @@ fn run_tcp_proof(iface: &mut Interface, device: &mut RunixNetDevice, start_itera
     }
 }
 
+/// Sockets IPC surface: the "sockets API/IPC surface for other ring 3
+/// processes to use this stack" gap `docs/STATUS.md`'s network-stack
+/// section calls out as deferred. Serves [`SOCKET_REQUEST_PORT`] requests
+/// against one `smoltcp` TCP socket — single connection at a time, matching
+/// this driver's own shape (one `tcp::Socket` in its `SocketSet`);
+/// concurrent sockets stay a separate, explicitly deferred gap, not solved
+/// here. Requests/responses are the typed wire format `runix_ipc::sockets`
+/// defines, not a hand-rolled byte layout of this driver's own — see that
+/// module's doc comment for the wire shape and why it's encoded the way it
+/// is (one byte per IPC syscall, no blocking receive).
+///
+/// Mirrors `blk-driver-host/src/main.rs`'s `run_fs_ipc_server` in shape: a
+/// bounded poll loop, same discipline every wait loop in this codebase
+/// uses (a real request arrives promptly in practice; the bound exists so
+/// a driver that's genuinely stuck reports that instead of hanging the
+/// boot forever).
+fn run_socket_ipc_server(iface: &mut Interface, device: &mut RunixNetDevice, start_iteration: u32) {
+    let tcp_rx_buffer = tcp::SocketBuffer::new(vec![0; 256]);
+    let tcp_tx_buffer = tcp::SocketBuffer::new(vec![0; 256]);
+    let mut tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
+    tcp_socket.set_nagle_enabled(false);
+
+    let mut sockets = SocketSet::new(vec![]);
+    let handle = sockets.add(tcp_socket);
+
+    write_all(b"net-driver-host: sockets IPC server ready\n");
+
+    let mut request_buf: Vec<u8> = Vec::new();
+    let mut requests_served = 0u32;
+    // `Connect` alone needs several polls to resolve (ARP + the TCP
+    // handshake, same as `run_tcp_proof`'s own connect above) -- tracked
+    // here so the single loop below can keep calling `iface.poll` on every
+    // iteration (required for the handshake to progress at all) while a
+    // connect attempt is pending, instead of blocking inside a nested loop
+    // that can't reach `device`/`sockets` (both borrowed by the outer
+    // loop already).
+    let mut pending_connect_since: Option<u32> = None;
+    // Same bound (~200,000 iterations at the outer loop's own cadence) as
+    // every other bounded connect-wait in this file (`run_tcp_proof`'s
+    // implicit one via its own poll bound) -- long enough for a real
+    // handshake against a reachable peer, short enough that an
+    // unreachable one still reports failure well inside this function's
+    // own 2,000,000-iteration budget.
+    const CONNECT_TIMEOUT_ITERATIONS: u32 = 200_000;
+
+    // Same bound and yield cadence as every other poll loop in this file.
+    for offset in 0..2_000_000u32 {
+        let timestamp = Instant::from_millis((start_iteration + offset) as i64);
+        iface.poll(timestamp, device, &mut sockets);
+        let socket = sockets.get_mut::<tcp::Socket>(handle);
+
+        if let Some(since) = pending_connect_since {
+            if socket.state() == tcp::State::Established {
+                send_response(&SocketResponse::Connected);
+                pending_connect_since = None;
+                requests_served += 1;
+            } else if socket.state() == tcp::State::Closed
+                || offset.wrapping_sub(since) > CONNECT_TIMEOUT_ITERATIONS
+            {
+                send_response(&SocketResponse::OpenFailed(SocketError::ConnectFailed));
+                pending_connect_since = None;
+                requests_served += 1;
+            }
+        }
+
+        if let Some(byte) = ipc_try_recv(SOCK_REQUEST_PORT) {
+            request_buf.push(byte);
+        }
+
+        // Only accept a new request once any pending `Connect` has been
+        // answered -- this driver serves one connection, and therefore one
+        // in-flight request, at a time.
+        if pending_connect_since.is_none() {
+            if let Some((request, consumed)) = SocketRequest::decode(&request_buf) {
+                request_buf.drain(..consumed);
+                match handle_socket_request(iface, socket, request) {
+                    RequestOutcome::Immediate(response) => {
+                        send_response(&response);
+                        requests_served += 1;
+                    }
+                    RequestOutcome::ConnectPending => {
+                        pending_connect_since = Some(offset);
+                    }
+                }
+            }
+        }
+
+        if offset % 10_000 == 0 {
+            yield_now();
+        }
+    }
+
+    write_all(b"net-driver-host: sockets IPC server served ");
+    write_decimal(requests_served as u64);
+    write_all(b" request(s)\n");
+}
+
+/// What [`handle_socket_request`] wants the caller to do next: either send
+/// `response` back immediately, or (only for
+/// [`SocketRequest::Connect`]) wait for the handshake to resolve on a later
+/// poll before responding at all.
+enum RequestOutcome {
+    Immediate(SocketResponse),
+    ConnectPending,
+}
+
+/// Applies one already-decoded [`SocketRequest`] to `socket`.
+fn handle_socket_request(
+    iface: &mut Interface,
+    socket: &mut tcp::Socket,
+    request: SocketRequest,
+) -> RequestOutcome {
+    match request {
+        SocketRequest::Connect {
+            remote_ip,
+            remote_port,
+            local_port,
+        } => {
+            if socket.is_open() {
+                return RequestOutcome::Immediate(SocketResponse::OpenFailed(
+                    SocketError::AlreadyOpen,
+                ));
+            }
+            let remote = IpAddress::Ipv4(Ipv4Address::new(
+                remote_ip[0],
+                remote_ip[1],
+                remote_ip[2],
+                remote_ip[3],
+            ));
+            match socket.connect(iface.context(), (remote, remote_port), local_port) {
+                Ok(()) => RequestOutcome::ConnectPending,
+                Err(_) => RequestOutcome::Immediate(SocketResponse::OpenFailed(
+                    SocketError::ConnectFailed,
+                )),
+            }
+        }
+        SocketRequest::Send(data) => {
+            let response = if !socket.is_open() {
+                SocketResponse::SendFailed(SocketError::NotOpen)
+            } else {
+                match socket.send_slice(&data) {
+                    Ok(len) => SocketResponse::Sent { len: len as u16 },
+                    Err(_) => SocketResponse::SendFailed(SocketError::InvalidLength),
+                }
+            };
+            RequestOutcome::Immediate(response)
+        }
+        SocketRequest::Recv { max_len } => {
+            let response = if !socket.is_open() {
+                SocketResponse::Error(SocketError::NotOpen)
+            } else {
+                let max_len = (max_len as usize).min(runix_ipc::sockets::MAX_PAYLOAD_LEN);
+                let mut buf = vec![0u8; max_len];
+                if socket.can_recv() {
+                    match socket.recv_slice(&mut buf) {
+                        Ok(n) => {
+                            buf.truncate(n);
+                            SocketResponse::Data(buf)
+                        }
+                        Err(_) => SocketResponse::Data(Vec::new()),
+                    }
+                } else {
+                    SocketResponse::Data(Vec::new())
+                }
+            };
+            RequestOutcome::Immediate(response)
+        }
+        SocketRequest::Close => {
+            socket.close();
+            RequestOutcome::Immediate(SocketResponse::Closed)
+        }
+    }
+}
+
+/// Sends `response`'s encoded bytes one at a time on
+/// [`SOCK_RESPONSE_PORT`], same "one byte per `SYS_IPC_SEND`" convention
+/// `blk-driver-host/src/main.rs`'s own reply path already uses.
+fn send_response(response: &SocketResponse) {
+    for byte in response.encode() {
+        let _ = ipc_send(SOCK_RESPONSE_PORT, byte);
+    }
+}
+
 /// Offset into the `NetBootInfo` page reserved for this process's own
 /// PASS/FAIL result byte — past `NetBootInfo`'s own fields with room to
 /// spare, so a future field added to that struct can't collide with it.
@@ -399,6 +614,23 @@ pub const NET_RESULT_OFFSET: usize = 128;
 pub const NET_TCP_RESULT_OFFSET: usize = 129;
 pub const NET_RESULT_PASS: u8 = 1;
 pub const NET_RESULT_FAIL: u8 = 2;
+
+/// Same as `blk-driver-host/src/main.rs`'s function of the same name --
+/// used by `run_socket_ipc_server`'s own summary line.
+fn write_decimal(mut value: u64) {
+    if value == 0 {
+        write_byte(b'0');
+        return;
+    }
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    while value > 0 {
+        i -= 1;
+        digits[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    write_all(&digits[i..]);
+}
 
 fn write_hex_byte(byte: u8) {
     const HEX: &[u8; 16] = b"0123456789abcdef";

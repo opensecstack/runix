@@ -309,6 +309,19 @@ jobs:
           sleep 0.3
           RUNIX_NETDEV_ARG="user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001" \
             cargo test --target x86_64-unknown-none --test net_driver_tcp
+      # Sockets IPC surface -- same `guestfwd`/listener setup as
+      # net_driver_tcp above (a fresh listener process, since the previous
+      # one already exited after serving that test's one connection), now
+      # driven entirely through the capability-gated sockets IPC ports
+      # (`net_driver_sockets.rs`) instead of `net-driver-host`'s own
+      # hardcoded Phase 2b proof.
+      - name: cargo test net_driver_sockets (sockets IPC surface via guestfwd)
+        working-directory: kernel
+        run: |
+          python3 tests/support/tcp_proof_listener.py &
+          sleep 0.3
+          RUNIX_NETDEV_ARG="user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001" \
+            cargo test --target x86_64-unknown-none --test net_driver_sockets
 
   # Mobile L1 (aarch64/TrustZone), separate from the x86_64 `kernel` job
   # above — different target triple, different toolchain requirement (this

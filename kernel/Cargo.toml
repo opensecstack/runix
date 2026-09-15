@@ -14,6 +14,12 @@ publish = false
 [workspace]
 
 [dependencies]
+# `default-features = false`: skips `runix-ipc`'s `std` feature (and
+# transitively `serde_json`, a hard-`std` dependency) -- this kernel has no
+# `std` at all. Only used by `kernel/tests/net_driver_sockets.rs` today
+# (the sockets IPC surface's typed wire format, `runix_ipc::sockets`), not
+# by the kernel's own runtime code.
+runix-ipc = { path = "../ipc", default-features = false }
 bootloader_api = "0.11"
 spin = "0.9"
 x86_64 = "0.15"
@@ -103,6 +109,10 @@ harness = false
 
 [[test]]
 name = "net_driver_tcp"
+harness = false
+
+[[test]]
+name = "net_driver_sockets"
 harness = false
 
 [[test]]
