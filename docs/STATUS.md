@@ -992,13 +992,37 @@ specific and can't be rehearsed identically on Windows — packet capture
 (`-object filter-dump`) inside WSL is what actually diagnosed both bugs
 above, rather than guessing from symptoms alone.
 
-Also still deferred: DHCP, multiple concurrent sockets, a sockets API/IPC
-surface for other ring 3 processes to use this stack, UDP, TX/RX
-interrupts, MSI-X/IOAPIC, real wall-clock timestamps, TCP performance
-tuning, and fuzzing the ICMP/ARP-resolution/TCP parsing path (required
-per the testing-rigor commitment below, scoped as a fast-follow now that
-these parsers actually exist — the property-testing work already done for
+Also still deferred at the time: DHCP, multiple concurrent sockets, and a
+sockets API/IPC surface for other ring 3 processes to use this stack — all
+three since closed (see below) — plus UDP, TX/RX interrupts, MSI-X/IOAPIC,
+real wall-clock timestamps, TCP performance tuning, and fuzzing the
+ICMP/ARP-resolution/TCP parsing path (required per the testing-rigor
+commitment below, scoped as a fast-follow now that these parsers actually
+exist — the property-testing work already done for
 `is_arp_reply`/`validate_rx_completion` is the template to extend).
+
+**Sockets IPC surface, then DHCP + concurrent sockets on top of it.** A
+typed request/response wire format (`ipc/src/sockets.rs`'s
+`SocketRequest`/`SocketResponse`, same one-byte-per-IPC-syscall encoding
+`blk-driver-host`'s filesystem IPC surface established) lets other ring 3
+processes drive `net-driver-host`'s TCP stack over capability-gated IPC
+(`net-driver-host/src/main.rs`'s `run_socket_ipc_server`,
+`kernel/tests/net_driver_sockets.rs`) instead of only the driver's own
+hardcoded proof. That surface then grew two of this section's own
+originally-deferred gaps: `SocketRequest::Open` allocates one of a small,
+fixed number of handles (`MAX_SOCKETS`) up front, so `Connect`/`Send`/
+`Recv`/`Close` all name which handle they apply to and two independently
+opened connections run concurrently without clobbering each other's state
+(`kernel/tests/net_driver_sockets_concurrent.rs`, proven with two
+overlapping connections through a single `guestfwd` route rather than
+two — see that test's own doc comment for why); and `net-driver-host`
+acquires its own address via a real `smoltcp::socket::dhcpv4` handshake
+against QEMU/SLIRP's built-in DHCP server (always present on `-netdev
+user`, whether or not anything asks it for a lease) on the real boot path
+(`NetBootInfo::use_dhcp`, `kernel/tests/net_driver_dhcp.rs`) rather than
+the fixed `LOCAL_IP` `net_driver_icmp.rs`/`net_driver_tcp.rs`/
+`net_driver_sockets.rs` still deliberately use, so as not to disturb those
+tests' own static-address assumptions.
 
 **The testing-rigor commitment, no longer just a commitment for later.**
 Everything verified in this kernel up to Phase 1 above was a hand-written

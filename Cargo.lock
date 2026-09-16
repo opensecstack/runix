@@ -530,6 +530,7 @@ name = "runix-ipc"
 version = "0.0.1"
 dependencies = [
  "proptest",
+ "runix-capability-manager",
  "serde",
  "serde_json",
 ]

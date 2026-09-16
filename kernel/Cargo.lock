@@ -259,6 +259,7 @@ dependencies = [
 name = "runix-ipc"
 version = "0.0.1"
 dependencies = [
+ "runix-capability-manager",
  "serde",
 ]
 

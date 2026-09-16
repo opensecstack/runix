@@ -100,6 +100,10 @@ name = "grid_sandbox_tier_t3"
 harness = false
 
 [[test]]
+name = "grid_sandbox_multi_instance"
+harness = false
+
+[[test]]
 name = "citadel_demo"
 harness = false
 
@@ -113,6 +117,14 @@ harness = false
 
 [[test]]
 name = "net_driver_sockets"
+harness = false
+
+[[test]]
+name = "net_driver_sockets_concurrent"
+harness = false
+
+[[test]]
+name = "net_driver_dhcp"
 harness = false
 
 [[test]]

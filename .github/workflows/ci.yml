@@ -184,8 +184,10 @@ jobs:
           cargo test --target x86_64-unknown-none --test grid_sandbox_wasm
           cargo test --target x86_64-unknown-none --test grid_sandbox_tier_t1
           cargo test --target x86_64-unknown-none --test grid_sandbox_tier_t3
+          cargo test --target x86_64-unknown-none --test grid_sandbox_multi_instance
           cargo test --target x86_64-unknown-none --test citadel_demo
           cargo test --target x86_64-unknown-none --test net_driver_icmp
+          cargo test --target x86_64-unknown-none --test net_driver_dhcp
           cargo test --target x86_64-unknown-none --test blk_driver_rw
       # Filesystem driver, Phase 2 -- points xtask's virtio-blk `-drive` at
       # the real FAT32 fixture built above instead of the plain zero-filled
@@ -322,6 +324,20 @@ jobs:
           sleep 0.3
           RUNIX_NETDEV_ARG="user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001" \
             cargo test --target x86_64-unknown-none --test net_driver_sockets
+      # Concurrent sockets -- two independently-opened handles through the
+      # same sockets IPC surface, proven with a *single* `guestfwd` route
+      # reused for two overlapping connections rather than two routes (see
+      # `kernel/tests/support/two_socket_proof_listener.py`'s own doc
+      # comment for why: QEMU spawns a fresh bridge per new
+      # guest-initiated connection to a `guestfwd` target regardless of how
+      # many to it are already open, so one route is enough).
+      - name: cargo test net_driver_sockets_concurrent (two concurrent socket handles)
+        working-directory: kernel
+        run: |
+          python3 tests/support/two_socket_proof_listener.py &
+          sleep 0.3
+          RUNIX_NETDEV_ARG="user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9002" \
+            cargo test --target x86_64-unknown-none --test net_driver_sockets_concurrent
 
   # Mobile L1 (aarch64/TrustZone), separate from the x86_64 `kernel` job
   # above — different target triple, different toolchain requirement (this
