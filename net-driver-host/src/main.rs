@@ -461,11 +461,43 @@ fn run_socket_ipc_server(iface: &mut Interface, device: &mut RunixNetDevice, sta
     // implicit one via its own poll bound) -- long enough for a real
     // handshake against a reachable peer, short enough that an
     // unreachable one still reports failure well inside this function's
-    // own 2,000,000-iteration budget.
+    // own outer-loop budget below.
     const CONNECT_TIMEOUT_ITERATIONS: u32 = 200_000;
 
-    // Same bound and yield cadence as every other poll loop in this file.
-    for offset in 0..2_000_000u32 {
+    // Bumped from `2_000_000` (same bound `run_tcp_proof` above uses) --
+    // confirmed by real reproduction, not guessed: this loop's own
+    // iteration count is *not* a proxy for wall-clock time the way it is
+    // in `run_tcp_proof`, because this server's caller
+    // (`kernel/tests/net_driver_sockets.rs`'s `kernel_main`) spends a
+    // fixed ~2,000 cooperative-scheduler `yield_now()` calls settling in
+    // before it even attempts the capability-denial check, then up to
+    // another ~20,000 polling for the client thread's result -- and on
+    // this codebase's *cooperative* scheduler (no timer-based preemption;
+    // see docs/THREAT_MODEL.md), every one of those handoffs lets this
+    // loop run for a full ~10,000 iterations (its own yield cadence
+    // below) before control returns to whichever thread yielded. A
+    // temporary instrumented build confirmed the actual numbers: with
+    // the old 2,000,000 bound, this loop always finished (and stopped
+    // servicing `SOCK_REQUEST_PORT` for good, "served 0 requests" logged)
+    // *before* the client thread was even spawned -- consuming its whole
+    // budget on `kernel_main`'s own settle-wait alone, roughly
+    // 2,000 yields * ~10,000 iterations/yield. A real end-to-end run
+    // (connect/send/recv/close all succeeding) consumed ~13.25-13.5
+    // million iterations total, almost entirely on that same settle-wait,
+    // with the connect/send/recv/close round trip itself costing well
+    // under 500,000 more. This reproduces identically under both TCG and
+    // KVM (a cooperative-scheduler yield-cadence mismatch between this
+    // loop and its caller's wait loops, not a TCG-vs-KVM execution-speed
+    // issue) -- but CI's forced-TCG runners are where it was actually
+    // caught, since a real per-iteration slowdown there was the first
+    // (and reasonable) hypothesis, ruled out by reproducing the exact
+    // same failure locally under KVM. `500_000_000` leaves wide margin
+    // above both the measured ~13.5 million actual and the theoretical
+    // worst case if `kernel_main`'s up-to-22,000 total yields each
+    // happened to hand this loop its full ~10,000-iteration slice
+    // (~220,000,000) -- confirmed passing at this bound, not just
+    // theorized.
+    for offset in 0..500_000_000u32 {
         let timestamp = Instant::from_millis((start_iteration + offset) as i64);
         iface.poll(timestamp, device, &mut sockets);
         let socket = sockets.get_mut::<tcp::Socket>(handle);
