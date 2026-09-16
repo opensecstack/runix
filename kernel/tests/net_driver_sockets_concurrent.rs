@@ -1,31 +1,43 @@
-//! Sockets IPC surface (see `net-driver-host/src/main.rs`'s
-//! `run_socket_ipc_server` doc comment and `docs/STATUS.md`'s
-//! network-stack section — "a sockets API/IPC surface for other ring 3
-//! processes to use this stack" is exactly the gap this closes): proves a
-//! client can open/send/recv/close a real TCP connection through
-//! `net-driver-host` over capability-gated IPC, using the typed wire format
-//! `runix_ipc::sockets` defines on *both* ends — this test decodes
-//! `net-driver-host`'s responses with `runix_ipc::sockets::SocketResponse::decode`
-//! the same way `net-driver-host` itself decodes requests with
-//! `SocketRequest::decode`, not a hand-rolled parser of its own.
+//! Concurrent sockets (see `net-driver-host/src/main.rs`'s
+//! `run_socket_ipc_server` doc comment and `ipc/src/sockets.rs`'s own doc
+//! comment on [`SocketRequest::Open`]/handles): proves two independent TCP
+//! connections, opened as two separate handles through the same sockets
+//! IPC surface `net_driver_sockets.rs` already proves for one connection,
+//! genuinely run *concurrently* without clobbering each other's state --
+//! not just two connections used one after another (which the old
+//! single-socket server already effectively allowed, just without a
+//! handle to distinguish them).
 //!
-//! Same capability-scoping proof shape `kernel/tests/blk_fs_ipc.rs` already
-//! established for the filesystem driver's IPC surface: a thread holding no
-//! capability is denied when it tries to send a request, and a thread
-//! holding a capability scoped to exactly the request port gets served.
-//!
-//! Reuses `net_driver_tcp.rs`'s exact host-listener setup
-//! (`kernel/tests/support/tcp_proof_listener.py`, `guestfwd` to
-//! `10.0.2.100:9000`) rather than a new one — same fixed PING/PONG payload,
-//! same one-connection-then-exit listener, just driven through this
-//! surface's IPC ports instead of `net-driver-host`'s own hardcoded Phase 2b
-//! proof.
+//! Opens handle A and handle B, connects both (to the *same*
+//! guest-visible remote address/port -- deliberately: QEMU's `guestfwd`
+//! spawns a fresh bridge for every new guest-initiated connection to that
+//! destination regardless of how many prior connections to it are still
+//! open, so this alone is enough to get two independent, concurrently
+//! open TCP connections without depending on whether repeating
+//! `guestfwd=` twice in one `-netdev user` string is parsed as two
+//! independent rules or one overwriting the other -- see
+//! `kernel/tests/support/two_socket_proof_listener.py`'s own doc comment),
+//! then deliberately interleaves `Send`/`Recv` across both handles (A,
+//! then B, then back to A) before closing either -- a bug that let one
+//! handle's request touch the *other* handle's socket would show up here
+//! as a wrong PING/PONG pair or a response tagged with the wrong handle,
+//! not silently pass the way it might if each connection were driven to
+//! completion before the other ever opened.
 //!
 //! **Manual build step required when running this locally** — same as
-//! `net_driver_tcp.rs`:
+//! `net_driver_sockets.rs`:
 //!
 //! ```text
 //! cd net-driver-host && cargo build --target x86_64-unknown-none --release
+//! ```
+//!
+//! **QEMU `-netdev` setup**: one `guestfwd` route, bridged to
+//! `two_socket_proof_listener.py`'s port 9002 instead of
+//! `tcp_proof_listener.py`'s 9001:
+//!
+//! ```text
+//! RUNIX_NETDEV_ARG="user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9002" \
+//!   cargo test --target x86_64-unknown-none --test net_driver_sockets_concurrent
 //! ```
 
 #![no_std]
@@ -79,14 +91,18 @@ const NET_TX_BUFFER_COUNT: u64 = 4;
 const SOCK_REQUEST_PORT: usize = 11;
 const SOCK_RESPONSE_PORT: usize = 12;
 
-// Same `guestfwd` target and fixed payload `net_driver_tcp.rs` already
-// proves against `tcp_proof_listener.py` -- see that test's own doc
-// comment for why `10.0.2.100`, not the gateway `10.0.2.2`, is used.
-const TCP_REMOTE_IP: [u8; 4] = [10, 0, 2, 100];
-const TCP_REMOTE_PORT: u16 = 9000;
-const TCP_LOCAL_PORT: u16 = 49153;
-const TCP_PING: &[u8] = b"RUNIX-TCP-PROOF-PING";
-const TCP_PONG: &[u8] = b"RUNIX-TCP-PROOF-PONG";
+// Same guest-visible remote address/port both handles connect to --
+// deliberate, not an oversight; see this file's own module doc comment for
+// why one `guestfwd` route is enough to prove two concurrent connections.
+const REMOTE_IP: [u8; 4] = [10, 0, 2, 100];
+const REMOTE_PORT: u16 = 9000;
+const LOCAL_PORT_A: u16 = 49154;
+const LOCAL_PORT_B: u16 = 49155;
+
+const PING_A: &[u8] = b"RUNIX-SOCK-A-PING";
+const PONG_A: &[u8] = b"RUNIX-SOCK-A-PONG";
+const PING_B: &[u8] = b"RUNIX-SOCK-B-PING";
+const PONG_B: &[u8] = b"RUNIX-SOCK-B-PONG";
 
 #[repr(C)]
 struct NetBootInfo {
@@ -98,8 +114,8 @@ struct NetBootInfo {
     tx_buffer_phys: [u64; 4],
     attempt_tcp: u8,
     serve_sockets: u8,
-    /// `0` -- this test's `guestfwd` route/fixed remote address assumes
-    /// net-driver-host's own address is the static `LOCAL_IP`, not
+    /// `0` -- this test's two `guestfwd` routes/fixed remote addresses
+    /// assume net-driver-host's own address is the static `LOCAL_IP`, not
     /// whatever a real DHCP lease would hand back; see `net_driver_dhcp.rs`
     /// for the test that sets this to `1`.
     use_dhcp: u8,
@@ -135,7 +151,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     {
         Some(io_base) => io_base,
         None => {
-            serial_println!("net_driver_sockets: FAIL — no virtio-net I/O-space BAR0 found");
+            serial_println!(
+                "net_driver_sockets_concurrent: FAIL — no virtio-net I/O-space BAR0 found"
+            );
             exit_qemu(QemuExitCode::Failed);
         }
     };
@@ -146,7 +164,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         runix_kernel::citadel::SandboxTier::T1Critical,
     ) {
         serial_println!(
-            "net_driver_sockets: FAIL — CITADEL allowlist rejected net-driver-host: {:?}",
+            "net_driver_sockets_concurrent: FAIL — CITADEL allowlist rejected net-driver-host: {:?}",
             e
         );
         exit_qemu(QemuExitCode::Failed);
@@ -156,7 +174,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Ok(elf) => elf,
         Err(e) => {
             serial_println!(
-                "net_driver_sockets: FAIL — parse() rejected the binary: {:?}",
+                "net_driver_sockets_concurrent: FAIL — parse() rejected the binary: {:?}",
                 e
             );
             exit_qemu(QemuExitCode::Failed);
@@ -167,12 +185,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let entry = match elf.load_segments(&mut space) {
         Ok(entry) => entry,
         Err(e) => {
-            serial_println!("net_driver_sockets: FAIL — load_segments() failed: {:?}", e);
+            serial_println!(
+                "net_driver_sockets_concurrent: FAIL — load_segments() failed: {:?}",
+                e
+            );
             exit_qemu(QemuExitCode::Failed);
         }
     };
     serial_println!(
-        "net_driver_sockets: loaded, entry point {:#x}",
+        "net_driver_sockets_concurrent: loaded, entry point {:#x}",
         entry.as_u64()
     );
 
@@ -239,9 +260,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "demo-key",
         &signing_key,
     );
-    // `net-driver-host` needs a second capability to reply at all —
-    // `Thread::extra_capabilities`, same shape `blk_fs_ipc.rs` already
-    // proves for `blk-driver-host`'s own response port.
     let response_token = runix_capability_manager::CapabilityToken::issue(
         "net-driver-host",
         runix_kernel::capabilities::port_resource(SOCK_RESPONSE_PORT),
@@ -262,37 +280,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         alloc::vec![response_token],
     );
 
-    // Give it time to probe the device, bring up the interface (including
-    // its own unconditional ICMP proof against the gateway), and reach its
-    // sockets server loop before either requester attempts anything.
+    // Give it time to probe the device, bring up the interface, and reach
+    // its sockets server loop before the client attempts anything -- same
+    // budget `net_driver_sockets.rs` already uses.
     for _ in 0..2000 {
         scheduler::yield_now();
     }
 
-    // Negative case first: this test's own boot thread holds no capability
-    // at all -- the request must never reach the channel, same expectation
-    // `blk_fs_ipc.rs` already proves for the filesystem driver's request
-    // port.
-    let denied = unsafe {
-        runix_kernel::syscall::syscall(
-            runix_kernel::syscall::SYS_IPC_SEND,
-            SOCK_REQUEST_PORT as u64,
-            SocketRequest::Close { handle: 0 }.encode()[0] as u64,
-            0,
-        )
-    };
-    if denied != u64::MAX {
-        serial_println!(
-            "net_driver_sockets: FAIL — an unauthorized send to the request port was not denied \
-             (returned {}, expected u64::MAX)",
-            denied
-        );
-        exit_qemu(QemuExitCode::Failed);
-    }
-    serial_println!("net_driver_sockets: unauthorized send correctly denied (capability gate OK)");
-
-    // Positive case: a thread holding a capability scoped to exactly the
-    // request port drives a full connect/send/recv/close round trip.
     let request_token = runix_capability_manager::CapabilityToken::issue(
         "test-socket-client",
         runix_kernel::capabilities::port_resource(SOCK_REQUEST_PORT),
@@ -304,7 +298,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     scheduler::spawn_with_capability(authorized_client_thread, Some(request_token));
 
     let mut result = SocketTestResult::Pending;
-    for _ in 0..20_000 {
+    for _ in 0..30_000 {
         scheduler::yield_now();
         #[allow(static_mut_refs)]
         let current = unsafe { RESULT };
@@ -316,14 +310,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     if result == SocketTestResult::Pass {
         serial_println!(
-            "net_driver_sockets: PASS — connect/send/recv/close all round-tripped through the \
-             typed sockets IPC surface, capability-gated, against a real TCP peer"
+            "net_driver_sockets_concurrent: PASS — two independently-opened socket handles ran \
+             concurrently through the sockets IPC surface without clobbering each other's state"
         );
         exit_qemu(QemuExitCode::Success);
     } else {
         serial_println!(
-            "net_driver_sockets: FAIL — socket client thread reported {:?} (is \
-             RUNIX_NETDEV_ARG/the host listener actually set up? see net_driver_tcp.rs)",
+            "net_driver_sockets_concurrent: FAIL — socket client thread reported {:?} (are both \
+             `guestfwd` routes and `two_socket_proof_listener.py` actually set up? see this \
+             test's own doc comment)",
             result
         );
         exit_qemu(QemuExitCode::Failed);
@@ -339,17 +334,6 @@ enum SocketTestResult {
 
 static mut RESULT: SocketTestResult = SocketTestResult::Pending;
 
-/// Drives the whole connect -> send -> recv -> close sequence, entirely
-/// through `runix_ipc::sockets`'s typed request/response wire format —
-/// this thread holds the one capability scoped to [`SOCK_REQUEST_PORT`]
-/// ([`kernel_main`]'s own boot thread deliberately doesn't, proving the
-/// capability gate above). Writes its final verdict to [`RESULT`] rather
-/// than returning one, since a `spawn`-ed thread's entry point is
-/// `extern "C" fn() -> !` -- same "write a result byte/flag somewhere the
-/// spawning thread polls" convention every other proof in this codebase
-/// already uses (`NetBootInfo`'s own `NET_RESULT_OFFSET`, etc.), just a
-/// `static` instead of a shared memory page since both threads already
-/// share this process's address space.
 extern "C" fn authorized_client_thread() -> ! {
     let outcome = run_socket_client();
     #[allow(static_mut_refs)]
@@ -361,92 +345,176 @@ extern "C" fn authorized_client_thread() -> ! {
     }
 }
 
+/// Opens two handles, connects both, then deliberately interleaves
+/// `Send`/`Recv` across both (A, then B, then back to A for its reply,
+/// then B for its reply) before closing either -- see this file's own
+/// module doc comment for why interleaving (not "finish A entirely, then
+/// start B") is the actual property this test needs to prove.
 fn run_socket_client() -> SocketTestResult {
-    send_request(&SocketRequest::Open);
-    let handle = match recv_response() {
-        Some(SocketResponse::Opened { handle }) => handle,
-        other => {
-            serial_println!("net_driver_sockets: open failed, got {:?}", other);
-            return SocketTestResult::Fail;
-        }
+    let handle_a = match open_handle() {
+        Some(h) => h,
+        None => return SocketTestResult::Fail,
     };
-
-    send_request(&SocketRequest::Connect {
-        handle,
-        remote_ip: TCP_REMOTE_IP,
-        remote_port: TCP_REMOTE_PORT,
-        local_port: TCP_LOCAL_PORT,
-    });
-    match recv_response() {
-        Some(SocketResponse::Connected { handle: h }) if h == handle => {}
-        other => {
-            serial_println!("net_driver_sockets: connect failed, got {:?}", other);
-            return SocketTestResult::Fail;
-        }
+    let handle_b = match open_handle() {
+        Some(h) => h,
+        None => return SocketTestResult::Fail,
+    };
+    if handle_a == handle_b {
+        serial_println!(
+            "net_driver_sockets_concurrent: FAIL — Open handed back the same handle ({}) twice",
+            handle_a
+        );
+        return SocketTestResult::Fail;
     }
 
+    if !connect(handle_a, REMOTE_IP, LOCAL_PORT_A) {
+        return SocketTestResult::Fail;
+    }
+    if !connect(handle_b, REMOTE_IP, LOCAL_PORT_B) {
+        return SocketTestResult::Fail;
+    }
+
+    if !send_and_check(handle_a, PING_A) {
+        return SocketTestResult::Fail;
+    }
+    if !send_and_check(handle_b, PING_B) {
+        return SocketTestResult::Fail;
+    }
+
+    // Recv A first, then B -- if the server ever routed A's reply to B's
+    // handle (or vice versa), this ordering (and the exact-byte check
+    // inside `recv_and_check`) is what would catch it.
+    if !recv_and_check(handle_a, PONG_A) {
+        return SocketTestResult::Fail;
+    }
+    if !recv_and_check(handle_b, PONG_B) {
+        return SocketTestResult::Fail;
+    }
+
+    if !close(handle_a) {
+        return SocketTestResult::Fail;
+    }
+    if !close(handle_b) {
+        return SocketTestResult::Fail;
+    }
+
+    SocketTestResult::Pass
+}
+
+fn open_handle() -> Option<u8> {
+    send_request(&SocketRequest::Open);
+    match recv_response() {
+        Some(SocketResponse::Opened { handle }) => Some(handle),
+        other => {
+            serial_println!(
+                "net_driver_sockets_concurrent: open failed, got {:?}",
+                other
+            );
+            None
+        }
+    }
+}
+
+fn connect(handle: u8, remote_ip: [u8; 4], local_port: u16) -> bool {
+    send_request(&SocketRequest::Connect {
+        handle,
+        remote_ip,
+        remote_port: REMOTE_PORT,
+        local_port,
+    });
+    match recv_response() {
+        Some(SocketResponse::Connected { handle: h }) if h == handle => true,
+        other => {
+            serial_println!(
+                "net_driver_sockets_concurrent: connect on handle {} failed, got {:?}",
+                handle,
+                other
+            );
+            false
+        }
+    }
+}
+
+fn send_and_check(handle: u8, ping: &[u8]) -> bool {
     send_request(&SocketRequest::Send {
         handle,
-        data: TCP_PING.to_vec(),
+        data: ping.to_vec(),
     });
     match recv_response() {
         Some(SocketResponse::Sent { handle: h, len })
-            if h == handle && len as usize == TCP_PING.len() => {}
+            if h == handle && len as usize == ping.len() =>
+        {
+            true
+        }
         other => {
-            serial_println!("net_driver_sockets: send failed, got {:?}", other);
-            return SocketTestResult::Fail;
+            serial_println!(
+                "net_driver_sockets_concurrent: send on handle {} failed, got {:?}",
+                handle,
+                other
+            );
+            false
         }
     }
+}
 
-    // The listener's reply may not have arrived yet by the time the first
-    // `Recv` is served -- `SocketRequest::Recv` never blocks (see
-    // `runix_ipc::sockets`'s own doc comment), so a caller polls by
-    // resending it, same as this codebase's other bounded wait loops.
+/// Same "`Recv` never blocks, so poll by resending" pattern
+/// `net_driver_sockets.rs`'s own `run_socket_client` already uses.
+fn recv_and_check(handle: u8, pong: &[u8]) -> bool {
     let mut received: Vec<u8> = Vec::new();
     for _ in 0..2000 {
         send_request(&SocketRequest::Recv {
             handle,
-            max_len: TCP_PONG.len() as u16,
+            max_len: pong.len() as u16,
         });
         match recv_response() {
             Some(SocketResponse::Data { handle: h, data }) if h == handle => {
                 received.extend_from_slice(&data);
-                if received.len() >= TCP_PONG.len() {
+                if received.len() >= pong.len() {
                     break;
                 }
             }
             other => {
-                serial_println!("net_driver_sockets: recv failed, got {:?}", other);
-                return SocketTestResult::Fail;
+                serial_println!(
+                    "net_driver_sockets_concurrent: recv on handle {} failed, got {:?}",
+                    handle,
+                    other
+                );
+                return false;
             }
         }
         scheduler::yield_now();
     }
 
-    // Exact bytes checked, not just "received something" -- the same
-    // discipline every other proof in this codebase applies.
-    if received != TCP_PONG {
+    if received != pong {
         serial_println!(
-            "net_driver_sockets: FAIL — expected {:?}, got {:?}",
-            TCP_PONG,
+            "net_driver_sockets_concurrent: FAIL — handle {} expected {:?}, got {:?}",
+            handle,
+            pong,
             received
         );
-        return SocketTestResult::Fail;
+        return false;
     }
+    true
+}
 
+fn close(handle: u8) -> bool {
     send_request(&SocketRequest::Close { handle });
     match recv_response() {
-        Some(SocketResponse::Closed { handle: h }) if h == handle => SocketTestResult::Pass,
+        Some(SocketResponse::Closed { handle: h }) if h == handle => true,
         other => {
-            serial_println!("net_driver_sockets: close failed, got {:?}", other);
-            SocketTestResult::Fail
+            serial_println!(
+                "net_driver_sockets_concurrent: close on handle {} failed, got {:?}",
+                handle,
+                other
+            );
+            false
         }
     }
 }
 
 /// Sends `request`'s encoded bytes one at a time on [`SOCK_REQUEST_PORT`] —
-/// same "one byte per `SYS_IPC_SEND`" convention
-/// `blk_fs_ipc.rs`'s `authorized_writer_thread` already uses.
+/// same "one byte per `SYS_IPC_SEND`" convention `net_driver_sockets.rs`
+/// already uses.
 fn send_request(request: &SocketRequest) {
     for byte in request.encode() {
         unsafe {
@@ -460,13 +528,7 @@ fn send_request(request: &SocketRequest) {
     }
 }
 
-/// Polls [`SOCK_RESPONSE_PORT`] for one full [`SocketResponse`], decoding
-/// with `runix_ipc::sockets::SocketResponse::decode` (the same typed
-/// wire-format function `net-driver-host` itself uses to decode requests)
-/// rather than a hand-rolled parser here. `None` if nothing arrives within
-/// the bound -- there is no blocking-receive syscall in this codebase (see
-/// `blk-driver-host/src/main.rs`'s `poll_recv_byte` doc comment for the
-/// same constraint on the transport this rides over).
+/// Same as `net_driver_sockets.rs`'s function of the same name.
 fn recv_response() -> Option<SocketResponse> {
     let mut buf: Vec<u8> = Vec::new();
     for i in 0..200_000u32 {
@@ -550,6 +612,6 @@ extern "C" fn kernel_trampoline() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    serial_println!("net_driver_sockets: PANIC: {}", info);
+    serial_println!("net_driver_sockets_concurrent: PANIC: {}", info);
     exit_qemu(QemuExitCode::Failed);
 }

@@ -54,8 +54,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use linked_list_allocator::LockedHeap;
 use runix_ipc::sockets::{SocketError, SocketRequest, SocketResponse};
-use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::socket::{icmp, tcp};
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use smoltcp::socket::{dhcpv4, icmp, tcp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address};
 use smoltcp_device::{RunixNetDevice, RX_BUFFER_COUNT, TX_BUFFER_COUNT};
@@ -119,6 +119,22 @@ struct NetBootInfo {
     /// `kernel/tests/net_driver_sockets.rs`, which alone spawns a second
     /// process to actually send socket requests.
     serve_sockets: u8,
+    /// Whether to acquire this interface's address via a real DHCP
+    /// handshake (`smoltcp::socket::dhcpv4`) instead of the fixed
+    /// [`LOCAL_IP`]/[`GATEWAY_IP`] SLIRP defaults above. `1` on the real
+    /// boot path (`kernel/src/main.rs`'s `load_and_run_net_driver_host`) —
+    /// production has no reason to hardcode an address QEMU/SLIRP's own
+    /// built-in DHCP server (present on every `-netdev user` instance,
+    /// whether or not anything asks it for a lease) can hand out for real.
+    /// `0` in `net_driver_icmp.rs`/`net_driver_tcp.rs`/`net_driver_sockets.rs`
+    /// — those tests' own fixed remote addresses
+    /// (`TCP_REMOTE_IP`/`guestfwd` routes) are set up assuming this
+    /// process's own address is the static `LOCAL_IP`, not whatever a real
+    /// DHCP lease happens to hand back; changing that would be a separate,
+    /// unrelated test change. `1` only in `kernel/tests/net_driver_dhcp.rs`,
+    /// which alone verifies a real acquired lease and needs no other
+    /// static-address assumption to hold.
+    use_dhcp: u8,
 }
 
 const NET_INFO_VA: usize = 0x_1111_3333_0000;
@@ -153,6 +169,11 @@ const TCP_PONG: &[u8] = b"RUNIX-TCP-PROOF-PONG";
 /// `kernel/tests/net_driver_sockets.rs`'s own constants exactly.
 const SOCK_REQUEST_PORT: usize = 11;
 const SOCK_RESPONSE_PORT: usize = 12;
+
+/// Number of concurrently open TCP socket handles the sockets IPC server
+/// supports — must match `runix_ipc::sockets::MAX_SOCKETS` exactly (the
+/// wire format's own sanity bound on valid handle values).
+const MAX_SOCKETS: usize = runix_ipc::sockets::MAX_SOCKETS as usize;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -196,15 +217,28 @@ pub extern "C" fn _start() -> ! {
 
     let config = Config::new(EthernetAddress(mac).into());
     let mut iface = Interface::new(config, &mut device, Instant::from_millis(0));
-    iface.update_ip_addrs(|ip_addrs| {
-        ip_addrs
-            .push(IpCidr::new(IpAddress::Ipv4(LOCAL_IP), 24))
+
+    // Bring up this interface's address either via a real DHCP handshake
+    // or the fixed SLIRP defaults -- see `NetBootInfo::use_dhcp`'s own doc
+    // comment for which boot/test paths pick which. `next_iteration` is
+    // the timestamp offset every phase after this one must continue from
+    // (not restart from 0) -- see `run_tcp_proof`'s caller-side comment on
+    // why an `Interface`'s internal timestamp must stay strictly
+    // increasing across phases.
+    let next_iteration = if info.use_dhcp != 0 {
+        run_dhcp(&mut iface, &mut device)
+    } else {
+        iface.update_ip_addrs(|ip_addrs| {
+            ip_addrs
+                .push(IpCidr::new(IpAddress::Ipv4(LOCAL_IP), 24))
+                .unwrap();
+        });
+        iface
+            .routes_mut()
+            .add_default_ipv4_route(GATEWAY_IP)
             .unwrap();
-    });
-    iface
-        .routes_mut()
-        .add_default_ipv4_route(GATEWAY_IP)
-        .unwrap();
+        0
+    };
 
     let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
     let icmp_tx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
@@ -223,7 +257,7 @@ pub extern "C" fn _start() -> ! {
     // driver report failure instead of hanging the boot forever.
     'poll: for iteration in 0..2_000_000u32 {
         final_iteration = iteration;
-        let timestamp = Instant::from_millis(iteration as i64);
+        let timestamp = Instant::from_millis((next_iteration + iteration) as i64);
         iface.poll(timestamp, &mut device, &mut sockets);
 
         let socket = sockets.get_mut::<icmp::Socket>(icmp_handle);
@@ -305,25 +339,122 @@ pub extern "C" fn _start() -> ! {
         // capture showed the guest never even sent an ARP request for the
         // TCP remote, let alone a SYN). One shared, always-increasing
         // counter across both phases avoids this.
-        run_tcp_proof(&mut iface, &mut device, final_iteration + 1);
+        run_tcp_proof(
+            &mut iface,
+            &mut device,
+            next_iteration + final_iteration + 1,
+        );
     }
 
     if info.serve_sockets != 0 {
         // Well past any timestamp either phase above could have already
-        // handed `iface` (ICMP's own bound is 2,000,000; Phase 2b's TCP
-        // proof starts at `final_iteration + 1` and runs at most 2,000,000
-        // more) — restarting from a timestamp `iface` has already seen
-        // internally would silently stall its retransmit/backoff timers,
-        // the exact real bug `run_tcp_proof`'s caller-side doc comment
-        // already found once for the ICMP -> TCP transition. Cheaper than
-        // threading the exact final iteration back out of `run_tcp_proof`
-        // for what's already a generous, one-off constant.
-        run_socket_ipc_server(&mut iface, &mut device, 5_000_000);
+        // handed `iface` (DHCP's own bound below plus ICMP's own bound is
+        // 2,000,000; Phase 2b's TCP proof starts at
+        // `next_iteration + final_iteration + 1` and runs at most
+        // 2,000,000 more) — restarting from a timestamp `iface` has already
+        // seen internally would silently stall its retransmit/backoff
+        // timers, the exact real bug `run_tcp_proof`'s caller-side doc
+        // comment already found once for the ICMP -> TCP transition.
+        // Cheaper than threading the exact final iteration back out of
+        // `run_tcp_proof` for what's already a generous, one-off constant.
+        run_socket_ipc_server(&mut iface, &mut device, next_iteration + 5_000_000);
     }
 
     loop {
         yield_now();
     }
+}
+
+/// Acquires a real IPv4 address/gateway via `smoltcp::socket::dhcpv4`
+/// against QEMU/SLIRP's own built-in DHCP server — present on every
+/// `-netdev user` instance regardless of whether anything asks it for a
+/// lease, so this needs no new QEMU/CI infrastructure, the same "SLIRP
+/// already answers this" property the module doc comment's ICMP proof
+/// relies on. Called only when `NetBootInfo::use_dhcp != 0` — see that
+/// field's own doc comment for exactly which boot/test paths set it.
+///
+/// Returns the timestamp offset every phase after this one must continue
+/// from (see `run_tcp_proof`'s caller-side comment on why an `Interface`'s
+/// internal timestamp must stay strictly increasing across phases) — the
+/// iteration count this function's own poll loop actually consumed, plus
+/// one, regardless of whether the lease was actually acquired (a failed
+/// DHCP attempt still advances `iface`'s internal timestamp by however many
+/// iterations it polled for).
+fn run_dhcp(iface: &mut Interface, device: &mut RunixNetDevice) -> u32 {
+    let dhcp_socket = dhcpv4::Socket::new();
+    let mut sockets = SocketSet::new(vec![]);
+    let dhcp_handle = sockets.add(dhcp_socket);
+
+    let mut acquired = false;
+    let mut acquired_ip = Ipv4Address::new(0, 0, 0, 0);
+    let mut final_iteration = 0u32;
+
+    // Same bound and reasoning as the ICMP loop below: a real lease from
+    // QEMU/SLIRP's own DHCP server arrives promptly in practice (well under
+    // a second of wall-clock time), so this bound exists purely to make a
+    // genuinely broken/unreachable DHCP server report failure instead of
+    // hanging the boot forever.
+    for iteration in 0..2_000_000u32 {
+        final_iteration = iteration;
+        let timestamp = Instant::from_millis(iteration as i64);
+        iface.poll(timestamp, device, &mut sockets);
+
+        let event = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
+        match event {
+            Some(dhcpv4::Event::Configured(config)) => {
+                iface.update_ip_addrs(|addrs| {
+                    addrs.clear();
+                    let _ = addrs.push(IpCidr::Ipv4(config.address));
+                });
+                if let Some(router) = config.router {
+                    let _ = iface.routes_mut().add_default_ipv4_route(router);
+                }
+                acquired_ip = config.address.address();
+                acquired = true;
+                break;
+            }
+            Some(dhcpv4::Event::Deconfigured) | None => {}
+        }
+
+        if iteration % 10_000 == 0 {
+            yield_now();
+        }
+    }
+
+    if acquired {
+        write_all(b"net-driver-host: DHCP lease acquired, IP=");
+        for (i, octet) in acquired_ip.octets().iter().enumerate() {
+            write_decimal(*octet as u64);
+            if i != 3 {
+                write_byte(b'.');
+            }
+        }
+        write_all(b" (DHCP OK)\n");
+    } else {
+        write_all(b"net-driver-host: no DHCP lease acquired within poll bound (DHCP FAILED)\n");
+    }
+
+    unsafe {
+        core::ptr::write_volatile(
+            (NET_INFO_VA + NET_DHCP_RESULT_OFFSET) as *mut u8,
+            if acquired {
+                NET_RESULT_PASS
+            } else {
+                NET_RESULT_FAIL
+            },
+        );
+        if acquired {
+            let octets = acquired_ip.octets();
+            for (i, octet) in octets.iter().enumerate() {
+                core::ptr::write_volatile(
+                    (NET_INFO_VA + NET_DHCP_ADDR_OFFSET + i) as *mut u8,
+                    *octet,
+                );
+            }
+        }
+    }
+
+    final_iteration + 1
 }
 
 /// Phase 2b: connect out to `TCP_REMOTE_IP:TCP_REMOTE_PORT` (a `guestfwd`
@@ -421,14 +552,19 @@ fn run_tcp_proof(iface: &mut Interface, device: &mut RunixNetDevice, start_itera
 
 /// Sockets IPC surface: the "sockets API/IPC surface for other ring 3
 /// processes to use this stack" gap `docs/STATUS.md`'s network-stack
-/// section calls out as deferred. Serves [`SOCKET_REQUEST_PORT`] requests
-/// against one `smoltcp` TCP socket — single connection at a time, matching
-/// this driver's own shape (one `tcp::Socket` in its `SocketSet`);
-/// concurrent sockets stay a separate, explicitly deferred gap, not solved
-/// here. Requests/responses are the typed wire format `runix_ipc::sockets`
-/// defines, not a hand-rolled byte layout of this driver's own — see that
-/// module's doc comment for the wire shape and why it's encoded the way it
-/// is (one byte per IPC syscall, no blocking receive).
+/// section calls out as deferred. Serves [`SOCK_REQUEST_PORT`] requests
+/// against up to [`MAX_SOCKETS`] concurrently open `smoltcp` TCP sockets,
+/// addressed by the handle [`SocketRequest::Open`] hands back — see that
+/// module's doc comment for why a handle must be allocated before
+/// [`SocketRequest::Connect`] can target it, and for the capability-scoping
+/// caveat inherent to sharing one fixed request/response port pair across
+/// callers (this server itself can't distinguish *which* caller opened a
+/// given handle; the capability gate is on the port, same as every other
+/// IPC surface in this codebase, not on the handle number). Requests/
+/// responses are the typed wire format `runix_ipc::sockets` defines, not a
+/// hand-rolled byte layout of this driver's own — see that module's doc
+/// comment for the wire shape and why it's encoded the way it is (one byte
+/// per IPC syscall, no blocking receive).
 ///
 /// Mirrors `blk-driver-host/src/main.rs`'s `run_fs_ipc_server` in shape: a
 /// bounded poll loop, same discipline every wait loop in this codebase
@@ -436,13 +572,12 @@ fn run_tcp_proof(iface: &mut Interface, device: &mut RunixNetDevice, start_itera
 /// a driver that's genuinely stuck reports that instead of hanging the
 /// boot forever).
 fn run_socket_ipc_server(iface: &mut Interface, device: &mut RunixNetDevice, start_iteration: u32) {
-    let tcp_rx_buffer = tcp::SocketBuffer::new(vec![0; 256]);
-    let tcp_tx_buffer = tcp::SocketBuffer::new(vec![0; 256]);
-    let mut tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
-    tcp_socket.set_nagle_enabled(false);
-
     let mut sockets = SocketSet::new(vec![]);
-    let handle = sockets.add(tcp_socket);
+    // `slots[h]` is `Some(handle)` while socket handle `h` (the *public*,
+    // wire-format handle -- distinct from smoltcp's own internal
+    // `SocketHandle`) is open; `None` means `h` is free for a future
+    // [`SocketRequest::Open`] to allocate.
+    let mut slots: [Option<SocketHandle>; MAX_SOCKETS] = [None; MAX_SOCKETS];
 
     write_all(b"net-driver-host: sockets IPC server ready\n");
 
@@ -450,12 +585,13 @@ fn run_socket_ipc_server(iface: &mut Interface, device: &mut RunixNetDevice, sta
     let mut requests_served = 0u32;
     // `Connect` alone needs several polls to resolve (ARP + the TCP
     // handshake, same as `run_tcp_proof`'s own connect above) -- tracked
-    // here so the single loop below can keep calling `iface.poll` on every
-    // iteration (required for the handshake to progress at all) while a
-    // connect attempt is pending, instead of blocking inside a nested loop
-    // that can't reach `device`/`sockets` (both borrowed by the outer
-    // loop already).
-    let mut pending_connect_since: Option<u32> = None;
+    // per handle so the single loop below can keep calling `iface.poll` on
+    // every iteration (required for every handshake to progress at all)
+    // while one handle's connect attempt is pending, without blocking
+    // requests aimed at any *other* handle -- the concurrency this
+    // function exists to add. `pending_connect_since[h]` mirrors `slots[h]`
+    // in indexing.
+    let mut pending_connect_since: [Option<u32>; MAX_SOCKETS] = [None; MAX_SOCKETS];
     // Same bound (~200,000 iterations at the outer loop's own cadence) as
     // every other bounded connect-wait in this file (`run_tcp_proof`'s
     // implicit one via its own poll bound) -- long enough for a real
@@ -500,18 +636,31 @@ fn run_socket_ipc_server(iface: &mut Interface, device: &mut RunixNetDevice, sta
     for offset in 0..500_000_000u32 {
         let timestamp = Instant::from_millis((start_iteration + offset) as i64);
         iface.poll(timestamp, device, &mut sockets);
-        let socket = sockets.get_mut::<tcp::Socket>(handle);
 
-        if let Some(since) = pending_connect_since {
+        for h in 0..MAX_SOCKETS {
+            let Some(since) = pending_connect_since[h] else {
+                continue;
+            };
+            let Some(sock_handle) = slots[h] else {
+                // Can't happen (a pending connect always has an open slot
+                // behind it), but fail closed rather than panic on this
+                // untrusted-input-adjacent state machine.
+                pending_connect_since[h] = None;
+                continue;
+            };
+            let socket = sockets.get_mut::<tcp::Socket>(sock_handle);
             if socket.state() == tcp::State::Established {
-                send_response(&SocketResponse::Connected);
-                pending_connect_since = None;
+                send_response(&SocketResponse::Connected { handle: h as u8 });
+                pending_connect_since[h] = None;
                 requests_served += 1;
             } else if socket.state() == tcp::State::Closed
                 || offset.wrapping_sub(since) > CONNECT_TIMEOUT_ITERATIONS
             {
-                send_response(&SocketResponse::OpenFailed(SocketError::ConnectFailed));
-                pending_connect_since = None;
+                send_response(&SocketResponse::ConnectFailed {
+                    handle: h as u8,
+                    error: SocketError::ConnectFailed,
+                });
+                pending_connect_since[h] = None;
                 requests_served += 1;
             }
         }
@@ -520,19 +669,24 @@ fn run_socket_ipc_server(iface: &mut Interface, device: &mut RunixNetDevice, sta
             request_buf.push(byte);
         }
 
-        // Only accept a new request once any pending `Connect` has been
-        // answered -- this driver serves one connection, and therefore one
-        // in-flight request, at a time.
-        if pending_connect_since.is_none() {
-            if let Some((request, consumed)) = SocketRequest::decode(&request_buf) {
+        if let Some((request, consumed)) = SocketRequest::decode(&request_buf) {
+            // Only accept a request naming a handle with a `Connect`
+            // already pending on it once that connect has been answered --
+            // requests naming any *other* handle (including a fresh
+            // `Open`) proceed immediately, the concurrency this function
+            // exists to add over the old single-connection server.
+            let blocked = request_handle(&request)
+                .map(|h| pending_connect_since[h as usize].is_some())
+                .unwrap_or(false);
+            if !blocked {
                 request_buf.drain(..consumed);
-                match handle_socket_request(iface, socket, request) {
+                match handle_socket_request(iface, &mut sockets, &mut slots, request) {
                     RequestOutcome::Immediate(response) => {
                         send_response(&response);
                         requests_served += 1;
                     }
-                    RequestOutcome::ConnectPending => {
-                        pending_connect_since = Some(offset);
+                    RequestOutcome::ConnectPending { handle } => {
+                        pending_connect_since[handle as usize] = Some(offset);
                     }
                 }
             }
@@ -554,25 +708,64 @@ fn run_socket_ipc_server(iface: &mut Interface, device: &mut RunixNetDevice, sta
 /// poll before responding at all.
 enum RequestOutcome {
     Immediate(SocketResponse),
-    ConnectPending,
+    ConnectPending { handle: u8 },
 }
 
-/// Applies one already-decoded [`SocketRequest`] to `socket`.
+/// The handle a request names, if any — [`SocketRequest::Open`] is the one
+/// variant with no handle yet (it's the request that allocates one).
+fn request_handle(request: &SocketRequest) -> Option<u8> {
+    match *request {
+        SocketRequest::Open => None,
+        SocketRequest::Connect { handle, .. }
+        | SocketRequest::Send { handle, .. }
+        | SocketRequest::Recv { handle, .. }
+        | SocketRequest::Close { handle } => Some(handle),
+    }
+}
+
+/// Applies one already-decoded [`SocketRequest`] against `slots`/`sockets`.
+/// `slots[h]` maps a wire-format handle to smoltcp's own internal
+/// `SocketHandle` — see [`run_socket_ipc_server`]'s own doc comment for why
+/// a request naming a handle outside `0..MAX_SOCKETS`, or one that was
+/// never opened (or already closed), is answered with
+/// [`SocketError::InvalidHandle`] rather than trusted: naming a number
+/// isn't the same as being entitled to whatever it might refer to.
 fn handle_socket_request(
     iface: &mut Interface,
-    socket: &mut tcp::Socket,
+    sockets: &mut SocketSet,
+    slots: &mut [Option<SocketHandle>; MAX_SOCKETS],
     request: SocketRequest,
 ) -> RequestOutcome {
     match request {
+        SocketRequest::Open => match slots.iter().position(Option::is_none) {
+            Some(idx) => {
+                let tcp_rx_buffer = tcp::SocketBuffer::new(vec![0; 256]);
+                let tcp_tx_buffer = tcp::SocketBuffer::new(vec![0; 256]);
+                let mut tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
+                tcp_socket.set_nagle_enabled(false);
+                slots[idx] = Some(sockets.add(tcp_socket));
+                RequestOutcome::Immediate(SocketResponse::Opened { handle: idx as u8 })
+            }
+            None => RequestOutcome::Immediate(SocketResponse::OpenFailed(SocketError::TooManyOpen)),
+        },
         SocketRequest::Connect {
+            handle,
             remote_ip,
             remote_port,
             local_port,
         } => {
+            let Some(sock_handle) = slots.get(handle as usize).copied().flatten() else {
+                return RequestOutcome::Immediate(SocketResponse::ConnectFailed {
+                    handle,
+                    error: SocketError::InvalidHandle,
+                });
+            };
+            let socket = sockets.get_mut::<tcp::Socket>(sock_handle);
             if socket.is_open() {
-                return RequestOutcome::Immediate(SocketResponse::OpenFailed(
-                    SocketError::AlreadyOpen,
-                ));
+                return RequestOutcome::Immediate(SocketResponse::ConnectFailed {
+                    handle,
+                    error: SocketError::AlreadyOpen,
+                });
             }
             let remote = IpAddress::Ipv4(Ipv4Address::new(
                 remote_ip[0],
@@ -581,46 +774,95 @@ fn handle_socket_request(
                 remote_ip[3],
             ));
             match socket.connect(iface.context(), (remote, remote_port), local_port) {
-                Ok(()) => RequestOutcome::ConnectPending,
-                Err(_) => RequestOutcome::Immediate(SocketResponse::OpenFailed(
-                    SocketError::ConnectFailed,
-                )),
+                Ok(()) => RequestOutcome::ConnectPending { handle },
+                Err(_) => RequestOutcome::Immediate(SocketResponse::ConnectFailed {
+                    handle,
+                    error: SocketError::ConnectFailed,
+                }),
             }
         }
-        SocketRequest::Send(data) => {
-            let response = if !socket.is_open() {
-                SocketResponse::SendFailed(SocketError::NotOpen)
-            } else {
-                match socket.send_slice(&data) {
-                    Ok(len) => SocketResponse::Sent { len: len as u16 },
-                    Err(_) => SocketResponse::SendFailed(SocketError::InvalidLength),
-                }
-            };
-            RequestOutcome::Immediate(response)
-        }
-        SocketRequest::Recv { max_len } => {
-            let response = if !socket.is_open() {
-                SocketResponse::Error(SocketError::NotOpen)
-            } else {
-                let max_len = (max_len as usize).min(runix_ipc::sockets::MAX_PAYLOAD_LEN);
-                let mut buf = vec![0u8; max_len];
-                if socket.can_recv() {
-                    match socket.recv_slice(&mut buf) {
-                        Ok(n) => {
-                            buf.truncate(n);
-                            SocketResponse::Data(buf)
+        SocketRequest::Send { handle, data } => {
+            let response = match slots.get(handle as usize).copied().flatten() {
+                None => SocketResponse::SendFailed {
+                    handle,
+                    error: SocketError::InvalidHandle,
+                },
+                Some(sock_handle) => {
+                    let socket = sockets.get_mut::<tcp::Socket>(sock_handle);
+                    if !socket.is_open() {
+                        SocketResponse::SendFailed {
+                            handle,
+                            error: SocketError::NotOpen,
                         }
-                        Err(_) => SocketResponse::Data(Vec::new()),
+                    } else {
+                        match socket.send_slice(&data) {
+                            Ok(len) => SocketResponse::Sent {
+                                handle,
+                                len: len as u16,
+                            },
+                            Err(_) => SocketResponse::SendFailed {
+                                handle,
+                                error: SocketError::InvalidLength,
+                            },
+                        }
                     }
-                } else {
-                    SocketResponse::Data(Vec::new())
                 }
             };
             RequestOutcome::Immediate(response)
         }
-        SocketRequest::Close => {
-            socket.close();
-            RequestOutcome::Immediate(SocketResponse::Closed)
+        SocketRequest::Recv { handle, max_len } => {
+            let response = match slots.get(handle as usize).copied().flatten() {
+                None => SocketResponse::Error {
+                    handle,
+                    error: SocketError::InvalidHandle,
+                },
+                Some(sock_handle) => {
+                    let socket = sockets.get_mut::<tcp::Socket>(sock_handle);
+                    if !socket.is_open() {
+                        SocketResponse::Error {
+                            handle,
+                            error: SocketError::NotOpen,
+                        }
+                    } else {
+                        let max_len = (max_len as usize).min(runix_ipc::sockets::MAX_PAYLOAD_LEN);
+                        let mut buf = vec![0u8; max_len];
+                        if socket.can_recv() {
+                            match socket.recv_slice(&mut buf) {
+                                Ok(n) => {
+                                    buf.truncate(n);
+                                    SocketResponse::Data { handle, data: buf }
+                                }
+                                Err(_) => SocketResponse::Data {
+                                    handle,
+                                    data: Vec::new(),
+                                },
+                            }
+                        } else {
+                            SocketResponse::Data {
+                                handle,
+                                data: Vec::new(),
+                            }
+                        }
+                    }
+                }
+            };
+            RequestOutcome::Immediate(response)
+        }
+        SocketRequest::Close { handle } => {
+            if let Some(slot) = slots.get_mut(handle as usize) {
+                if let Some(sock_handle) = slot.take() {
+                    // Best-effort graceful shutdown -- `close()` alone (no
+                    // further poll to let a FIN actually go out) matches
+                    // this server's own non-blocking posture everywhere
+                    // else; the freed slot is immediately available to a
+                    // future `Open`, same as smoltcp's own
+                    // `SocketSet::remove` freeing the underlying storage
+                    // right away.
+                    sockets.get_mut::<tcp::Socket>(sock_handle).close();
+                    sockets.remove(sock_handle);
+                }
+            }
+            RequestOutcome::Immediate(SocketResponse::Closed { handle })
         }
     }
 }
@@ -646,6 +888,16 @@ pub const NET_RESULT_OFFSET: usize = 128;
 pub const NET_TCP_RESULT_OFFSET: usize = 129;
 pub const NET_RESULT_PASS: u8 = 1;
 pub const NET_RESULT_FAIL: u8 = 2;
+/// DHCP acquisition result byte — one past the TCP one above; read only by
+/// `kernel/tests/net_driver_dhcp.rs`. `0` (never written) means
+/// `NetBootInfo::use_dhcp` was never set to `1` or the DHCP phase never ran
+/// far enough to write a result at all.
+pub const NET_DHCP_RESULT_OFFSET: usize = 130;
+/// The acquired IPv4 address's 4 octets, written only when
+/// [`NET_DHCP_RESULT_OFFSET`] reads [`NET_RESULT_PASS`] — the 4 bytes
+/// immediately after it, still well clear of any other reserved offset in
+/// this page.
+pub const NET_DHCP_ADDR_OFFSET: usize = 131;
 
 /// Same as `blk-driver-host/src/main.rs`'s function of the same name --
 /// used by `run_socket_ipc_server`'s own summary line.

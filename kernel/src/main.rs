@@ -147,6 +147,12 @@ struct NetBootInfo {
     /// `BlkBootInfo::serve_fs_requests`'s own doc comment already gives.
     /// `1` only in `kernel/tests/net_driver_sockets.rs`.
     serve_sockets: u8,
+    /// `1` here on the real boot path -- see
+    /// `net-driver-host/src/main.rs`'s `NetBootInfo::use_dhcp` doc comment
+    /// for the full reasoning (production has no reason to hardcode an
+    /// address QEMU/SLIRP's own DHCP server can hand out for real) and for
+    /// which test files deliberately leave this `0` instead.
+    use_dhcp: u8,
 }
 
 /// `blk-driver-host`, Phase B9's payload (filesystem driver, Phase 1 —
@@ -900,6 +906,7 @@ fn load_and_run_net_driver_host(io_base: u16, now: u64, signing_key: &ed25519_da
         tx_buffer_phys,
         attempt_tcp: 0,
         serve_sockets: 0,
+        use_dhcp: 1,
     };
     unsafe {
         (info_content.as_mut_ptr() as *mut NetBootInfo).write(info);

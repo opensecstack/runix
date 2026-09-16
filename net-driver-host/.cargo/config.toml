@@ -19,4 +19,19 @@
 # ring 3-faulted on an instruction fetch from address `0x0` almost
 # immediately after entry — a null, never-relocated function pointer
 # somewhere getting called.
-rustflags = ["-C", "relocation-model=static"]
+#
+# `curve25519-dalek` (pulled in transitively via `ed25519-dalek`, for
+# `runix-ipc`'s unconditional `runix-capability-manager` dependency — see
+# that crate's own `Cargo.toml` comment) auto-selects a "simd" backend
+# regardless of whether this target actually has usable SIMD codegen
+# support. On `x86_64-unknown-none` that trips an LLVM crash during
+# codegen (confirmed for real: a SIGILL inside `rustc`'s own LLVM backend,
+# not a normal compile error), not just a theoretical concern — the same
+# issue `kernel/.cargo/config.toml`'s own identical `rustflags` entry
+# already documents and works around for the kernel's build of the same
+# transitive dependency. Force the portable scalar backend instead, same
+# fix, same reasoning.
+rustflags = [
+    "-C", "relocation-model=static",
+    "--cfg", "curve25519_dalek_backend=\"serial\"",
+]

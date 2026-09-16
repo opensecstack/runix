@@ -1,38 +1,28 @@
-//! Network stack, Phase 2a (see docs/STATUS.md's network-stack section):
-//! proves `smoltcp`'s `Device`/`Interface` bring-up actually works, not
-//! just that it compiles. Loads `net-driver-host` (a real compiled ELF,
-//! same mechanism `grid_sandbox_wasm.rs` already proved for
-//! `grid-sandbox-host`) as a capability-gated ring 3 process, and lets it
-//! bring up smoltcp on top of the virtio-net virtqueue transport (Phase 1)
-//! and exchange one real ICMP echo with QEMU/SLIRP's own gateway
-//! (10.0.2.2) — which SLIRP answers out of the box, needing no new QEMU/CI
-//! infrastructure.
+//! DHCP (see `net-driver-host/src/main.rs`'s `run_dhcp`/
+//! `NetBootInfo::use_dhcp` doc comments): proves `net-driver-host` can
+//! acquire a real IPv4 address via `smoltcp::socket::dhcpv4` against
+//! QEMU/SLIRP's own built-in DHCP server (present on every plain
+//! `-netdev user` instance, whether or not anything asks it for a lease —
+//! no `guestfwd`/host-listener infrastructure needed, unlike
+//! `net_driver_tcp.rs`/`net_driver_sockets.rs`), instead of the
+//! `net_driver_icmp.rs`/`net_driver_tcp.rs`/`net_driver_sockets.rs` static
+//! `LOCAL_IP` those tests deliberately keep using.
 //!
-//! Supersedes `net_driver_arp.rs` (Phase 1's dedicated test, now retired):
-//! `net-driver-host`'s `_start` no longer sends a hand-built ARP request
-//! directly — smoltcp's own neighbor-discovery cache performs the
-//! equivalent ARP resolution automatically as a prerequisite to routing
-//! the ICMP echo, so this test still exercises the exact same virtqueue
-//! mechanism Phase 1 proved, plus real IPv4/ICMP checksums Phase 1 never
-//! touched.
+//! Also re-proves the ICMP echo round-trip still succeeds *after* the DHCP
+//! phase, on the same `Interface` -- this is the real regression class
+//! that motivated `run_dhcp` returning a timestamp offset for the caller to
+//! continue from rather than letting the ICMP phase restart its own
+//! internal counter at 0 (see that function's own doc comment): a wrong
+//! offset wouldn't fail loudly, it would silently stall smoltcp's
+//! retransmit/backoff timers, the exact bug class `run_tcp_proof`'s own
+//! doc comment already documents once for the ICMP -> TCP transition.
 //!
-//! **Manual build step required when running this locally** (same
-//! requirement `grid_sandbox_wasm.rs` already has for its own payload):
+//! **Manual build step required when running this locally** — same as
+//! `net_driver_icmp.rs`:
 //!
 //! ```text
 //! cd net-driver-host && cargo build --target x86_64-unknown-none --release
 //! ```
-//!
-//! CI does this automatically (`.github/workflows/ci.yml`'s `kernel-tests`
-//! job builds `net-driver-host` before running this test).
-//!
-//! Pass/fail is a real result code, not "didn't crash": `net-driver-host`
-//! writes a PASS/FAIL byte into the shared `NetBootInfo` page after its own
-//! bounded poll loop finishes (see that crate's own doc comment on
-//! `NET_RESULT_OFFSET`) — reaching the end of this test's yield budget
-//! without a fault only proves nothing crashed; reading back an actual
-//! PASS byte proves the ICMP echo round-trip through QEMU/SLIRP genuinely
-//! succeeded, with the exact payload bytes verified.
 
 #![no_std]
 #![no_main]
@@ -65,9 +55,7 @@ static NET_DRIVER_HOST_ELF: &[u8] =
     include_bytes!("../../net-driver-host/target/x86_64-unknown-none/release/net-driver-host");
 
 // Must match `net-driver-host/src/main.rs`'s own constants exactly — see
-// `kernel/src/main.rs`'s identical set for the full "why 0x1" account (a
-// prior `0x_3333_...` choice collided with `scheduler.rs`'s
-// `KERNEL_ENTRY_STACK_REGION_START`).
+// `kernel/src/main.rs`'s identical set for the full "why 0x1" account.
 const NET_HEAP_START: u64 = 0x_1111_1111_0000;
 const NET_HEAP_SIZE: u64 = 256 * 1024;
 const NET_STACK_VA: u64 = 0x_1111_2222_0000;
@@ -78,13 +66,14 @@ const NET_TXQ_VA: u64 = 0x_1111_5555_0000;
 const NET_RXBUF_VA: u64 = 0x_1111_6666_0000;
 const NET_TXBUF_VA: u64 = 0x_1111_7777_0000;
 const NET_QUEUE_ALIGN: u64 = 4096;
-// Grown from Phase 1's 4/1 -- see `net-driver-host/src/smoltcp_device.rs`'s
-// `RX_BUFFER_COUNT`/`TX_BUFFER_COUNT`.
 const NET_RX_BUFFER_COUNT: u64 = 8;
 const NET_TX_BUFFER_COUNT: u64 = 4;
 
-// Must match `net-driver-host/src/main.rs`'s `NET_RESULT_OFFSET`/`NET_RESULT_PASS`.
+// Must match `net-driver-host/src/main.rs`'s `NET_RESULT_OFFSET`/
+// `NET_DHCP_RESULT_OFFSET`/`NET_DHCP_ADDR_OFFSET`/`NET_RESULT_PASS`.
 const NET_RESULT_OFFSET: u64 = 128;
+const NET_DHCP_RESULT_OFFSET: u64 = 130;
+const NET_DHCP_ADDR_OFFSET: u64 = 131;
 const NET_RESULT_PASS: u8 = 1;
 
 #[repr(C)]
@@ -96,17 +85,14 @@ struct NetBootInfo {
     rx_buffer_phys: [u64; 8],
     tx_buffer_phys: [u64; 4],
     /// `0` -- this test has no `guestfwd` route or host listener for
-    /// net-driver-host's Phase 2b TCP attempt to reach; see
-    /// `net_driver_tcp.rs` for the test that sets this to `1`.
+    /// net-driver-host's Phase 2b TCP attempt to reach.
     attempt_tcp: u8,
     /// `0` -- this test never spawns a second process to send socket
-    /// requests; see `net_driver_sockets.rs` for the test that sets this
-    /// to `1`.
+    /// requests.
     serve_sockets: u8,
-    /// `0` -- this test's own fixed remote address assumptions (SLIRP's
-    /// static defaults) require net-driver-host's own address to be the
-    /// static `LOCAL_IP`, not whatever a real DHCP lease would hand back;
-    /// see `net_driver_dhcp.rs` for the test that sets this to `1`.
+    /// `1` -- the whole point of this test: acquire a real address via
+    /// DHCP instead of the static `LOCAL_IP` every other `net_driver_*`
+    /// test deliberately keeps using.
     use_dhcp: u8,
 }
 
@@ -141,10 +127,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     {
         Some(io_base) => io_base,
         None => {
-            serial_println!(
-                "net_driver_icmp: FAIL — no virtio-net I/O-space BAR0 found (is xtask's \
-                 -device virtio-net-pci still wired into run_qemu?)"
-            );
+            serial_println!("net_driver_dhcp: FAIL — no virtio-net I/O-space BAR0 found");
             exit_qemu(QemuExitCode::Failed);
         }
     };
@@ -155,21 +138,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         runix_kernel::citadel::SandboxTier::T1Critical,
     ) {
         serial_println!(
-            "net_driver_icmp: FAIL — CITADEL allowlist rejected net-driver-host: {:?}",
+            "net_driver_dhcp: FAIL — CITADEL allowlist rejected net-driver-host: {:?}",
             e
         );
         exit_qemu(QemuExitCode::Failed);
     }
 
     serial_println!(
-        "net_driver_icmp: parsing net-driver-host ({} bytes)",
+        "net_driver_dhcp: parsing net-driver-host ({} bytes)",
         NET_DRIVER_HOST_ELF.len()
     );
     let elf = match Elf64::parse(NET_DRIVER_HOST_ELF) {
         Ok(elf) => elf,
         Err(e) => {
             serial_println!(
-                "net_driver_icmp: FAIL — parse() rejected the binary: {:?}",
+                "net_driver_dhcp: FAIL — parse() rejected the binary: {:?}",
                 e
             );
             exit_qemu(QemuExitCode::Failed);
@@ -180,11 +163,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let entry = match elf.load_segments(&mut space) {
         Ok(entry) => entry,
         Err(e) => {
-            serial_println!("net_driver_icmp: FAIL — load_segments() failed: {:?}", e);
+            serial_println!("net_driver_dhcp: FAIL — load_segments() failed: {:?}", e);
             exit_qemu(QemuExitCode::Failed);
         }
     };
-    serial_println!("net_driver_icmp: loaded, entry point {:#x}", entry.as_u64());
+    serial_println!("net_driver_dhcp: loaded, entry point {:#x}", entry.as_u64());
 
     let rw_user_flags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
@@ -233,15 +216,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         tx_buffer_phys,
         attempt_tcp: 0,
         serve_sockets: 0,
-        use_dhcp: 0,
+        use_dhcp: 1,
     };
     unsafe {
         (info_content.as_mut_ptr() as *mut NetBootInfo).write(info);
     }
-    // Keep a raw pointer to the result byte -- reachable via the physical-
+    // Raw pointers to both result bytes -- reachable via the physical-
     // memory-offset mapping regardless of which `Cr3` is active, same as
     // `info_content` itself (see `map_private_page`'s doc comment).
-    let result_ptr = unsafe { info_content.as_mut_ptr().add(NET_RESULT_OFFSET as usize) };
+    let dhcp_result_ptr = unsafe {
+        info_content
+            .as_mut_ptr()
+            .add(NET_DHCP_RESULT_OFFSET as usize)
+    };
+    let dhcp_addr_ptr = unsafe { info_content.as_mut_ptr().add(NET_DHCP_ADDR_OFFSET as usize) };
+    let icmp_result_ptr = unsafe { info_content.as_mut_ptr().add(NET_RESULT_OFFSET as usize) };
 
     let now = runix_kernel::interrupts::ticks();
     let signing_key = runix_kernel::capabilities::demo_signing_key();
@@ -260,38 +249,80 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     scheduler::spawn_ring3_process_with_capability(kernel_trampoline, space, Some(net_token));
 
-    // Same bound net-driver-host itself polls for internally (2,000,000
-    // iterations, yielding every 10,000) plus headroom -- a real reply
-    // arrives promptly in practice.
-    let mut result = 0u8;
-    for _ in 0..3000 {
+    // DHCP's own poll bound is 2,000,000 iterations, then the ICMP phase
+    // runs its own further 2,000,000 -- same generous headroom convention
+    // `net_driver_icmp.rs` already uses for its single phase.
+    let mut dhcp_result = 0u8;
+    let mut icmp_result = 0u8;
+    for _ in 0..6000 {
         scheduler::yield_now();
-        result = unsafe { core::ptr::read_volatile(result_ptr) };
-        if result != 0 {
+        dhcp_result = unsafe { core::ptr::read_volatile(dhcp_result_ptr) };
+        icmp_result = unsafe { core::ptr::read_volatile(icmp_result_ptr) };
+        if dhcp_result != 0 && icmp_result != 0 {
             break;
         }
     }
 
-    if result == NET_RESULT_PASS {
+    if dhcp_result != NET_RESULT_PASS {
         serial_println!(
-            "net_driver_icmp: PASS — a real compiled binary brought up smoltcp on the virtio-net \
-             virtqueue and received a genuine ICMP echo reply from QEMU/SLIRP in an isolated \
-             ring 3 process"
-        );
-        exit_qemu(QemuExitCode::Success);
-    } else {
-        serial_println!(
-            "net_driver_icmp: FAIL — net-driver-host reported result byte {} (0 = never finished, \
-             2 = ICMP echo reply never arrived)",
-            result
+            "net_driver_dhcp: FAIL — DHCP result byte was {} (0 = never finished, 2 = no lease \
+             acquired within poll bound)",
+            dhcp_result
         );
         exit_qemu(QemuExitCode::Failed);
     }
+
+    let acquired_ip: [u8; 4] = unsafe {
+        [
+            core::ptr::read_volatile(dhcp_addr_ptr),
+            core::ptr::read_volatile(dhcp_addr_ptr.add(1)),
+            core::ptr::read_volatile(dhcp_addr_ptr.add(2)),
+            core::ptr::read_volatile(dhcp_addr_ptr.add(3)),
+        ]
+    };
+    // A real lease, not a placeholder -- SLIRP's DHCP server hands out
+    // addresses from its own `10.0.2.0/24` pool (see
+    // `net-driver-host/src/main.rs`'s `LOCAL_IP`/`GATEWAY_IP` doc comment
+    // for that same subnet's static defaults); `0.0.0.0` would mean the
+    // result byte lied about actually acquiring one.
+    if acquired_ip == [0, 0, 0, 0]
+        || acquired_ip[0] != 10
+        || acquired_ip[1] != 0
+        || acquired_ip[2] != 2
+    {
+        serial_println!(
+            "net_driver_dhcp: FAIL — DHCP reported PASS but the acquired address {:?} isn't a \
+             real 10.0.2.0/24 lease",
+            acquired_ip
+        );
+        exit_qemu(QemuExitCode::Failed);
+    }
+    serial_println!(
+        "net_driver_dhcp: real DHCP lease acquired: {}.{}.{}.{}",
+        acquired_ip[0],
+        acquired_ip[1],
+        acquired_ip[2],
+        acquired_ip[3]
+    );
+
+    if icmp_result != NET_RESULT_PASS {
+        serial_println!(
+            "net_driver_dhcp: FAIL — ICMP result byte was {} after DHCP (0 = never finished, 2 = \
+             no echo reply -- the phase-transition timestamp offset `run_dhcp` returns may be \
+             wrong)",
+            icmp_result
+        );
+        exit_qemu(QemuExitCode::Failed);
+    }
+
+    serial_println!(
+        "net_driver_dhcp: PASS — net-driver-host acquired a real DHCP lease from QEMU/SLIRP and \
+         still completed the ICMP echo proof afterward on the same Interface"
+    );
+    exit_qemu(QemuExitCode::Success);
 }
 
-/// Same as `kernel/src/main.rs`'s function of the same name — see its doc
-/// comment for why the leaf frames are batched *before* any `map_to`-driven
-/// page-table-build can interleave and break physical contiguity.
+/// Same as `kernel/src/main.rs`'s function of the same name.
 fn map_zeroed_contiguous_region(
     space: &mut AddressSpace,
     start_va: u64,
@@ -350,6 +381,6 @@ extern "C" fn kernel_trampoline() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    serial_println!("net_driver_icmp: PANIC: {}", info);
+    serial_println!("net_driver_dhcp: PANIC: {}", info);
     exit_qemu(QemuExitCode::Failed);
 }

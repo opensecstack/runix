@@ -102,6 +102,11 @@ struct NetBootInfo {
     /// requests; see `net_driver_sockets.rs` for the test that sets this
     /// to `1`.
     serve_sockets: u8,
+    /// `0` -- this test's `guestfwd` route/fixed remote address assumes
+    /// net-driver-host's own address is the static `LOCAL_IP`, not
+    /// whatever a real DHCP lease would hand back; see `net_driver_dhcp.rs`
+    /// for the test that sets this to `1`.
+    use_dhcp: u8,
 }
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
@@ -227,6 +232,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         tx_buffer_phys,
         attempt_tcp: 1,
         serve_sockets: 0,
+        use_dhcp: 0,
     };
     unsafe {
         (info_content.as_mut_ptr() as *mut NetBootInfo).write(info);
