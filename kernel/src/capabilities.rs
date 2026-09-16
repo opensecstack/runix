@@ -61,6 +61,32 @@ pub fn check(token: &CapabilityToken, resource: &str, now: u64) -> Result<(), Ca
     token.verify(&demo_verifying_key(), resource, now)
 }
 
+/// The resource string a capability must name to be scoped to one spawned
+/// `grid-sandbox-host` *instance* specifically — never a module-wide grant
+/// reused across instances (see
+/// `runix_citadel_integration::InstanceManifestEntry`'s doc comment and
+/// `grid_sandbox::spawn_instance`, which issues exactly one token per
+/// instance against this resource string, keyed on that instance's own
+/// `instance_id`). A token scoped to one instance's resource string never
+/// matches another instance's, by construction — `CapabilityToken::verify`
+/// checks the resource string exactly, same as `port_resource` above.
+pub fn grid_instance_resource(instance_id: &str) -> String {
+    format!("grid-instance:{instance_id}")
+}
+
+/// The resource-string convention for per-file filesystem-IPC
+/// authorization (`blk-driver-host`'s `ipc::fs` surface,
+/// `docs/STATUS.md`'s filesystem-driver Phase 8 section) — one capability
+/// per file name, checked by `blk-driver-host` itself against a token
+/// embedded in each request, not by the kernel's own `SYS_IPC_SEND` gate
+/// (that gate only ever sees the fixed request/response port, never the
+/// dynamic filename inside the payload). `name` is the display-form ASCII
+/// filename (e.g. `"HELLO.TXT"`), matching what `ipc::fs::FsRequest`
+/// carries.
+pub fn file_resource(name: &str) -> String {
+    format!("file:{name}")
+}
+
 /// The resource-string convention for port-I/O access: one capability
 /// covers a whole inclusive port range, not one token per port — matching
 /// the granularity `port_resource` already uses for IPC (one token per

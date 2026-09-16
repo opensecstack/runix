@@ -20,6 +20,7 @@ pub mod capabilities;
 pub mod citadel;
 pub mod elf;
 pub mod gdt;
+pub mod grid_sandbox;
 pub mod interrupts;
 pub mod ipc;
 pub mod memory;

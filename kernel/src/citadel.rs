@@ -16,7 +16,9 @@
 //! this gate, not just a demo call proving the gate itself works.
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use runix_citadel_integration::{BootAllowlist, CitadelError, ModuleManifestEntry};
+use runix_citadel_integration::{
+    BootAllowlist, CitadelError, InstanceAllowlist, InstanceManifestEntry, ModuleManifestEntry,
+};
 use sha2::Digest;
 
 // Re-exported so callers (e.g. `main.rs`) can name the tier they're
@@ -86,4 +88,48 @@ pub fn demo_reject_tampered(
         tampered.push(0xff);
     }
     allowlist.authorize_module_load(&demo_verifying_key(), module_id, &tampered)
+}
+
+/// Builds a one-entry [`InstanceAllowlist`] authorizing exactly
+/// `module_id`/`instance_id`/`module_bytes` under the demo trust root — the
+/// instance-scoped counterpart to [`demo_allowlist`]. See
+/// `runix_citadel_integration::InstanceManifestEntry`'s doc comment for why
+/// this exists separately from `BootAllowlist`: one module-wide grant reused
+/// across every spawned instance would be ambient authority the moment more
+/// than one instance of the same binary runs at once.
+fn demo_instance_allowlist(
+    module_id: &str,
+    instance_id: &str,
+    module_bytes: &[u8],
+    tier: SandboxTier,
+) -> InstanceAllowlist {
+    let signing_key = demo_signing_key();
+    let sha256_hex = hex::encode(sha2::Sha256::digest(module_bytes));
+    let entry = InstanceManifestEntry::issue(
+        module_id,
+        instance_id,
+        sha256_hex,
+        tier,
+        "demo-key",
+        &signing_key,
+    );
+    let mut allowlist = InstanceAllowlist::new();
+    allowlist.insert(entry);
+    allowlist
+}
+
+/// Runs the demo instance-scoped authorization gate: proves this exact
+/// `(module_id, instance_id)` pair is authorized at `tier`, independently of
+/// any other instance of the same module — the primitive
+/// `grid_sandbox::spawn_instance` calls once per spawned instance, never
+/// reusing one grant across instances (see [`demo_instance_allowlist`]'s doc
+/// comment).
+pub fn demo_authorize_instance(
+    module_id: &str,
+    instance_id: &str,
+    module_bytes: &[u8],
+    tier: SandboxTier,
+) -> Result<SandboxTier, CitadelError> {
+    let allowlist = demo_instance_allowlist(module_id, instance_id, module_bytes, tier);
+    allowlist.authorize_instance_load(&demo_verifying_key(), module_id, instance_id, module_bytes)
 }
