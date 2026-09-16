@@ -12,4 +12,12 @@
 # instruction fetch from address `0x0`, a null never-relocated function
 # pointer). Applied here from the start rather than re-discovering it a
 # third time.
-rustflags = ["-C", "relocation-model=static"]
+#
+# `curve25519-dalek` (pulled in transitively via `ed25519-dalek`, now a
+# direct dependency here too -- per-request capability-token verification,
+# `main.rs`'s `verify_file_token`) auto-selects a "simd" backend on
+# nightly toolchains, regardless of whether this target actually has
+# usable SIMD codegen support -- an LLVM ICE on `x86_64-unknown-none`, not
+# a normal compile error. Same fix, same reasoning as
+# `kernel/.cargo/config.toml`'s identical override.
+rustflags = ["-C", "relocation-model=static", "--cfg", "curve25519_dalek_backend=\"serial\""]

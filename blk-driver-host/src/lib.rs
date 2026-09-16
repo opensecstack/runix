@@ -47,6 +47,17 @@ pub struct BootSectorInfo {
     /// Derived: the first sector of the data region (cluster 2's sector),
     /// immediately after all `num_fats` copies of the FAT.
     pub data_start_sector: u32,
+    /// The FAT32 FSInfo sector number (BPB offset 48, `u16`) — an absolute
+    /// sector number on the volume (not relative to `reserved_sector_count`
+    /// the way `fat_start_sector` is derived), almost always `1` in
+    /// practice. Read but never validated by `parse` itself — a `0` or
+    /// otherwise-implausible value just means [`FsInfoSector::parse`] will
+    /// later reject whatever sector this points at, the same fail-soft
+    /// posture the free-cluster-count hint update already needs (see that
+    /// struct's own doc comment for why a missing/invalid FSInfo sector is
+    /// not itself a reason to reject the whole volume — this driver's own
+    /// correctness never depends on the hint being present or accurate).
+    pub fsinfo_sector: u32,
 }
 
 /// Bytes-per-sector values FAT32 actually allows per spec — a device could
@@ -105,6 +116,7 @@ impl BootSectorInfo {
         }
 
         let root_cluster = u32::from_le_bytes([sector[44], sector[45], sector[46], sector[47]]);
+        let fsinfo_sector = u32::from(u16::from_le_bytes([sector[48], sector[49]]));
 
         let fat_start_sector = u32::from(reserved_sector_count);
         let fat_region_sectors = fat_size_32.checked_mul(u32::from(num_fats))?;
@@ -119,6 +131,7 @@ impl BootSectorInfo {
             root_cluster,
             fat_start_sector,
             data_start_sector,
+            fsinfo_sector,
         })
     }
 
@@ -136,6 +149,106 @@ impl BootSectorInfo {
         let offset_sectors = cluster_index.checked_mul(u32::from(self.sectors_per_cluster))?;
         self.data_start_sector.checked_add(offset_sectors)
     }
+}
+
+/// The FAT32 FSInfo sector's free-cluster-count/next-free hint — real
+/// on-disk fields (`docs/STATUS.md`'s filesystem-driver section names this
+/// as a real, previously-named gap: this driver always scans the FAT from
+/// cluster 2 itself, so its own correctness never depended on this hint,
+/// but a real OS mounting this volume afterward would see a stale one).
+/// Structural layout confirmed against `mkfs.fat -F 32`'s own output, not
+/// assumed from the spec text alone: signature `0x41615252` at offset 0,
+/// `free_count` at offset 488, `next_free` at offset 492, trailing
+/// signature `0x61417272` at offset 484 and the same `0x55 0xAA` sector
+/// signature every FAT32 sector ends with, at 510/511.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsInfoSector {
+    pub free_count: u32,
+    pub next_free: u32,
+}
+
+const FSINFO_SIG1: u32 = 0x4161_5252;
+const FSINFO_SIG2: u32 = 0x6141_7272;
+/// The on-disk sentinel meaning "this hint isn't maintained/known" — never
+/// itself a valid count, so a caller must check for it before trusting
+/// [`FsInfoSector::free_count`]/[`FsInfoSector::next_free`] as real numbers.
+pub const FSINFO_UNKNOWN: u32 = 0xFFFF_FFFF;
+
+impl FsInfoSector {
+    /// Returns `None` for anything that doesn't check out: either
+    /// signature missing, or the sector's own trailing `0x55 0xAA` missing
+    /// — the same "don't trust a field from a sector that doesn't even
+    /// look like the structure it's supposed to be" posture
+    /// `BootSectorInfo::parse` already applies to the boot sector.
+    pub fn parse(sector: &[u8; 512]) -> Option<Self> {
+        if sector[510] != 0x55 || sector[511] != 0xAA {
+            return None;
+        }
+        let sig1 = u32::from_le_bytes([sector[0], sector[1], sector[2], sector[3]]);
+        if sig1 != FSINFO_SIG1 {
+            return None;
+        }
+        let sig2 = u32::from_le_bytes([sector[484], sector[485], sector[486], sector[487]]);
+        if sig2 != FSINFO_SIG2 {
+            return None;
+        }
+        let free_count = u32::from_le_bytes([sector[488], sector[489], sector[490], sector[491]]);
+        let next_free = u32::from_le_bytes([sector[492], sector[493], sector[494], sector[495]]);
+        Some(FsInfoSector {
+            free_count,
+            next_free,
+        })
+    }
+
+    /// Patches just the `free_count`/`next_free` fields into `sector` in
+    /// place — every other byte (both signatures, the trailing `0x55 0xAA`,
+    /// and any reserved padding) is left exactly as it was, the same
+    /// narrow read-modify-write discipline every other in-place patch in
+    /// this module already uses (e.g. `run_partial_write_proof`'s
+    /// `file_size` patch in `main.rs`).
+    pub fn encode_into(&self, sector: &mut [u8; 512]) {
+        sector[488..492].copy_from_slice(&self.free_count.to_le_bytes());
+        sector[492..496].copy_from_slice(&self.next_free.to_le_bytes());
+    }
+}
+
+/// Encodes a display-form ASCII filename (e.g. `"HELLO.TXT"`, `"BIG.TXT"`)
+/// into the raw, space-padded 8.3 on-disk form
+/// (`*b"HELLO   TXT"`/`*b"BIG     TXT"`) that [`parse_short_dir_entry`]'s
+/// `name` field and every existing fixed-name lookup in `main.rs` already
+/// compares against. Returns `None` for anything that doesn't fit 8.3
+/// (base part longer than 8 characters, extension longer than 3, more
+/// than one `.`-delimited extension, a space anywhere, or a non-ASCII
+/// byte) — a dynamic filename arriving over IPC that doesn't fit gets
+/// [`None`] here and falls back to a long-name lookup
+/// (`find_entry_by_long_name`) instead of this function guessing at a
+/// truncated/mangled short name, the same "fail closed on ambiguity, don't
+/// guess" posture every other parser in this module already has.
+pub fn encode_short_name(display: &[u8]) -> Option<[u8; 11]> {
+    if display.is_empty() || display.len() > 12 {
+        return None;
+    }
+    let (base, ext): (&[u8], &[u8]) = match display.iter().rposition(|&b| b == b'.') {
+        Some(pos) => (&display[..pos], &display[pos + 1..]),
+        None => (display, &[]),
+    };
+    if base.is_empty() || base.len() > 8 || ext.len() > 3 {
+        return None;
+    }
+    let mut out = [b' '; 11];
+    for (slot, &b) in out[..base.len()].iter_mut().zip(base) {
+        if !b.is_ascii() || b == b' ' || b == b'.' {
+            return None;
+        }
+        *slot = b.to_ascii_uppercase();
+    }
+    for (slot, &b) in out[8..8 + ext.len()].iter_mut().zip(ext) {
+        if !b.is_ascii() || b == b' ' || b == b'.' {
+            return None;
+        }
+        *slot = b.to_ascii_uppercase();
+    }
+    Some(out)
 }
 
 /// A parsed 8.3 short directory entry. `name` is the raw, space-padded
@@ -634,8 +747,8 @@ mod tests {
     #[test]
     fn find_reusable_slot_prefers_the_first_deleted_or_sentinel_entry() {
         let mut sector = [0xFFu8; 512]; // never a valid first byte on its own
-        // Slot 0: a live entry (first byte 0x41 is a plausible short-name
-        // char, not 0x00/0xE5).
+                                        // Slot 0: a live entry (first byte 0x41 is a plausible short-name
+                                        // char, not 0x00/0xE5).
         sector[0] = 0x41;
         // Slot 1: deleted -- the first reusable slot, must win over slot 3's
         // sentinel even though it comes later in scan order.
@@ -751,8 +864,63 @@ mod tests {
                 root_cluster: 2,
                 fat_start_sector: 0,
                 data_start_sector,
+                fsinfo_sector: 1,
             };
             let _ = info.cluster_to_sector(cluster);
         }
+
+        #[test]
+        fn fsinfo_parse_never_panics(bytes in proptest::collection::vec(any::<u8>(), 512..=512)) {
+            let mut sector = [0u8; 512];
+            sector.copy_from_slice(&bytes);
+            let _ = FsInfoSector::parse(&sector);
+        }
+
+        #[test]
+        fn encode_short_name_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..32)) {
+            let _ = encode_short_name(&bytes);
+        }
+    }
+
+    #[test]
+    fn fsinfo_round_trips_through_encode_into() {
+        let mut sector = [0u8; 512];
+        sector[0..4].copy_from_slice(&FSINFO_SIG1.to_le_bytes());
+        sector[484..488].copy_from_slice(&FSINFO_SIG2.to_le_bytes());
+        sector[510] = 0x55;
+        sector[511] = 0xAA;
+        let info = FsInfoSector {
+            free_count: 123,
+            next_free: 456,
+        };
+        info.encode_into(&mut sector);
+        let parsed = FsInfoSector::parse(&sector).expect("well-formed FSInfo should parse");
+        assert_eq!(parsed, info);
+        // Signatures/trailer must survive untouched -- the whole point of
+        // patching only the two count fields.
+        assert_eq!(sector[510], 0x55);
+        assert_eq!(sector[511], 0xAA);
+    }
+
+    #[test]
+    fn fsinfo_rejects_missing_signature() {
+        let mut sector = [0u8; 512];
+        sector[510] = 0x55;
+        sector[511] = 0xAA;
+        assert_eq!(FsInfoSector::parse(&sector), None);
+    }
+
+    #[test]
+    fn encode_short_name_produces_expected_padded_form() {
+        assert_eq!(encode_short_name(b"HELLO.TXT"), Some(*b"HELLO   TXT"));
+        assert_eq!(encode_short_name(b"BIG.TXT"), Some(*b"BIG     TXT"));
+        assert_eq!(encode_short_name(b"hello.txt"), Some(*b"HELLO   TXT"));
+    }
+
+    #[test]
+    fn encode_short_name_rejects_names_that_do_not_fit_8_3() {
+        assert_eq!(encode_short_name(b"WAY-TOO-LONG-NAME.TXT"), None);
+        assert_eq!(encode_short_name(b"FILE.LONGEXT"), None);
+        assert_eq!(encode_short_name(b""), None);
     }
 }

@@ -27,16 +27,94 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod syscall;
 mod virtio;
 
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 use blk_driver_host::{
-    fat_entry_at, is_end_of_chain, parse_lfn_fragment, parse_short_dir_entry, short_name_checksum,
-    BootSectorInfo,
+    encode_short_name, fat_entry_at, is_end_of_chain, parse_lfn_fragment, parse_short_dir_entry,
+    short_name_checksum, BootSectorInfo, FsInfoSector, FSINFO_UNKNOWN,
 };
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use linked_list_allocator::LockedHeap;
+use runix_capability_manager::CapabilityToken;
+use runix_ipc::fs::{FsError, FsRequest, FsResponse};
 use syscall::{write_all, write_byte, yield_now};
 use virtio::{VirtioBlk, Virtqueue};
+
+/// Demo capability trust root: **the same fixed seed**
+/// `kernel/src/capabilities.rs`'s `DEMO_SEED` uses — a token
+/// `kernel/src/capabilities.rs` issues (or a test issues via that same
+/// module) has to verify against the identical public key here, or every
+/// per-file authorization check in [`verify_file_token`] would reject a
+/// legitimately-issued token. Not a real secret (see that module's own
+/// doc comment for the full reasoning) — this driver only ever needs the
+/// *public* half, but reconstructing it from the seed keeps the two
+/// independently-compiled crates trivially in sync instead of hand-copying
+/// a raw public-key byte string that could silently drift from the
+/// signing side.
+///
+/// Gated behind `insecure-demo-keys` (on by default — see `Cargo.toml`),
+/// same convention and same reasoning as `kernel/src/capabilities.rs`'s
+/// own feature: there is no real key provisioning yet, so a release build
+/// that disables default features gets a compile error here instead of a
+/// silently-shipped demo trust root.
+#[cfg(not(feature = "insecure-demo-keys"))]
+compile_error!(
+    "main.rs's hardcoded Ed25519 demo trust root (verify_file_token) requires the \
+     `insecure-demo-keys` feature. There is no real key provisioning yet -- if this is \
+     meant to ship, that has to exist first. If this is still an alpha/dev build, \
+     re-enable default features."
+);
+
+const DEMO_SEED: [u8; 32] = [
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+];
+
+fn demo_verifying_key() -> VerifyingKey {
+    SigningKey::from_bytes(&DEMO_SEED).verifying_key()
+}
+
+/// The resource-string convention a per-file capability token must match
+/// -- mirrors `kernel/src/capabilities.rs`'s own `file_resource`; a token
+/// issued via that function for `name` verifies against exactly this
+/// string. Not shared code between the two crates (same "no shared type,
+/// just an agreed convention" reasoning as every other kernel/ring-3
+/// boundary in this codebase) -- kept in sync by both sides using the same
+/// literal `"file:{name}"` shape, checked end to end by
+/// `kernel/tests/blk_fs_ipc.rs`.
+fn file_resource(name: &str) -> String {
+    format!("file:{name}")
+}
+
+/// Verifies `token` was validly signed by the demo trust root, hasn't
+/// expired (checked against [`syscall::ticks`] -- see that function's own
+/// doc comment for why this driver needs a syscall for "now" at all), and
+/// is scoped to exactly `file:<name>`, not some other resource -- the
+/// per-request authorization [`runix_ipc::fs`]'s own doc comment names as
+/// the actual point of embedding a capability token in every request,
+/// rather than relying solely on the coarser port-level capability the
+/// kernel's `SYS_IPC_SEND` gate already checks.
+///
+/// Deliberately does **not** consult a revocation list: this driver has
+/// no access to the kernel's own `capabilities::REVOCATIONS` state (it's
+/// kernel-internal, not exposed over any syscall) -- a revoked-but-not-yet-
+/// expired file token would still verify here. Named explicitly as a known
+/// limitation, not silently assumed solved: closing it needs either a new
+/// syscall exposing revocation status or routing file-capability
+/// revocation through the kernel's existing `SYS_IPC_SEND` gate instead
+/// (e.g. a dedicated revocation-check port), neither of which exists yet.
+fn verify_file_token(token: &CapabilityToken, name: &str) -> bool {
+    let now = syscall::ticks();
+    token
+        .verify(&demo_verifying_key(), &file_resource(name), now)
+        .is_ok()
+}
 
 /// Small — this driver does no dynamic allocation at all (no `alloc`
 /// crate even linked); kept only because `LockedHeap` needs *some*
@@ -550,6 +628,7 @@ fn run_fat32_proof(dev: &mut BlkDevice) -> bool {
     let delete_pass = run_delete_proof(dev, &info);
     let create_pass = run_create_proof(dev, &info);
     let directory_growth_pass = run_directory_growth_proof(dev, &info);
+    let fsinfo_hint_pass = run_fsinfo_hint_proof(dev, &info);
 
     let pass = contents_match
         && subdir_pass
@@ -559,6 +638,7 @@ fn run_fat32_proof(dev: &mut BlkDevice) -> bool {
         && partial_write_pass
         && grow_pass
         && multi_grow_pass
+        && fsinfo_hint_pass
         && delete_pass
         && create_pass
         && directory_growth_pass;
@@ -876,6 +956,15 @@ fn write_fat_entry(dev: &mut BlkDevice, info: &BootSectorInfo, cluster: u32, val
     let offset_in_sector = (byte_offset % bytes_per_sector) as usize;
     let masked = value & 0x0FFF_FFFF;
 
+    // Structural gap closed: the FSInfo free-cluster-count hint. Captured
+    // from the *first* FAT copy's existing entry before any write happens
+    // -- every copy is kept byte-identical by this same function (see its
+    // own doc comment), so the first copy's masked value is exactly the
+    // "was this cluster free before this call" answer the hint update
+    // below needs. `None` (a read failure) means "don't know" -- treated
+    // the same as "no transition", not a guess.
+    let mut previous_masked: Option<u32> = None;
+
     for fat_copy in 0..u32::from(info.num_fats) {
         let Some(copy_base) = info
             .fat_start_sector
@@ -894,6 +983,9 @@ fn write_fat_entry(dev: &mut BlkDevice, info: &BootSectorInfo, cluster: u32, val
                 .try_into()
                 .unwrap(),
         );
+        if fat_copy == 0 {
+            previous_masked = Some(existing & 0x0FFF_FFFF);
+        }
         let reserved_top_bits = existing & 0xF000_0000;
         let new_value = reserved_top_bits | masked;
         sector[offset_in_sector..offset_in_sector + 4].copy_from_slice(&new_value.to_le_bytes());
@@ -902,7 +994,53 @@ fn write_fat_entry(dev: &mut BlkDevice, info: &BootSectorInfo, cluster: u32, val
             return false;
         }
     }
+
+    // A transition strictly between "free" (0) and "used" (nonzero) is the
+    // only case the hint tracks -- a link rewrite between two already-used
+    // values (e.g. extending a chain's tail pointer) changes no cluster's
+    // free/used status, so it must not double-count. Best-effort: a
+    // missing/invalid FSInfo sector (`adjust_fsinfo_free_count`'s own doc
+    // comment) silently skips the update rather than failing this whole,
+    // already-committed write.
+    if let Some(previous) = previous_masked {
+        match (previous == 0, masked == 0) {
+            (true, false) => adjust_fsinfo_free_count(dev, info, -1),
+            (false, true) => adjust_fsinfo_free_count(dev, info, 1),
+            _ => {}
+        }
+    }
     true
+}
+
+/// Reads the FSInfo sector, and if it parses as a real FSInfo structure
+/// with a *known* (not [`FSINFO_UNKNOWN`]) `free_count`, applies `delta`
+/// (`+1`/`-1` from [`write_fat_entry`]'s own transition detection) and
+/// writes it back — the structural gap `docs/STATUS.md`'s filesystem-
+/// driver section named ("the FSInfo sector's free-cluster-count/
+/// next-free hint... a real OS reading this volume afterward would see a
+/// stale hint"). Silently does nothing if the sector doesn't parse (no
+/// FSInfo sector on this volume, or a corrupt one) or if `free_count`
+/// already reads as "unknown" -- this driver's own correctness never
+/// depends on the hint (`allocate_free_cluster` always scans the FAT
+/// itself), so there's nothing to fail here that would mean anything to
+/// the caller, which has already committed its own FAT write regardless.
+fn adjust_fsinfo_free_count(dev: &mut BlkDevice, info: &BootSectorInfo, delta: i32) {
+    let Some(mut sector) = dev.read_sector(u64::from(info.fsinfo_sector)) else {
+        return;
+    };
+    let Some(mut fsinfo) = FsInfoSector::parse(&sector) else {
+        return;
+    };
+    if fsinfo.free_count == FSINFO_UNKNOWN {
+        return;
+    }
+    fsinfo.free_count = if delta < 0 {
+        fsinfo.free_count.saturating_sub(delta.unsigned_abs())
+    } else {
+        fsinfo.free_count.saturating_add(delta as u32)
+    };
+    fsinfo.encode_into(&mut sector);
+    let _ = dev.write_sector(u64::from(info.fsinfo_sector), &sector);
 }
 
 /// Writes `0` (free) into every entry in `clusters` — the rollback half of
@@ -918,6 +1056,81 @@ fn free_clusters(dev: &mut BlkDevice, info: &BootSectorInfo, clusters: &[u32]) {
     for &cluster in clusters {
         let _ = write_fat_entry(dev, info, cluster, 0);
     }
+}
+
+/// Structural gap closed: the FSInfo free-cluster-count hint actually
+/// tracks real allocations/frees, not just this driver's own (already
+/// FSInfo-independent) internal bookkeeping. Self-contained, deliberately
+/// isolated from every other proof in this file: reads the hint before
+/// touching anything, allocates one cluster (mirroring
+/// [`allocate_free_cluster`] + [`write_fat_entry`]'s exact commit
+/// sequence every real allocation site in this module uses), confirms the
+/// hint dropped by exactly one, frees that same cluster back via
+/// [`write_fat_entry`], and confirms the hint returned to its original
+/// value — proving both directions of [`adjust_fsinfo_free_count`]'s
+/// transition detection, not just one.
+fn run_fsinfo_hint_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
+    let Some(before_sector) = dev.read_sector(u64::from(info.fsinfo_sector)) else {
+        write_all(b"blk-driver-host: FAT32 FAIL - could not read FSInfo sector\n");
+        return false;
+    };
+    let Some(before) = FsInfoSector::parse(&before_sector) else {
+        write_all(b"blk-driver-host: FAT32 FAIL - FSInfo sector did not parse\n");
+        return false;
+    };
+    if before.free_count == FSINFO_UNKNOWN {
+        write_all(b"blk-driver-host: FAT32 FSInfo hint unknown, skipping (fixture limitation)\n");
+        // Nothing this driver can meaningfully check against an
+        // intentionally-unmaintained hint -- not a failure of this
+        // driver's own write path, so this doesn't fail the whole boot.
+        return true;
+    }
+
+    let Some(cluster) = allocate_free_cluster(dev, info) else {
+        write_all(b"blk-driver-host: FAT32 FAIL - no free cluster available for FSInfo proof\n");
+        return false;
+    };
+    if !write_fat_entry(dev, info, cluster, blk_driver_host::CHAIN_EOC_MARKER) {
+        write_all(b"blk-driver-host: FAT32 FAIL - could not mark cluster used for FSInfo proof\n");
+        return false;
+    }
+
+    let after_allocate_ok = match dev
+        .read_sector(u64::from(info.fsinfo_sector))
+        .and_then(|s| FsInfoSector::parse(&s))
+    {
+        Some(after) => after.free_count == before.free_count - 1,
+        None => false,
+    };
+
+    if !write_fat_entry(dev, info, cluster, 0) {
+        write_all(b"blk-driver-host: FAT32 FAIL - could not free cluster back for FSInfo proof\n");
+        return false;
+    }
+
+    let after_free_ok = match dev
+        .read_sector(u64::from(info.fsinfo_sector))
+        .and_then(|s| FsInfoSector::parse(&s))
+    {
+        Some(after) => after.free_count == before.free_count,
+        None => false,
+    };
+
+    write_all(b"blk-driver-host: FAT32 fsinfo_hint before=");
+    write_decimal(u64::from(before.free_count));
+    write_all(b" after_allocate_ok=");
+    write_byte(if after_allocate_ok { b'1' } else { b'0' });
+    write_all(b" after_free_ok=");
+    write_byte(if after_free_ok { b'1' } else { b'0' });
+    write_byte(b'\n');
+
+    let pass = after_allocate_ok && after_free_ok;
+    if pass {
+        write_all(b"blk-driver-host: FAT32 FSInfo hint proof OK\n");
+    } else {
+        write_all(b"blk-driver-host: FAT32 FSInfo hint proof FAILED\n");
+    }
+    pass
 }
 
 /// Filesystem driver, structural gap closed: allocates `count` fresh,
@@ -1432,8 +1645,7 @@ fn run_multi_cluster_grow_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> b
     write_byte(if contents_match { b'1' } else { b'0' });
     write_byte(b'\n');
 
-    let pass =
-        data_writes_ok && link_ok && size_write_ok && size_visible && contents_match;
+    let pass = data_writes_ok && link_ok && size_write_ok && size_visible && contents_match;
     if pass {
         write_all(b"blk-driver-host: FAT32 multi-cluster grow proof OK\n");
     } else {
@@ -1455,7 +1667,9 @@ fn run_multi_cluster_grow_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> b
 fn run_directory_growth_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
     let Some((slot_sector, slot_offset)) = find_or_grow_create_slot(dev, info, info.root_cluster)
     else {
-        write_all(b"blk-driver-host: FAT32 FAIL - directory growth did not produce a usable slot\n");
+        write_all(
+            b"blk-driver-host: FAT32 FAIL - directory growth did not produce a usable slot\n",
+        );
         return false;
     };
 
@@ -1830,78 +2044,228 @@ fn read_file_contents(
     written
 }
 
-/// Filesystem driver, Phase 8 status byte written on [`FS_RESPONSE_PORT`]
-/// after a write request, before any read-style length header (a read
-/// reply has no status byte at all, unchanged from Phase 3 -- the two
-/// reply shapes were never ambiguous to begin with, since each port's
-/// capability already tells a caller which one it's going to get).
-const FS_WRITE_STATUS_OK: u8 = 0;
-const FS_WRITE_STATUS_BAD_LENGTH: u8 = 1;
-const FS_WRITE_STATUS_DEVICE_FAILED: u8 = 2;
+/// Locates `name` (an arbitrary display-form ASCII filename arriving over
+/// IPC — see [`runix_ipc::fs::FsRequest`]) in `dir_cluster`, trying the
+/// short-name path first ([`encode_short_name`] + [`find_entry_in_directory`])
+/// and falling back to the long-name path ([`find_entry_by_long_name`])
+/// when `name` doesn't fit 8.3 — the generalization of every existing
+/// fixed-name lookup in this file (each of which only ever had to handle
+/// one hardcoded name, known in advance to fit whichever path it used) to
+/// a name this driver doesn't know ahead of time. Item 1's actual point:
+/// this is the one lookup [`run_fs_ipc_server`] now calls for *any*
+/// requested filename, not a fixed port-per-file mapping decided at spawn
+/// time.
+fn find_entry_by_display_name(
+    dev: &mut BlkDevice,
+    info: &BootSectorInfo,
+    dir_cluster: u32,
+    name: &str,
+) -> Option<blk_driver_host::ShortDirEntry> {
+    if let Some(short) = encode_short_name(name.as_bytes()) {
+        if let Some(entry) = find_entry_in_directory(dev, info, dir_cluster, &short) {
+            return Some(entry);
+        }
+    }
+    find_entry_by_long_name(dev, info, dir_cluster, name.as_bytes())
+}
 
-/// Filesystem driver, Phase 3: locates [`TARGET_FILE_NAME`] once, then
-/// serves at most one request over the fixed IPC ports (see
-/// `FS_REQUEST_PORT`/`FS_RESPONSE_PORT`) -- one trigger byte in, a 2-byte
-/// little-endian length header plus that many content bytes out.
-///
-/// Filesystem driver, Phase 8: rewritten from "serve at most one request,
-/// then idle forever" into a real loop serving both this read path *and*
-/// a second, independently capability-gated write path against
-/// [`WRITE_FILE_NAME`] over [`FS_WRITE_REQUEST_PORT`] -- the first real
-/// multi-request, multi-file IPC surface this driver has had. Still no
-/// arbitrary/dynamic filename in the request itself (each file gets its
-/// own fixed port, decided at spawn time, not named in the payload) --
-/// that needs a path-scoped capability convention that doesn't exist yet
-/// (see `docs/THREAT_MODEL.md`), and stays explicitly out of scope here.
-///
-/// Write wire format (caller -> [`FS_WRITE_REQUEST_PORT`]): a 2-byte
-/// little-endian length, then that many payload bytes. Deliberately
-/// narrow for this slice: the length must be exactly `SECTOR_SIZE` (one
-/// sector, `WRITE.TXT`'s entire capacity, matching Phase 5's
-/// already-proven single-sector overwrite) -- anything else is rejected,
-/// not truncated or padded. No resize, no allocation, no filename in the
-/// payload. Reply is a single status byte on [`FS_RESPONSE_PORT`]
-/// ([`FS_WRITE_STATUS_OK`]/[`FS_WRITE_STATUS_BAD_LENGTH`]/
-/// [`FS_WRITE_STATUS_DEVICE_FAILED`]).
-fn run_fs_ipc_server(dev: &mut BlkDevice, info: &BootSectorInfo) {
-    let Some(entry) = find_entry_in_directory(dev, info, info.root_cluster, &TARGET_FILE_NAME)
-    else {
-        write_all(b"blk-driver-host: FS server FAIL - target file not found\n");
-        return;
+/// Same lookup [`resolve_single_sector_file`] already does for a fixed
+/// name, generalized to an arbitrary display-form name — the write IPC
+/// path's own scope limit (see [`handle_write_ipc_request`]'s doc
+/// comment): only ever a name that fits 8.3 ([`encode_short_name`]),
+/// matching every write this driver has ever supported (single sector, no
+/// resize, no long-name directory entries to patch).
+fn resolve_single_sector_file_by_name(
+    dev: &mut BlkDevice,
+    info: &BootSectorInfo,
+    name: &str,
+) -> Option<u32> {
+    let short = encode_short_name(name.as_bytes())?;
+    resolve_single_sector_file(dev, info, &short)
+}
+
+/// Filesystem driver, structural gap closed: [`handle_read_ipc_request`]
+/// verifies `token` against `file:<name>` ([`verify_file_token`]) before
+/// ever touching the device — the per-caller, per-file authorization
+/// [`runix_ipc::fs`]'s own doc comment names as the actual point of this
+/// slice, checked here rather than only at the coarser port level the
+/// kernel's own `SYS_IPC_SEND` gate already enforces (unchanged: a caller
+/// still needs a `port:<n>` capability to reach this server at all).
+fn handle_read_ipc_request(
+    dev: &mut BlkDevice,
+    info: &BootSectorInfo,
+    name: &str,
+    token: &CapabilityToken,
+) -> FsResponse {
+    if !verify_file_token(token, name) {
+        return FsResponse::Error(FsError::Unauthorized);
+    }
+    let Some(entry) = find_entry_by_display_name(dev, info, info.root_cluster, name) else {
+        return FsResponse::Error(FsError::NotFound);
     };
+    if entry.is_dir {
+        return FsResponse::Error(FsError::NotFound);
+    }
+    let mut buf = [0u8; MAX_FILE_BYTES];
+    let written = read_file_contents(dev, info, &entry, &mut buf);
+    FsResponse::Data(Vec::from(&buf[..written]))
+}
 
-    let mut file_buf = [0u8; MAX_FILE_BYTES];
-    let written = read_file_contents(dev, info, &entry, &mut file_buf);
+/// Same per-file authorization check as [`handle_read_ipc_request`], for
+/// the write path. Deliberately narrower than the read path, same
+/// restriction every write this driver has ever supported has had: `data`
+/// must be exactly `SECTOR_SIZE` bytes (one sector, the target file's
+/// entire capacity) — no resize, no free-cluster allocation, no directory-
+/// entry creation over IPC. Each of those stays internal-only (Phase 7's
+/// own proofs), not exposed to a caller yet.
+fn handle_write_ipc_request(
+    dev: &mut BlkDevice,
+    info: &BootSectorInfo,
+    name: &str,
+    token: &CapabilityToken,
+    data: &[u8],
+) -> FsResponse {
+    if !verify_file_token(token, name) {
+        return FsResponse::Error(FsError::Unauthorized);
+    }
+    if data.len() != SECTOR_SIZE {
+        return FsResponse::Error(FsError::BadRequest);
+    }
+    let Some(sector) = resolve_single_sector_file_by_name(dev, info, name) else {
+        return FsResponse::Error(FsError::NotFound);
+    };
+    let mut payload = [0u8; SECTOR_SIZE];
+    payload.copy_from_slice(data);
+    let (completed, status) = dev.write_sector(u64::from(sector), &payload);
+    if completed && status == VIRTIO_BLK_S_OK {
+        FsResponse::Ok
+    } else {
+        FsResponse::Error(FsError::DeviceFailed)
+    }
+}
 
+/// Defensive cap on how many not-yet-decodable bytes [`run_fs_ipc_server`]
+/// will accumulate per port before giving up and discarding them. Without
+/// this, a sender that never completes a well-formed
+/// [`runix_ipc::fs::FsRequest`] (a bug, or a hostile process holding a
+/// valid port-level capability but not bothering to speak the real wire
+/// format) could grow `read_buf`/`write_buf` without bound — every field
+/// `FsRequest::decode` itself checks is already bounded
+/// ([`runix_ipc::fs::MAX_NAME_LEN`]/`MAX_TOKEN_FIELD_LEN`/`MAX_DATA_LEN`),
+/// but `decode` returning `None` doesn't distinguish "need more bytes yet"
+/// from "this header already claims more than any bound allows" — both
+/// look identical to a caller that just keeps accumulating. A real request
+/// never approaches this size (see those same bounds); this exists purely
+/// to make a broken/hostile sender's own buffer bounded, not to be a
+/// meaningful limit on any legitimate message.
+const FS_MAX_PENDING_BYTES: usize = 8192;
+
+fn send_fs_response(response: &FsResponse) {
+    for byte in response.encode() {
+        let _ = syscall::ipc_send(FS_RESPONSE_PORT, byte);
+    }
+}
+
+/// Filesystem driver, Phase 3/8's fixed-port, fixed-filename IPC surface,
+/// generalized: **dynamic filenames plus per-request, per-file
+/// authorization**, closing the two gaps `docs/STATUS.md`'s Phase 8
+/// section named as the next trigger ("an arbitrary path sent at request
+/// time instead of one fixed target name... a real path-scoped capability
+/// convention"). [`FS_REQUEST_PORT`]/[`FS_WRITE_REQUEST_PORT`] are still
+/// fixed, kernel-capability-gated ports (a caller still needs a
+/// `port:<n>` grant to reach this server at all — unchanged, see
+/// `kernel/src/syscall.rs`'s `SYS_IPC_SEND`), but each now carries a real
+/// [`runix_ipc::fs::FsRequest`] naming *which* file and presenting a
+/// [`CapabilityToken`] scoped to exactly that file — verified by this
+/// driver itself ([`verify_file_token`]) on every single request, not
+/// once at spawn time. Two different files served over the same read
+/// port in one boot is the actual proof this closes (see
+/// `kernel/tests/blk_fs_ipc.rs`), where Phase 8 could only ever serve one.
+///
+/// **Concurrency, deliberately still deferred, not silently assumed
+/// solved**: this loop remains single-writer/single-in-flight-request-per-
+/// port, the same posture every write this driver performs already has
+/// (`docs/STATUS.md`'s filesystem-driver section: "any concurrency/locking
+/// around allocation... same as every other write this driver performs").
+/// Two callers sending overlapping multi-byte requests to the *same* port
+/// at the same time can still interleave their bytes in the underlying
+/// fixed-capacity channel (`kernel/src/ipc.rs`'s `Channel`) before either
+/// message is fully decoded — a real gap, not fixed here: a genuine fix
+/// needs either a session/lock IPC primitive or kernel-side request
+/// framing, neither of which exists yet. Each of this driver's two ports
+/// still only ever has one legitimate sender in every test that exists
+/// today, so this gap isn't exercised by anything currently wired into
+/// CI — named explicitly so it isn't mistaken for solved.
+fn run_fs_ipc_server(dev: &mut BlkDevice, info: &BootSectorInfo) {
     write_all(b"blk-driver-host: FS server ready, serving read/write requests\n");
+
+    let mut read_buf: Vec<u8> = Vec::new();
+    let mut write_buf: Vec<u8> = Vec::new();
+    let mut requests_served = 0u32;
 
     // Same poll-bound discipline as every other wait loop in this
     // codebase: real requests arrive promptly in practice, so this bound
     // exists purely to make "a test that sends N requests" report a clean
     // result instead of hanging the boot forever waiting for an N+1th
     // request that was never going to come.
-    let mut requests_served = 0u32;
-    for i in 0..2_000_000u32 {
-        if syscall::ipc_try_recv(FS_REQUEST_PORT).is_some() {
-            write_all(b"blk-driver-host: FS server got a read request, replying with ");
-            write_decimal(written as u64);
-            write_all(b" bytes\n");
-            let len_bytes = (written as u16).to_le_bytes();
-            let _ = syscall::ipc_send(FS_RESPONSE_PORT, len_bytes[0]);
-            let _ = syscall::ipc_send(FS_RESPONSE_PORT, len_bytes[1]);
-            for &byte in &file_buf[..written] {
-                let _ = syscall::ipc_send(FS_RESPONSE_PORT, byte);
+    //
+    // Bumped from `2_000_000` to `20_000_000`, confirmed by real
+    // reproduction (not guessed) the same way `poll_for_completion`'s own
+    // bound already had to grow once: with per-request Ed25519 signature
+    // verification now in the mix (`verify_file_token`) and each request
+    // arriving byte-by-byte through a 32-byte channel
+    // (`kernel/src/ipc.rs`'s `CHANNEL_CAPACITY`), five sequential
+    // request/response round trips in one boot (the actual shape
+    // `kernel/tests/blk_fs_ipc.rs` now exercises) accumulate enough
+    // cooperative-scheduler round-trip overhead — more so under TCG, which
+    // interprets guest instructions far slower than KVM, the same
+    // "`poll_for_completion`'s own bound had to grow for exactly this
+    // reason" note already on this file — that the unbumped budget ran out
+    // mid-way through the fifth request: its sender got stuck forever
+    // (`SYS_IPC_SEND`'s internal spin-yield keeps waiting for room a
+    // receiver that already exited its own loop will never make), never
+    // completing, while this loop itself reported "4 requests served" and
+    // returned normally. Not a logic bug in the request-handling code
+    // itself — every byte that *did* arrive decoded and served correctly;
+    // this loop simply stopped listening too soon.
+    for i in 0..20_000_000u32 {
+        if let Some(byte) = syscall::ipc_try_recv(FS_REQUEST_PORT) {
+            read_buf.push(byte);
+            if let Some((request, consumed)) = FsRequest::decode(&read_buf) {
+                read_buf.drain(..consumed);
+                if let FsRequest::Read { name, token } = request {
+                    write_all(b"blk-driver-host: FS server got a read request for ");
+                    write_all(name.as_bytes());
+                    write_byte(b'\n');
+                    let response = handle_read_ipc_request(dev, info, &name, &token);
+                    send_fs_response(&response);
+                    requests_served += 1;
+                }
+                // A `Write` variant arriving on the read port is malformed
+                // by construction (a well-behaved client only ever encodes
+                // `FsRequest::Write` towards `FS_WRITE_REQUEST_PORT`) --
+                // silently dropped, matching every other "untrusted input
+                // fails closed, not loudly" parser in this module.
+            } else if read_buf.len() > FS_MAX_PENDING_BYTES {
+                read_buf.clear();
             }
-            requests_served += 1;
         }
 
-        if let Some(len_lo) = syscall::ipc_try_recv(FS_WRITE_REQUEST_PORT) {
-            let status = handle_write_ipc_request(dev, info, len_lo);
-            write_all(b"blk-driver-host: FS server got a write request, status=");
-            write_decimal(status as u64);
-            write_byte(b'\n');
-            let _ = syscall::ipc_send(FS_RESPONSE_PORT, status);
-            requests_served += 1;
+        if let Some(byte) = syscall::ipc_try_recv(FS_WRITE_REQUEST_PORT) {
+            write_buf.push(byte);
+            if let Some((request, consumed)) = FsRequest::decode(&write_buf) {
+                write_buf.drain(..consumed);
+                if let FsRequest::Write { name, token, data } = request {
+                    write_all(b"blk-driver-host: FS server got a write request for ");
+                    write_all(name.as_bytes());
+                    write_byte(b'\n');
+                    let response = handle_write_ipc_request(dev, info, &name, &token, &data);
+                    send_fs_response(&response);
+                    requests_served += 1;
+                }
+            } else if write_buf.len() > FS_MAX_PENDING_BYTES {
+                write_buf.clear();
+            }
         }
 
         if i % 10_000 == 0 {
@@ -1911,67 +2275,7 @@ fn run_fs_ipc_server(dev: &mut BlkDevice, info: &BootSectorInfo) {
 
     write_all(b"blk-driver-host: FS server served ");
     write_decimal(requests_served as u64);
-    write_all(b" request(s) total (Phase 8)\n");
-}
-
-/// Receives the rest of a write request whose first byte (`len_lo`, the
-/// little-endian length header's low byte) has already been consumed by
-/// `run_fs_ipc_server`'s own poll loop -- the write path has no separate
-/// opcode byte, since the destination port itself already names the
-/// operation, same simplicity the read path's single trigger byte
-/// already has. Receives the length's high byte, and if the resulting
-/// length is exactly `SECTOR_SIZE`, receives that many payload bytes and
-/// overwrites [`WRITE_FILE_NAME`]'s one sector with them via
-/// [`resolve_single_sector_file`], the same lookup `run_write_proof`
-/// uses. Returns the status byte the caller should reply with; never
-/// panics on a malformed/incomplete request, same "untrusted input fails
-/// closed, not loudly" posture every parser in this crate already has.
-fn handle_write_ipc_request(dev: &mut BlkDevice, info: &BootSectorInfo, len_lo: u8) -> u8 {
-    let Some(len_hi) = poll_recv_byte(FS_WRITE_REQUEST_PORT) else {
-        return FS_WRITE_STATUS_BAD_LENGTH;
-    };
-    let len = u16::from_le_bytes([len_lo, len_hi]) as usize;
-    if len != SECTOR_SIZE {
-        return FS_WRITE_STATUS_BAD_LENGTH;
-    }
-
-    let mut payload = [0u8; SECTOR_SIZE];
-    for slot in payload.iter_mut() {
-        let Some(byte) = poll_recv_byte(FS_WRITE_REQUEST_PORT) else {
-            return FS_WRITE_STATUS_BAD_LENGTH;
-        };
-        *slot = byte;
-    }
-
-    let Some(sector) = resolve_single_sector_file(dev, info, &WRITE_FILE_NAME) else {
-        return FS_WRITE_STATUS_DEVICE_FAILED;
-    };
-    let (completed, status) = dev.write_sector(u64::from(sector), &payload);
-    if completed && status == VIRTIO_BLK_S_OK {
-        FS_WRITE_STATUS_OK
-    } else {
-        FS_WRITE_STATUS_DEVICE_FAILED
-    }
-}
-
-/// Polls `port` for one byte using the same bounded-iteration idiom every
-/// wait loop in this module uses -- `None` if nothing arrives within the
-/// bound, never blocks forever. There is no blocking-receive syscall in
-/// this codebase (`kernel/src/syscall.rs`'s own `SYS_IPC_RECV` dispatch
-/// calls `ipc::try_recv`, not `ipc::recv` -- confirmed, not assumed), so
-/// receiving "the rest of" a multi-byte message that a well-behaved
-/// sender posts byte-by-byte in a tight loop still has to poll, same as
-/// the request-detection loop that calls this.
-fn poll_recv_byte(port: usize) -> Option<u8> {
-    for i in 0..200_000u32 {
-        if let Some(byte) = syscall::ipc_try_recv(port) {
-            return Some(byte);
-        }
-        if i % 10_000 == 0 {
-            yield_now();
-        }
-    }
-    None
+    write_all(b" request(s) total\n");
 }
 
 /// Scans every 32-byte entry of `dir_cluster`'s cluster chain for

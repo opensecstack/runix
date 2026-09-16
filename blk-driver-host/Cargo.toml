@@ -16,6 +16,38 @@ publish = false
 
 [dependencies]
 linked_list_allocator = "0.10"
+# `default-features = false`: skips `runix-ipc`'s `std` feature (and
+# transitively `serde_json`, a hard-`std` dependency) -- this crate targets
+# `x86_64-unknown-none` with no `std` at all. Only the `fs` module (typed
+# wire format for the filesystem IPC surface, dynamic filenames + a
+# per-request capability token -- see `main.rs`'s `run_fs_ipc_server`) is
+# usable under that configuration, same split `net-driver-host` already
+# established for its own `sockets` usage.
+runix-ipc = { path = "../ipc", default-features = false }
+# Per-request authorization (see `ipc::fs`'s doc comment): `blk-driver-host`
+# itself now verifies a `CapabilityToken` scoped to the requested file's
+# name, rather than only relying on the kernel's port-level capability
+# gate. Same crate, same convention `kernel/src/capabilities.rs` already
+# uses -- not a parallel authorization mechanism.
+runix-capability-manager = { path = "../capability-manager" }
+# Needed directly (not just transitively through `runix-capability-manager`)
+# to reconstruct the same demo verifying key `kernel/src/capabilities.rs`
+# issues tokens against -- see `demo_verifying_key`'s own doc comment.
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+# Not used directly -- pulled in transitively by `ed25519-dalek` for its
+# internal SHA-512 hashing. Declared here only to force `force-soft`, same
+# reasoning `capability-manager/Cargo.toml`'s own comment gives: the
+# default build hits an LLVM codegen ICE on `x86_64-unknown-none`.
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+
+[features]
+default = ["insecure-demo-keys"]
+# Gates the hardcoded demo Ed25519 trust root in `main.rs`
+# (`demo_verifying_key`) -- same reasoning and same seed as
+# `kernel/src/capabilities.rs`'s own `insecure-demo-keys` feature: there is
+# no real key provisioning yet, so this exists to catch an accidental
+# release build with the demo key baked in at *compile* time, not runtime.
+insecure-demo-keys = []
 
 [dev-dependencies]
 # Host-only (tests run on the host, never the x86_64-unknown-none target) —
@@ -23,6 +55,21 @@ linked_list_allocator = "0.10"
 # `#![cfg_attr(not(test), no_std)]` split, same convention net-driver-host
 # already uses for the same reason.
 proptest = "1"
+
+# Unoptimized elliptic-curve arithmetic (curve25519-dalek, transitively via
+# ed25519-dalek) is stack-hungry enough in debug builds to overflow a small
+# ring-3 stack -- same real bug class `kernel/Cargo.toml`'s identical
+# overrides already document and fix there. This crate's own `[workspace]`
+# above makes it its own profile root, so the same overrides have to be
+# repeated here, not inherited.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
 
 [lib]
 name = "blk_driver_host"

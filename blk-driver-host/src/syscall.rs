@@ -11,6 +11,7 @@ const SYS_IPC_SEND: u64 = 2;
 const SYS_IPC_RECV: u64 = 3;
 const SYS_PORT_IN: u64 = 4;
 const SYS_PORT_OUT: u64 = 5;
+const SYS_TICKS: u64 = 6;
 
 /// # Safety
 /// Whatever `num`'s own contract requires.
@@ -86,6 +87,13 @@ pub fn port_out(port: u16, width: u8, value: u32) -> bool {
 pub fn ipc_send(port: usize, byte: u8) -> bool {
     let ret = unsafe { syscall(SYS_IPC_SEND, port as u64, byte as u64, 0) };
     ret != u64::MAX
+}
+
+/// PIT ticks since boot -- see `kernel/src/syscall.rs`'s `SYS_TICKS` doc
+/// comment for why this driver needs it (per-request capability-token
+/// expiry checking, `main.rs`'s `verify_file_token`).
+pub fn ticks() -> u64 {
+    unsafe { syscall(SYS_TICKS, 0, 0, 0) }
 }
 
 /// Reads one byte off IPC `port`, non-blocking — `None` if the port is

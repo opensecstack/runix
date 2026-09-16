@@ -5,9 +5,9 @@
 //! (`serve_fs_requests: 1`) against the Phase 2 FAT32 fixture, then proves
 //! both directions of capability scoping over the real IPC syscalls
 //! (`SYS_IPC_SEND`/`SYS_IPC_RECV`, `kernel/src/syscall.rs`): a thread
-//! holding no capability at all is denied when it tries to send the
-//! request trigger (the same way `kernel/src/main.rs`'s own Phase B4 demo
-//! proves `thread_sender_unauthorized` is denied), and a thread holding a
+//! holding no capability at all is denied when it tries to send a
+//! request (the same way `kernel/src/main.rs`'s own Phase B4 demo proves
+//! `thread_sender_unauthorized` is denied), and a thread holding a
 //! capability scoped to exactly the request port gets the exact file
 //! bytes back over the response port.
 //!
@@ -17,18 +17,23 @@
 //! one scoped to the response port it replies on), which is exactly the
 //! scenario that field exists for.
 //!
-//! Filesystem driver, Phase 8 extends this same boot with a second,
+//! Filesystem driver, Phase 8 extended this same boot with a second,
 //! independently capability-gated port (`FS_WRITE_REQUEST_PORT`) for
-//! write requests against `WRITE.TXT` — proving both directions again for
-//! the write path (unauthorized denied, authorized succeeds) and, unlike
-//! Phase 3's "serves at most one request, then idles forever," that the
-//! *same* server loop actually serves more than one request in a single
-//! boot (a read, then two write attempts). `blk-driver-host` itself needs
-//! no new capability for this — it only ever *receives* on ports 8/10
-//! (unauthenticated, same as before) and *sends* on port 9 (already
-//! covered by `response_token`); the new capability is granted to the
-//! *client* thread that's allowed to send a write request, same shape as
-//! `request_token` already is for reads.
+//! write requests, and the structural gap closed here generalizes both
+//! ports' wire format from "one fixed file per port, one trigger byte"
+//! into a real, typed [`runix_ipc::fs::FsRequest`] carrying an arbitrary
+//! filename *and* a per-file [`runix_capability_manager::CapabilityToken`]
+//! on every single request — verified by `blk-driver-host` itself
+//! (`verify_file_token`), not just by the kernel's own port-level
+//! `SYS_IPC_SEND` gate. Proven three ways past what Phase 8 already
+//! covered: **two different files** (`HELLO.TXT`, `BIG.TXT`) served
+//! successfully over the *same* read port in one boot (Phase 8 could only
+//! ever serve one fixed file); a caller holding a perfectly valid
+//! port-level capability but a file-scoped token minted for a *different*
+//! file gets [`runix_ipc::fs::FsError::Unauthorized`], not the file's
+//! contents — the actual point of per-request authorization, since the
+//! coarse port-level gate alone would have let this caller through; and
+//! the same mismatched-token denial proven again for the write path.
 //!
 //! **Requires the same real FAT32 fixture image** `blk_fat32_read.rs`
 //! does, via `RUNIX_BLK_IMG` — `blk-driver-host` locates the same
@@ -46,10 +51,13 @@
 
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use bootloader_api::config::{BootloaderConfig, Mapping};
 use bootloader_api::{entry_point, BootInfo};
 use core::panic::PanicInfo;
+use runix_capability_manager::CapabilityToken;
+use runix_ipc::fs::{FsError, FsRequest, FsResponse};
 use runix_kernel::elf::Elf64;
 use runix_kernel::process::AddressSpace;
 use runix_kernel::qemu_exit::{exit_qemu, QemuExitCode};
@@ -75,7 +83,16 @@ static BLK_DRIVER_HOST_ELF: &[u8] =
 const BLK_HEAP_START: u64 = 0x_0999_1111_0000;
 const BLK_HEAP_SIZE: u64 = 256 * 1024;
 const BLK_STACK_VA: u64 = 0x_0999_2222_0000;
-const BLK_STACK_SIZE: u64 = 4096 * 4;
+/// Bumped from `4096 * 4` (16 KiB): `blk-driver-host` now verifies a real
+/// Ed25519 signature (`verify_file_token`) on every request this test
+/// sends, the same unoptimized-crypto-stack-hungriness
+/// `kernel/Cargo.toml`'s own `[profile.dev.package.*]` overrides already
+/// document for the exact same dependency tree. `blk-driver-host`'s own
+/// `Cargo.toml` carries the matching `opt-level = 3` overrides for a debug
+/// build, but this is extra headroom on top, the same "size bump, not a
+/// substitute for the real fix" reasoning `kernel/src/main.rs`'s
+/// `BOOTLOADER_CONFIG` comment already gives for the boot stack.
+const BLK_STACK_SIZE: u64 = 4096 * 16;
 const BLK_INFO_VA: u64 = 0x_0999_3333_0000;
 const BLK_QUEUE_VA: u64 = 0x_0999_4444_0000;
 const BLK_REQBUF_VA: u64 = 0x_0999_5555_0000;
@@ -87,10 +104,6 @@ const FS_REQUEST_PORT: usize = 8;
 const FS_RESPONSE_PORT: usize = 9;
 const FS_WRITE_REQUEST_PORT: usize = 10;
 
-// Must match `blk-driver-host/src/main.rs`'s own
-// `FS_WRITE_STATUS_OK`/`FS_WRITE_STATUS_BAD_LENGTH`.
-const FS_WRITE_STATUS_OK: u8 = 0;
-
 const IPC_WRITE_LEN: usize = 512;
 fn ipc_write_pattern_byte(i: usize) -> u8 {
     b'z' - (i % 26) as u8
@@ -100,6 +113,16 @@ fn ipc_write_pattern_byte(i: usize) -> u8 {
 // and `kernel/tests/support/make_fat32_image.sh`'s fixture byte-for-byte.
 const EXPECTED_FILE_CONTENTS: &[u8] =
     b"RUNIX-FAT32-PROOF: this file was read from a real FAT32 filesystem.\n";
+
+// Matches `blk-driver-host/src/main.rs`'s own `BIG_FILE_LEN`/
+// `expected_big_file_byte` -- the second, independently-named file this
+// test requests over the *same* read port as `HELLO.TXT`, proving the
+// dynamic-filename lookup actually varies by request rather than always
+// resolving to whatever `blk-driver-host` happened to locate at boot.
+const BIG_FILE_LEN: usize = 3000;
+fn expected_big_file_byte(i: usize) -> u8 {
+    b'0' + (i % 10) as u8
+}
 
 #[repr(C)]
 struct BlkBootInfo {
@@ -216,7 +239,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     let now = runix_kernel::interrupts::ticks();
     let signing_key = runix_kernel::capabilities::demo_signing_key();
-    let blk_token = runix_capability_manager::CapabilityToken::issue(
+    let blk_token = CapabilityToken::issue(
         "blk-driver-host",
         runix_kernel::capabilities::ioport_range_resource(io_base, 0x20),
         now,
@@ -227,7 +250,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // The second capability `blk-driver-host` needs to reply at all —
     // `Thread::extra_capabilities`'s whole reason for existing (see
     // `kernel/src/scheduler.rs`'s doc comment).
-    let response_token = runix_capability_manager::CapabilityToken::issue(
+    let response_token = CapabilityToken::issue(
         "blk-driver-host",
         runix_kernel::capabilities::port_resource(FS_RESPONSE_PORT),
         now,
@@ -299,73 +322,156 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "blk_fs_ipc: unauthorized send correctly denied, no response leaked (capability gate OK)"
     );
 
-    // Positive case: a thread holding a capability scoped to exactly the
-    // request port.
-    let request_token = runix_capability_manager::CapabilityToken::issue(
-        "test-requester",
-        runix_kernel::capabilities::port_resource(FS_REQUEST_PORT),
-        now,
-        now + 1_000_000,
-        "demo-key",
-        &signing_key,
-    );
-    scheduler::spawn_with_capability(authorized_requester_thread, Some(request_token));
-
-    // Collect the 2-byte little-endian length header, then that many
-    // payload bytes, off the response port.
-    let mut response: Vec<u8> = Vec::new();
-    let mut expected_len: Option<usize> = None;
-    for _ in 0..4000 {
-        scheduler::yield_now();
-        let ret = unsafe {
-            runix_kernel::syscall::syscall(
-                runix_kernel::syscall::SYS_IPC_RECV,
-                FS_RESPONSE_PORT as u64,
-                0,
-                0,
-            )
-        };
-        if ret != u64::MAX {
-            response.push(ret as u8);
-        }
-        if expected_len.is_none() && response.len() >= 2 {
-            expected_len = Some(u16::from_le_bytes([response[0], response[1]]) as usize);
-        }
-        if let Some(len) = expected_len {
-            if response.len() >= 2 + len {
-                break;
-            }
-        }
-    }
-
-    let read_pass = match expected_len {
-        Some(len) if response.len() >= 2 + len => &response[2..2 + len] == EXPECTED_FILE_CONTENTS,
-        _ => false,
+    // Structural gap closed: dynamic filenames + per-request authorization.
+    // A port-level capability (`port_resource(FS_REQUEST_PORT)`) is now
+    // only a coarse "may talk to the filesystem service at all" grant --
+    // which *file* that talking is allowed to touch is authorized
+    // separately, per request, by a `CapabilityToken` scoped to
+    // `file:<name>` that `blk-driver-host` itself verifies
+    // (`verify_file_token`). Every case below issues its own fresh
+    // port-level token (a real system would let many callers share one,
+    // but a fresh one per case keeps each proof independent) plus
+    // whatever file-scoped token that case actually needs.
+    let request_port_token = |subject: &str| {
+        CapabilityToken::issue(
+            subject,
+            runix_kernel::capabilities::port_resource(FS_REQUEST_PORT),
+            now,
+            now + 1_000_000,
+            "demo-key",
+            &signing_key,
+        )
+    };
+    let write_port_token = |subject: &str| {
+        CapabilityToken::issue(
+            subject,
+            runix_kernel::capabilities::port_resource(FS_WRITE_REQUEST_PORT),
+            now,
+            now + 1_000_000,
+            "demo-key",
+            &signing_key,
+        )
+    };
+    let file_token = |subject: &str, file_name: &str| {
+        CapabilityToken::issue(
+            subject,
+            runix_kernel::capabilities::file_resource(file_name),
+            now,
+            now + 1_000_000,
+            "demo-key",
+            &signing_key,
+        )
     };
 
-    if read_pass {
+    // Case 1 (item 1 -- dynamic filenames): read `HELLO.TXT` by name over
+    // the same request port Phase 3/8 already proved, now carrying a real
+    // `FsRequest::Read` instead of a fixed trigger byte.
+    let hello_token = file_token("test-hello", "HELLO.TXT");
+    let hello_request = FsRequest::Read {
+        name: String::from("HELLO.TXT"),
+        token: hello_token,
+    };
+    send_fs_request(
+        FS_REQUEST_PORT,
+        request_port_token("test-hello"),
+        hello_request.encode(),
+    );
+    let hello_response = recv_fs_response(40000);
+    let hello_pass = matches!(&hello_response, Some(FsResponse::Data(bytes)) if bytes.as_slice() == EXPECTED_FILE_CONTENTS);
+    if hello_pass {
         serial_println!(
-            "blk_fs_ipc: authorized read got the exact file bytes back over capability-gated IPC"
+            "blk_fs_ipc: authorized dynamic read of HELLO.TXT got the exact file bytes back"
         );
     } else {
         serial_println!(
-            "blk_fs_ipc: FAIL — authorized read did not produce the expected response \
-             (expected_len={:?}, got {} bytes)",
-            expected_len,
-            response.len()
+            "blk_fs_ipc: FAIL — dynamic read of HELLO.TXT did not produce the expected response \
+             (got {:?})",
+            hello_response
         );
         exit_qemu(QemuExitCode::Failed);
     }
 
-    // Filesystem driver, Phase 8, negative case: same shape as the
-    // unauthorized-read check above, now for the write port -- this
-    // thread holds no capability for `FS_WRITE_REQUEST_PORT` either, so
-    // even a well-formed write request must never reach the channel.
+    // Case 2 (item 1, continued -- a *second*, different file over the
+    // *same* server instance and the *same* port, proving this driver's
+    // lookup genuinely varies per request rather than always resolving to
+    // whatever it happened to locate once at boot): `BIG.TXT`.
+    let big_token = file_token("test-big", "BIG.TXT");
+    let big_request = FsRequest::Read {
+        name: String::from("BIG.TXT"),
+        token: big_token,
+    };
+    send_fs_request(
+        FS_REQUEST_PORT,
+        request_port_token("test-big"),
+        big_request.encode(),
+    );
+    let big_response = recv_fs_response(40000);
+    let big_pass = match &big_response {
+        Some(FsResponse::Data(bytes)) => {
+            bytes.len() == BIG_FILE_LEN
+                && bytes
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &b)| b == expected_big_file_byte(i))
+        }
+        _ => false,
+    };
+    if big_pass {
+        serial_println!(
+            "blk_fs_ipc: authorized dynamic read of BIG.TXT (a second, different file over the \
+             same port) got the exact file bytes back"
+        );
+    } else {
+        serial_println!(
+            "blk_fs_ipc: FAIL — dynamic read of BIG.TXT did not produce the expected response"
+        );
+        exit_qemu(QemuExitCode::Failed);
+    }
+
+    // Case 3 (item 2 -- per-caller dynamic authorization, the actual
+    // point): a caller with a perfectly valid *port-level* capability, but
+    // whose *file-scoped* token was minted for `HELLO.TXT`, requests
+    // `BIG.TXT` instead. If the coarse port-level gate were the only
+    // authorization checked, this would succeed -- it must not.
+    let mismatched_token = file_token("test-mismatch", "HELLO.TXT");
+    let mismatched_request = FsRequest::Read {
+        name: String::from("BIG.TXT"),
+        token: mismatched_token,
+    };
+    send_fs_request(
+        FS_REQUEST_PORT,
+        request_port_token("test-mismatch"),
+        mismatched_request.encode(),
+    );
+    let mismatched_response = recv_fs_response(40000);
+    let mismatched_pass = matches!(
+        mismatched_response,
+        Some(FsResponse::Error(FsError::Unauthorized))
+    );
+    if mismatched_pass {
+        serial_println!(
+            "blk_fs_ipc: PASS — a valid port-level capability with a file-token scoped to a \
+             *different* file was correctly denied (Unauthorized), not served BIG.TXT's \
+             contents (per-caller dynamic authorization OK)"
+        );
+    } else {
+        serial_println!(
+            "blk_fs_ipc: FAIL — a mismatched file-scoped token was not denied \
+             (got {:?}, expected Error(Unauthorized))",
+            mismatched_response
+        );
+        exit_qemu(QemuExitCode::Failed);
+    }
+
+    // Filesystem driver, Phase 8, negative case, generalized: same shape
+    // as the unauthorized-read check above, now for the write port --
+    // this thread holds no capability for `FS_WRITE_REQUEST_PORT` at all,
+    // so even a well-formed write request must never reach the channel.
     let write_denied = unsafe {
         runix_kernel::syscall::syscall(
             runix_kernel::syscall::SYS_IPC_SEND,
             FS_WRITE_REQUEST_PORT as u64,
-            (IPC_WRITE_LEN as u16).to_le_bytes()[0] as u64,
+            1,
             0,
         )
     };
@@ -379,24 +485,156 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     serial_println!("blk_fs_ipc: unauthorized write correctly denied (capability gate OK)");
 
-    // Positive case: a thread holding a capability scoped to exactly the
-    // write port sends a real 512-byte payload — the same "one port, one
-    // capability, one file" scoping the read path already has, now
-    // proven for a second, independently-gated file operation in the
-    // same running server loop (Phase 8's actual point: more than one
-    // request, more than one file, in a single boot).
-    let write_token = runix_capability_manager::CapabilityToken::issue(
-        "test-writer",
-        runix_kernel::capabilities::port_resource(FS_WRITE_REQUEST_PORT),
-        now,
-        now + 1_000_000,
-        "demo-key",
-        &signing_key,
+    // Case 4 (item 2, write path): a valid port-level capability, but a
+    // file-scoped token minted for the wrong file (`HELLO.TXT` instead of
+    // `WRITE.TXT`) -- must be denied, and must not touch the disk.
+    let mismatched_write_token = file_token("test-write-mismatch", "HELLO.TXT");
+    let mut mismatched_payload = alloc::vec![0u8; IPC_WRITE_LEN];
+    for (i, byte) in mismatched_payload.iter_mut().enumerate() {
+        *byte = ipc_write_pattern_byte(i);
+    }
+    let mismatched_write_request = FsRequest::Write {
+        name: String::from("WRITE.TXT"),
+        token: mismatched_write_token,
+        data: mismatched_payload,
+    };
+    send_fs_request(
+        FS_WRITE_REQUEST_PORT,
+        write_port_token("test-write-mismatch"),
+        mismatched_write_request.encode(),
     );
-    scheduler::spawn_with_capability(authorized_writer_thread, Some(write_token));
+    let mismatched_write_response = recv_fs_response(40000);
+    let mismatched_write_pass = matches!(
+        mismatched_write_response,
+        Some(FsResponse::Error(FsError::Unauthorized))
+    );
+    if mismatched_write_pass {
+        serial_println!(
+            "blk_fs_ipc: PASS — a write request with a file-token scoped to the wrong file was \
+             correctly denied (Unauthorized), not written to WRITE.TXT"
+        );
+    } else {
+        serial_println!(
+            "blk_fs_ipc: FAIL — a mismatched write file-token was not denied \
+             (got {:?}, expected Error(Unauthorized))",
+            mismatched_write_response
+        );
+        exit_qemu(QemuExitCode::Failed);
+    }
 
-    let mut write_status: Option<u8> = None;
-    for _ in 0..4000 {
+    // Positive case: a thread holding a capability scoped to exactly the
+    // write port *and* a file-scoped token that actually matches
+    // `WRITE.TXT` sends a real 512-byte payload -- the same "one file, one
+    // matching token" scoping the read path already proved, now for the
+    // write path, over the same server loop that already served three
+    // reads and one denied write in this same boot.
+    let write_token = file_token("test-writer", "WRITE.TXT");
+    let mut write_payload = alloc::vec![0u8; IPC_WRITE_LEN];
+    for (i, byte) in write_payload.iter_mut().enumerate() {
+        *byte = ipc_write_pattern_byte(i);
+    }
+    let write_request = FsRequest::Write {
+        name: String::from("WRITE.TXT"),
+        token: write_token,
+        data: write_payload,
+    };
+    send_fs_request(
+        FS_WRITE_REQUEST_PORT,
+        write_port_token("test-writer"),
+        write_request.encode(),
+    );
+    let write_response = recv_fs_response(40000);
+    let write_pass = matches!(write_response, Some(FsResponse::Ok));
+
+    if write_pass {
+        serial_println!(
+            "blk_fs_ipc: PASS — an authorized writer (matching port *and* file-scoped tokens) \
+             overwrote WRITE.TXT over capability-gated IPC, and the same server loop served \
+             two dynamically-named reads, two denied mismatched-token attempts, and one \
+             authorized write in one boot"
+        );
+        exit_qemu(QemuExitCode::Success);
+    } else {
+        serial_println!(
+            "blk_fs_ipc: FAIL — authorized write did not report success (got {:?})",
+            write_response
+        );
+        exit_qemu(QemuExitCode::Failed);
+    }
+}
+
+/// Encodes and sends `bytes` (an already-encoded [`FsRequest`]) one byte
+/// per `SYS_IPC_SEND` syscall on `port`, from a freshly spawned thread
+/// holding `port_token` -- the same per-syscall capability check every
+/// other sender in this codebase goes through, now carrying a real
+/// multi-byte structured message instead of a single trigger byte. Reuses
+/// one pair of statics across sequential calls (never two calls in
+/// flight at once in this test -- every call here is followed by a full
+/// [`recv_fs_response`] wait before the next one starts), the same
+/// "no real concurrency in this test, so no real synchronization needed
+/// yet" posture `run_fs_ipc_server`'s own doc comment names as still open
+/// in general.
+fn send_fs_request(port: usize, port_token: CapabilityToken, bytes: Vec<u8>) {
+    #[allow(static_mut_refs)]
+    unsafe {
+        PENDING_SEND_PORT = port;
+        PENDING_SEND_BYTES = bytes;
+    }
+    scheduler::spawn_with_capability(send_request_thread, Some(port_token));
+}
+
+static mut PENDING_SEND_PORT: usize = 0;
+static mut PENDING_SEND_BYTES: Vec<u8> = Vec::new();
+
+extern "C" fn send_request_thread() -> ! {
+    // Copies both statics into locals *before* doing anything else, so
+    // `send_fs_request` is free to overwrite them for its next call the
+    // moment this thread has started running -- this thread never touches
+    // either static again afterward.
+    #[allow(static_mut_refs)]
+    let (port, bytes) = unsafe { (PENDING_SEND_PORT, core::mem::take(&mut PENDING_SEND_BYTES)) };
+    serial_println!(
+        "blk_fs_ipc: send_request_thread starting, port={} len={}",
+        port,
+        bytes.len()
+    );
+    let mut sent = 0usize;
+    let mut denied = 0usize;
+    for byte in bytes {
+        let ret = unsafe {
+            runix_kernel::syscall::syscall(
+                runix_kernel::syscall::SYS_IPC_SEND,
+                port as u64,
+                byte as u64,
+                0,
+            )
+        };
+        if ret == u64::MAX {
+            denied += 1;
+        } else {
+            sent += 1;
+        }
+    }
+    serial_println!(
+        "blk_fs_ipc: send_request_thread done, port={} sent={} denied={}",
+        port,
+        sent,
+        denied
+    );
+    loop {
+        scheduler::yield_now();
+    }
+}
+
+/// Accumulates bytes off [`FS_RESPONSE_PORT`] until [`FsResponse::decode`]
+/// reports a complete message, or `max_iters` polls pass with nothing
+/// decodable -- same bounded-wait discipline every other poll loop in this
+/// codebase uses, generalized from a fixed-shape reply
+/// (`kernel/tests/blk_fs_ipc.rs`'s previous length-header-then-bytes
+/// parsing) to a real typed decode.
+fn recv_fs_response(max_iters: u32) -> Option<FsResponse> {
+    let mut buf: Vec<u8> = Vec::new();
+    for _ in 0..max_iters {
         scheduler::yield_now();
         let ret = unsafe {
             runix_kernel::syscall::syscall(
@@ -407,73 +645,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             )
         };
         if ret != u64::MAX {
-            write_status = Some(ret as u8);
-            break;
+            buf.push(ret as u8);
+            if let Some((response, _consumed)) = FsResponse::decode(&buf) {
+                return Some(response);
+            }
         }
     }
-
-    let write_pass = write_status == Some(FS_WRITE_STATUS_OK);
-    if write_pass {
-        serial_println!(
-            "blk_fs_ipc: PASS — an authorized writer overwrote WRITE.TXT over capability-gated \
-             IPC, and the same server loop served a read and a write in one boot (Phase 8)"
-        );
-        exit_qemu(QemuExitCode::Success);
-    } else {
-        serial_println!(
-            "blk_fs_ipc: FAIL — authorized write did not report success (status={:?})",
-            write_status
-        );
-        exit_qemu(QemuExitCode::Failed);
-    }
-}
-
-extern "C" fn authorized_requester_thread() -> ! {
-    unsafe {
-        runix_kernel::syscall::syscall(
-            runix_kernel::syscall::SYS_IPC_SEND,
-            FS_REQUEST_PORT as u64,
-            1,
-            0,
-        );
-    }
-    loop {
-        scheduler::yield_now();
-    }
-}
-
-/// Sends a real write request: 2-byte little-endian length header, then
-/// `IPC_WRITE_LEN` payload bytes, one `SYS_IPC_SEND` per byte — matching
-/// `blk-driver-host`'s `handle_write_ipc_request` wire format exactly
-/// (the destination port already names the operation, so there's no
-/// separate opcode byte).
-extern "C" fn authorized_writer_thread() -> ! {
-    let len_bytes = (IPC_WRITE_LEN as u16).to_le_bytes();
-    unsafe {
-        runix_kernel::syscall::syscall(
-            runix_kernel::syscall::SYS_IPC_SEND,
-            FS_WRITE_REQUEST_PORT as u64,
-            len_bytes[0] as u64,
-            0,
-        );
-        runix_kernel::syscall::syscall(
-            runix_kernel::syscall::SYS_IPC_SEND,
-            FS_WRITE_REQUEST_PORT as u64,
-            len_bytes[1] as u64,
-            0,
-        );
-        for i in 0..IPC_WRITE_LEN {
-            runix_kernel::syscall::syscall(
-                runix_kernel::syscall::SYS_IPC_SEND,
-                FS_WRITE_REQUEST_PORT as u64,
-                ipc_write_pattern_byte(i) as u64,
-                0,
-            );
-        }
-    }
-    loop {
-        scheduler::yield_now();
-    }
+    None
 }
 
 /// Same as `kernel/src/main.rs`'s function of the same name.

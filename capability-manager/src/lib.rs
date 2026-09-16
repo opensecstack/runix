@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// old-format signature against new-format field semantics (or vice versa).
 const CANONICAL_VERSION: &str = "v1";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityToken {
     pub subject: String,
     pub resource: String,

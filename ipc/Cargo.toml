@@ -19,6 +19,13 @@ publish.workspace = true
 # consumers get automatically.
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", optional = true }
+# `fs`'s wire format embeds a real `CapabilityToken` on every request
+# (see that module's doc comment) rather than a hand-rolled parallel
+# authorization payload — same no_std + alloc-only dependency shape this
+# crate's own `sockets` module already requires, so a freestanding ring 3
+# binary like `blk-driver-host` can depend on this with
+# `default-features = false` and still get both modules.
+runix-capability-manager = { path = "../capability-manager" }
 
 [features]
 default = ["std"]

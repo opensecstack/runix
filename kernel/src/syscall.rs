@@ -21,6 +21,15 @@ pub const SYS_IPC_SEND: u64 = 2; // rdi = port, rsi = byte
 pub const SYS_IPC_RECV: u64 = 3; // rdi = port -> byte in rax, or u64::MAX if empty
 pub const SYS_PORT_IN: u64 = 4; // rdi = I/O port, rsi = width (1/2/4) -> value in rax, or u64::MAX if denied/bad width
 pub const SYS_PORT_OUT: u64 = 5; // rdi = I/O port, rsi = width (1/2/4), rdx = value -> 0 ok, u64::MAX if denied/bad width
+/// Returns `interrupts::ticks()` (PIT ticks since boot) in rax — no
+/// capability gate, same reasoning `SYS_YIELD` has none: a monotonic tick
+/// count isn't privileged data on its own, and a ring 3 process holding a
+/// [`runix_capability_manager::CapabilityToken`] that embeds an
+/// `expires_at` in the same tick units (e.g. `blk-driver-host`'s
+/// per-request file-capability check, `ipc::fs`'s doc comment) has no
+/// other way to learn "now" to check it against — it never gets raw PIT
+/// port I/O privilege the way the kernel itself does.
+pub const SYS_TICKS: u64 = 6;
 
 pub const VECTOR: u8 = 0x80;
 
@@ -100,6 +109,7 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             0
         }
         SYS_IPC_RECV => ipc::try_recv(arg1 as usize).map_or(u64::MAX, u64::from),
+        SYS_TICKS => crate::interrupts::ticks(),
         SYS_PORT_IN => {
             let port = arg1 as u16;
             let width = arg2 as u8;

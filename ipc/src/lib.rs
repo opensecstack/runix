@@ -23,4 +23,5 @@ mod envelope;
 #[cfg(feature = "std")]
 pub use envelope::Envelope;
 
+pub mod fs;
 pub mod sockets;
