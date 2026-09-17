@@ -293,6 +293,18 @@ jobs:
             echo "expected WRITE.TXT to start with zyxwv after blk_fs_ipc's IPC write proof, got: $actual" >&2
             exit 1
           fi
+      # Filesystem driver: concurrency/locking -- two client threads
+      # sending to the same FS_REQUEST_PORT with no yield between their
+      # spawns, proving the new SYS_IPC_SEND_LOCK/SYS_IPC_SEND_UNLOCK pair
+      # (kernel/src/ipc.rs's begin_send/end_send) actually serializes them
+      # instead of letting their byte streams interleave. Read-only, so no
+      # follow-up disk-state check is needed the way the write-path steps
+      # above have.
+      - name: cargo test blk_fs_concurrent (concurrent same-port requests via virtio-blk)
+        working-directory: kernel
+        run: |
+          RUNIX_BLK_IMG="$(pwd)/target/runix-fat32-test.img" \
+            cargo test --target x86_64-unknown-none --test blk_fs_concurrent
       # Phase 2b's real TCP client proof -- SLIRP has no built-in TCP
       # listener to connect to (confirmed during design research), so this
       # starts a real listener on the host first (kernel/tests/support/

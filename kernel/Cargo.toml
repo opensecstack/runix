@@ -139,6 +139,10 @@ harness = false
 name = "blk_fs_ipc"
 harness = false
 
+[[test]]
+name = "blk_fs_concurrent"
+harness = false
+
 [profile.dev]
 panic = "abort"
 

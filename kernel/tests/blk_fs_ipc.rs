@@ -570,10 +570,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 /// multi-byte structured message instead of a single trigger byte. Reuses
 /// one pair of statics across sequential calls (never two calls in
 /// flight at once in this test -- every call here is followed by a full
-/// [`recv_fs_response`] wait before the next one starts), the same
-/// "no real concurrency in this test, so no real synchronization needed
-/// yet" posture `run_fs_ipc_server`'s own doc comment names as still open
-/// in general.
+/// [`recv_fs_response`] wait before the next one starts). Every real
+/// sender, including this one, wraps its byte loop in
+/// `SYS_IPC_SEND_LOCK`/`SYS_IPC_SEND_UNLOCK` (`kernel::ipc`'s own doc
+/// comment) -- this test's own sends are already sequential, so the lock
+/// is a no-op contention-wise here, but `blk_fs_concurrent.rs` is the one
+/// that actually needs it, and there is exactly one correct calling
+/// convention, not two.
 fn send_fs_request(port: usize, port_token: CapabilityToken, bytes: Vec<u8>) {
     #[allow(static_mut_refs)]
     unsafe {
@@ -598,21 +601,34 @@ extern "C" fn send_request_thread() -> ! {
         port,
         bytes.len()
     );
+    let lock_denied = unsafe {
+        runix_kernel::syscall::syscall(runix_kernel::syscall::SYS_IPC_SEND_LOCK, port as u64, 0, 0)
+    } == u64::MAX;
     let mut sent = 0usize;
-    let mut denied = 0usize;
-    for byte in bytes {
-        let ret = unsafe {
+    let mut denied = if lock_denied { bytes.len() } else { 0 };
+    if !lock_denied {
+        for byte in bytes {
+            let ret = unsafe {
+                runix_kernel::syscall::syscall(
+                    runix_kernel::syscall::SYS_IPC_SEND,
+                    port as u64,
+                    byte as u64,
+                    0,
+                )
+            };
+            if ret == u64::MAX {
+                denied += 1;
+            } else {
+                sent += 1;
+            }
+        }
+        unsafe {
             runix_kernel::syscall::syscall(
-                runix_kernel::syscall::SYS_IPC_SEND,
+                runix_kernel::syscall::SYS_IPC_SEND_UNLOCK,
                 port as u64,
-                byte as u64,
                 0,
-            )
-        };
-        if ret == u64::MAX {
-            denied += 1;
-        } else {
-            sent += 1;
+                0,
+            );
         }
     }
     serial_println!(

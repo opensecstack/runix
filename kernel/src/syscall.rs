@@ -30,6 +30,28 @@ pub const SYS_PORT_OUT: u64 = 5; // rdi = I/O port, rsi = width (1/2/4), rdx = v
 /// other way to learn "now" to check it against — it never gets raw PIT
 /// port I/O privilege the way the kernel itself does.
 pub const SYS_TICKS: u64 = 6;
+/// rdi = port -> blocks (spin-yielding) until no other sender is mid-message
+/// on `port`, then claims it. Capability-gated identically to
+/// [`SYS_IPC_SEND`] (same `port:<n>` resource) — this is part of *sending*
+/// to a port, not a separate privilege. See `kernel::ipc`'s own doc comment
+/// for the exact interleaving hazard this pair of syscalls closes: a
+/// multi-byte message routinely exceeds the channel's own capacity, so a
+/// caller sending one without holding this lock across the whole send loop
+/// can have its bytes interleaved with a second, concurrent sender's on the
+/// same port.
+pub const SYS_IPC_SEND_LOCK: u64 = 7;
+/// rdi = port -> releases the lock claimed by an earlier [`SYS_IPC_SEND_LOCK`]
+/// on the same port from the same thread. Capability-gated identically to
+/// [`SYS_IPC_SEND_LOCK`]/[`SYS_IPC_SEND`] — not a symmetry nicety: without
+/// this check, a caller with *no* capability for the port could still
+/// release a lock it never held, letting some other, legitimately
+/// authorized sender start mid-message while the actual lock holder isn't
+/// done yet, reopening the interleaving hazard this whole mechanism exists
+/// to close via an unauthenticated caller instead of a race between two
+/// authorized ones. An unpaired unlock from a caller that *is* authorized
+/// is still just a caller bug, not further distinguished — same
+/// "no distinguishable failure" posture the rest of this ABI already has.
+pub const SYS_IPC_SEND_UNLOCK: u64 = 8;
 
 pub const VECTOR: u8 = 0x80;
 
@@ -66,6 +88,31 @@ pub unsafe extern "C" fn entry() {
     );
 }
 
+/// Shared by [`SYS_IPC_SEND`] and [`SYS_IPC_SEND_LOCK`] — locking a port's
+/// send lock is part of the act of sending to it, not a separate privilege,
+/// so both check the exact same `port:<n>` capability [`SYS_IPC_SEND`]
+/// always has. Pulled out once both syscalls needed it, rather than a
+/// second hand-copied version of the same check.
+fn authorized_for_port(port: usize) -> bool {
+    let resource = crate::capabilities::port_resource(port);
+    let now = crate::interrupts::ticks();
+    let token_authorizes = |token: &runix_capability_manager::CapabilityToken| {
+        !crate::capabilities::is_revoked(token)
+            && crate::capabilities::check(token, &resource, now).is_ok()
+    };
+    // Most threads carry exactly one capability (`current_capability()`) —
+    // `current_extra_capabilities()` is only ever non-empty for a thread
+    // spawned via `spawn_ring3_process_with_capabilities` (e.g.
+    // `blk-driver-host`, authorized for both its own device I/O *and* the
+    // reply port it serves filesystem requests over), so checking it is a
+    // no-op allocation-and-empty-scan for every other thread in this
+    // kernel.
+    crate::scheduler::current_capability().is_some_and(|token| token_authorizes(&token))
+        || crate::scheduler::current_extra_capabilities()
+            .iter()
+            .any(token_authorizes)
+}
+
 extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     match num {
         SYS_YIELD => {
@@ -78,26 +125,7 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         }
         SYS_IPC_SEND => {
             let port = arg1 as usize;
-            let resource = crate::capabilities::port_resource(port);
-            let now = crate::interrupts::ticks();
-            let token_authorizes = |token: &runix_capability_manager::CapabilityToken| {
-                !crate::capabilities::is_revoked(token)
-                    && crate::capabilities::check(token, &resource, now).is_ok()
-            };
-            // Most threads carry exactly one capability
-            // (`current_capability()`) — `current_extra_capabilities()` is
-            // only ever non-empty for a thread spawned via
-            // `spawn_ring3_process_with_capabilities` (e.g.
-            // `blk-driver-host`, authorized for both its own device I/O
-            // *and* the reply port it serves filesystem requests over), so
-            // checking it is a no-op allocation-and-empty-scan for every
-            // other thread in this kernel.
-            let authorized = crate::scheduler::current_capability()
-                .is_some_and(|token| token_authorizes(&token))
-                || crate::scheduler::current_extra_capabilities()
-                    .iter()
-                    .any(token_authorizes);
-            if !authorized {
+            if !authorized_for_port(port) {
                 // Denied: the send never reaches the channel — a thread
                 // with no (or an invalid/expired/wrong-resource) capability
                 // gets the same "nothing happened" signal as any other
@@ -106,6 +134,30 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                 return u64::MAX;
             }
             ipc::send(port, arg2 as u8);
+            0
+        }
+        SYS_IPC_SEND_LOCK => {
+            let port = arg1 as usize;
+            if !authorized_for_port(port) {
+                return u64::MAX;
+            }
+            ipc::begin_send(port);
+            0
+        }
+        SYS_IPC_SEND_UNLOCK => {
+            let port = arg1 as usize;
+            // Same capability check as `SYS_IPC_SEND_LOCK`, and for a
+            // sharper reason than symmetry: an *unauthorized* caller could
+            // otherwise release a lock it never held, letting a second,
+            // legitimate sender start mid-message while the thread that
+            // actually holds the lock still isn't done — reopening the
+            // exact interleaving hazard this pair of syscalls exists to
+            // close, just through a different, unauthenticated caller
+            // instead of a race between two authorized ones.
+            if !authorized_for_port(port) {
+                return u64::MAX;
+            }
+            ipc::end_send(port);
             0
         }
         SYS_IPC_RECV => ipc::try_recv(arg1 as usize).map_or(u64::MAX, u64::from),
