@@ -1,0 +1,72 @@
+# cargo-deny configuration — dependency supply-chain policy for Runix.
+#
+# Why this exists: citadel-integration will eventually depend on
+# opensecstack/sdk/rust (see docs/ROADMAP.md's Open Questions, and
+# opensecstack/opensecstack#34) to reach MARSHAL/WORM. That dependency sits
+# on the boot-time authorization path — a compromised or maliciously-updated
+# version of it doesn't just add a bug, it can make privileged actions
+# execute that governance was supposed to refuse. That's a meaningfully
+# higher-value supply-chain target than a typical crate (see the xz-utils/
+# liblzma backdoor for what a patient, trusted-maintainer supply-chain
+# attack on exactly this kind of dependency looks like), so it gets this
+# guardrail instead of relying on Cargo.lock pinning alone — pinning only
+# stops *future* malicious commits from being picked up automatically; it
+# does nothing if the version you first pin to is already compromised.
+#
+# Run via `cargo deny check` from each of this repo's independent manifest
+# roots — root workspace, kernel/, xtask/, grid-sandbox-host/,
+# net-driver-host/, blk-driver-host/, kernel-arm/ — since none of those are
+# members of the root `[workspace]` (see Cargo.toml's own comment on why).
+# See .github/workflows/ci.yml's `cargo-deny` job.
+
+[graph]
+all-features = true
+
+[advisories]
+# Fail the build on any known RustSec advisory anywhere in the dependency
+# graph (not just direct dependencies) — a compromised transitive
+# dependency is exactly the risk this file exists to catch.
+ignore = []
+
+[licenses]
+# Workspace default is Apache-2.0 (see CLAUDE.md, docs/ROADMAP.md).
+# CITADEL's own governance core is AGPL-3.0 *by design* on the
+# opensecstack side — correct for a network service Runix talks to, but
+# Runix itself must never *link* AGPL/other-copyleft code into its own
+# binaries, which would undermine citadel-integration's own Apache-2.0
+# analysis in docs/ROADMAP.md's Open Questions. An unlisted license fails
+# closed rather than silently passing.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate versions of the same crate are noise, not a security issue on
+# their own — warn, don't fail the build over them.
+multiple-versions = "warn"
+# A `*` version requirement accepts literally anything a dependency
+# publishes next, including a same-day malicious release — deny outright.
+wildcards = "deny"
+deny = []
+
+[sources]
+# Fail closed on anything not from crates.io or an explicitly allow-listed
+# git source. `allow-git` is deliberately empty today: nothing in this
+# codebase depends on a git source yet, and the day citadel-integration
+# adds opensecstack/sdk/rust as a git dependency, this file must be updated
+# (and reviewed) in the same change — never let a git dependency start
+# resolving silently just because deny.toml wasn't touched. Per
+# docs/ROADMAP.md's Open Questions, that dependency should be pinned to an
+# exact `rev` (commit), never a floating branch, when it's added.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

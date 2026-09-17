@@ -69,3 +69,36 @@ of Alpha's scope (and beyond it) is done, in progress, or not started.
   regardless. Tracked upstream:
   [opensecstack/opensecstack#34](https://github.com/opensecstack/opensecstack/issues/34).
   This is an external blocker, not something Runix's own roadmap controls.
+- **SDK dependency — supply-chain policy for when #34 unblocks this.** This
+  dependency sits on the boot-time authorization path: a compromised or
+  maliciously-updated version doesn't just add a bug, it can make MARSHAL
+  approve what governance was supposed to refuse — a higher-value
+  supply-chain target than a typical crate (see the xz-utils/liblzma
+  backdoor for the shape of attack this is meant to survive: a patient,
+  trusted-maintainer-over-years compromise of exactly this kind of
+  dependency). Two things decided now, ahead of the dependency actually
+  existing, so whoever adds it doesn't default to the convenient-but-risky
+  form under deadline pressure:
+  - **Pin to an exact `rev` (commit) or tag, never a floating branch.**
+    `Cargo.lock` alone only stops *future* malicious commits from being
+    picked up automatically on a `cargo update` — it does nothing if the
+    specific version first pinned is already compromised, so this is
+    necessary but not sufficient. `deny.toml`'s `[sources]` section
+    enforces this mechanically: `allow-git` is empty today, so *any* git
+    dependency fails CI closed until this file is updated (and reviewed)
+    in the same change that adds one.
+  - **Least-privilege capability scoping is the real mitigation, not
+    pinning.** Whatever process ends up holding the SDK client (`kernel/`
+    directly under Option 1, or a `desktop`/`mobile` user-space
+    CITADEL-proxy under Option 2 — see the SDK-dependency entry above)
+    must be granted only the capability token(s) it actually needs (e.g.
+    "talk to this one network endpoint"), never broad/ambient access —
+    the same rule this repo already applies everywhere else
+    (`capability-manager`). This has to be designed into whichever RFC
+    resolves #34's Option 1 vs Option 2 question, not retrofitted after a
+    broad-access client already exists and works.
+  - Every version bump of this specific dependency (once it exists)
+    should get its diff actually read, not just waved through by CI —
+    there's no independent third-party review forcing that scrutiny the
+    way an active open-source community sometimes provides, since Runix
+    and the SDK share a maintainer.

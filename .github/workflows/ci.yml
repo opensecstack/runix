@@ -7,6 +7,34 @@ on:
     branches: [main]
 
 jobs:
+  # Dependency supply-chain policy (deny.toml at repo root) — checked
+  # against every one of this repo's independent manifest roots, since
+  # none of kernel/xtask/grid-sandbox-host/net-driver-host/blk-driver-host/
+  # kernel-arm are members of the root `[workspace]` (see Cargo.toml's own
+  # comment on why) and each resolves its own dependency graph. See
+  # deny.toml's own doc comment for why this exists — not just "keep deps
+  # fresh," but specifically to catch a compromised/malicious dependency
+  # version before it lands, given citadel-integration will eventually
+  # depend on opensecstack/sdk/rust on the boot-time authorization path.
+  cargo-deny:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        manifest:
+          - .
+          - kernel
+          - xtask
+          - grid-sandbox-host
+          - net-driver-host
+          - blk-driver-host
+          - kernel-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --manifest-path ${{ matrix.manifest }}/Cargo.toml --config deny.toml
+
   # Every crate except kernel/ — see kernel/Cargo.toml's `[workspace]` stanza
   # for why it's a standalone package instead of a member here.
   host:
