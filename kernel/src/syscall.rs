@@ -125,6 +125,11 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         }
         SYS_IPC_SEND => {
             let port = arg1 as usize;
+            // Once a real `runix_citadel_integration::KerkeseTransport`
+            // implementation exists, a Gate-evaluation call would be
+            // inserted here, gated on the existing capability check
+            // (`authorized_for_port`) succeeding first — never in place of
+            // it.
             if !authorized_for_port(port) {
                 // Denied: the send never reaches the channel — a thread
                 // with no (or an invalid/expired/wrong-resource) capability
@@ -165,6 +170,10 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         SYS_PORT_IN => {
             let port = arg1 as u16;
             let width = arg2 as u8;
+            // Once a real `runix_citadel_integration::KerkeseTransport`
+            // implementation exists, a Gate-evaluation call would be
+            // inserted here, gated on the existing capability check
+            // (`authorized_for_ioport`) succeeding first.
             if !crate::capabilities::authorized_for_ioport(port, crate::interrupts::ticks()) {
                 return u64::MAX;
             }
@@ -185,6 +194,10 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             let port = arg1 as u16;
             let width = arg2 as u8;
             let value = arg3;
+            // Once a real `runix_citadel_integration::KerkeseTransport`
+            // implementation exists, a Gate-evaluation call would be
+            // inserted here, gated on the existing capability check
+            // (`authorized_for_ioport`) succeeding first.
             if !crate::capabilities::authorized_for_ioport(port, crate::interrupts::ticks()) {
                 return u64::MAX;
             }

@@ -105,6 +105,11 @@ pub struct SpawnedInstance {
 /// `instance_id` — never reusing one instance's authorization decision or
 /// capability token for another, even though every instance loads the exact
 /// same binary.
+///
+/// Once a real `runix_citadel_integration::KerkeseTransport` implementation
+/// exists, a Gate-evaluation call for this instance's tier assignment would
+/// be inserted here, gated on the existing `citadel::demo_authorize_instance`
+/// allowlist check succeeding first.
 pub fn spawn_instance(
     instance_id: &str,
     tier: SandboxTier,

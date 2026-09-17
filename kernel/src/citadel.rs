@@ -63,6 +63,10 @@ fn demo_allowlist(module_id: &str, module_bytes: &[u8], tier: SandboxTier) -> Bo
 /// `module_bytes`, under an allowlist that authorizes exactly that module at
 /// `tier` — proving the crate's own `authorize_module_load` accepts what it
 /// should, and returns the tier a successful authorization carries.
+///
+/// Once a real `runix_citadel_integration::KerkeseTransport` implementation
+/// exists, a Gate-evaluation call would be inserted here, gated on the
+/// existing `authorize_module_load` allowlist check succeeding first.
 pub fn demo_authorize(
     module_id: &str,
     module_bytes: &[u8],
@@ -124,6 +128,10 @@ fn demo_instance_allowlist(
 /// `grid_sandbox::spawn_instance` calls once per spawned instance, never
 /// reusing one grant across instances (see [`demo_instance_allowlist`]'s doc
 /// comment).
+///
+/// Once a real `runix_citadel_integration::KerkeseTransport` implementation
+/// exists, a Gate-evaluation call would be inserted here, gated on the
+/// existing `authorize_instance_load` allowlist check succeeding first.
 pub fn demo_authorize_instance(
     module_id: &str,
     instance_id: &str,

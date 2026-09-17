@@ -38,6 +38,16 @@
 //! `opensecstack/opensecstack#34` for the still-open question of what a
 //! *runtime* (non-boot) MARSHAL client looks like for Beta's user-space
 //! processes, once there's a network stack and something ring-3 to gate.
+//!
+//! [`KerkeseTransport`] is the documented future extension point for that
+//! still-open question: `opensecstack/opensecstack#34` proposes resolving
+//! it with a `no_std` core crate (`opensecstack/sdk/rust`, not yet
+//! published) that builds/signs a Kerkese envelope and parses MARSHAL's
+//! decision, calling out through a transport trait for the actual network
+//! I/O. `KerkeseTransport` is that trait's shape, defined here so kernel/
+//! desktop/mobile call sites that will eventually need to gate on a live
+//! Gate decision have something stable to code against — see its own doc
+//! comment for exactly what it is and (emphatically) is not today.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -51,6 +61,71 @@ use core::fmt;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+/// The boundary a future `opensecstack/sdk/rust` dependency's `no_std`
+/// Kerkese core would call through, once `opensecstack/opensecstack#34`
+/// resolves: that crate is expected to own envelope construction/signing
+/// and decision-parsing, and call out through something shaped like this
+/// trait to actually put bytes on a wire and get a response back.
+///
+/// **This is not wired into any real authorization path today, and there is
+/// no implementation of it anywhere in this codebase — not a mock, not a
+/// stub, not behind a test or feature flag.** It exists only so kernel/
+/// desktop/mobile call sites (see e.g. `kernel/src/syscall.rs`'s
+/// `SYS_IPC_SEND`/`SYS_PORT_IN`/`SYS_PORT_OUT`, `kernel/src/grid_sandbox.rs`'s
+/// `spawn_instance`, and `kernel/src/citadel.rs`'s `demo_authorize`/
+/// `demo_authorize_instance`) have a stable shape to code against once the
+/// real `opensecstack/sdk/rust` dependency lands. Until then, boot-time
+/// module authorization continues to work exactly as described above:
+/// offline signature verification, no network round-trip, no live Gate
+/// decision.
+pub trait KerkeseTransport {
+    /// Submits `envelope_bytes` (a JSON-encoded Kerkese envelope, built and
+    /// signed by the future `no_std` Kerkese core, not by this trait) to
+    /// MARSHAL and returns the raw response body bytes (expected to decode
+    /// as a JSON Decision) on success. This trait only concerns itself with
+    /// getting bytes to MARSHAL and back — it has no opinion on envelope
+    /// format, decision semantics, or `REFUSE`/`HARD_STOP` handling, all of
+    /// which belong to the Kerkese core that would call through it (in the
+    /// real crate, a free `submit_kerkese<T: KerkeseTransport>` function
+    /// does that JSON encode/decode around the transport call — the
+    /// transport trait itself never touches typed Kerkese/Decision values).
+    fn submit(&self, envelope_bytes: &[u8]) -> Result<Vec<u8>, TransportError>;
+}
+
+/// Why a [`KerkeseTransport::submit`] call failed to produce a response.
+///
+/// Matches `opensecstack/sdk/rust`'s `citadel-kerkese-core::transport::TransportError`
+/// shape exactly (see that crate's `src/transport.rs` for the canonical
+/// definition) — not an independent design, so a future switch from this
+/// locally-defined trait to a real dependency on that crate is a type-alias
+/// swap, not a call-site rewrite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportError {
+    /// The transport could not deliver the request at all (connection
+    /// refused, no route, link down, etc).
+    Unreachable(String),
+    /// The transport delivered the request but did not get a usable
+    /// response back in time.
+    Timeout,
+    /// The transport delivered the request and got a response, but the
+    /// response was not a well-formed MARSHAL Decision (e.g. non-2xx HTTP
+    /// status, or a body this crate's caller couldn't otherwise interpret).
+    BadResponse(String),
+    /// Anything else, with a caller-supplied description.
+    Other(String),
+}
+
+impl fmt::Display for TransportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TransportError::Unreachable(msg) => write!(f, "transport unreachable: {msg}"),
+            TransportError::Timeout => f.write_str("transport timed out"),
+            TransportError::BadResponse(msg) => write!(f, "bad response from transport: {msg}"),
+            TransportError::Other(msg) => write!(f, "transport error: {msg}"),
+        }
+    }
+}
 
 /// Canonical-form version prefix — same convention as
 /// `capability-manager::CapabilityToken`. Bump if the signed field set or
@@ -692,6 +767,16 @@ mod tests {
 
     fn test_key() -> SigningKey {
         SigningKey::generate(&mut OsRng)
+    }
+
+    /// Structural check only: confirms `KerkeseTransport` is object-safe
+    /// (usable as `dyn KerkeseTransport`), which is what a real call site
+    /// will need once an implementation exists. Deliberately does not
+    /// implement the trait — see its own doc comment for why no
+    /// implementation, mock or otherwise, belongs in this codebase yet.
+    #[test]
+    fn kerkese_transport_is_object_safe() {
+        fn _assert_object_safe(_: &dyn KerkeseTransport) {}
     }
 
     #[test]
