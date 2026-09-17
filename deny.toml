@@ -26,7 +26,15 @@ all-features = true
 # Fail the build on any known RustSec advisory anywhere in the dependency
 # graph (not just direct dependencies) — a compromised transitive
 # dependency is exactly the risk this file exists to catch.
-ignore = []
+ignore = [
+    # paste (proc-macro helper, compile-time only) is pulled in
+    # transitively via wasmi_core -> wasmi -> wasm-runtime and is flagged
+    # unmaintained, not vulnerable (RUSTSEC-2024-0436) -- the advisory
+    # itself states no safe upgrade exists. Consciously accepted, not
+    # silently ignored: revisit if wasmi ever moves off it, or if this
+    # advisory is ever upgraded from "unmaintained" to an actual CVE.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 # Workspace default is Apache-2.0 (see CLAUDE.md, docs/ROADMAP.md).
@@ -38,6 +46,7 @@ ignore = []
 # closed rather than silently passing.
 allow = [
     "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
     "MIT",
     "BSD-2-Clause",
     "BSD-3-Clause",
@@ -54,7 +63,15 @@ confidence-threshold = 0.8
 multiple-versions = "warn"
 # A `*` version requirement accepts literally anything a dependency
 # publishes next, including a same-day malicious release — deny outright.
+# Runix's own intra-workspace deps (desktop/ipc/mobile -> capability-
+# manager/wasm-runtime/citadel-integration) are path-only with no version,
+# which Cargo treats the same as a wildcard internally -- but there's no
+# "malicious future publish" risk there, since path deps resolve from this
+# same repo/commit, never a registry. `allow-wildcard-paths` is exactly
+# the documented escape hatch for that case, so this stays "deny" for
+# every real (registry) wildcard dependency.
 wildcards = "deny"
+allow-wildcard-paths = true
 deny = []
 
 [sources]
