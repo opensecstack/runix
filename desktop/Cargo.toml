@@ -12,6 +12,21 @@ publish.workspace = true
 runix-capability-manager = { path = "../capability-manager" }
 runix-wasm-runtime = { path = "../wasm-runtime" }
 runix-citadel-integration = { path = "../citadel-integration" }
+# Pinned to an exact `rev` (commit), never a floating branch — see
+# docs/ROADMAP.md's Open Questions and deny.toml's `[sources]` section,
+# which was updated in the same change that added this dependency.
+citadel-kerkese-core = { git = "https://github.com/opensecstack/opensecstack", rev = "c21aedcb5efcf3b8de7be5d0861d70a7fdcbbc69" }
+# default-tls (not rustls-tls): on Windows this resolves to native-tls's
+# `schannel` backend, which wraps the OS's SChannel APIs directly — no
+# external OpenSSL install or C compiler needed, unlike rustls-tls's `ring`
+# dependency (which needs a working `cc`/gcc and fails to build here; see
+# docs/BUILDING.md's Windows MSVC/GNU nightly gotcha for the same class of
+# issue).
+reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros"] }
 
 [lib]
 name = "runix_desktop"

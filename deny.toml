@@ -85,14 +85,12 @@ deny = []
 
 [sources]
 # Fail closed on anything not from crates.io or an explicitly allow-listed
-# git source. `allow-git` is deliberately empty today: nothing in this
-# codebase depends on a git source yet, and the day citadel-integration
-# adds opensecstack/sdk/rust as a git dependency, this file must be updated
-# (and reviewed) in the same change — never let a git dependency start
-# resolving silently just because deny.toml wasn't touched. Per
-# docs/ROADMAP.md's Open Questions, that dependency should be pinned to an
-# exact `rev` (commit), never a floating branch, when it's added.
+# git source. `allow-git` used to be deliberately empty (nothing in this
+# codebase depended on a git source), but `desktop` now depends on
+# opensecstack/sdk/rust's `citadel-kerkese-core` (see desktop/Cargo.toml),
+# pinned to an exact `rev` (commit), never a floating branch, per
+# docs/ROADMAP.md's Open Questions.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+allow-git = ["https://github.com/opensecstack/opensecstack"]
