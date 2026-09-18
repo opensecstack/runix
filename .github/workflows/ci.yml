@@ -215,6 +215,7 @@ jobs:
           cargo test --target x86_64-unknown-none --test grid_sandbox_tier_t3
           cargo test --target x86_64-unknown-none --test grid_sandbox_multi_instance
           cargo test --target x86_64-unknown-none --test citadel_demo
+          cargo test --target x86_64-unknown-none --test marshal_ipc_roundtrip
           cargo test --target x86_64-unknown-none --test net_driver_icmp
           cargo test --target x86_64-unknown-none --test net_driver_dhcp
           cargo test --target x86_64-unknown-none --test blk_driver_rw

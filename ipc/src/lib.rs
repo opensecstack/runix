@@ -24,4 +24,5 @@ mod envelope;
 pub use envelope::Envelope;
 
 pub mod fs;
+pub mod marshal;
 pub mod sockets;

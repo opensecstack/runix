@@ -23,6 +23,7 @@ pub mod gdt;
 pub mod grid_sandbox;
 pub mod interrupts;
 pub mod ipc;
+pub mod marshal_client;
 pub mod memory;
 pub mod pci;
 pub mod process;

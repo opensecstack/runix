@@ -16,9 +16,11 @@ publish = false
 [dependencies]
 # `default-features = false`: skips `runix-ipc`'s `std` feature (and
 # transitively `serde_json`, a hard-`std` dependency) -- this kernel has no
-# `std` at all. Only used by `kernel/tests/net_driver_sockets.rs` today
-# (the sockets IPC surface's typed wire format, `runix_ipc::sockets`), not
-# by the kernel's own runtime code.
+# `std` at all. Used by `kernel/tests/net_driver_sockets.rs` (the sockets
+# IPC surface's typed wire format, `runix_ipc::sockets`) and, now, by
+# `kernel/src/marshal_client.rs` (`runix_ipc::marshal`) -- the latter is
+# additive infrastructure not called from any real boot/authorization path
+# yet, see that module's own doc comment.
 runix-ipc = { path = "../ipc", default-features = false }
 bootloader_api = "0.11"
 spin = "0.9"
@@ -141,6 +143,10 @@ harness = false
 
 [[test]]
 name = "blk_fs_concurrent"
+harness = false
+
+[[test]]
+name = "marshal_ipc_roundtrip"
 harness = false
 
 [profile.dev]
