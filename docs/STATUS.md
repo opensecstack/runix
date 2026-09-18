@@ -240,17 +240,38 @@ initial default, not tuned against a real workload" honesty as
 `SandboxLimits`' own numbers.
 
 What this doesn't claim: no live MARSHAL Gate evaluation exists (still
-SDK-blocked, and not attempted here); T3's "evidence-gated" tier is
-approximated purely by resource strictness, not real VIGIL/WORM evidence
-collection (neither exists yet); still exactly one `grid-sandbox-host`
-instance, spawned once at boot — this makes that one instance's tier real
-and enforced, not multi-tenant; and `grid-sandbox-host` still has no
-capability-manager token the way `net-driver-host` does for port I/O — its
-only syscalls today (`SYS_YIELD`/`SYS_WRITE`) don't need kernel-mediated
-tier-gating, since enforcement happens inside the WASM engine itself,
-in-process. Revisit that last point if/when `grid-sandbox-host` gains a
-syscall that plausibly needs tier-gating (e.g. an IPC channel to a T1
-service).
+SDK-blocked — see the `citadel-integration`/MARSHAL narrative below for
+what's actually changed there); T3's "evidence-gated" tier is approximated
+purely by resource strictness, not real VIGIL evidence collection (VIGIL
+itself doesn't exist yet — though a real, local WORM log now does, see
+below); and `grid-sandbox-host` still has no capability-manager token the
+way `net-driver-host` does for port I/O — its only syscalls today
+(`SYS_YIELD`/`SYS_WRITE`) don't need kernel-mediated tier-gating, since
+enforcement happens inside the WASM engine itself, in-process. Revisit
+that last point if/when `grid-sandbox-host` gains a syscall that plausibly
+needs tier-gating (e.g. an IPC channel to a T1 service).
+
+**No longer true: "still exactly one `grid-sandbox-host` instance, spawned
+once at boot."** `kernel::grid_sandbox::spawn_instance(instance_id, tier,
+now, key)` is real multi-instance spawning, factored out of the original
+single-spawn boot path so it's callable N times — each call gets its own
+`AddressSpace`, its own *physically distinct* heap/stack/`GridBootInfo`
+frames (not just distinct virtual addresses reusing the same physical
+backing, which would have been a much cheaper, much less meaningful
+claim), and its own capability token scoped to that specific instance.
+Authorization moved with it: `citadel::demo_authorize_instance` checks a
+new `InstanceAllowlist`/`InstanceManifestEntry` (additive alongside the
+original `BootAllowlist` — existing single-instance boot call sites are
+untouched) so a second instance is authorized on its own signed manifest
+entry, not by silently inheriting the first instance's grant. That
+distinction matters for a concrete reason: once more than one instance
+can exist, one module-wide grant would have been ambient authority for
+every instance that module ever spawns — a real design point this commit
+addressed rather than deferred. Verified by `kernel/tests/
+grid_sandbox_multi_instance.rs`: two concurrent instances at *different*
+tiers, proving independent tier enforcement, genuinely distinct physical
+memory despite identical virtual addresses, and that neither instance's
+token authorizes the other's resources.
 
 **`capability-manager`** is no longer a stub either: `CapabilityToken`
 issuance and verification are real (Ed25519 over a canonical, pipe-joined
@@ -334,10 +355,72 @@ is never touched. Verified in QEMU: the real boot log shows
 loading and running to completion (its `wasmi`-hosted WASM module prints
 `"Hi"`, round-tripping through the syscall gate, exactly as
 `grid_sandbox_wasm.rs` already proved), before the boot thread continues
-on to `user_hello`. Real *runtime* MARSHAL/WORM/VIGIL integration (once Runix has running
+on to `user_hello`. Real *runtime* MARSHAL Gate integration (once Runix has running
 user-space processes to gate, not just boot-time module loads) remains
-Beta/RC work, blocked on the same external SDK gap as before — see
-[ROADMAP.md § Open questions](ROADMAP.md#open-questions).
+blocked on the same external SDK gap as before — see
+[ROADMAP.md § Open questions](ROADMAP.md#open-questions). What follows is
+everything that's actually changed on that front since — real movement,
+none of it yet a live Gate call.
+
+**A real local WORM evidence log — not the live MARSHAL binding, a
+narrower and honestly-scoped first piece of it.** `WormLog`/`WormEntry`
+(`citadel-integration/src/lib.rs`) is an append-only, hash-chained log —
+each entry's hash covers the previous entry's hash, so removing or
+editing a past entry breaks every hash after it, the same tamper-evidence
+property a real WORM log needs — recording every authorization decision
+(allow/deny, module or instance id, tier) as a side effect of both the
+original `BootAllowlist::authorize_module_load` and the new instance-level
+authorization below. Its own doc comment is explicit about the boundary:
+*local evidence collection only* — no signing, no network round-trip, no
+Gate semantics. It does not move the live-Gate blocker; it gives the
+eventual live Gate call something real to submit as evidence once that
+call exists.
+
+**Toward the actual blocker: a transport shape, a wire contract, and a
+first working implementation — in that order, each still one step short
+of a real Gate call.** Three commits move this forward, reconciled
+against `opensecstack/opensecstack`'s own drafted RFC-0005 rather than a
+guessed shape:
+
+1. `KerkeseTransport` trait + `TransportError` enum
+   (`citadel-integration/src/lib.rs`) — field-for-field matched against
+   the real `citadel-kerkese-core::transport::TransportError` shape, with
+   doc-comment-only markers at the three places a real Gate-evaluation
+   call would plausibly go (`kernel/src/syscall.rs`'s `SYS_IPC_SEND`/
+   `SYS_PORT_IN`/`SYS_PORT_OUT`, `grid_sandbox::spawn_instance`,
+   `citadel::demo_authorize`/`demo_authorize_instance`). No
+   implementation, not even a mock — a trait shape only.
+2. A kernel↔proxy wire contract (`ipc::marshal`'s `MarshalRequest`/
+   `MarshalResponse`, `kernel::marshal_client` on fixed ports 13/14,
+   reusing the per-port send lock above) — `MarshalOutcome`
+   (`Execute`/`Refuse`/`HardStop`) mirrors `citadel-kerkese-core`'s own
+   `Outcome` enum. Verified by `kernel/tests/marshal_ipc_roundtrip.rs`
+   against a *test-only* fake proxy thread that always answers `Refuse` —
+   chosen deliberately so that if this test scaffolding were ever
+   mistaken for real governance and left in a real path, it would fail
+   closed, not open.
+3. **A real, working HTTP `KerkeseTransport`** — `desktop::citadel::
+   transport::HttpKerkeseTransport`, the first genuinely external-facing
+   piece of this whole chain. `desktop/`'s `Cargo.toml` takes
+   `citadel-kerkese-core` as a real dependency, pinned to an exact
+   upstream commit (never a floating branch — `deny.toml`'s `allow-git`
+   now allow-lists exactly that one pinned source, matching the pinning
+   policy `ROADMAP.md`'s Open Questions section already committed to).
+   The transport bridges the trait's synchronous `submit` to async HTTP
+   over `reqwest` via a dedicated Tokio runtime, reads its target endpoint
+   from `RUNIX_CITADEL_URL` (never hardcoded), and fails closed with
+   `TransportError::Unreachable` *before any network I/O* if
+   unconfigured. Genuinely tested, not a stub: four tests against a
+   hand-rolled `std::net::TcpListener` mock server covering success,
+   not-configured, a non-2xx response, and connection-refused.
+
+None of this is wired into a real authorization path yet — `desktop/`
+has no call site that invokes `HttpKerkeseTransport` during an actual
+module load or instance spawn, and `kernel::marshal_client` has no caller
+outside its own roundtrip test. The honest summary: the external blocker
+went from "nothing to build against" to "a real upstream crate exists,
+pinned, and three of the pieces needed to call it are now real and
+tested" — genuine movement, not yet a resolved blocker.
 
 Two real bugs surfaced integrating `capability-manager` into `kernel/`,
 both worth knowing before touching crypto-heavy code here again:
@@ -1022,7 +1105,12 @@ user`, whether or not anything asks it for a lease) on the real boot path
 (`NetBootInfo::use_dhcp`, `kernel/tests/net_driver_dhcp.rs`) rather than
 the fixed `LOCAL_IP` `net_driver_icmp.rs`/`net_driver_tcp.rs`/
 `net_driver_sockets.rs` still deliberately use, so as not to disturb those
-tests' own static-address assumptions.
+tests' own static-address assumptions. One more real, if narrow, bug
+found getting DHCP's added dependency weight to build for
+`x86_64-unknown-none`: a `curve25519-dalek` LLVM codegen crash, the same
+class of SIMD-backend bug `kernel/.cargo/config.toml` already works
+around for `kernel/` itself — just missing from `net-driver-host/
+.cargo/config.toml`, which hadn't needed it until this dependency arrived.
 
 **The testing-rigor commitment, no longer just a commitment for later.**
 Everything verified in this kernel up to Phase 1 above was a hand-written
@@ -1545,14 +1633,14 @@ before any of the above is meaningful:
   shared, mutable state across a test run, same as every other
   write-adjacent phase's fixture-handling care already assumes.
 
-**Still not attempted, unchanged from Phase 6's own list**: growing the
-*directory* itself (create still only ever reuses an existing deleted
-slot), allocating or linking more than one cluster in a single grow/create
-call, the FSInfo sector's free-cluster-count/next-free hint (this driver
-always scans from cluster 2, so its own correctness doesn't depend on it,
-but a real OS reading this volume afterward would see a stale hint), any
-concurrency/locking around allocation (single-writer, same as every other
-write this driver performs).
+**Still not attempted immediately after Phase 7**: growing the *directory*
+itself, allocating or linking more than one cluster in a single
+grow/create call, and the FSInfo sector's free-cluster-count/next-free
+hint going stale — all three closed by Phase 9, below. Concurrency around
+IPC sends is closed by the section after that; the allocation path itself
+remains single-writer internally (nothing in this driver spawns concurrent
+allocations against itself), which is a narrower, still-accurate claim
+than "no concurrency/locking exists anywhere," which was too broad.
 
 **Filesystem driver, Phase 8: a first write-capable, multi-request IPC
 surface — Phase 3's syscall/IPC gap finally gets a real increment.**
@@ -1600,16 +1688,111 @@ this still-young protocol: `WRITE.TXT` shows the IPC write's own
 CI run. Passed on the first genuinely correct attempt, no debugging
 detours this time.
 
-**Still not attempted, explicitly**: arbitrary/dynamic filenames in the
-request (still one port per file, statically issued at spawn time — a
-real path-scoped resource string is the next trigger, not this one);
-create/delete/grow over IPC (Phase 7's riskier primitives stay
-internal-only); per-caller dynamic authorization (capabilities are still
-issued once at spawn time, not on demand); more than two files/requests
-types. `docs/THREAT_MODEL.md`'s revisit trigger for this surface is
-updated to reflect exactly this — closed on "one request only" and "one
-file only," still open on "arbitrary path" and "path-scoped capability
-convention."
+**Still not attempted immediately after Phase 8**: arbitrary/dynamic
+filenames in the request, per-caller dynamic authorization, and
+create/delete/grow over IPC. The first two are closed by Phase 10, below;
+create/delete/grow stay internal-only, deliberately — Phase 7's riskier
+primitives are not yet exposed to a caller that only proved it can name a
+file, not that it should be trusted with allocation/deallocation.
+
+**Filesystem driver, Phase 9: directory growth and multi-cluster
+allocation in one call — the two structural gaps Phase 7 named as its own
+next planning pass.** Both closed together because they share the same
+root cause: Phase 7's `find_deleted_slot` only ever recognized an
+`0xE5`-marked entry as reusable, and its allocation calls only ever
+reserved one cluster. A directory that was full but had *never* had a
+deletion — or a grow/create that needed more than one new cluster — both
+failed closed, correctly but not usefully.
+
+`find_deleted_slot` is replaced by `find_reusable_slot`, which recognizes
+**both** an `0xE5` deleted entry *and* the `0x00` end-of-directory
+sentinel — the latter case allocates and links a fresh directory cluster
+(zeroed, so it still ends in its own `0x00` sentinel), extending the
+directory chain the same way a file's chain gets extended, then reuses
+the first slot in the new cluster. `allocate_cluster_chain` replaces
+Phase 7's single-cluster `allocate_free_cluster` call sites with a real
+two-pass allocator: reserve N free clusters first (failing the whole
+operation closed if fewer than N exist, before touching any FAT entry),
+then link them into a chain — no half-linked chain is ever left behind on
+a failure partway through.
+
+Verified via a new `run_multi_cluster_grow_proof` (extends `MULTI.TXT` by
+700 bytes, spanning two brand-new clusters allocated and linked in a
+*single* call — deliberately distinct from Phase 7's `GROW.TXT`, which
+only ever needed one) and a new `run_directory_growth_proof`. The
+directory-growth fixture is deliberately adversarial, not incidental:
+`make_fat32_image.sh` now packs the root directory's first cluster to
+**exactly** 16 live entries (its full 512-byte capacity, 32 bytes each) —
+`HELLO.TXT`, `BIG.TXT`, `SUBDIR`, the long-filename entry, `WRITE.TXT`,
+`PARTIAL.TXT`, `GROW.TXT`, `DELETE_M.TXT`, `MULTI.TXT`, plus five
+one-line `FILL01.TXT`–`FILL05.TXT` filler files — so that by the time the
+directory-growth proof runs, Phase 7's own delete+create (net zero
+occupancy change) has left this cluster still genuinely full, forcing a
+real second cluster to be allocated rather than incidentally finding room
+left over from an earlier phase. Independently confirmed in CI: a real
+finding while wiring the check up — `mdir`'s space-padded 8.3 field
+format broke a naive `grep`/size check for `GROW.TXT` once `GROWDIR.TXT`
+also existed (a substring collision in the parsing, not a driver bug),
+fixed by tightening the match.
+
+**Filesystem driver, Phase 10: dynamic filenames over IPC, per-caller
+authorization, and a live FSInfo hint — the two gaps Phase 8 named as its
+own next trigger, plus one from even earlier.** `ipc/src/fs.rs` replaces
+Phase 8's "one port names one fixed file" protocol with a real typed
+message: `FsRequest::Read { name, token }` / `Write { name, data, token }`
+— an arbitrary filename *and* a real `CapabilityToken` embedded in every
+single request, not just a capability to reach the port at all.
+`blk-driver-host` calls `verify_file_token` on every request, checking the
+embedded token against the *specific named file* before touching disk —
+a second, per-request authorization layer sitting on top of (not instead
+of) the kernel's existing port-level `SYS_IPC_SEND` gate. This is the
+actual point of per-request authorization the port-level gate alone can't
+give: a caller can hold a perfectly valid capability for the port itself
+and still be denied for the file it names in a given request.
+
+Verified via `kernel/tests/blk_fs_ipc.rs`, extended past Phase 8's two
+cases into four: **two different files** (`HELLO.TXT`, `BIG.TXT`) served
+successfully over the *same* read port in one boot (Phase 8 could only
+ever serve the one file its port was wired to); a caller holding a
+genuinely valid port-level capability but a file-scoped token minted for
+a *different* file gets `FsError::Unauthorized`, not the file's contents
+— proven for both the read and the write path. Also closes the FSInfo
+sector's stale-hint gap named back in Phase 7: `allocate_cluster_chain`
+and the delete path now keep the FSInfo sector's free-cluster count in
+sync with every allocation and every free, so a real OS reading this
+volume afterward no longer sees a hint that lied about how much space Phase
+7–10's own writes actually consumed.
+
+**Filesystem driver: closing a concurrency hazard that lived in the IPC
+layer itself, not in this driver's own logic — the last item on Phase
+7's original list.** A real `FsRequest` (Phase 10's embedded
+`CapabilityToken` alone encodes past 1 KB) exceeds the IPC channel's
+32-byte `CHANNEL_CAPACITY`, so a sender's `SYS_IPC_SEND` loop has to block
+mid-message — which was exactly the scheduler's opportunity to interleave
+a second concurrent sender's bytes into the first message, producing a
+"franken-message" that still *decodes* as well-formed, just wrong. This
+was a real, previously-latent bug in `kernel/src/ipc.rs`'s send path, not
+something Phase 10's own logic introduced — it only became reachable once
+a message got large enough to need more than one blocking round.
+
+Fixed with a per-port advisory send lock: `kernel::ipc::begin_send`/
+`end_send`, exposed as two new capability-gated syscalls
+(`SYS_IPC_SEND_LOCK`/`SYS_IPC_SEND_UNLOCK`, checked through the same
+`authorized_for_port` gate `SYS_IPC_SEND` itself uses) — now the mandatory
+calling convention for any multi-byte send, documented directly in
+`kernel::ipc`'s own doc comment. Verified by a new
+`kernel/tests/blk_fs_concurrent.rs`: two client threads send real,
+different `FsRequest`s to the same port at the same time, and both get
+back their own exact, uncorrupted content — the test that would have
+failed, non-deterministically, before this fix.
+
+**Still not attempted, filesystem driver, current state**: allocating in
+response to concurrent *callers* racing each other (single-writer
+internally remains true — nothing in this driver itself spawns
+concurrent allocation attempts against itself; today's fix closes
+concurrent *senders*, not concurrent *allocators*); `blk-driver-host`'s
+own FAT32 parser still has no `cargo-fuzz` harness, only the `proptest`
+coverage below.
 
 **Real `cargo-fuzz`/libFuzzer harnesses — closing the gap this document
 named above ("No `cargo-fuzz`/libFuzzer harness exists yet").**
