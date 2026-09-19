@@ -149,6 +149,10 @@ harness = false
 name = "marshal_tcp_roundtrip"
 harness = false
 
+[[test]]
+name = "marshal_proxy_e2e"
+harness = false
+
 [profile.dev]
 panic = "abort"
 
