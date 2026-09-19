@@ -391,14 +391,25 @@ guessed shape:
    `citadel::demo_authorize`/`demo_authorize_instance`). No
    implementation, not even a mock — a trait shape only.
 2. A kernel↔proxy wire contract (`ipc::marshal`'s `MarshalRequest`/
-   `MarshalResponse`, `kernel::marshal_client` on fixed ports 13/14,
-   reusing the per-port send lock above) — `MarshalOutcome`
+   `MarshalResponse`) carried over a real TCP connection through the
+   sockets IPC surface (`ipc::sockets`, `net-driver-host`'s
+   `run_socket_ipc_server`) — `kernel::marshal_client` opens a socket,
+   connects it to a configurable remote IP/port, sends the encoded
+   request, and decodes the response with `MarshalResponse::decode`'s
+   already-resumable/streaming-safe parser. (An earlier version of this
+   module rode Runix's own internal port-channel IPC on fixed ports
+   13/14 instead — that only works between ring-3 processes the kernel
+   itself loaded inside the same boot image, and can't reach a real,
+   separate proxy process; reworked to use a real socket once that
+   limitation was identified.) `MarshalOutcome`
    (`Execute`/`Refuse`/`HardStop`) mirrors `citadel-kerkese-core`'s own
-   `Outcome` enum. Verified by `kernel/tests/marshal_ipc_roundtrip.rs`
-   against a *test-only* fake proxy thread that always answers `Refuse` —
-   chosen deliberately so that if this test scaffolding were ever
-   mistaken for real governance and left in a real path, it would fail
-   closed, not open.
+   `Outcome` enum. Verified by `kernel/tests/marshal_tcp_roundtrip.rs`
+   against a *test-only* Python listener (`tests/support/
+   marshal_proof_listener.py`) reached over a real TCP connection via
+   QEMU `guestfwd` — not a MARSHAL proxy or any stand-in for one, it
+   always answers `Refuse`, chosen deliberately so that if this test
+   scaffolding were ever mistaken for real governance and left in a real
+   path, it would fail closed, not open.
 3. **A real, working HTTP `KerkeseTransport`** — `desktop::citadel::
    transport::HttpKerkeseTransport`, the first genuinely external-facing
    piece of this whole chain. `desktop/`'s `Cargo.toml` takes

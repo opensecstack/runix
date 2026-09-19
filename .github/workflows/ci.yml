@@ -215,7 +215,6 @@ jobs:
           cargo test --target x86_64-unknown-none --test grid_sandbox_tier_t3
           cargo test --target x86_64-unknown-none --test grid_sandbox_multi_instance
           cargo test --target x86_64-unknown-none --test citadel_demo
-          cargo test --target x86_64-unknown-none --test marshal_ipc_roundtrip
           cargo test --target x86_64-unknown-none --test net_driver_icmp
           cargo test --target x86_64-unknown-none --test net_driver_dhcp
           cargo test --target x86_64-unknown-none --test blk_driver_rw
@@ -380,6 +379,20 @@ jobs:
           sleep 0.3
           RUNIX_NETDEV_ARG="user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9002" \
             cargo test --target x86_64-unknown-none --test net_driver_sockets_concurrent
+      # MARSHAL evaluation surface's socket-based transport
+      # (kernel::marshal_client) -- same `guestfwd`/listener setup as
+      # net_driver_tcp/net_driver_sockets above, bridged to
+      # marshal_proof_listener.py's port 9003 instead. That listener is not
+      # a MARSHAL proxy or any stand-in for one (see its own doc comment) --
+      # it only proves the MarshalRequest/MarshalResponse wire format
+      # survives a real TCP round trip through the sockets IPC surface.
+      - name: cargo test marshal_tcp_roundtrip (MARSHAL client over sockets IPC via guestfwd)
+        working-directory: kernel
+        run: |
+          python3 tests/support/marshal_proof_listener.py &
+          sleep 0.3
+          RUNIX_NETDEV_ARG="user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9003" \
+            cargo test --target x86_64-unknown-none --test marshal_tcp_roundtrip
 
   # Mobile L1 (aarch64/TrustZone), separate from the x86_64 `kernel` job
   # above — different target triple, different toolchain requirement (this
