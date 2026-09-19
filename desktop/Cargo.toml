@@ -12,6 +12,17 @@ publish.workspace = true
 runix-capability-manager = { path = "../capability-manager" }
 runix-wasm-runtime = { path = "../wasm-runtime" }
 runix-citadel-integration = { path = "../citadel-integration" }
+# `citadel_proxy`'s wire format with a kernel/user-space caller — the typed
+# `ipc` crate, not a hand-rolled payload (see `desktop/src/citadel/proxy.rs`).
+# Default (`std`) features: this crate is a hosted `std` platform, unlike
+# `net-driver-host`'s `default-features = false` use of this same crate.
+runix-ipc = { path = "../ipc" }
+# Used only to parse a real CITADEL Decision response body (via
+# `citadel-kerkese-core::decision::Decision`, which already depends on
+# `serde`/`serde_json` itself) in `citadel_proxy` — see that module's doc
+# comment for why parsing the real type beats a hand-scraped `outcome`
+# field.
+serde_json = "1"
 # Pinned to an exact `rev` (commit), never a floating branch — see
 # docs/ROADMAP.md's Open Questions and deny.toml's `[sources]` section,
 # which was updated in the same change that added this dependency.

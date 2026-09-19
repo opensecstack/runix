@@ -1019,7 +1019,9 @@ dependencies = [
  "reqwest",
  "runix-capability-manager",
  "runix-citadel-integration",
+ "runix-ipc",
  "runix-wasm-runtime",
+ "serde_json",
  "tokio",
 ]
 
