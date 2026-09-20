@@ -422,6 +422,23 @@ jobs:
           sleep 0.3
           RUNIX_NETDEV_ARG="user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9104" \
             cargo test --target x86_64-unknown-none --test marshal_proxy_e2e
+      # grid_sandbox::spawn_instance's shadow-mode (observe-only, never
+      # gates a real spawn) MARSHAL evaluation -- see that function's own
+      # doc comment for why shadow mode, not real enforcement. Two cases in
+      # one boot: unconfigured (no networking attempted, records
+      # Unreachable) and configured against a real listener answering
+      # REFUSE (grid_sandbox_marshal_shadow_listener.py, port 9004 -- a
+      # permissive sibling of marshal_proof_listener.py, not a MARSHAL
+      # proxy or stand-in for one, see its own doc comment). Both cases
+      # assert spawn_instance still returns Ok regardless of the shadow
+      # outcome.
+      - name: cargo test grid_sandbox_marshal_shadow (shadow-mode MARSHAL evaluation, observe-only)
+        working-directory: kernel
+        run: |
+          python3 tests/support/grid_sandbox_marshal_shadow_listener.py &
+          sleep 0.3
+          RUNIX_NETDEV_ARG="user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9004" \
+            cargo test --target x86_64-unknown-none --test grid_sandbox_marshal_shadow
 
   # Mobile L1 (aarch64/TrustZone), separate from the x86_64 `kernel` job
   # above — different target triple, different toolchain requirement (this

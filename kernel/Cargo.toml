@@ -153,6 +153,10 @@ harness = false
 name = "marshal_proxy_e2e"
 harness = false
 
+[[test]]
+name = "grid_sandbox_marshal_shadow"
+harness = false
+
 [profile.dev]
 panic = "abort"
 

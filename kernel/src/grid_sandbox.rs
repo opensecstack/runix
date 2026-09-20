@@ -25,13 +25,18 @@
 use crate::capabilities;
 use crate::citadel::{self, SandboxTier};
 use crate::elf::Elf64;
+use crate::marshal_client;
 use crate::process::AddressSpace;
 use crate::scheduler;
 use crate::serial_println;
 use crate::userspace;
+use alloc::format;
 use ed25519_dalek::SigningKey;
+use lazy_static::lazy_static;
 use runix_capability_manager::CapabilityToken;
-use runix_citadel_integration::CitadelError;
+use runix_citadel_integration::{CitadelError, ShadowMarshalOutcome, WormLog};
+use runix_ipc::marshal::{MarshalOutcome, MarshalRequest, MarshalResponse};
+use spin::Mutex;
 use x86_64::structures::paging::{Page, PageTableFlags};
 use x86_64::VirtAddr;
 
@@ -78,6 +83,124 @@ fn tier_byte(tier: SandboxTier) -> u8 {
     }
 }
 
+/// Where a shadow-mode MARSHAL evaluation (see [`spawn_instance`]'s own doc
+/// comment) should reach a MARSHAL proxy, if one is configured at all. There
+/// is no live, reachable CITADEL deployment in any dev/CI/QEMU scenario
+/// today (see `kernel/src/marshal_client.rs`'s own doc comment) — a
+/// hardcoded production address would just be a fail-*open* default nobody
+/// actually validated, the opposite of the "fails closed if unconfigured"
+/// discipline `desktop::citadel::transport::HttpKerkeseTransport` already
+/// applies. So the default is `None` ("no proxy configured"), treated as the
+/// expected common case: [`spawn_instance`] then records an `Unreachable`
+/// shadow outcome without attempting any network I/O at all, rather than
+/// spending even a bounded budget of syscalls discovering that nobody is
+/// listening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShadowMarshalProxyConfig {
+    pub remote_ip: [u8; 4],
+    pub remote_port: u16,
+    pub local_port: u16,
+}
+
+static SHADOW_MARSHAL_PROXY: Mutex<Option<ShadowMarshalProxyConfig>> = Mutex::new(None);
+
+/// Configures (or clears, with `None`) where [`spawn_instance`]'s shadow
+/// MARSHAL evaluation should look for a proxy — see
+/// [`ShadowMarshalProxyConfig`]'s own doc comment for why the default is
+/// unconfigured rather than a hardcoded address. Exists mainly for tests
+/// (e.g. `kernel/tests/grid_sandbox_marshal_shadow.rs`) that stand up a real
+/// listener and want to prove the evaluation call reaches it; a real
+/// deployment would call this once at boot, from wherever it learns the
+/// proxy's address, same as it would configure any other service endpoint.
+pub fn set_shadow_marshal_proxy(config: Option<ShadowMarshalProxyConfig>) {
+    *SHADOW_MARSHAL_PROXY.lock() = config;
+}
+
+/// Bounded, fail-fast poll budget for [`spawn_instance`]'s shadow MARSHAL
+/// evaluation — deliberately much smaller than `marshal_proxy_e2e.rs`'s
+/// 200_000-iteration budget (a test can afford to wait for a real listener
+/// on the other end of a `guestfwd` bridge; a production spawn must not
+/// meaningfully slow down over an absent or slow proxy). At this budget, a
+/// completely unreachable proxy costs on the order of a couple thousand
+/// syscall attempts and a handful of `yield_now` calls, not a stall visible
+/// to whatever's waiting on this instance to spawn.
+const SHADOW_MARSHAL_MAX_ITERS: u32 = 2_000;
+
+// Every shadow MARSHAL evaluation `spawn_instance` performs is recorded
+// here, through the same tamper-evident `WormLog` mechanism
+// `BootAllowlist`/`InstanceAllowlist` already use for real boot-time/
+// instance authorization decisions — see
+// `WormLog::record_shadow_marshal_evaluation`'s own doc comment for why a
+// parallel logging path was deliberately not added instead. A dedicated
+// log, not appended to either allowlist's own (per-allowlist) log: those
+// are owned internally by `BootAllowlist`/`InstanceAllowlist` and dropped
+// with the throwaway allowlist `citadel::demo_authorize_instance` builds
+// per call (see that function's own doc comment) — there is nothing
+// long-lived to append to there. This log is `grid_sandbox`'s own, exactly
+// as `capabilities.rs`'s `REVOCATIONS` is that module's own long-lived
+// state.
+lazy_static! {
+    static ref SHADOW_MARSHAL_LOG: Mutex<WormLog> = Mutex::new(WormLog::default());
+}
+
+/// This crate's read-only view onto [`SHADOW_MARSHAL_LOG`] — what
+/// `kernel/tests/grid_sandbox_marshal_shadow.rs` inspects to confirm a
+/// shadow evaluation was actually recorded.
+pub fn shadow_marshal_log_entries() -> alloc::vec::Vec<runix_citadel_integration::WormEntry> {
+    SHADOW_MARSHAL_LOG.lock().entries().to_vec()
+}
+
+/// Performs [`spawn_instance`]'s shadow-mode MARSHAL evaluation for an
+/// already-authorized `(module_id, instance_id)` pair and records the
+/// outcome in [`SHADOW_MARSHAL_LOG`]. **Never influences `spawn_instance`'s
+/// return value or control flow** — every branch below ends in exactly one
+/// [`WormLog::record_shadow_marshal_evaluation`] call and nothing else; there
+/// is no `?`, no early return, no error propagated to the caller.
+///
+/// Builds a minimal, genuinely well-formed Kerkese-shaped request
+/// (`dry_run: true` — see `runix_ipc::marshal`'s own doc comment for why
+/// `kerkese_json` is an opaque blob no hop in this chain parses) and calls
+/// [`marshal_client::evaluate`] with [`SHADOW_MARSHAL_MAX_ITERS`], the
+/// bounded, fail-fast budget appropriate for a spawn path rather than a
+/// test.
+fn shadow_marshal_evaluate(module_id: &str, instance_id: &str) {
+    let config = *SHADOW_MARSHAL_PROXY.lock();
+    let outcome = match config {
+        None => ShadowMarshalOutcome::Unreachable,
+        Some(config) => {
+            let kerkese_json = format!(
+                r#"{{"kerkese_version":"1.0","dry_run":true,"action":{{"type":"grid_sandbox.spawn_instance","module_id":"{module_id}","instance_id":"{instance_id}"}},"actor":"kernel","verifier":"kernel","execution_id":"{instance_id}"}}"#
+            );
+            let request = MarshalRequest {
+                kerkese_json: kerkese_json.into_bytes(),
+            };
+            match marshal_client::evaluate(
+                config.remote_ip,
+                config.remote_port,
+                config.local_port,
+                &request,
+                SHADOW_MARSHAL_MAX_ITERS,
+            ) {
+                Some(MarshalResponse::Decision { outcome, .. }) => match outcome {
+                    MarshalOutcome::Execute => ShadowMarshalOutcome::Execute,
+                    MarshalOutcome::Refuse => ShadowMarshalOutcome::Refuse,
+                    MarshalOutcome::HardStop => ShadowMarshalOutcome::HardStop,
+                },
+                Some(MarshalResponse::Error(_)) | None => ShadowMarshalOutcome::Unreachable,
+            }
+        }
+    };
+    serial_println!(
+        "grid_sandbox: shadow MARSHAL evaluation for instance {:?}: {:?} (observe-only, does not \
+         gate this spawn)",
+        instance_id,
+        outcome
+    );
+    SHADOW_MARSHAL_LOG
+        .lock()
+        .record_shadow_marshal_evaluation(module_id, instance_id, outcome);
+}
+
 /// What [`spawn_instance`] hands back to its caller once a `grid-sandbox-host`
 /// instance is loaded and running.
 pub struct SpawnedInstance {
@@ -106,10 +229,20 @@ pub struct SpawnedInstance {
 /// capability token for another, even though every instance loads the exact
 /// same binary.
 ///
-/// Once a real `runix_citadel_integration::KerkeseTransport` implementation
-/// exists, a Gate-evaluation call for this instance's tier assignment would
-/// be inserted here, gated on the existing `citadel::demo_authorize_instance`
-/// allowlist check succeeding first.
+/// Once `citadel::demo_authorize_instance` already succeeds, this function
+/// also performs a **shadow-mode, observe-only** MARSHAL evaluation via
+/// [`shadow_marshal_evaluate`] — it calls `marshal_client::evaluate` and
+/// records whatever comes back (or the fact that it didn't) through
+/// [`SHADOW_MARSHAL_LOG`], but the result never changes this function's
+/// return value or control flow: this instance spawns exactly as it would if
+/// that call were never made, whether MARSHAL says `EXECUTE`, `REFUSE`,
+/// `HARD_STOP`, or is entirely unreachable. This is deliberate: there is no
+/// live, reachable CITADEL deployment in any dev/CI/QEMU scenario today (see
+/// `marshal_client`'s own doc comment), so gating real spawns on it would
+/// break every spawn everywhere. A future, separately and carefully
+/// reviewed change would be the one to turn this into real enforcement — see
+/// `ShadowMarshalProxyConfig`'s own doc comment for the still-open question
+/// of where that proxy address comes from once a real deployment exists.
 pub fn spawn_instance(
     instance_id: &str,
     tier: SandboxTier,
@@ -127,6 +260,12 @@ pub fn spawn_instance(
         instance_id,
         tier
     );
+
+    // Shadow-mode only: observes and records a MARSHAL evaluation for this
+    // already-authorized instance, never gates it — see
+    // `shadow_marshal_evaluate`'s own doc comment. Placed after the real
+    // `demo_authorize_instance` gate above, never before it.
+    shadow_marshal_evaluate("grid-sandbox-host", instance_id);
 
     let elf = Elf64::parse(GRID_SANDBOX_HOST_ELF)
         .expect("grid-sandbox-host failed to parse as a valid ELF64 binary");

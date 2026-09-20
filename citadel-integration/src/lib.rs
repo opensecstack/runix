@@ -316,7 +316,7 @@ impl BootAllowlist {
             Ok(tier) => {
                 self.evidence
                     .borrow_mut()
-                    .record(module_id, None, Some(*tier), true, None);
+                    .record(module_id, None, Some(*tier), true, None, None);
             }
             Err(err) => {
                 self.evidence.borrow_mut().record(
@@ -325,6 +325,7 @@ impl BootAllowlist {
                     None,
                     false,
                     Some(format!("{err}")),
+                    None,
                 );
             }
         }
@@ -410,6 +411,13 @@ pub struct WormEntry {
     /// `Display` of the [`CitadelError`] that caused a denial. `None` when
     /// `authorized` is `true`.
     pub reason: Option<String>,
+    /// `Some` only for an entry recorded by
+    /// [`WormLog::record_shadow_marshal_evaluation`] — a shadow-mode MARSHAL
+    /// evaluation's outcome, observed and logged for visibility only. `None`
+    /// for every entry [`BootAllowlist`]/[`InstanceAllowlist`] record (a real
+    /// boot-time/instance authorization decision, not a MARSHAL evaluation).
+    /// See that method's own doc comment for exactly what "shadow" means.
+    pub shadow_marshal: Option<ShadowMarshalOutcome>,
     /// The previous entry's `entry_hash` (all-zero for the first entry) —
     /// this is what makes the log a *chain*: recomputing `entry_hash` for
     /// every entry and checking it against both its own recorded value and
@@ -420,6 +428,7 @@ pub struct WormEntry {
 }
 
 impl WormEntry {
+    #[allow(clippy::too_many_arguments)]
     fn compute_hash(
         prev_hash: &[u8; 32],
         seq: u64,
@@ -428,6 +437,7 @@ impl WormEntry {
         tier: Option<SandboxTier>,
         authorized: bool,
         reason: Option<&str>,
+        shadow_marshal: Option<ShadowMarshalOutcome>,
     ) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(prev_hash);
@@ -445,7 +455,39 @@ impl WormEntry {
         if let Some(r) = reason {
             hasher.update(r.as_bytes());
         }
+        hasher.update([shadow_marshal.is_some() as u8]);
+        if let Some(sm) = shadow_marshal {
+            hasher.update(sm.as_str().as_bytes());
+        }
         hasher.finalize().into()
+    }
+}
+
+/// Outcome of a shadow-mode MARSHAL evaluation recorded via
+/// [`WormLog::record_shadow_marshal_evaluation`] — mirrors
+/// [`runix_ipc`]'s (via `kernel::marshal_client`) `MarshalOutcome`
+/// (`Execute`/`Refuse`/`HardStop`) plus [`Self::Unreachable`] for the case
+/// no usable `MarshalResponse::Decision` came back at all (proxy
+/// unreachable, timed out, or — the expected common case today, see
+/// `kernel/src/grid_sandbox.rs`'s own doc comment — not configured). Not
+/// itself a decision this crate or `kernel/` ever acts on: see the
+/// recording method's own doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowMarshalOutcome {
+    Execute,
+    Refuse,
+    HardStop,
+    Unreachable,
+}
+
+impl ShadowMarshalOutcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ShadowMarshalOutcome::Execute => "execute",
+            ShadowMarshalOutcome::Refuse => "refuse",
+            ShadowMarshalOutcome::HardStop => "hard_stop",
+            ShadowMarshalOutcome::Unreachable => "unreachable",
+        }
     }
 }
 
@@ -462,6 +504,7 @@ pub struct WormLog {
 }
 
 impl WormLog {
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         module_id: &str,
@@ -469,6 +512,7 @@ impl WormLog {
         tier: Option<SandboxTier>,
         authorized: bool,
         reason: Option<String>,
+        shadow_marshal: Option<ShadowMarshalOutcome>,
     ) {
         let seq = self.entries.len() as u64;
         let prev_hash = self
@@ -484,6 +528,7 @@ impl WormLog {
             tier,
             authorized,
             reason.as_deref(),
+            shadow_marshal,
         );
         self.entries.push(WormEntry {
             seq,
@@ -492,9 +537,40 @@ impl WormLog {
             tier,
             authorized,
             reason,
+            shadow_marshal,
             prev_hash,
             entry_hash,
         });
+    }
+
+    /// Records the outcome of a shadow-mode MARSHAL evaluation —
+    /// `kernel/src/grid_sandbox.rs`'s `spawn_instance` is the one call site
+    /// today, and the only intended one: this method exists so that shadow
+    /// evaluation, which per this project's architecture rules must never
+    /// grow a parallel authorization or logging path, is recorded through
+    /// this same tamper-evident [`WormLog`] mechanism instead.
+    ///
+    /// **Shadow mode only.** This method has no return value and no effect
+    /// beyond appending one entry — nothing in this crate reads `outcome`
+    /// back to gate anything, and callers must not either. `module_id`/
+    /// `instance_id` name the instance this evaluation shadowed; this is
+    /// only ever called *after* that instance's own
+    /// [`InstanceAllowlist::authorize_instance_load`] (or equivalent) already
+    /// succeeded, never in place of it.
+    pub fn record_shadow_marshal_evaluation(
+        &mut self,
+        module_id: &str,
+        instance_id: &str,
+        outcome: ShadowMarshalOutcome,
+    ) {
+        self.record(
+            module_id,
+            Some(instance_id),
+            None,
+            false,
+            None,
+            Some(outcome),
+        );
     }
 
     /// Every entry recorded so far, oldest first.
@@ -526,6 +602,7 @@ impl WormLog {
                 entry.tier,
                 entry.authorized,
                 entry.reason.as_deref(),
+                entry.shadow_marshal,
             );
             if recomputed != entry.entry_hash {
                 return false;
@@ -728,6 +805,7 @@ impl InstanceAllowlist {
                     Some(*tier),
                     true,
                     None,
+                    None,
                 );
             }
             Err(err) => {
@@ -737,6 +815,7 @@ impl InstanceAllowlist {
                     None,
                     false,
                     Some(format!("{err}")),
+                    None,
                 );
             }
         }
@@ -1037,6 +1116,64 @@ mod tests {
         assert_eq!(log.entries().len(), 2);
         assert_eq!(log.entries()[0].instance_id.as_deref(), Some("app-1"));
         assert_eq!(log.entries()[1].instance_id.as_deref(), Some("app-2"));
+        assert!(log.verify_chain());
+    }
+
+    #[test]
+    fn shadow_marshal_evaluation_records_without_disturbing_real_entries() {
+        let signing_key = test_key();
+        let verifying_key = signing_key.verifying_key();
+        let bytes = b"grid-sandbox-host bytes for shadow marshal test";
+        let hash = hex::encode(Sha256::digest(bytes));
+
+        let entry = InstanceManifestEntry::issue(
+            "grid-sandbox-host",
+            "app-1",
+            hash,
+            SandboxTier::T2Trusted,
+            "release-2027-q1",
+            &signing_key,
+        );
+        let mut allowlist = InstanceAllowlist::new();
+        allowlist.insert(entry);
+
+        // Real authorization decision first...
+        allowlist
+            .authorize_instance_load(&verifying_key, "grid-sandbox-host", "app-1", bytes)
+            .unwrap();
+
+        // ...then a shadow MARSHAL evaluation appended to the *same* log,
+        // as `spawn_instance` would after that authorization already
+        // succeeded.
+        {
+            let mut log = allowlist.evidence.borrow_mut();
+            log.record_shadow_marshal_evaluation(
+                "grid-sandbox-host",
+                "app-1",
+                ShadowMarshalOutcome::Refuse,
+            );
+        }
+
+        let log = allowlist.evidence_log();
+        let entries = log.entries();
+        assert_eq!(entries.len(), 2);
+
+        // The real authorization entry is untouched.
+        assert!(entries[0].authorized);
+        assert!(entries[0].shadow_marshal.is_none());
+
+        // The shadow entry names the same instance, carries the outcome,
+        // and does not claim to be a real authorization decision.
+        assert_eq!(entries[1].module_id, "grid-sandbox-host");
+        assert_eq!(entries[1].instance_id.as_deref(), Some("app-1"));
+        assert_eq!(
+            entries[1].shadow_marshal,
+            Some(ShadowMarshalOutcome::Refuse)
+        );
+        assert!(!entries[1].authorized);
+        assert!(entries[1].tier.is_none());
+
+        // Still one tamper-evident chain.
         assert!(log.verify_chain());
     }
 

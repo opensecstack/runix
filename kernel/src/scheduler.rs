@@ -56,7 +56,28 @@ use x86_64::structures::paging::{
 };
 use x86_64::VirtAddr;
 
-const STACK_SIZE: usize = 4096 * 4;
+// Bumped from `4096 * 4` (16 KiB): confirmed by real reproduction, not
+// guessed — `grid_sandbox::spawn_instance`'s shadow-mode MARSHAL evaluation
+// (kernel/src/grid_sandbox.rs's `shadow_marshal_evaluate`, calling
+// `marshal_client::evaluate` over the sockets IPC surface) double-faulted
+// with RSP landing exactly at `STACK_REGION_START` when `spawn_instance` ran
+// on a `scheduler::spawn_with_capability`-spawned thread instead of a boot
+// thread's own much larger stack (see `kernel/tests/
+// grid_sandbox_marshal_shadow.rs`'s "configured" case) -- a real stack
+// overflow into the guard page below, not silent corruption (the guard page
+// did exactly its job; see this const's own doc comment on why one exists).
+// `spawn_instance`'s own stack usage (ELF parsing, `AddressSpace` setup,
+// several page-mapping calls) was already non-trivial in a debug build
+// before this; adding `shadow_marshal_evaluate`'s own call depth (JSON
+// formatting, request encoding, a socket round-trip) tipped it over 16 KiB.
+// Virtual address space for thread stacks is 48-bit and effectively
+// unlimited (see `NEXT_STACK_SLOT`'s own doc comment) -- there is no
+// capacity reason to keep this tight. First doubled to `4096 * 8` (32 KiB);
+// confirmed by re-running the same test that this was still insufficient
+// (the double fault moved further into spawn_instance's own post-shadow-
+// eval body -- ELF parsing, AddressSpace setup, page mapping -- rather
+// than disappearing), so doubled again here rather than nudged repeatedly.
+const STACK_SIZE: usize = 4096 * 16;
 /// Left deliberately unmapped below every thread's stack, so a stack
 /// overflow page-faults (or, more precisely — see `Thread::new`'s
 /// doc comment — double-faults) instead of silently corrupting whatever
