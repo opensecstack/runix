@@ -150,6 +150,10 @@ name = "blk_fs_concurrent"
 harness = false
 
 [[test]]
+name = "blk_fs_concurrent_write"
+harness = false
+
+[[test]]
 name = "marshal_tcp_roundtrip"
 harness = false
 

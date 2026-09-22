@@ -1152,9 +1152,9 @@ fn run_fsinfo_hint_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
 /// newly-found cluster must be marked non-zero (reserved, temporarily as
 /// its own EOC marker) *before* scanning for the next one — otherwise a
 /// second scan in the same call would find and "reserve" the exact same
-/// cluster already claimed a moment earlier (no concurrency exists in this
-/// driver to race against, but a single call reserving the same cluster
-/// twice would be a correctness bug regardless). Once all `count` clusters
+/// cluster already claimed a moment earlier — a single call reserving the
+/// same cluster twice would be a correctness bug regardless of whether any
+/// concurrency exists. Once all `count` clusters
 /// are reserved this way, a second pass rewrites every entry via
 /// [`blk_driver_host::chain_link_values`] — the last cluster's rewrite
 /// happens to write back the same EOC value its reservation step already
@@ -1163,6 +1163,41 @@ fn run_fsinfo_hint_proof(dev: &mut BlkDevice, info: &BootSectorInfo) -> bool {
 /// Fails closed on any error (not enough free clusters, or a write
 /// failure): every cluster reserved so far in *this* call is freed back via
 /// [`free_clusters`] before returning `false` — never half-committed.
+///
+/// **Not re-entrancy-safe, and does not need to be — verified, not
+/// assumed** (`docs/STATUS.md`'s "concurrent *allocators*" gap). This
+/// function yields to the scheduler while it runs (every `write_fat_entry`
+/// goes through `dev.write_sector` → `poll_for_completion`'s `yield_now`),
+/// so a *second* concurrent caller would observe a half-reserved chain.
+/// Two independent properties of this driver mean no second caller can
+/// exist today, both checked against the code rather than inferred from
+/// this comment's earlier bare assertion that "no concurrency exists":
+///
+/// 1. Every call site of this function and of [`allocate_free_cluster`]
+///    lives in `_start`'s `attempt_fat32` branch ([`run_grow_proof`],
+///    [`run_multi_cluster_grow_proof`], [`run_create_proof`],
+///    [`run_directory_growth_proof`], [`run_fsinfo_hint_proof`]), which is
+///    *mutually exclusive* with the `serve_fs_requests` branch that enters
+///    [`run_fs_ipc_server`]. Nothing reachable over IPC allocates at all:
+///    [`handle_write_ipc_request`] writes exactly one already-allocated
+///    sector and rejects anything else.
+/// 2. This process is a single ring 3 thread (spawned once via
+///    `scheduler::spawn_ring3_process_with_capabilities`) with no second
+///    thread, no async executor and no interrupt handler of its own.
+///    [`run_fs_ipc_server`] calls its handler inline and cannot begin
+///    decoding the next request until the current one has fully returned.
+///    The kernel's scheduler *is* timer-preemptive, but preemption
+///    suspends and later resumes this same context — it never produces a
+///    second one — and no other process holds the virtio-blk io-port
+///    capability needed to touch the FAT at all.
+///
+/// `kernel/tests/blk_fs_concurrent_write.rs` is the QEMU proof of the
+/// serialization half (two genuinely racing callers, two *mutating*
+/// requests, both files intact afterwards). Property 2 is what would have
+/// to be re-verified — and this function given a real mutual-exclusion
+/// guard — if this driver ever gains internal concurrency (per-client
+/// scheduled tasks instead of one sequential loop, say), or if any
+/// allocating operation is exposed over IPC.
 fn allocate_cluster_chain(
     dev: &mut BlkDevice,
     info: &BootSectorInfo,
@@ -1212,16 +1247,12 @@ fn allocate_free_cluster(dev: &mut BlkDevice, info: &BootSectorInfo) -> Option<u
     for fat_sector_index in 0..total_fat_sectors {
         let fat_sector = info.fat_start_sector.checked_add(fat_sector_index)?;
         let sector = dev.read_sector(u64::from(fat_sector))?;
-        for entry_in_sector in 0..entries_per_sector {
-            let cluster = fat_sector_index
-                .checked_mul(entries_per_sector)?
-                .checked_add(entry_in_sector)?;
-            if cluster < 2 {
-                continue; // clusters 0/1 are reserved, never allocatable
-            }
-            if fat_entry_at(&sector, entry_in_sector) == Some(0) {
-                return Some(cluster);
-            }
+        if let Some(cluster) = blk_driver_host::first_free_cluster_in_fat_sector(
+            &sector,
+            fat_sector_index,
+            entries_per_sector,
+        ) {
+            return Some(cluster);
         }
     }
     None
@@ -2182,20 +2213,37 @@ fn send_fs_response(response: &FsResponse) {
 /// port in one boot is the actual proof this closes (see
 /// `kernel/tests/blk_fs_ipc.rs`), where Phase 8 could only ever serve one.
 ///
-/// **Concurrency, deliberately still deferred, not silently assumed
-/// solved**: this loop remains single-writer/single-in-flight-request-per-
-/// port, the same posture every write this driver performs already has
-/// (`docs/STATUS.md`'s filesystem-driver section: "any concurrency/locking
-/// around allocation... same as every other write this driver performs").
-/// Two callers sending overlapping multi-byte requests to the *same* port
-/// at the same time can still interleave their bytes in the underlying
-/// fixed-capacity channel (`kernel/src/ipc.rs`'s `Channel`) before either
-/// message is fully decoded — a real gap, not fixed here: a genuine fix
-/// needs either a session/lock IPC primitive or kernel-side request
-/// framing, neither of which exists yet. Each of this driver's two ports
-/// still only ever has one legitimate sender in every test that exists
-/// today, so this gap isn't exercised by anything currently wired into
-/// CI — named explicitly so it isn't mistaken for solved.
+/// **Concurrency: what this loop does and does not guarantee, verified in
+/// QEMU rather than assumed.** This loop is strictly sequential — one
+/// in-flight request at a time across *both* ports. The two
+/// `ipc_try_recv` blocks below run one after the other in the same
+/// iteration, and each one's handler is called inline and runs to
+/// completion (device round trips and response send included) before
+/// anything else is decoded; there is no second thread, no async executor
+/// and no interrupt-driven re-entry into this process to overlap two
+/// handlers.
+///
+/// Two separate hazards, both now closed:
+///
+/// * *Concurrent senders* — two callers' multi-byte messages interleaving
+///   their bytes in the underlying fixed-capacity channel
+///   (`kernel/src/ipc.rs`'s `Channel`) before either decodes, producing a
+///   well-formed but wrong "franken-request". Fixed in the IPC layer by
+///   the per-port advisory send lock (`kernel::ipc::begin_send`/
+///   `end_send`, `SYS_IPC_SEND_LOCK`/`SYS_IPC_SEND_UNLOCK`); proven by
+///   `kernel/tests/blk_fs_concurrent.rs`.
+/// * *Concurrent handlers* — two fully-arrived requests being served at
+///   once, which is what would matter for anything mutating (a write, and
+///   in principle an allocation). Foreclosed by this loop's own shape
+///   above; proven by `kernel/tests/blk_fs_concurrent_write.rs`, where two
+///   racing callers each land a full-sector write on a *different* file
+///   and both files afterwards hold exactly their own writer's bytes.
+///
+/// See [`allocate_cluster_chain`]'s doc comment for why "concurrent
+/// allocators" specifically cannot arise today (allocation isn't reachable
+/// from this loop at all), and for exactly which of those properties would
+/// have to be re-established if this driver ever gained real internal
+/// concurrency.
 fn run_fs_ipc_server(dev: &mut BlkDevice, info: &BootSectorInfo) {
     write_all(b"blk-driver-host: FS server ready, serving read/write requests\n");
 

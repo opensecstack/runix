@@ -542,40 +542,73 @@ to recover. Fixed on both ends:
   regression fails loudly and specifically, not "eventually something felt
   slow." Wired into CI's `kernel-tests` job.
 
-**Scheduler watchdog: detection, not preemption.** The cooperative scheduler
-has always had one structural weakness: a thread that never calls
-`yield_now()` blocks every other thread forever, with no way for anything
-else in the kernel to even notice, let alone recover. That gap was
-tolerable while the only threads that existed were ones we wrote ourselves,
-each looping and yielding forever by hand — it stops being tolerable the
-moment less-trusted code (a driver, eventually a WASM-sandboxed app) can
-get scheduled. Real preemption (timer-interrupt-driven forced context
-switches) is a bigger feature than this needed to be — it still isn't
-built — but *detecting* a stuck thread instead of hanging silently forever
-was small enough to do now, and is exactly the same trade guard pages made
-for stack overflows: turn a silent failure into a loud, immediate one.
+**Real, timer-interrupt-driven preemption — not just cooperative yielding.** A thread that never calls
+`yield_now()` no longer blocks every other thread forever; the PIT timer forces
+a reschedule on every tick regardless of what's currently running. This replaced
+an earlier cooperative-only design (`switch_to`, callee-saved registers, resumed
+via plain `ret`) that was correct for voluntary yields at function-call
+boundaries but fundamentally can't extend to preemption: an interrupt can land
+at *any* instruction with arbitrary live registers a `ret`-based resume would
+silently corrupt.
 
-- `interrupts.rs` gained a lock-free watchdog: `record_yield()` (called
-  from `scheduler::yield_now()`/`exit_current_thread()` on every call)
-  stamps the current PIT tick count into an atomic; `timer_interrupt_handler`
-  checks, on every tick, whether more than `WATCHDOG_THRESHOLD_TICKS` (20 —
-  a little over a second at the default ~18.2 Hz PIT rate) have passed
-  since the last recorded yield, and panics if so. Deliberately lock-free —
-  this runs from inside the timer ISR, which can fire while some other
-  thread already holds `scheduler::SCHEDULER`'s lock mid-`yield_now()`;
-  taking that same lock here would deadlock the CPU against itself.
-- `scheduler::init()` arms it; `main.rs` explicitly disarms it right before
-  the ring 3 handoff, with a comment explaining why: `user_hello` spins
-  forever by design (see `userspace.rs`) and doesn't call `yield_now()` at
-  all, so an armed watchdog would eventually mistake that intended
-  behavior for a real hang.
-- Two regression tests, not one, because this needed proof in both
-  directions: `kernel/tests/watchdog.rs` spawns a thread that spins without
-  ever yielding and asserts the kernel panics with the watchdog's message
-  rather than hanging; `kernel/tests/thread_reclaim.rs`'s existing
-  20,000-iteration cooperative loop doubles as proof the watchdog does
-  *not* false-positive under heavy, legitimate `yield_now()` traffic. Both
-  wired into CI's `kernel-tests` job.
+The mechanism: voluntary `yield_now()` and involuntary timer preemption trap
+into ring 0 through a real interrupt (hardware for the timer, `int
+RESCHEDULE_VECTOR` for a yield) and share one unified save/resume path.
+`reschedule_entry` (a naked stub) captures all GPRs; the CPU captures RFLAGS/
+CS/SS/RSP/RIP as a hardware `TrapFrame`. Resuming *any* thread later is always
+the same `iretq`, whether it was suspended by preemption or cooperative yield —
+a thread suspended by one can be resumed by the other with no format dispatch.
+
+An earlier design considered keeping two formats (`Cooperative`/`Preempted`) to
+avoid touching the full GPR set on voluntary yields (a callee-saved-only
+optimization). It was rejected for a real correctness hazard: RFLAGS.IF handling
+across a resume triggered by the *other* mechanism than what suspended a thread
+— in particular, resuming a voluntarily-yielded thread that was saved with `IF=1`
+via an interrupt handler that itself ran with `IF=0` — creates a state machine
+hazard at the resume boundary. The unified frame handles this correctly by
+letting the hardware's `iretq` restore the exact IF state that was live when the
+thread was originally saved, regardless of how the save was triggered.
+
+`kernel/tests/watchdog.rs` proves preemption end-to-end: spawns a thread that
+spins forever without ever calling `yield_now()`, and a cooperating counter
+thread. The counter still makes progress despite the spinning thread never
+yielding — direct proof the preemption mechanism reschedules other threads
+regardless of one thread's lack of cooperation. The test runs until the counter
+reaches a target (20 iterations), proving genuine progress, not accidental lucky
+scheduling. No explicit preemption-only regression test exists beyond this (a
+thread spinning without yield_now is exactly the real-world case `watchdog.rs`
+covers).
+
+**Scheduler watchdog: now a backstop against mechanism failure.** Back when only
+cooperative yielding existed, a stuck thread meant starvation. Now the watchdog's
+role changed: it detects if the *reschedule mechanism itself* is broken, not if
+a thread forgets to yield. `interrupts.rs` calls `record_yield()` on every
+`reschedule` call, whether triggered by a timer tick or a voluntary `int
+RESCHEDULE_VECTOR`, and the timer ISR panics if no reschedule has succeeded in
+over `WATCHDOG_THRESHOLD_TICKS` (20 — ~1 second) — failure of the preemption
+mechanism itself, not an uncooperative thread. The watchdog stays armed through
+the ring 3 handoff now; `user_hello` spins forever by design but gets
+preempted anyway, so `reschedule` succeeds on every tick and the watchdog never
+triggers.
+
+- `interrupts.rs` has the lock-free watchdog implementation: `record_yield()`
+  (called from `scheduler::yield_now()`/`exit_current_thread()` on every call,
+  and also from `reschedule` itself on every tick) stamps the current PIT tick
+  count into an atomic; `timer_interrupt_handler` checks, on every tick, whether
+  more than `WATCHDOG_THRESHOLD_TICKS` ticks have passed since the last recorded
+  reschedule success, and panics if so. Deliberately lock-free — this runs from
+  inside the timer ISR with `RFLAGS.IF=0`, so taking a lock would risk deadlock
+  against code holding it mid-reschedule.
+- `scheduler::init()` arms it via `interrupts::arm_watchdog()`; stays armed
+  permanently after that. Safe to leave on across any ring 3 handoff,
+  cooperative or not — the preemption mechanism itself keeps ticking.
+- Regression test: `kernel/tests/watchdog.rs` proves recovery (the cooperative
+  thread makes real progress despite the rogue thread's refusal to yield),
+  coupled with proof that no unexpected panic occurs (the watchdog shouldn't
+  trigger once preemption keeps `reschedule` alive). `kernel/tests/
+  thread_reclaim.rs`'s 20,000-iteration loop doubles as proof the watchdog does
+  *not* false-positive under heavy `yield_now()` traffic. Both wired into CI's
+  `kernel-tests` job.
 
 **Compile-time barrier on the demo signing key.** `kernel/src/capabilities.rs`'s
 hardcoded Ed25519 seed (`DEMO_SEED`) exists purely to prove the
@@ -1797,13 +1830,71 @@ different `FsRequest`s to the same port at the same time, and both get
 back their own exact, uncorrupted content — the test that would have
 failed, non-deterministically, before this fix.
 
-**Still not attempted, filesystem driver, current state**: allocating in
-response to concurrent *callers* racing each other (single-writer
-internally remains true — nothing in this driver itself spawns
-concurrent allocation attempts against itself; today's fix closes
-concurrent *senders*, not concurrent *allocators*); `blk-driver-host`'s
-own FAT32 parser still has no `cargo-fuzz` harness, only the `proptest`
-coverage below.
+**Filesystem driver: the concurrent-*allocator* half of that same gap —
+investigated, and closed as safe *by construction* with a real QEMU proof
+rather than an assertion.** The send-lock fix above closed concurrent
+*senders*; this document then named concurrent *allocators* ("allocating
+in response to concurrent callers racing each other") as still open. It
+was never actually established whether that was a live bug or a gap the
+architecture already forecloses — `allocate_cluster_chain`'s own doc
+comment asserted "no concurrency exists in this driver to race against"
+without anything backing it. Traced end to end, it is foreclosed, for two
+*independent* reasons:
+
+1. **Allocation is not reachable over IPC at all today.** `_start`'s
+   `serve_fs_requests` branch (which enters `run_fs_ipc_server`) and its
+   `attempt_fat32` branch (which runs `run_grow_proof` /
+   `run_multi_cluster_grow_proof` / `run_create_proof` /
+   `run_directory_growth_proof` / `run_fsinfo_hint_proof` — every single
+   `allocate_cluster_chain`/`allocate_free_cluster` call site in the
+   driver) are mutually exclusive. `handle_write_ipc_request` writes
+   exactly one already-allocated sector and rejects anything else, so no
+   client request can reach the allocator even once, let alone twice
+   concurrently.
+2. **This process has exactly one thread of execution.** It is spawned
+   once via `scheduler::spawn_ring3_process_with_capabilities` (one
+   `Thread`); it spawns nothing, runs no async executor, and handles no
+   interrupts of its own. `run_fs_ipc_server` calls its handler inline and
+   cannot begin decoding request N+1 until request N has fully returned —
+   the read port and write port are polled in sequence in the same loop
+   body, never overlapped. The scheduler *is* timer-preemptive (not
+   cooperative-only — `kernel/src/scheduler.rs`, and this driver does
+   yield mid-allocation, since every `dev.write_sector` spins through
+   `poll_for_completion`'s `yield_now`), but preemption suspends and later
+   resumes this *same* context; it never creates a second one. No other
+   process holds the virtio-blk io-port capability needed to touch the FAT
+   at all.
+
+The serialization half of that argument is now proven in QEMU, not just
+reasoned about: `kernel/tests/blk_fs_concurrent_write.rs` spawns two
+client threads back-to-back (no yield between the spawns) that both send
+a full `FsRequest::Write` to the *same* `FS_WRITE_REQUEST_PORT` for two
+different files, with byte patterns drawn from disjoint value ranges
+(`b'A'..=b'G'` vs `b'a'..=b'k'`) so a single stray byte from the wrong
+writer is detectable at every offset. Both writes report `Ok`, and both
+files read back holding exactly their own writer's pattern — confirmed
+independently against the raw image afterwards (each pattern occurs
+exactly once, in its own sector, with no sector mixing the two ranges),
+the same "don't let the thing under test grade itself" discipline every
+other write-path phase here uses. `allocate_cluster_chain`'s doc comment
+now carries this conclusion instead of the bare assertion.
+
+What this does **not** prove, stated plainly: nothing here makes
+`allocate_cluster_chain` itself re-entrancy-safe. Its two-pass
+reserve-then-link sequence yields to the scheduler between (and inside)
+its FAT writes, so a *second* concurrent caller would observe a
+half-reserved chain. That is safe today only because reason 2 above
+holds. If this driver ever gains real internal concurrency — per-client
+scheduled tasks instead of one sequential loop, a second thread, or an
+async executor — or if an allocating operation is ever exposed over IPC,
+this argument must be redone and the allocator given an actual mutual-
+exclusion guard.
+
+**Still not attempted, filesystem driver, current state**: any *internal*
+concurrency in this driver (a second thread, an async executor, or
+per-client scheduled tasks rather than one sequential request loop) —
+which is exactly what today's allocation-safety argument rests on, see the
+section immediately above.
 
 **Real `cargo-fuzz`/libFuzzer harnesses — closing the gap this document
 named above ("No `cargo-fuzz`/libFuzzer harness exists yet").**
@@ -1851,13 +1942,34 @@ capability-manager/fuzz && cargo +nightly fuzz run verify_fuzz`, similarly
 for `net-driver-host/fuzz`'s `smoltcp_fuzz`), revisited if/when a
 `workflow_dispatch`-triggered smoke job is worth the added CI surface.
 
-**Explicitly still NOT fuzzed**: `blk-driver-host`'s FAT32 parser
+**`blk-driver-host`'s allocator — the fuzz-coverage half of the same
+"concurrent allocators" gap named above, closed separately.** The
+allocator's real entry points (`allocate_cluster_chain`/
+`allocate_free_cluster`) do live virtio-blk I/O with no fake-able device
+abstraction, so rather than leave the gap unaddressed, the sector-scan
+decision logic was extracted into a new pure function,
+`first_free_cluster_in_fat_sector` (`blk-driver-host/src/lib.rs`) —
+behavior unchanged, `allocate_free_cluster` now calls it per sector read
+off the real device, covered by 3 new unit tests plus a `proptest`
+property asserting the actual invariant a caller depends on (any returned
+cluster is `>= 2` and its own FAT entry genuinely reads back as free, not
+just "didn't panic"). `blk-driver-host/fuzz/` (`blk-driver-host-fuzz`) adds
+two targets on the same convention as `capability-manager/fuzz`/
+`net-driver-host/fuzz`: `chain_link_values_fuzz` (2,130,212 runs in 20s, no
+crash) and `first_free_cluster_fuzz` (580 runs in 20s — dramatically fewer,
+because a fuzzer-controlled `entries_per_sector` can drive its scan loop
+into billions of iterations; a real latent algorithmic-DoS shape, harmless
+today only because every real caller derives that value from a
+`BootSectorInfo` capped at 1024, flagged here rather than fixed since
+tightening it was out of this task's scope). Both verified in WSL Fedora,
+same constraint as the two fuzz crates above.
+
+**Explicitly still NOT fuzzed**: `blk-driver-host`'s FAT32 *parser itself*
 (`boot_sector_parse`, directory-entry parsing, LFN fragment reassembly,
-short-name checksums — all in `blk-driver-host/src/lib.rs`) has only the
-`proptest` coverage described in this document's Filesystem-driver Phase 2
-section above, no `cargo-fuzz` harness of its own yet, despite parsing
-genuinely disk-resident (if not yet attacker-network-controlled) bytes.
-Also unfuzzed: `net-driver-host`'s virtio-net completion validation
+short-name checksums) still has only the `proptest` coverage described in
+this document's Filesystem-driver Phase 2 section above — the fuzz targets
+above cover the allocator, not the parser. Also unfuzzed:
+`net-driver-host`'s virtio-net completion validation
 (`validate_rx_completion`, covered by its own `proptest` suite only) and
 anything in `kernel/` itself (no parser there takes fully untrusted input
 today). None of this is a regression — it's the same "proptest first,

@@ -1,0 +1,8 @@
+[toolchain]
+# `cargo-fuzz` needs nightly regardless of target — it builds with
+# `-Z sanitizer=address` and libFuzzer instrumentation flags, both
+# nightly-only rustc features. No explicit `targets` list: unlike
+# `net-driver-host`/`blk-driver-host`'s freestanding builds, this fuzz
+# harness runs on the host (whatever triple `cargo fuzz` invokes by
+# default), not a bare-metal one.
+channel = "nightly"

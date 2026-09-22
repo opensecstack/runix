@@ -1,0 +1,36 @@
+[package]
+name = "blk-driver-host-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone, NOT swept into blk-driver-host's own `[workspace]` (which is
+# itself standalone, not a root-workspace member -- see blk-driver-host/
+# Cargo.toml) -- same "declare it as its own workspace so cargo doesn't
+# walk up and merge it" reasoning as capability-manager/fuzz/Cargo.toml and
+# net-driver-host/fuzz/Cargo.toml.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+blk-driver-host = { path = ".." }
+
+# Two targets, same "one binary per fuzzed boundary" convention
+# capability-manager/fuzz and net-driver-host/fuzz already use, rather than
+# one target branching on an input tag.
+[[bin]]
+name = "chain_link_values_fuzz"
+path = "fuzz_targets/chain_link_values_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "first_free_cluster_fuzz"
+path = "fuzz_targets/first_free_cluster_fuzz.rs"
+test = false
+doc = false
+bench = false

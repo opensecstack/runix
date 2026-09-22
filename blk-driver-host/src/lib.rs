@@ -501,6 +501,42 @@ pub fn chain_link_values(clusters: &[u32]) -> impl Iterator<Item = (u32, u32)> +
     })
 }
 
+/// Scans one already-in-memory FAT sector's worth of bytes for the first
+/// free (all-zero) entry, returning the *absolute* cluster number it
+/// corresponds to — `None` if every entry in this sector is already in use
+/// (or `sector`/`entries_per_sector` don't admit a valid cluster number at
+/// all, via [`fat_entry_at`]'s own bounds check or a checked-arithmetic
+/// overflow, same fail-closed posture as everything else in this module).
+///
+/// `fat_sector_index` is which physical FAT sector `sector`'s bytes came
+/// from (0-based from the start of the FAT region) — needed to convert a
+/// sector-local entry index into an absolute cluster number, the same
+/// conversion `main.rs`'s own `allocate_free_cluster` used to do inline
+/// before this was split out specifically so it's testable/fuzzable
+/// without a real virtio-blk device: `allocate_free_cluster` is still the
+/// one responsible for actually reading `sector` off the device, one
+/// sector at a time, and now calls this pure helper per sector instead of
+/// repeating the same loop body. Behavior is unchanged — this is a pure
+/// extraction, not a new algorithm.
+pub fn first_free_cluster_in_fat_sector(
+    sector: &[u8],
+    fat_sector_index: u32,
+    entries_per_sector: u32,
+) -> Option<u32> {
+    for entry_in_sector in 0..entries_per_sector {
+        let cluster = fat_sector_index
+            .checked_mul(entries_per_sector)?
+            .checked_add(entry_in_sector)?;
+        if cluster < 2 {
+            continue; // clusters 0/1 are reserved, never allocatable
+        }
+        if fat_entry_at(sector, entry_in_sector) == Some(0) {
+            return Some(cluster);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,6 +821,36 @@ mod tests {
         assert_eq!(links, vec![(7, CHAIN_EOC_MARKER)]);
     }
 
+    #[test]
+    fn first_free_cluster_in_fat_sector_finds_the_first_zero_entry() {
+        // 16 bytes = 4 entries; entries 0,1 are the reserved clusters,
+        // entry 2 (cluster 2) is already in use, entry 3 (cluster 3) is
+        // free -- must return 3, not 2.
+        let mut sector = [0u8; 16];
+        sector[8..12].copy_from_slice(&0x0000_0005u32.to_le_bytes()); // cluster 2: in use
+        assert_eq!(
+            first_free_cluster_in_fat_sector(&sector, 0, 4),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn first_free_cluster_in_fat_sector_returns_none_when_all_in_use() {
+        let mut sector = [0u8; 16];
+        for chunk in sector.chunks_mut(4) {
+            chunk.copy_from_slice(&0x0000_0001u32.to_le_bytes());
+        }
+        assert_eq!(first_free_cluster_in_fat_sector(&sector, 0, 4), None);
+    }
+
+    #[test]
+    fn first_free_cluster_in_fat_sector_offsets_by_fat_sector_index() {
+        // fat_sector_index=1, entries_per_sector=4 -> this sector covers
+        // clusters 4..=7. Entry 0 in this sector (cluster 4) is free.
+        let sector = [0u8; 16];
+        assert_eq!(first_free_cluster_in_fat_sector(&sector, 1, 4), Some(4));
+    }
+
     proptest! {
         // The actual regression class this whole module exists to catch:
         // no byte pattern, however malformed, may make any of these three
@@ -879,6 +945,30 @@ mod tests {
         #[test]
         fn encode_short_name_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..32)) {
             let _ = encode_short_name(&bytes);
+        }
+
+        // Same "no byte pattern makes this crash" property as every other
+        // parser here, applied to the allocator's own scan-one-sector
+        // decision logic -- plus the actual correctness invariant a real
+        // allocator caller depends on: whatever cluster this returns must
+        // genuinely be free (its own FAT entry reads back as zero) and must
+        // be >= 2 (clusters 0/1 are reserved, never a valid allocation).
+        #[test]
+        fn first_free_cluster_in_fat_sector_never_panics_and_is_correct_when_found(
+            bytes in proptest::collection::vec(any::<u8>(), 0..2048),
+            fat_sector_index in any::<u32>(),
+            entries_per_sector in 0u32..2048,
+        ) {
+            let result = first_free_cluster_in_fat_sector(&bytes, fat_sector_index, entries_per_sector);
+            if let Some(cluster) = result {
+                prop_assert!(cluster >= 2);
+                // Recompute which sector-local entry this cluster came
+                // from and confirm it really does read as free -- the
+                // property a caller (`allocate_free_cluster`) actually
+                // relies on, not just "didn't panic."
+                let entry_in_sector = cluster - fat_sector_index.wrapping_mul(entries_per_sector);
+                prop_assert_eq!(fat_entry_at(&bytes, entry_in_sector), Some(0));
+            }
         }
     }
 
