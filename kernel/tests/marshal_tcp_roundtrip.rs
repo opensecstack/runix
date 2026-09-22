@@ -263,6 +263,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "demo-key",
         &signing_key,
     );
+    // `SYS_IPC_RECV` is now capability-gated identically to `SYS_IPC_SEND`
+    // (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) -- `net-driver-host` itself
+    // now needs its own token to *receive* on `SOCK_REQUEST_PORT`, not
+    // only the response-port send token it already held. See
+    // `net_driver_sockets.rs`'s identical fix for the full reasoning.
+    let request_recv_token = runix_capability_manager::CapabilityToken::issue(
+        "net-driver-host",
+        runix_kernel::capabilities::port_resource(marshal_client::SOCK_REQUEST_PORT),
+        now,
+        now + 1_000_000,
+        "demo-key",
+        &signing_key,
+    );
 
     #[allow(static_mut_refs)]
     unsafe {
@@ -272,7 +285,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         kernel_trampoline,
         space,
         Some(net_token),
-        alloc::vec![response_token],
+        alloc::vec![response_token, request_recv_token],
     );
 
     // Give it time to probe the device, bring up the interface, and reach
@@ -318,6 +331,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "demo-key",
         &signing_key,
     );
+    // `marshal_client::evaluate` receives on `SOCK_RESPONSE_PORT`
+    // internally (`recv_socket_response`'s `SYS_IPC_RECV`), which is now
+    // capability-gated too -- `spawn_with_capability` only carries one
+    // token, so this thread grants itself the second one at its own start
+    // (`scheduler::grant_current_extra_capability`), the same fix
+    // `net_driver_sockets.rs` needed for its own client thread.
+    let response_recv_token = runix_capability_manager::CapabilityToken::issue(
+        "test-marshal-client",
+        runix_kernel::capabilities::port_resource(marshal_client::SOCK_RESPONSE_PORT),
+        now,
+        now + 1_000_000,
+        "demo-key",
+        &signing_key,
+    );
+    #[allow(static_mut_refs)]
+    unsafe {
+        PENDING_RESPONSE_RECV_TOKEN = Some(response_recv_token);
+    }
     scheduler::spawn_with_capability(authorized_client_thread, Some(request_token));
 
     let mut result = TestResult::Pending;
@@ -357,12 +388,17 @@ enum TestResult {
 }
 
 static mut RESULT: TestResult = TestResult::Pending;
+static mut PENDING_RESPONSE_RECV_TOKEN: Option<runix_capability_manager::CapabilityToken> = None;
 
 /// Drives the client half entirely through `kernel::marshal_client` -- this
 /// thread holds the one capability scoped to
 /// [`marshal_client::SOCK_REQUEST_PORT`] (`kernel_main`'s own boot thread
 /// deliberately doesn't, proving the capability gate above).
 extern "C" fn authorized_client_thread() -> ! {
+    #[allow(static_mut_refs)]
+    let response_recv_token =
+        unsafe { PENDING_RESPONSE_RECV_TOKEN.take() }.expect("no pending response-recv token");
+    scheduler::grant_current_extra_capability(response_recv_token);
     let request = MarshalRequest {
         kerkese_json: FAKE_KERKESE_JSON.to_vec(),
     };

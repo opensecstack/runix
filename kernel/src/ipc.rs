@@ -105,6 +105,22 @@ pub fn try_recv(port: usize) -> Option<u8> {
     CHANNELS[port].lock().queue.pop_front()
 }
 
+/// Peeks whether `port` currently has anything queued, without popping —
+/// `syscall.rs`'s `SYS_IPC_RECV` arm checks this *before* paying for
+/// `authorized_for_port`'s real Ed25519 verification, so a busy-poll loop
+/// spinning on an empty port (this codebase's universal `SYS_IPC_RECV`
+/// calling convention — see e.g. `net_driver_sockets.rs`'s `recv_response`,
+/// `blk-driver-host`'s `run_fs_ipc_server`) pays the old, cheap
+/// lock-and-check cost on every empty iteration instead of a full
+/// signature verification on every single one. Confirmed as a real,
+/// measured problem, not a guess: with the check unconditional, a single
+/// `net_driver_sockets.rs` run took long enough under QEMU/TCG that it
+/// looked indistinguishable from a hang (minutes to cross a few tens of
+/// thousands of otherwise-empty polls) before this fix.
+pub fn is_empty(port: usize) -> bool {
+    CHANNELS[port].lock().queue.is_empty()
+}
+
 /// Blocks (spin-yielding) until a byte is available on `port`.
 pub fn recv(port: usize) -> u8 {
     loop {

@@ -235,6 +235,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "demo-key",
         &signing_key,
     );
+    // `SYS_IPC_RECV` is now capability-gated identically to `SYS_IPC_SEND`
+    // (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) -- `blk-driver-host` itself
+    // now needs its own token to *receive* on the request port it polls,
+    // not only the response-port send token it already held.
+    let fs_request_recv_token = CapabilityToken::issue(
+        "blk-driver-host",
+        runix_kernel::capabilities::port_resource(FS_REQUEST_PORT),
+        now,
+        now + 1_000_000,
+        "demo-key",
+        &signing_key,
+    );
 
     #[allow(static_mut_refs)]
     unsafe {
@@ -244,8 +256,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         kernel_trampoline,
         space,
         Some(blk_token),
-        alloc::vec![response_token],
+        alloc::vec![response_token.clone(), fs_request_recv_token],
     );
+
+    // This test's own boot thread now also needs a capability to receive
+    // on `FS_RESPONSE_PORT` -- see `blk_fs_ipc.rs`'s identical fix for why
+    // reusing `response_token` (rather than minting a fresh one) is
+    // correct: verification never checks subject, only resource/signature/
+    // expiry.
+    runix_kernel::scheduler::grant_current_extra_capability(response_token.clone());
 
     // Give it time to probe the device and reach its receive loop before
     // either requester attempts anything.
@@ -277,10 +296,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let hello_request = FsRequest::Read {
         name: String::from("HELLO.TXT"),
         token: file_token("test-hello", "HELLO.TXT"),
+        response_port: FS_RESPONSE_PORT as u16,
+        response_token: response_token.clone(),
     };
     let big_request = FsRequest::Read {
         name: String::from("BIG.TXT"),
         token: file_token("test-big", "BIG.TXT"),
+        response_port: FS_RESPONSE_PORT as u16,
+        response_token: response_token.clone(),
     };
 
     // The actual point: both sends are queued *before either thread has run

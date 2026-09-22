@@ -258,6 +258,28 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "demo-key",
         &signing_key,
     );
+    // `SYS_IPC_RECV` is now capability-gated identically to `SYS_IPC_SEND`
+    // (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) -- `blk-driver-host` itself
+    // now needs its own tokens to *receive* on the two request ports it
+    // polls (`run_fs_ipc_server`'s `ipc_try_recv(FS_REQUEST_PORT)`/
+    // `ipc_try_recv(FS_WRITE_REQUEST_PORT)`), not only the response-port
+    // send token it already held.
+    let fs_request_recv_token = CapabilityToken::issue(
+        "blk-driver-host",
+        runix_kernel::capabilities::port_resource(FS_REQUEST_PORT),
+        now,
+        now + 1_000_000,
+        "demo-key",
+        &signing_key,
+    );
+    let fs_write_request_recv_token = CapabilityToken::issue(
+        "blk-driver-host",
+        runix_kernel::capabilities::port_resource(FS_WRITE_REQUEST_PORT),
+        now,
+        now + 1_000_000,
+        "demo-key",
+        &signing_key,
+    );
 
     #[allow(static_mut_refs)]
     unsafe {
@@ -267,8 +289,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         kernel_trampoline,
         space,
         Some(blk_token),
-        alloc::vec![response_token],
+        alloc::vec![
+            response_token.clone(),
+            fs_request_recv_token,
+            fs_write_request_recv_token
+        ],
     );
+
+    // This test's own boot thread now also needs a capability to receive
+    // on `FS_RESPONSE_PORT` -- `SYS_IPC_RECV`'s new gate
+    // (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) applies to it exactly like
+    // any other caller. Reusing `response_token`'s own resource
+    // (`port:FS_RESPONSE_PORT`) rather than minting a fresh one --
+    // `CapabilityToken` verification only checks resource/signature/expiry,
+    // never subject, so the same token that authorizes `blk-driver-host` to
+    // *send* on this port also authorizes this thread to *receive* on it.
+    runix_kernel::scheduler::grant_current_extra_capability(response_token.clone());
 
     // Give it time to probe the device, locate HELLO.TXT, and reach its
     // receive loop before either requester attempts anything.
@@ -370,6 +406,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let hello_request = FsRequest::Read {
         name: String::from("HELLO.TXT"),
         token: hello_token,
+        response_port: FS_RESPONSE_PORT as u16,
+        response_token: response_token.clone(),
     };
     send_fs_request(
         FS_REQUEST_PORT,
@@ -399,6 +437,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let big_request = FsRequest::Read {
         name: String::from("BIG.TXT"),
         token: big_token,
+        response_port: FS_RESPONSE_PORT as u16,
+        response_token: response_token.clone(),
     };
     send_fs_request(
         FS_REQUEST_PORT,
@@ -437,6 +477,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mismatched_request = FsRequest::Read {
         name: String::from("BIG.TXT"),
         token: mismatched_token,
+        response_port: FS_RESPONSE_PORT as u16,
+        response_token: response_token.clone(),
     };
     send_fs_request(
         FS_REQUEST_PORT,
@@ -497,6 +539,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         name: String::from("WRITE.TXT"),
         token: mismatched_write_token,
         data: mismatched_payload,
+        response_port: FS_RESPONSE_PORT as u16,
+        response_token: response_token.clone(),
     };
     send_fs_request(
         FS_WRITE_REQUEST_PORT,
@@ -537,6 +581,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         name: String::from("WRITE.TXT"),
         token: write_token,
         data: write_payload,
+        response_port: FS_RESPONSE_PORT as u16,
+        response_token: response_token.clone(),
     };
     send_fs_request(
         FS_WRITE_REQUEST_PORT,

@@ -18,7 +18,18 @@ use x86_64::instructions::port::Port;
 pub const SYS_YIELD: u64 = 0;
 pub const SYS_WRITE: u64 = 1; // rdi = byte to write to serial
 pub const SYS_IPC_SEND: u64 = 2; // rdi = port, rsi = byte
-pub const SYS_IPC_RECV: u64 = 3; // rdi = port -> byte in rax, or u64::MAX if empty
+/// rdi = port -> byte in rax, or u64::MAX if empty *or denied*. Gated
+/// identically to [`SYS_IPC_SEND`] (same `port:<n>` resource,
+/// `authorized_for_port`) — see `docs/RFC-IPC-RESPONSE-CAPABILITY.md` for
+/// why: receiving from a port is a distinct privilege from sending to it,
+/// not a symmetry nicety added for its own sake. Before this gate existed,
+/// any thread that could issue this syscall at all could drain *any* port's
+/// queue regardless of which resource it held a token for — including a
+/// response port some other, legitimately-authorized client was waiting on
+/// (the confidentiality leak that RFC responds to). An unauthorized receive
+/// and an empty port are deliberately indistinguishable to the caller, same
+/// fail-closed convention as every other gated syscall in this table.
+pub const SYS_IPC_RECV: u64 = 3;
 pub const SYS_PORT_IN: u64 = 4; // rdi = I/O port, rsi = width (1/2/4) -> value in rax, or u64::MAX if denied/bad width
 pub const SYS_PORT_OUT: u64 = 5; // rdi = I/O port, rsi = width (1/2/4), rdx = value -> 0 ok, u64::MAX if denied/bad width
 /// Returns `interrupts::ticks()` (PIT ticks since boot) in rax — no
@@ -165,7 +176,37 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             ipc::end_send(port);
             0
         }
-        SYS_IPC_RECV => ipc::try_recv(arg1 as usize).map_or(u64::MAX, u64::from),
+        SYS_IPC_RECV => {
+            let port = arg1 as usize;
+            // Cheap peek *before* paying for `authorized_for_port`'s real
+            // Ed25519 verification — see `ipc::is_empty`'s own doc comment
+            // for why. `SYS_IPC_RECV`'s universal calling convention across
+            // this codebase is a tight busy-poll (yield-and-retry) while
+            // waiting for a response; charging a full signature check on
+            // every otherwise-empty iteration of that loop turned a
+            // near-free spin into a real, measured multi-minute-under-TCG
+            // slowdown. The empty case can never leak anything regardless
+            // of authorization, so it's safe to skip the check entirely
+            // when there's nothing queued.
+            if ipc::is_empty(port) {
+                return u64::MAX;
+            }
+            // Same gate `SYS_IPC_SEND` already has, against the same
+            // `port:<n>` resource — see this constant's own doc comment for
+            // why receiving needs its own authorization rather than riding
+            // on whatever the sender happened to check. Denial and "nothing
+            // queued yet" are deliberately the same `u64::MAX` in outcome
+            // (though not in timing — see `ipc::is_empty`'s doc comment;
+            // this project's current threat model already accepts other
+            // timing side channels as out of scope, see
+            // docs/THREAT_MODEL.md), so a hostile caller with no token for
+            // this port learns nothing about whether traffic exists on it
+            // from the *return value* alone.
+            if !authorized_for_port(port) {
+                return u64::MAX;
+            }
+            ipc::try_recv(port).map_or(u64::MAX, u64::from)
+        }
         SYS_TICKS => crate::interrupts::ticks(),
         SYS_PORT_IN => {
             let port = arg1 as u16;

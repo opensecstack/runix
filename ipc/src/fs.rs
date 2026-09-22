@@ -48,6 +48,21 @@ pub const MAX_TOKEN_FIELD_LEN: usize = 256;
 /// outright by [`FsRequest::decode`], not truncated.
 pub const MAX_DATA_LEN: usize = 4096;
 
+/// Doubling the per-request encoded size, roughly: every [`FsRequest`]
+/// variant now embeds a *second* [`CapabilityToken`]
+/// (`response_token`, scoped to `port:<response_port>`) alongside the
+/// existing per-file one -- `docs/RFC-IPC-RESPONSE-CAPABILITY.md`'s Option A,
+/// the fix for the shared-response-port confidentiality leak
+/// `docs/THREAT_MODEL.md` names. Not a new size bound in itself (each
+/// token's own fields are still checked against [`MAX_TOKEN_FIELD_LEN`]
+/// exactly as before) -- called out here because a token is already well
+/// over a kilobyte encoded and this genuinely doubles the bytes
+/// `blk-driver-host`'s `FS_MAX_PENDING_BYTES` and the underlying 32-byte
+/// `kernel::ipc::Channel` have to shepherd through one byte at a time per
+/// request, the cost the RFC's own Open Questions section flags against
+/// T1's <300ms MARSHAL budget.
+const _RESPONSE_TOKEN_DOUBLES_REQUEST_SIZE: () = ();
+
 fn encode_string(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u16).to_le_bytes());
     out.extend_from_slice(s.as_bytes());
@@ -115,13 +130,28 @@ fn decode_token(buf: &[u8]) -> Option<(CapabilityToken, usize)> {
 /// Client -> `blk-driver-host`, over a fixed request port (still
 /// capability-gated at the port level — see this module's own doc
 /// comment for what that layer proves vs. what `token` here proves).
+///
+/// **`response_port`/`response_token`** — `docs/RFC-IPC-RESPONSE-CAPABILITY.md`
+/// Option A: which port `blk-driver-host` should send the [`FsResponse`]
+/// back on, plus a [`CapabilityToken`] scoped to `port:<response_port>`
+/// proving the caller actually holds (i.e. was spawned with, or otherwise
+/// granted) the authorization to receive there. Before this existed, every
+/// client answered on one fixed, shared response port — any process that
+/// could issue `SYS_IPC_RECV` on it could drain *another* client's file
+/// contents regardless of whether it ever held a `file:<name>` token for
+/// that content. `blk-driver-host` verifies `response_token` itself
+/// (`verify_response_token`) before ever sending a byte; a request whose
+/// response token fails to verify is dropped, not answered on the port it
+/// claims, since replying there is exactly the leak this closes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsRequest {
     /// Read `name`'s full contents. Answered with [`FsResponse::Data`] or
-    /// [`FsResponse::Error`].
+    /// [`FsResponse::Error`], sent to `response_port`.
     Read {
         name: String,
         token: CapabilityToken,
+        response_port: u16,
+        response_token: CapabilityToken,
     },
     /// Overwrite `name`'s contents with `data`. Answered with
     /// [`FsResponse::Ok`] or [`FsResponse::Error`] — same single-sector,
@@ -133,6 +163,8 @@ pub enum FsRequest {
         name: String,
         token: CapabilityToken,
         data: Vec<u8>,
+        response_port: u16,
+        response_token: CapabilityToken,
     },
 }
 
@@ -140,17 +172,32 @@ impl FsRequest {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
-            FsRequest::Read { name, token } => {
+            FsRequest::Read {
+                name,
+                token,
+                response_port,
+                response_token,
+            } => {
                 out.push(0);
                 encode_string(&mut out, name);
                 encode_token(&mut out, token);
+                out.extend_from_slice(&response_port.to_le_bytes());
+                encode_token(&mut out, response_token);
             }
-            FsRequest::Write { name, token, data } => {
+            FsRequest::Write {
+                name,
+                token,
+                data,
+                response_port,
+                response_token,
+            } => {
                 out.push(1);
                 encode_string(&mut out, name);
                 encode_token(&mut out, token);
                 out.extend_from_slice(&(data.len() as u16).to_le_bytes());
                 out.extend_from_slice(data);
+                out.extend_from_slice(&response_port.to_le_bytes());
+                encode_token(&mut out, response_token);
             }
         }
         out
@@ -169,7 +216,25 @@ impl FsRequest {
         let (token, n) = decode_token(buf.get(off..)?)?;
         off += n;
         match tag {
-            0 => Some((FsRequest::Read { name, token }, off)),
+            0 => {
+                let rest = buf.get(off..)?;
+                if rest.len() < 2 {
+                    return None;
+                }
+                let response_port = u16::from_le_bytes([rest[0], rest[1]]);
+                off += 2;
+                let (response_token, n) = decode_token(buf.get(off..)?)?;
+                off += n;
+                Some((
+                    FsRequest::Read {
+                        name,
+                        token,
+                        response_port,
+                        response_token,
+                    },
+                    off,
+                ))
+            }
             1 => {
                 let rest = buf.get(off..)?;
                 if rest.len() < 2 {
@@ -183,7 +248,25 @@ impl FsRequest {
                     return None;
                 }
                 let data = rest[2..2 + len].to_vec();
-                Some((FsRequest::Write { name, token, data }, off + 2 + len))
+                off += 2 + len;
+                let rest = buf.get(off..)?;
+                if rest.len() < 2 {
+                    return None;
+                }
+                let response_port = u16::from_le_bytes([rest[0], rest[1]]);
+                off += 2;
+                let (response_token, n) = decode_token(buf.get(off..)?)?;
+                off += n;
+                Some((
+                    FsRequest::Write {
+                        name,
+                        token,
+                        data,
+                        response_port,
+                        response_token,
+                    },
+                    off,
+                ))
             }
             _ => None,
         }
@@ -298,6 +381,8 @@ mod tests {
         let req = FsRequest::Read {
             name: String::from("HELLO.TXT"),
             token: dummy_token("file:HELLO.TXT"),
+            response_port: 4,
+            response_token: dummy_token("port:4"),
         };
         let bytes = req.encode();
         assert_eq!(FsRequest::decode(&bytes), Some((req, bytes.len())));
@@ -309,6 +394,8 @@ mod tests {
             name: String::from("WRITE.TXT"),
             token: dummy_token("file:WRITE.TXT"),
             data: alloc::vec![1, 2, 3, 4, 5],
+            response_port: 5,
+            response_token: dummy_token("port:5"),
         };
         let bytes = req.encode();
         assert_eq!(FsRequest::decode(&bytes), Some((req, bytes.len())));
@@ -342,6 +429,8 @@ mod tests {
         let full = FsRequest::Read {
             name: String::from("HELLO.TXT"),
             token: dummy_token("file:HELLO.TXT"),
+            response_port: 4,
+            response_token: dummy_token("port:4"),
         }
         .encode();
         for cut in 0..full.len() {

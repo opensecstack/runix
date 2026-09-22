@@ -380,6 +380,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "demo-key",
         &signing_key,
     );
+    // `SYS_IPC_RECV` is now capability-gated identically to `SYS_IPC_SEND`
+    // (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) -- `net-driver-host` itself
+    // now needs its own token to *receive* on `SOCK_REQUEST_PORT`
+    // (`run_socket_ipc_server`'s `ipc_try_recv(SOCK_REQUEST_PORT)`), not
+    // only the response-port send token above -- same fix
+    // `net_driver_sockets.rs` already needed.
+    let request_recv_token = runix_capability_manager::CapabilityToken::issue(
+        "net-driver-host",
+        runix_kernel::capabilities::port_resource(marshal_client::SOCK_REQUEST_PORT),
+        now,
+        now + 1_000_000,
+        "demo-key",
+        &signing_key,
+    );
 
     #[allow(static_mut_refs)]
     unsafe {
@@ -389,7 +403,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         net_driver_trampoline,
         space,
         Some(net_token),
-        alloc::vec![response_token],
+        alloc::vec![response_token, request_recv_token],
     );
 
     // Give it time to probe the device, bring up the interface, and reach
@@ -487,6 +501,24 @@ static mut RESULT: TestResult = TestResult::Pending;
 extern "C" fn spawn_configured_instance_thread() -> ! {
     let now = runix_kernel::interrupts::ticks();
     let signing_key = capabilities::demo_signing_key();
+
+    // `spawn_instance`'s MARSHAL evaluation (`marshal_client::evaluate`)
+    // receives on `SOCK_RESPONSE_PORT` internally
+    // (`recv_socket_response`'s `SYS_IPC_RECV`), which is now
+    // capability-gated too (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) — this
+    // thread was only spawned with a `SOCK_REQUEST_PORT` *send* token
+    // above, so it grants itself the response-port *receive* token here,
+    // same pattern `marshal_tcp_roundtrip.rs`'s `authorized_client_thread`
+    // fix uses for the identical need.
+    let response_recv_token = runix_capability_manager::CapabilityToken::issue(
+        "test-grid-sandbox-marshal-shadow",
+        runix_kernel::capabilities::port_resource(marshal_client::SOCK_RESPONSE_PORT),
+        now,
+        now + 1_000_000,
+        "demo-key",
+        &signing_key,
+    );
+    scheduler::grant_current_extra_capability(response_recv_token);
 
     // --- Case 2: configured, reachable, REFUSE (Path 3) --------------------
     let refused_ok = match grid_sandbox::spawn_instance(

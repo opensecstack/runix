@@ -250,6 +250,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "demo-key",
         &signing_key,
     );
+    // `SYS_IPC_RECV` is now capability-gated identically to `SYS_IPC_SEND`
+    // (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) -- `net-driver-host` itself
+    // now needs its own token to *receive* on `SOCK_REQUEST_PORT`
+    // (`run_socket_ipc_server`'s `ipc_try_recv(SOCK_REQUEST_PORT)`), not
+    // only the response-port send token it already held. This is the
+    // recv-side gate landing "for free" on the sockets surface the RFC's
+    // own "What changes" section predicted -- it closes ambient receive
+    // access to this port, it does not add per-handle owner attribution
+    // (see `runix_ipc::sockets`'s own updated caveat).
+    let request_recv_token = runix_capability_manager::CapabilityToken::issue(
+        "net-driver-host",
+        runix_kernel::capabilities::port_resource(SOCK_REQUEST_PORT),
+        now,
+        now + 1_000_000,
+        "demo-key",
+        &signing_key,
+    );
 
     #[allow(static_mut_refs)]
     unsafe {
@@ -259,7 +276,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         kernel_trampoline,
         space,
         Some(net_token),
-        alloc::vec![response_token],
+        alloc::vec![response_token, request_recv_token],
     );
 
     // Give it time to probe the device, bring up the interface (including
@@ -301,6 +318,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "demo-key",
         &signing_key,
     );
+    // This thread also needs to *receive* on `SOCK_RESPONSE_PORT`
+    // (`recv_response`'s own `SYS_IPC_RECV`) now that that syscall is
+    // capability-gated too -- `spawn_with_capability` only carries one
+    // token, so this one is granted to the thread by itself, at its own
+    // start, via `scheduler::grant_current_extra_capability` (see that
+    // function's doc comment for why that's the right shape here rather
+    // than spawning a second thread purely to hold it).
+    let response_recv_token = runix_capability_manager::CapabilityToken::issue(
+        "test-socket-client",
+        runix_kernel::capabilities::port_resource(SOCK_RESPONSE_PORT),
+        now,
+        now + 1_000_000,
+        "demo-key",
+        &signing_key,
+    );
+    #[allow(static_mut_refs)]
+    unsafe {
+        PENDING_RESPONSE_RECV_TOKEN = Some(response_recv_token);
+    }
     scheduler::spawn_with_capability(authorized_client_thread, Some(request_token));
 
     let mut result = SocketTestResult::Pending;
@@ -338,6 +374,7 @@ enum SocketTestResult {
 }
 
 static mut RESULT: SocketTestResult = SocketTestResult::Pending;
+static mut PENDING_RESPONSE_RECV_TOKEN: Option<runix_capability_manager::CapabilityToken> = None;
 
 /// Drives the whole connect -> send -> recv -> close sequence, entirely
 /// through `runix_ipc::sockets`'s typed request/response wire format —
@@ -351,6 +388,10 @@ static mut RESULT: SocketTestResult = SocketTestResult::Pending;
 /// `static` instead of a shared memory page since both threads already
 /// share this process's address space.
 extern "C" fn authorized_client_thread() -> ! {
+    #[allow(static_mut_refs)]
+    let response_recv_token =
+        unsafe { PENDING_RESPONSE_RECV_TOKEN.take() }.expect("no pending response-recv token");
+    runix_kernel::scheduler::grant_current_extra_capability(response_recv_token);
     let outcome = run_socket_client();
     #[allow(static_mut_refs)]
     unsafe {

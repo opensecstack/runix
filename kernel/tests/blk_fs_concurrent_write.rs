@@ -270,6 +270,26 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "demo-key",
         &signing_key,
     );
+    // `SYS_IPC_RECV` is now capability-gated identically to `SYS_IPC_SEND`
+    // (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) -- `blk-driver-host` itself
+    // now needs its own tokens to *receive* on the two request ports it
+    // polls, not only the response-port send token it already held.
+    let fs_request_recv_token = CapabilityToken::issue(
+        "blk-driver-host",
+        runix_kernel::capabilities::port_resource(FS_REQUEST_PORT),
+        now,
+        now + 1_000_000,
+        "demo-key",
+        &signing_key,
+    );
+    let fs_write_request_recv_token = CapabilityToken::issue(
+        "blk-driver-host",
+        runix_kernel::capabilities::port_resource(FS_WRITE_REQUEST_PORT),
+        now,
+        now + 1_000_000,
+        "demo-key",
+        &signing_key,
+    );
 
     #[allow(static_mut_refs)]
     unsafe {
@@ -279,8 +299,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         kernel_trampoline,
         space,
         Some(blk_token),
-        alloc::vec![response_token],
+        alloc::vec![
+            response_token.clone(),
+            fs_request_recv_token,
+            fs_write_request_recv_token
+        ],
     );
+
+    // This test's own boot thread now also needs a capability to receive
+    // on `FS_RESPONSE_PORT` -- see `blk_fs_ipc.rs`'s identical fix for why
+    // reusing `response_token` (rather than minting a fresh one) is
+    // correct: verification never checks subject, only resource/signature/
+    // expiry.
+    runix_kernel::scheduler::grant_current_extra_capability(response_token.clone());
 
     // Give it time to probe the device and reach its receive loop before
     // either writer attempts anything.
@@ -322,11 +353,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         name: String::from(FILE_A),
         token: file_token("test-write-a", FILE_A),
         data: payload_a,
+        response_port: FS_RESPONSE_PORT as u16,
+        response_token: response_token.clone(),
     };
     let write_b = FsRequest::Write {
         name: String::from(FILE_B),
         token: file_token("test-write-b", FILE_B),
         data: payload_b,
+        response_port: FS_RESPONSE_PORT as u16,
+        response_token: response_token.clone(),
     };
 
     // The actual point: both writers are queued *before either thread has
@@ -383,11 +418,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         FILE_A,
         port_token("test-read-a", FS_REQUEST_PORT),
         file_token("test-read-a", FILE_A),
+        response_token.clone(),
     );
     let readback_b = read_file(
         FILE_B,
         port_token("test-read-b", FS_REQUEST_PORT),
         file_token("test-read-b", FILE_B),
+        response_token.clone(),
     );
 
     let a_ok = check_readback(FILE_A, &readback_a, pattern_a_byte);
@@ -463,10 +500,13 @@ fn read_file(
     name: &str,
     read_port_token: CapabilityToken,
     file_token: CapabilityToken,
+    response_token: CapabilityToken,
 ) -> Option<FsResponse> {
     let request = FsRequest::Read {
         name: String::from(name),
         token: file_token,
+        response_port: FS_RESPONSE_PORT as u16,
+        response_token,
     };
     #[allow(static_mut_refs)]
     unsafe {

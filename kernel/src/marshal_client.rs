@@ -53,7 +53,11 @@
 //! module doesn't make that policy decision, it only names the ports and
 //! issues the syscalls — an unauthorized caller's send is silently denied
 //! at the syscall gate the same way any other unauthorized `SYS_IPC_SEND`
-//! is.
+//! is, and (since `docs/RFC-IPC-RESPONSE-CAPABILITY.md` landed) the same is
+//! now true of [`recv_socket_response`]'s `SYS_IPC_RECV` on
+//! [`SOCK_RESPONSE_PORT`] — a caller of [`evaluate`] needs a capability for
+//! *both* ports, not just the request one, or its own receive silently
+//! sees nothing.
 
 use alloc::vec::Vec;
 use runix_ipc::marshal::{MarshalRequest, MarshalResponse};

@@ -234,14 +234,15 @@ struct BlkBootInfo {
 }
 
 /// Filesystem driver, Phase 3's fixed IPC ports -- request (a requester
-/// sends one trigger byte here) and response (`blk-driver-host` replies
-/// with a 2-byte little-endian length header, then that many content
-/// bytes) -- distinct from the transient demo ports (`0`-`2`) Phase
+/// sends a real `runix_ipc::fs::FsRequest`, one byte per `SYS_IPC_SEND`)
+/// and response (`blk-driver-host` replies with an `FsResponse`, one byte
+/// per `SYS_IPC_SEND`, on whichever port the request's own
+/// `response_port` field names -- see `docs/RFC-IPC-RESPONSE-CAPABILITY.md`
+/// Option A) -- distinct from the transient demo ports (`0`-`2`) Phase
 /// B4/B5's own capability-gate proof already uses during boot, though
 /// those never stay live long enough to actually collide with these.
 #[allow(dead_code)]
 const BLK_FS_REQUEST_PORT: usize = 8;
-const BLK_FS_RESPONSE_PORT: usize = 9;
 /// Filesystem driver, Phase 8: a second, independently capability-gated
 /// port for write requests -- a caller needs a capability scoped to
 /// `port_resource(BLK_FS_WRITE_REQUEST_PORT)` specifically, separate from
@@ -249,6 +250,37 @@ const BLK_FS_RESPONSE_PORT: usize = 9;
 /// `blk-driver-host/src/main.rs`'s own `FS_WRITE_REQUEST_PORT` constant.
 #[allow(dead_code)]
 const BLK_FS_WRITE_REQUEST_PORT: usize = 10;
+
+/// Port-allocation map, all 16 of `kernel::ipc::PORT_COUNT` -- kept here,
+/// not scattered across every port constant's own comment, so the next
+/// service to need one doesn't have to reconstruct this by grepping every
+/// `*_PORT` constant in the tree (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`
+/// calls this out explicitly as the thing to leave written down):
+///
+/// * `0`-`2`: boot-time capability-gate demo ports (Phase B4/B5), never live
+///   past early boot.
+/// * `3`-`7`: free -- Option A's per-client filesystem response-port pool.
+///   A real dynamic-client deployment would carve these out per spawned
+///   client; today's tests hand-pick one or two of these directly.
+/// * `8`: [`BLK_FS_REQUEST_PORT`] (filesystem read requests, recv-gated to
+///   `blk-driver-host` itself since `SYS_IPC_RECV`'s capability gate
+///   landed).
+/// * `9`: free -- formerly `BLK_FS_RESPONSE_PORT`, the one shared response
+///   port every filesystem client answered on before Option A. Retired:
+///   see `docs/RFC-IPC-RESPONSE-CAPABILITY.md`'s "Context" section for why
+///   a single shared response port was the actual confidentiality leak.
+/// * `10`: [`BLK_FS_WRITE_REQUEST_PORT`] (filesystem write requests, same
+///   recv-gating as `8`).
+/// * `11`: `net_driver_host::SOCK_REQUEST_PORT` / `marshal_client::SOCK_REQUEST_PORT`
+///   (sockets requests, recv-gated to `net-driver-host`).
+/// * `12`: `net_driver_host::SOCK_RESPONSE_PORT` / `marshal_client::SOCK_RESPONSE_PORT`
+///   (sockets responses -- still one port shared by every sockets client;
+///   Option A's per-client separation was only ever applied to the
+///   filesystem surface, not sockets -- see that RFC's "What changes"
+///   section).
+/// * `13`-`15`: free.
+#[allow(dead_code)]
+const PORT_ALLOCATION_MAP_SEE_DOC_COMMENT: () = ();
 
 /// Offset into the `BLK_INFO_VA` page `blk-driver-host` writes its own
 /// write-then-read-back result byte to -- same convention `NET_RESULT_OFFSET`
@@ -402,7 +434,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         &signing_key,
     );
     runix_kernel::scheduler::spawn_with_capability(thread_sender, Some(port0_token));
-    runix_kernel::scheduler::spawn(thread_receiver);
+    // `SYS_IPC_RECV` is now capability-gated identically to `SYS_IPC_SEND`
+    // (see `docs/RFC-IPC-RESPONSE-CAPABILITY.md`) -- receiving from port 0
+    // needs its own token, a distinct privilege from thread_sender's send
+    // token above even though both name the same `port:0` resource.
+    let port0_recv_token = runix_capability_manager::CapabilityToken::issue(
+        "thread:receiver",
+        runix_kernel::capabilities::port_resource(0),
+        now,
+        now + 1_000_000,
+        "demo-key",
+        &signing_key,
+    );
+    runix_kernel::scheduler::spawn_with_capability(thread_receiver, Some(port0_recv_token));
     for _ in 0..12 {
         runix_kernel::scheduler::yield_now();
     }
@@ -1077,9 +1121,29 @@ fn load_and_run_blk_driver_host(
     // callers" reasoning `Thread::extra_capabilities`'s own doc comment
     // gives.
     if serve_fs_requests {
-        let response_token = runix_capability_manager::CapabilityToken::issue(
+        // `SYS_IPC_RECV` is now capability-gated identically to
+        // `SYS_IPC_SEND` (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) --
+        // `blk-driver-host` itself now needs its own tokens to *receive* on
+        // the two request ports it polls (`run_fs_ipc_server`'s
+        // `ipc_try_recv(FS_REQUEST_PORT)`/`ipc_try_recv(FS_WRITE_REQUEST_PORT)`),
+        // not only the response-port send token it already held. Under
+        // Option A the per-client *response* ports are a spawn-time
+        // decision made by whichever caller actually turns
+        // `serve_fs_requests` on (each kernel test that does grants its own
+        // response-port send token(s) to this same `extra_capabilities`
+        // set) -- this function only owns the two fixed, always-shared
+        // request ports.
+        let fs_request_recv_token = runix_capability_manager::CapabilityToken::issue(
             "blk-driver-host",
-            runix_kernel::capabilities::port_resource(BLK_FS_RESPONSE_PORT),
+            runix_kernel::capabilities::port_resource(BLK_FS_REQUEST_PORT),
+            now,
+            now + 1_000_000,
+            "demo-key",
+            signing_key,
+        );
+        let fs_write_request_recv_token = runix_capability_manager::CapabilityToken::issue(
+            "blk-driver-host",
+            runix_kernel::capabilities::port_resource(BLK_FS_WRITE_REQUEST_PORT),
             now,
             now + 1_000_000,
             "demo-key",
@@ -1089,7 +1153,7 @@ fn load_and_run_blk_driver_host(
             blk_driver_host_trampoline,
             space,
             Some(blk_token),
-            alloc::vec![response_token],
+            alloc::vec![fs_request_recv_token, fs_write_request_recv_token],
         );
     } else {
         runix_kernel::scheduler::spawn_ring3_process_with_capability(

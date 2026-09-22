@@ -116,6 +116,39 @@ fn verify_file_token(token: &CapabilityToken, name: &str) -> bool {
         .is_ok()
 }
 
+/// The resource-string convention a response-port capability token must
+/// match — exactly `kernel/src/capabilities.rs`'s own `port_resource`
+/// (`format!("port:{port}")`), reused rather than inventing a distinct
+/// resource kind. `docs/RFC-IPC-RESPONSE-CAPABILITY.md`'s Open Questions
+/// section flags the alternative (a dedicated `respond-on:<n>` kind, so a
+/// token that authorizes *receiving* a response can't also be presented to
+/// authorize *sending* on that same port) as a real question the repo owner
+/// hasn't settled — reusing `port:<n>` here is the simpler, one-convention
+/// choice made for this pass, not a claim that the alternative was
+/// considered and rejected.
+fn response_port_resource(port: u16) -> String {
+    format!("port:{port}")
+}
+
+/// Verifies `token` was validly signed by the demo trust root, hasn't
+/// expired, and is scoped to exactly `port:<port>` — the actual point of
+/// Option A's second embedded token: proof that whoever sent this request
+/// really holds (was spawned with, or was otherwise granted) the
+/// authorization to receive on `port`, so this driver never sends a
+/// response's bytes — potentially another client's file contents — to a
+/// port the requester merely *claimed* as its own. A request whose
+/// response token fails this check is dropped by [`run_fs_ipc_server`],
+/// never answered anywhere: replying on the claimed port at that point
+/// would be exactly the leak this whole mechanism exists to close. Same
+/// "no revocation-list access from this driver" limitation
+/// [`verify_file_token`]'s own doc comment already names.
+fn verify_response_token(token: &CapabilityToken, port: u16) -> bool {
+    let now = syscall::ticks();
+    token
+        .verify(&demo_verifying_key(), &response_port_resource(port), now)
+        .is_ok()
+}
+
 /// Small — this driver does no dynamic allocation at all (no `alloc`
 /// crate even linked); kept only because `LockedHeap` needs *some*
 /// backing region to exist even though nothing here calls into the
@@ -163,12 +196,16 @@ struct BlkBootInfo {
     serve_fs_requests: u8,
 }
 
-/// Filesystem driver, Phase 3's fixed IPC ports — must match
-/// `kernel/src/main.rs`'s own `BLK_FS_REQUEST_PORT`/`BLK_FS_RESPONSE_PORT`
-/// constants exactly (same "no shared type, just an agreed ABI/protocol"
-/// convention as every other kernel/ring-3 boundary in this codebase).
+/// Filesystem driver, Phase 3's fixed request IPC port — must match
+/// `kernel/src/main.rs`'s own `BLK_FS_REQUEST_PORT` constant exactly (same
+/// "no shared type, just an agreed ABI/protocol" convention as every other
+/// kernel/ring-3 boundary in this codebase). The *response* side no longer
+/// has a fixed constant here at all — `docs/RFC-IPC-RESPONSE-CAPABILITY.md`
+/// Option A: each request now names its own response port
+/// (`FsRequest::Read`/`Write`'s `response_port` field), verified per-request
+/// against an embedded `response_token` (see [`verify_response_token`])
+/// rather than every client sharing one fixed, ambiently-readable port.
 const FS_REQUEST_PORT: usize = 8;
-const FS_RESPONSE_PORT: usize = 9;
 /// Filesystem driver, Phase 8: a second, independently capability-gated
 /// port for write requests against [`WRITE_FILE_NAME`] — a caller needs a
 /// capability scoped to `port_resource(FS_WRITE_REQUEST_PORT)` specifically,
@@ -2191,9 +2228,20 @@ fn handle_write_ipc_request(
 /// meaningful limit on any legitimate message.
 const FS_MAX_PENDING_BYTES: usize = 8192;
 
-fn send_fs_response(response: &FsResponse) {
+/// `port` is the *caller's own* response port (`FsRequest`'s
+/// `response_port` field), not a fixed constant — `docs/RFC-IPC-RESPONSE-CAPABILITY.md`
+/// Option A. Every call site in [`run_fs_ipc_server`] reaches this only
+/// after [`verify_response_token`] has already confirmed the caller holds
+/// a valid capability for exactly this port; this function itself performs
+/// no check, same "verify once, at the one call site that needs to, not
+/// redundantly everywhere" posture [`verify_file_token`]'s callers already
+/// follow. This driver must itself hold a `SYS_IPC_SEND` capability for
+/// `port` (granted at spawn time — see `kernel/src/main.rs`'s port
+/// allocation map) or the underlying syscall denies the send exactly like
+/// any other unauthorized sender's would.
+fn send_fs_response(port: u16, response: &FsResponse) {
     for byte in response.encode() {
-        let _ = syscall::ipc_send(FS_RESPONSE_PORT, byte);
+        let _ = syscall::ipc_send(port as usize, byte);
     }
 }
 
@@ -2281,13 +2329,35 @@ fn run_fs_ipc_server(dev: &mut BlkDevice, info: &BootSectorInfo) {
             read_buf.push(byte);
             if let Some((request, consumed)) = FsRequest::decode(&read_buf) {
                 read_buf.drain(..consumed);
-                if let FsRequest::Read { name, token } = request {
-                    write_all(b"blk-driver-host: FS server got a read request for ");
-                    write_all(name.as_bytes());
-                    write_byte(b'\n');
-                    let response = handle_read_ipc_request(dev, info, &name, &token);
-                    send_fs_response(&response);
-                    requests_served += 1;
+                if let FsRequest::Read {
+                    name,
+                    token,
+                    response_port,
+                    response_token,
+                } = request
+                {
+                    if !verify_response_token(&response_token, response_port) {
+                        // Dropped, not answered anywhere -- per
+                        // `docs/RFC-IPC-RESPONSE-CAPABILITY.md`, replying on
+                        // a port the caller merely *claimed* is exactly the
+                        // leak Option A closes. Logged so a legitimate
+                        // caller with a stale/misissued response token has
+                        // something to look at, same as every other
+                        // "untrusted input fails closed" path in this
+                        // module.
+                        write_all(
+                            b"blk-driver-host: FS server dropped a read request with an invalid response token for port ",
+                        );
+                        write_decimal(response_port as u64);
+                        write_byte(b'\n');
+                    } else {
+                        write_all(b"blk-driver-host: FS server got a read request for ");
+                        write_all(name.as_bytes());
+                        write_byte(b'\n');
+                        let response = handle_read_ipc_request(dev, info, &name, &token);
+                        send_fs_response(response_port, &response);
+                        requests_served += 1;
+                    }
                 }
                 // A `Write` variant arriving on the read port is malformed
                 // by construction (a well-behaved client only ever encodes
@@ -2303,13 +2373,28 @@ fn run_fs_ipc_server(dev: &mut BlkDevice, info: &BootSectorInfo) {
             write_buf.push(byte);
             if let Some((request, consumed)) = FsRequest::decode(&write_buf) {
                 write_buf.drain(..consumed);
-                if let FsRequest::Write { name, token, data } = request {
-                    write_all(b"blk-driver-host: FS server got a write request for ");
-                    write_all(name.as_bytes());
-                    write_byte(b'\n');
-                    let response = handle_write_ipc_request(dev, info, &name, &token, &data);
-                    send_fs_response(&response);
-                    requests_served += 1;
+                if let FsRequest::Write {
+                    name,
+                    token,
+                    data,
+                    response_port,
+                    response_token,
+                } = request
+                {
+                    if !verify_response_token(&response_token, response_port) {
+                        write_all(
+                            b"blk-driver-host: FS server dropped a write request with an invalid response token for port ",
+                        );
+                        write_decimal(response_port as u64);
+                        write_byte(b'\n');
+                    } else {
+                        write_all(b"blk-driver-host: FS server got a write request for ");
+                        write_all(name.as_bytes());
+                        write_byte(b'\n');
+                        let response = handle_write_ipc_request(dev, info, &name, &token, &data);
+                        send_fs_response(response_port, &response);
+                        requests_served += 1;
+                    }
                 }
             } else if write_buf.len() > FS_MAX_PENDING_BYTES {
                 write_buf.clear();

@@ -36,6 +36,20 @@
 //! comment for that scoping caveat and why the capability gate is on the
 //! *port*, not the handle.
 //!
+//! **Updated by `docs/RFC-IPC-RESPONSE-CAPABILITY.md` (Option A):** the
+//! port-level capability gate is now two-way — `SYS_IPC_RECV` checks the
+//! same `port:<n>` resource `SYS_IPC_SEND` always has, so a process with no
+//! token for [`SOCK_RESPONSE_PORT`... see `net-driver-host/src/main.rs`]
+//! can no longer drain it just by asking. That closes ambient *receive*
+//! access to the response port, full stop. It does **not** close the gap
+//! this doc comment already named: sockets still share one fixed
+//! request/response port pair across every caller, and a handle is still
+//! nameable by anyone holding the port-level token, with no per-handle
+//! owner check behind it — the RFC deliberately scoped that out as
+//! `net-driver-host`'s own follow-up work, not part of Option A. Do not
+//! read the recv-side gate landing as this gap having closed too; it has
+//! not.
+//!
 //! DHCP is out of scope for this module: [`SocketRequest::Connect`] takes
 //! an already-resolved remote address, not a hostname, and address
 //! acquisition for the interface itself is `net-driver-host`'s own

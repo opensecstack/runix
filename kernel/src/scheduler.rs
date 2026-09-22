@@ -615,6 +615,31 @@ pub fn current_extra_capabilities() -> Vec<CapabilityToken> {
     })
 }
 
+/// Adds `token` to whichever thread is currently running's own
+/// `extra_capabilities` — for a thread that never went through a `spawn*`
+/// call carrying the token it needs, most commonly a test harness's own
+/// boot thread. Before `SYS_IPC_RECV` gained its capability gate
+/// (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`), several kernel-test boot
+/// threads called it directly, unauthorized, and got away with it only
+/// because the syscall itself never checked. Post-gate, that same direct
+/// call needs a real token — spawning a whole second thread purely to hold
+/// one would be needless ceremony when the boot thread can simply grant
+/// itself the capability it's about to use, the same way a
+/// `spawn_ring3_process_with_capabilities` caller decides up front what a
+/// *different* thread will be authorized for. Not exposed as a syscall —
+/// ring 3 code granting itself capabilities on demand would defeat the
+/// entire point of this being a *capability* system; this is kernel-internal
+/// test/bootstrap plumbing only.
+pub fn grant_current_extra_capability(token: CapabilityToken) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(sched) = SCHEDULER.lock().as_mut() {
+            if let Some(thread) = sched.current.as_mut() {
+                thread.extra_capabilities.push(token);
+            }
+        }
+    });
+}
+
 /// The IDT vector a voluntary [`yield_now`]/[`exit_current_thread`] traps
 /// through — `int RESCHEDULE_VECTOR` is deliberately the *same kind* of
 /// event as a timer tick (a real interrupt, not a function call), so

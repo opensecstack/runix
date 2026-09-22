@@ -2470,3 +2470,83 @@ passing, including the two tests above), `cargo clippy -p runix-desktop
 `nightly-x86_64-pc-windows-gnu` (per `docs/BUILDING.md`'s Windows toolchain
 note) confirming the one-line `grid_sandbox.rs` change still compiles
 against the kernel's real target.
+
+## `SYS_IPC_RECV` capability gate — Option A (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) implemented
+
+The finding: any process that could issue `SYS_IPC_RECV` at all could drain
+*any* port's queue, including a response port a completely different,
+legitimately-authorized client was waiting on — `blk-driver-host`'s shared
+`FS_RESPONSE_PORT` was the concrete leak (a per-file `CapabilityToken`
+gated *asking* to read a file, but not *receiving* the answer). Fixed per
+the repo-owner-approved Option A: `SYS_IPC_RECV` now calls the same
+`authorized_for_port` gate `SYS_IPC_SEND`/`SYS_IPC_SEND_LOCK`/
+`SYS_IPC_SEND_UNLOCK` already had, and the filesystem surface's single
+shared response port is retired — each client's `FsRequest` now carries
+its own response port plus a second `CapabilityToken` scoped to it
+(`ipc/src/fs.rs`), verified by `blk-driver-host` before it ever answers on
+that port. Port `9` (formerly `BLK_FS_RESPONSE_PORT`) is now free;
+`kernel/src/main.rs` carries a documented allocation map of all 16 ports
+so the next service doesn't pick a colliding number by hand.
+
+**A real, measured performance regression was found and fixed while
+verifying this, not just a theoretical concern.** `SYS_IPC_RECV`'s
+universal calling convention across this entire codebase (`blk-driver-host`,
+`net-driver-host`, `marshal_client`, every kernel test that receives) is a
+tight busy-poll loop — yield-and-retry, up to hundreds of thousands of
+iterations, while waiting for a response. Before this change, an empty
+poll was a cheap lock-and-check (`ipc::try_recv`'s `pop_front` on an empty
+queue). With the naive fix (check `authorized_for_port` — a real Ed25519
+signature verification — on *every* poll, empty or not), a single
+`net_driver_sockets.rs` run went from finishing in seconds to still not
+finishing after 10+ minutes under QEMU/TCG, indistinguishable from a hang
+until directly instrumented and confirmed to be genuinely (if extremely
+slowly) progressing. Root cause confirmed by iteration-count debug logging,
+not guessed. Fixed with `ipc::is_empty` (`kernel/src/ipc.rs`): a cheap peek
+before the expensive check — `SYS_IPC_RECV` now costs what it always did
+on an empty port (the overwhelming majority of polls in this calling
+pattern) and only pays for real signature verification once there is an
+actual byte to reveal. The one honest tradeoff this introduces: an empty
+port and an unauthorized-but-nonempty port are no longer *timing*-
+indistinguishable to the caller (both still return the same `u64::MAX`, so
+the *outcome* is unchanged) — accepted for now, consistent with this
+project's threat model already treating other timing side channels as out
+of scope (see `docs/THREAT_MODEL.md`).
+
+**Every real `SYS_IPC_RECV` call site in the tree was audited and fixed**,
+per the RFC's own top-named risk (an unauthorized receive is silently
+indistinguishable from an empty port, so a caller missing a token doesn't
+error, it just never sees data): `blk-driver-host` (both request ports),
+`net-driver-host` (`SOCK_REQUEST_PORT`, needed in every test file that
+spawns it with `serve_sockets: 1` — `net_driver_sockets.rs`,
+`net_driver_sockets_concurrent.rs`, `marshal_tcp_roundtrip.rs`,
+`marshal_proxy_e2e.rs`, `grid_sandbox_marshal_shadow.rs`), and every client
+thread that calls `marshal_client::evaluate`/receives sockets responses
+directly (same five files above, each needed a self-granted
+`SOCK_RESPONSE_PORT` receive token via the new
+`scheduler::grant_current_extra_capability` — a thread that never went
+through a `spawn*` call carrying the token it needs grants it to itself at
+its own start, deliberately not exposed as a syscall, kernel-internal
+plumbing only).
+
+Verified in QEMU, every affected test, real pass/fail:
+`blk_fs_ipc.rs`/`blk_fs_concurrent.rs`/`blk_fs_concurrent_write.rs` (native
+Windows), `net_driver_sockets.rs`/`net_driver_sockets_concurrent.rs`/
+`marshal_tcp_roundtrip.rs`/`grid_sandbox_marshal_shadow.rs`/
+`marshal_proxy_e2e.rs` (this project's Fedora WSL environment — native
+Windows QEMU's Slirp still can't run `guestfwd` helpers on this machine,
+same pre-existing limitation earlier MARSHAL work already worked around).
+`marshal_proxy_e2e.rs` in particular re-proves the real `citadel_proxy`
+binary's full chain (mock CITADEL endpoint -> real HTTP -> real proxy ->
+real TCP -> sockets IPC) still works correctly under the new recv gate.
+`cargo build --workspace` and the kernel's own
+`cargo build --target x86_64-unknown-none` / `cargo clippy --target
+x86_64-unknown-none --bins --lib -- -D warnings` all clean.
+
+**What Option A does not close, named explicitly per the RFC**: this
+supports roughly eight capability-separated clients system-wide (the
+free port slots), all known at build time — `net-driver-host`'s sockets
+surface got the receive-side gate "for free" but not per-handle owner
+attribution (`ipc/src/sockets.rs`'s existing caller-attribution caveat
+still applies). Option C (a real session/handle primitive keyed on a new
+thread identity) remains the named long-term destination, not attempted
+here.

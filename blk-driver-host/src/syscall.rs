@@ -97,8 +97,16 @@ pub fn ticks() -> u64 {
 }
 
 /// Reads one byte off IPC `port`, non-blocking — `None` if the port is
-/// currently empty. No capability check on the receive side (matching
-/// `kernel/src/syscall.rs`'s real behavior today).
+/// currently empty *or* this process holds no capability authorizing
+/// `SYS_IPC_RECV` on it. `kernel/src/syscall.rs`'s `SYS_IPC_RECV` arm now
+/// gates the receive side identically to the send side
+/// (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) — this process needs its own
+/// `port:<n>` capability for every port it calls this on
+/// (`FS_REQUEST_PORT`/`FS_WRITE_REQUEST_PORT`, granted at spawn time by
+/// `kernel/src/main.rs`), not only the response-port *send* capability it
+/// already held. An unauthorized receive and an empty port are
+/// deliberately indistinguishable here, same as at the syscall gate
+/// itself.
 pub fn ipc_try_recv(port: usize) -> Option<u8> {
     let ret = unsafe { syscall(SYS_IPC_RECV, port as u64, 0, 0) };
     if ret == u64::MAX {
