@@ -27,6 +27,22 @@ serde_json = "1"
 # docs/ROADMAP.md's Open Questions and deny.toml's `[sources]` section,
 # which was updated in the same change that added this dependency.
 citadel-kerkese-core = { git = "https://github.com/opensecstack/opensecstack", rev = "c21aedcb5efcf3b8de7be5d0861d70a7fdcbbc69" }
+# `citadel_proxy`'s own Verifier identity (`desktop/src/citadel/identity.rs`)
+# — signs the enriched Kerkese envelope's `sig_verifier` with a key
+# deliberately distinct from any key `kernel/` holds. Plain `workspace =
+# true` (unlike `capability-manager`'s `no_std` override of this same
+# dependency): `desktop` is a hosted `std` platform, so the workspace's
+# default features are fine here. The demo key is loaded from a fixed seed
+# (`SigningKey::from_bytes`), never generated at runtime, so no
+# `rand_core`/CSPRNG feature is needed.
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+# Real UUIDs for `Kerkese.execution_id` — `citadel/internal/marshal/types.go`'s
+# `Kerkese.ExecutionID` is a Go `uuid.UUID`, which fails to unmarshal from
+# an arbitrary string (e.g. the kernel's own opaque `instance_id`) — see
+# `desktop/src/citadel/identity.rs`'s `Kerkese::execution_id` doc comment.
+uuid = { version = "1", features = ["v4"] }
 # default-tls (not rustls-tls): on Windows this resolves to native-tls's
 # `schannel` backend, which wraps the OS's SChannel APIs directly — no
 # external OpenSSL install or C compiler needed, unlike rustls-tls's `ring`

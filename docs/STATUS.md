@@ -425,13 +425,80 @@ guessed shape:
    hand-rolled `std::net::TcpListener` mock server covering success,
    not-configured, a non-2xx response, and connection-refused.
 
-None of this is wired into a real authorization path yet — `desktop/`
-has no call site that invokes `HttpKerkeseTransport` during an actual
-module load or instance spawn, and `kernel::marshal_client` has no caller
-outside its own roundtrip test. The honest summary: the external blocker
-went from "nothing to build against" to "a real upstream crate exists,
-pinned, and three of the pieces needed to call it are now real and
-tested" — genuine movement, not yet a resolved blocker.
+`desktop/` still has no call site that invokes `HttpKerkeseTransport`
+during an actual module load, and there is still no live CITADEL
+deployment reachable in any dev/CI/QEMU scenario — the external blocker
+(a real MARSHAL proxy to talk to) remains open. But `kernel::marshal_client`
+*does* now have a real caller in an actual authorization path: see
+"Grid sandbox: from shadow-mode to real MARSHAL enforcement" immediately
+below.
+
+**Grid sandbox: from shadow-mode to real MARSHAL enforcement.**
+`kernel::grid_sandbox::spawn_instance` (`kernel/src/grid_sandbox.rs`)
+first grew a shadow-mode-only MARSHAL evaluation on every spawn (calls
+`marshal_client::evaluate`, records the outcome as a
+`runix_citadel_integration::ShadowMarshalOutcome` in a dedicated
+`WormLog`, never acts on it — proved by `kernel/tests/
+grid_sandbox_marshal_shadow.rs` against a real listener
+(`tests/support/grid_sandbox_marshal_shadow_listener.py`) over a real
+TCP connection through `net-driver-host`). That has now been turned into
+**real enforcement**, per the approved policy in
+[MARSHAL-ENFORCEMENT-POLICY.md](MARSHAL-ENFORCEMENT-POLICY.md) (Option B:
+fail-open when there's nothing to honor, fail-closed only on a reachable
+refusal):
+
+- `shadow_marshal_evaluate` (name kept for continuity with
+  `SHADOW_MARSHAL_LOG`/existing tests) now returns the
+  `ShadowMarshalOutcome` it computes, in addition to recording it in
+  `WormLog` exactly as before — observability is unchanged, only now
+  something also acts on the result.
+- A new `enforce_marshal_decision` gate: `Unreachable` (which
+  `shadow_marshal_evaluate` already produces for both "no proxy
+  configured" and "configured but couldn't be reached" — see that
+  function's own `match`) and `Execute` both return `Ok(())`;
+  `Refuse`/`HardStop` return `Err(MarshalEnforcementError::Blocked(outcome))`.
+- `spawn_instance`'s return type changed from `Result<SpawnedInstance,
+  CitadelError>` to `Result<SpawnedInstance, SpawnInstanceError>`, a new
+  enum with `Authorization(CitadelError)` (boot-time allowlist failures,
+  unchanged) and `MarshalEnforcement(MarshalEnforcementError)` (the new
+  runtime gate) as two distinct variants — deliberately not folded into
+  `CitadelError` itself, since that enum is a closed set of boot-time
+  allowlist failures and this is meant to be the first of several future
+  runtime enforcement gates (see `MarshalEnforcementError`'s own doc
+  comment in `grid_sandbox.rs` for the full reasoning). The enforcement
+  gate runs, and can return `Err`, strictly before any ELF parsing,
+  `AddressSpace` setup, or capability-token issuance — a blocked spawn is
+  never started and then killed, nothing gets spawned at all.
+- Verified with a real QEMU boot against all three in-scope paths (Path 4,
+  execution under a real deployment's `Execute`, is out of scope until Beta
+  per the policy doc): Path 1 (fail-open, unconfigured) —
+  `grid_sandbox_multi_instance.rs` passes unchanged, confirming no
+  regression to the existing no-proxy-configured default. Paths 2
+  (fail-open, configured but unreachable) and 3 (fail-closed, configured
+  and reachable `REFUSE`) were both folded into an updated
+  `grid_sandbox_marshal_shadow.rs`: a `"shadow-unreachable"` instance
+  spawns successfully against an address with no `guestfwd` mapping at
+  all (`Unreachable` recorded, spawn allowed), and a `"shadow-refused"`
+  instance spawn against the real listener (always answers `REFUSE`)
+  returns `Err(SpawnInstanceError::MarshalEnforcement(MarshalEnforcementError::Blocked(ShadowMarshalOutcome::Refuse)))`
+  with `Refuse` recorded in the `WormLog` — genuinely blocked, not
+  spawned-then-killed by construction (the gate runs, and can return
+  `Err`, before any ELF parsing/`AddressSpace`/token work in
+  `spawn_instance`'s source). **Platform note**: native Windows QEMU's
+  Slirp backend can't run the `guestfwd=...-cmd:...` helper process at all
+  (`Slirp: fork_exec: Failed to execute helper program` — confirmed against
+  both this test and the pre-existing `marshal_tcp_roundtrip.rs`, so it's a
+  Windows-QEMU/harness gap, not a regression from this change), so Paths 2
+  and 3's networked cases were run and confirmed passing under this
+  project's Fedora WSL environment instead (`PASS` observed, including the
+  real listener's log showing it received the request and answered
+  `Refuse`, and the kernel's own log showing the `shadow-refused` spawn
+  genuinely blocked) — plain `cargo test --target x86_64-unknown-none` from
+  a Windows shell only exercises Path 1's no-network case for real.
+- Path 3 remains untestable against a *real* MARSHAL deployment (only a
+  mock listener) until the rbacMap-coverage and Separation-of-Duties
+  questions the policy doc's "Real blocking dependency" section describes
+  are resolved — unchanged from that doc's own caveat.
 
 Two real bugs surfaced integrating `capability-manager` into `kernel/`,
 both worth knowing before touching crypto-heavy code here again:
@@ -2293,3 +2360,113 @@ back via genuine `strb`/`ldrb` through `SP_EL0`, echoed via `SYS_WRITE`
 mapping, verified in QEMU for both the `secure=on` and no-`secure`
 boot paths. See `mmu.rs`'s doc comment on `Level3Table` for the complete
 account.
+
+## MARSHAL Verifier identity: the `citadel_proxy` becomes a real second principal
+
+`docs/RFC-VERIFIER-IDENTITY.md` (Option A, repo-owner-approved) fixes the
+specific defect that made `kernel/src/grid_sandbox.rs`'s shadow-mode MARSHAL
+evaluation provably trip CITADEL Gate 3's `NDS_SAME_IDENTITY` hard-stop
+regardless of deployment config: the kernel used to build a Kerkese-shaped
+envelope asserting `"actor":"kernel","verifier":"kernel"` — one identity
+playing both Separation-of-Duties roles, plus bare strings where CITADEL's
+real `KerkeseActor`/`KerkeseVerifier` Go types expect objects.
+
+**What changed, and where:**
+
+- `kernel/src/grid_sandbox.rs`'s `shadow_marshal_evaluate` — **one string
+  literal changed**, nothing else in that function or file: the kernel now
+  asserts `actor` as a real `{"user_id":"kernel:grid_sandbox","role":"operator"}`
+  object and never asserts a `verifier` at all. (This landed alongside a
+  separate, parallel task turning shadow-mode evaluation into real
+  enforcement — the two changes touch the same function for unrelated
+  reasons; this section covers only the envelope-shape/identity change.)
+- `desktop/src/citadel/identity.rs` (new): the proxy's own Ed25519 demo
+  keypair (`proxy_signing_key`/`proxy_verifying_key`, a fixed seed distinct
+  from both of `kernel/`'s demo trust roots — same "prove the wiring works,
+  not a real trust anchor" honesty `kernel/src/capabilities.rs`'s own demo
+  key already documents), real `KerkeseActor`/`KerkeseVerifier`/`KerkeseSoD`/
+  `KerkeseAction`/`KerkeseEvidence`/`Kerkese` structs matching
+  `citadel/internal/marshal/types.go` field-for-field, a `canonical_payload`
+  function that reproduces `citadel/internal/marshal/sig.go`'s
+  `CanonicalPayload` byte-for-byte (verified by a fixture test against the
+  same date `citadel/internal/marshal/marshal_test.go`'s `baseKerkese` uses),
+  and `sign_verifier_payload` — a real Ed25519 signature over that payload,
+  not a placeholder.
+- `desktop/src/citadel/policy.rs` (new): the proxy's own local policy check,
+  run *before* it ever attaches its Verifier identity. Real, scoped
+  honestly: it recognizes only action types CITADEL's own `rbacMap` lists
+  for `grid_sandbox.spawn_instance`, validates `module_id`/`instance_id`/
+  `actor.user_id` are well-formed, requires `dry_run` to be present rather
+  than defaulted, and refuses outright if the kernel's request already
+  carries a `verifier` (a regression guard, not just a shape check). What it
+  is **not**: a re-verification of `InstanceManifestEntry`'s signature —
+  that data is kernel-owned, in-memory state (`kernel::citadel::demo_authorize_instance`
+  builds a throwaway, self-signed, self-verified allowlist per call, see
+  that function's own doc comment) with no persisted, independently-checkable
+  form this process can reach without an `ipc::marshal::MarshalRequest`
+  wire-contract extension — out of this change's scope, flagged here rather
+  than faked.
+- `desktop/src/citadel/proxy.rs` — rewritten from a pure byte-forwarder
+  (its old module doc comment's own description) into a real
+  parse → policy-check → enrich → forward pipeline: `build_response` now
+  parses the kernel's minimal envelope, calls `policy::check`, and only on
+  success builds the enriched `Kerkese` (fresh UUID `execution_id` — the
+  kernel's own `instance_id` isn't UUID-shaped, so it's carried instead in
+  `evidence.extra.kernel_execution_id` — a real UTC timestamp, and a real
+  `sig_verifier`) before ever calling `HttpKerkeseTransport::submit`. A
+  policy refusal returns `MarshalError::Other` and never touches the
+  transport at all.
+
+**Verified, specifically, that this fixes the SoD defect** — not just that
+the code compiles: `desktop/src/citadel/proxy.rs`'s
+`enriches_envelope_with_a_distinct_signed_verifier_identity_before_forwarding`
+test captures the *actual bytes this proxy POSTs*, decodes them as a real
+`Kerkese`, and asserts `sod.operator_user_id != sod.verifier_user_id`
+(`"kernel:grid_sandbox"` vs. `"citadel_proxy:verifier"`), that `actor.role`
+(`"operator"`, CITADEL's `roleGroupMap` → `"privileged"`) and `verifier.role`
+(`"auditor"` → `"oversight"`) land in different groups (Gate 3's second,
+independent same-*group* check), and that `sig_verifier` is a real signature
+verifying under the proxy's own key over `canonical_payload` of exactly that
+envelope. A second test, `policy_refusal_never_forwards_to_citadel`, proves
+a policy-refused request never reaches the transport at all (the mock
+CITADEL endpoint panics if it receives a connection it shouldn't).
+
+**What's still scoped down — flagged, not faked:**
+
+- **Signature registration against a live CITADEL deployment.** `sig_verifier`
+  is computed correctly and verifies under the proxy's own key, but nothing
+  registers `proxy_verifying_key()` with a real `Store::GetSigningKey`
+  lookup, and CITADEL's `EnforceSignatures` defaults to `false` anyway (see
+  `Engine::EnforceSignatures`'s own doc comment) — so today this is *evidence
+  a real Verifier co-signed the request*, not something any live deployment
+  actually checks. Real key provisioning is its own ADR per the RFC's open
+  questions section, and needs infrastructure (CITADEL-side key registration,
+  sinauth-backed `VerifierToken`) outside this repo.
+- **The SoD-fix claim was verified by construction/inspection, not by
+  running the real Go `gate3NDS` code against this envelope.** This session
+  did not modify the sibling `opensecstack/opensecstack` working directory
+  (out of caution about write access/scope to another project) — the proof
+  is the Rust-side test above plus direct comparison against
+  `citadel/internal/marshal/marshal.go`'s real `gate3NDS`/`roleGroupMap`
+  source (read, not executed, as part of this change) and
+  `marshal_test.go`'s `TestGate3_HardStop_SameIdentity`/`TestGate3_HardStop_SameGroup`
+  fixtures, which show exactly what a real Gate 3 run keys its checks on.
+  Running the actual Go engine against this envelope (or adding an
+  equivalent Go-side test) is real, valuable follow-up work this change
+  did not do.
+- **No new `ipc::marshal::MarshalRequest` field for kernel-asserted evidence**
+  (e.g. an `InstanceManifestEntry` the proxy could independently re-verify)
+  — the RFC's "What changes" section names this as a plausible next step;
+  it's an `ipc` wire-contract change and was out of this change's scope.
+- **`citadel-integration::WormLog` does not yet record the proxy's own
+  verification decision as a separate evidence entry** (the RFC's "two
+  principals, two log entries" goal) — `desktop/` has no WORM-writing path
+  today; this is follow-up work, not attempted here.
+
+Verified: `cargo build --workspace`, `cargo test -p runix-desktop` (19/19
+passing, including the two tests above), `cargo clippy -p runix-desktop
+--all-targets -- -D warnings` (clean), and a standalone
+`cargo build --target x86_64-unknown-none` from `kernel/` under
+`nightly-x86_64-pc-windows-gnu` (per `docs/BUILDING.md`'s Windows toolchain
+note) confirming the one-line `grid_sandbox.rs` change still compiles
+against the kernel's real target.

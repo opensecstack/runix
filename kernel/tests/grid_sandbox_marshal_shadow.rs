@@ -1,42 +1,65 @@
-//! Proves `grid_sandbox::spawn_instance`'s shadow-mode MARSHAL evaluation
-//! (see that function's own doc comment) is genuinely observe-only: a
-//! `grid-sandbox-host` instance spawns identically — same `Ok`, same
-//! capability token, same tier enforcement — whether the shadow evaluation
-//! finds no proxy configured at all, or finds a real listener that answers
-//! `REFUSE`. Also proves the evaluation's outcome actually lands in
-//! `grid_sandbox`'s [`runix_kernel::grid_sandbox::shadow_marshal_log_entries`]
-//! (backed by `runix_citadel_integration::WormLog`), rather than being
-//! silently dropped or logged through some new, parallel mechanism.
+//! Proves `grid_sandbox::spawn_instance`'s real MARSHAL enforcement gate
+//! (Option B, `docs/MARSHAL-ENFORCEMENT-POLICY.md`) actually gates: a
+//! `grid-sandbox-host` instance spawns normally (`Ok`, real instance-scoped
+//! capability token, correct tier) when there's nothing to honor — no proxy
+//! configured, or a configured proxy that's unreachable — but is genuinely
+//! blocked, before any ELF parsing/address-space/token work happens, when a
+//! reachable proxy answers `REFUSE`. Also proves the evaluation's outcome
+//! actually lands in `grid_sandbox`'s
+//! [`runix_kernel::grid_sandbox::shadow_marshal_log_entries`] (backed by
+//! `runix_citadel_integration::WormLog`) in every case, whether or not it
+//! ends up gating the spawn.
 //!
-//! Two cases, run in sequence within one boot:
+//! Three cases, run in sequence within one boot — Paths 1-3 of the policy
+//! doc's verification plan (Path 4, a real MARSHAL `Execute` deployment, is
+//! explicitly out of scope until Beta):
 //!
-//! 1. **Unconfigured** (`grid_sandbox`'s own default): `spawn_instance`
-//!    called for `instance_id` `"shadow-unconfigured"` with no shadow proxy
-//!    configured at all. No networking is attempted — `net-driver-host`
-//!    isn't even loaded yet at this point in the test — and the recorded
-//!    outcome is `ShadowMarshalOutcome::Unreachable`.
-//! 2. **Configured, listener present**: after bringing up `net-driver-host`
-//!    (same shape `marshal_tcp_roundtrip.rs` uses) and pointing
-//!    `grid_sandbox::set_shadow_marshal_proxy` at
-//!    `tests/support/grid_sandbox_marshal_shadow_listener.py` (a
-//!    permissive sibling of `marshal_tcp_roundtrip.rs`'s own
-//!    `marshal_proof_listener.py` — that script checks the received
-//!    `kerkese_json` against one fixed fixture value, which doesn't fit
-//!    here since `shadow_marshal_evaluate` builds its request from the real
-//!    `instance_id` being spawned; this one accepts any well-formed request
-//!    and always answers `REFUSE`, same "fail closed, not open" reasoning —
-//!    see that script's own doc comment), `spawn_instance` is called for
-//!    `instance_id`
-//!    `"shadow-configured"` from a thread holding the one capability scoped
-//!    to `marshal_client::SOCK_REQUEST_PORT`. The instance spawns
-//!    successfully regardless — a `REFUSE` shadow outcome never denies,
-//!    delays, or otherwise changes the spawn — and the recorded outcome is
-//!    `ShadowMarshalOutcome::Refuse`.
+//! 1. **Unconfigured** (`grid_sandbox`'s own default — Path 1):
+//!    `spawn_instance` called for `instance_id` `"shadow-unconfigured"` with
+//!    no shadow proxy configured at all. No networking is attempted —
+//!    `net-driver-host` isn't even loaded yet at this point in the test —
+//!    the spawn succeeds (fail-open), and the recorded outcome is
+//!    `ShadowMarshalOutcome::Unreachable`.
+//! 2. **Configured, reachable, `REFUSE`** (Path 3): after bringing up
+//!    `net-driver-host`, `grid_sandbox::set_shadow_marshal_proxy` points at
+//!    `10.0.2.100:9000`, bridged via `guestfwd` to `tests/support/
+//!    grid_sandbox_marshal_shadow_listener.py` (a permissive sibling of
+//!    `marshal_tcp_roundtrip.rs`'s own `marshal_proof_listener.py` — that
+//!    script checks the received `kerkese_json` against one fixed fixture
+//!    value, which doesn't fit here since `shadow_marshal_evaluate` builds
+//!    its request from the real `instance_id` being spawned; this one
+//!    accepts any well-formed request and always answers `REFUSE`, same
+//!    "fail closed, not open" reasoning — see that script's own doc
+//!    comment). `spawn_instance` is called for `instance_id`
+//!    `"shadow-refused"`. The spawn is **blocked**: `spawn_instance` returns
+//!    `Err(SpawnInstanceError::MarshalEnforcement(MarshalEnforcementError::Blocked(ShadowMarshalOutcome::Refuse)))`,
+//!    and the recorded shadow outcome is `ShadowMarshalOutcome::Refuse`. No
+//!    `SpawnedInstance`/token is ever produced for this call — `enforce_marshal_decision`
+//!    runs, and returns `Err`, before `spawn_instance` does any ELF
+//!    parsing, `AddressSpace` setup, or `scheduler::spawn_ring3_process_with_capability`
+//!    call (see that function's own source: the enforcement gate is placed
+//!    strictly before all of that), so this is "never spawned," not
+//!    "spawned then killed."
+//! 3. **Configured, but unreachable** (Path 2): `set_shadow_marshal_proxy`
+//!    is repointed, after case 2's real listener has already answered and
+//!    its connection torn down, at a guest-side address (`10.0.2.100:9001`)
+//!    that has **no** `guestfwd` mapping at all in this test's QEMU
+//!    invocation — a connect attempt there gets no answer at all, which
+//!    `marshal_client::evaluate` treats as a bounded, fail-fast timeout
+//!    (see `SHADOW_MARSHAL_MAX_ITERS`'s own doc comment), a faithful "proxy
+//!    configured but unreachable" case without needing any extra host-side
+//!    process. Deliberately run *last*: an unresolved/timing-out connect
+//!    attempt is exactly the kind of state you don't want sitting on a
+//!    `net-driver-host` socket slot before a later case tries to open its
+//!    own connection, so this case has nothing scheduled after it in this
+//!    test. `spawn_instance` is called for `instance_id`
+//!    `"shadow-unreachable"`; the spawn still succeeds (fail-open), and the
+//!    recorded outcome is `ShadowMarshalOutcome::Unreachable`.
 //!
-//! In both cases, `spawn_instance`'s `Ok(SpawnedInstance)` is checked the
-//! same way `grid_sandbox_wasm.rs`/`grid_sandbox_multi_instance.rs` already
-//! do: a real, instance-scoped capability token that verifies against that
-//! instance's own resource string.
+//! Cases 2 and 3 both run on a dedicated thread holding the one capability
+//! scoped to `marshal_client::SOCK_REQUEST_PORT` (same reason
+//! `marshal_tcp_roundtrip.rs` uses a dedicated thread: `kernel_main`'s own
+//! thread deliberately doesn't hold it).
 //!
 //! **Manual build steps required when running this locally** — both of
 //! `grid_sandbox_multi_instance.rs`'s and `marshal_tcp_roundtrip.rs`'s:
@@ -48,13 +71,35 @@
 //!
 //! **Host-side setup** — same `guestfwd` shape as `marshal_tcp_roundtrip.rs`,
 //! bridged to this test's own listener's port `9004` instead of
-//! `marshal_proof_listener.py`'s `9003`:
+//! `marshal_proof_listener.py`'s `9003`. Only `10.0.2.100:9000` gets a
+//! `guestfwd` mapping — `10.0.2.100:9001` (case 3's target) is deliberately
+//! left unmapped:
 //!
 //! ```text
 //! python3 tests/support/grid_sandbox_marshal_shadow_listener.py &
 //! RUNIX_NETDEV_ARG="user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9004" \
 //!   cargo test --target x86_64-unknown-none --test grid_sandbox_marshal_shadow
 //! ```
+//!
+//! **Platform note: run this under Linux QEMU, not native Windows QEMU.**
+//! Native Windows QEMU's Slirp network backend has no working `fork()`/
+//! `exec()` to run a `guestfwd=...-cmd:...` helper process at all — confirmed
+//! on this project's Windows dev machine against *both* this test and the
+//! pre-existing, unmodified `marshal_tcp_roundtrip.rs`: QEMU logs `Slirp:
+//! fork_exec: Failed to execute helper program (No such file or directory)`
+//! and the guest-side connection to `10.0.2.100:9000` never reaches the
+//! listener at all (`shadow_marshal_evaluate` correctly reports
+//! `Unreachable` for that case, matching Option B's fail-open path, but
+//! case 2's fail-closed `REFUSE` assertion never gets exercised). This is a
+//! Windows-QEMU/test-harness gap, not a `grid_sandbox`/`net-driver-host` bug
+//! — confirmed working correctly under the Fedora WSL environment already
+//! set up for this project (see CLAUDE.md's "Runix dev environment" note):
+//! same `RUNIX_NETDEV_ARG`/listener invocation above, run from WSL instead
+//! of a native Windows shell, produces a real `Refuse` decision from the
+//! listener and a genuinely blocked `"shadow-refused"` spawn — this is how
+//! this test (and `marshal_tcp_roundtrip.rs`) must be run to actually
+//! exercise their networked cases; run from native Windows, only the
+//! no-network case (case 1) is real coverage.
 
 #![no_std]
 #![no_main]
@@ -68,7 +113,9 @@ use runix_citadel_integration::ShadowMarshalOutcome;
 use runix_kernel::capabilities;
 use runix_kernel::citadel::SandboxTier;
 use runix_kernel::elf::Elf64;
-use runix_kernel::grid_sandbox::{self, ShadowMarshalProxyConfig};
+use runix_kernel::grid_sandbox::{
+    self, MarshalEnforcementError, ShadowMarshalProxyConfig, SpawnInstanceError,
+};
 use runix_kernel::marshal_client;
 use runix_kernel::process::AddressSpace;
 use runix_kernel::qemu_exit::{exit_qemu, QemuExitCode};
@@ -111,6 +158,11 @@ const NET_TX_BUFFER_COUNT: u64 = 4;
 const TCP_REMOTE_IP: [u8; 4] = [10, 0, 2, 100];
 const TCP_REMOTE_PORT: u16 = 9000;
 const TCP_LOCAL_PORT: u16 = 49158;
+// Deliberately has no `guestfwd` mapping in this test's QEMU invocation
+// (see this file's own doc comment) — a connection attempt here fails
+// immediately, a faithful "proxy configured but unreachable" case (Path 2).
+const TCP_UNREACHABLE_PORT: u16 = 9001;
+const TCP_UNREACHABLE_LOCAL_PORT: u16 = 49159;
 
 #[repr(C)]
 struct NetBootInfo {
@@ -347,18 +399,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         scheduler::yield_now();
     }
 
+    // Case 2 (Path 3): configured, pointed at the real listener that always
+    // answers REFUSE.
     grid_sandbox::set_shadow_marshal_proxy(Some(ShadowMarshalProxyConfig {
         remote_ip: TCP_REMOTE_IP,
         remote_port: TCP_REMOTE_PORT,
         local_port: TCP_LOCAL_PORT,
     }));
 
-    // `spawn_instance`'s shadow evaluation needs the calling thread to hold
+    // `spawn_instance`'s MARSHAL evaluation needs the calling thread to hold
     // a capability scoped to `marshal_client::SOCK_REQUEST_PORT` — this
     // test's own `kernel_main` thread deliberately doesn't (same posture
-    // `marshal_tcp_roundtrip.rs` proves for its own boot thread), so the
-    // actual `spawn_instance` call for the configured case happens on a
-    // separate thread that does hold it.
+    // `marshal_tcp_roundtrip.rs` proves for its own boot thread), so both
+    // configured-case `spawn_instance` calls happen on a separate thread
+    // that does hold it. That thread also does the `set_shadow_marshal_proxy`
+    // repoint from "reachable, REFUSE" (case 2) to "unreachable" (case 3,
+    // run last on purpose — see this file's own doc comment) between its
+    // two spawn attempts — this is a plain global, callable from any
+    // thread, same as `kernel_main`'s own call above.
     let request_token = runix_capability_manager::CapabilityToken::issue(
         "test-grid-sandbox-marshal-shadow",
         runix_kernel::capabilities::port_resource(marshal_client::SOCK_REQUEST_PORT),
@@ -383,17 +441,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     match result {
         TestResult::Pass => {
             serial_println!(
-                "grid_sandbox_marshal_shadow: PASS — shadow-configured spawned successfully with \
-                 a real listener answering REFUSE, and the WormLog recorded that outcome without \
-                 it ever affecting the spawn"
+                "grid_sandbox_marshal_shadow: PASS — shadow-unreachable spawned successfully \
+                 (fail-open) and shadow-refused was genuinely blocked (fail-closed), matching \
+                 Option B (docs/MARSHAL-ENFORCEMENT-POLICY.md)"
             );
             exit_qemu(QemuExitCode::Success);
         }
         _ => {
             serial_println!(
                 "grid_sandbox_marshal_shadow: FAIL — configured-case thread reported {:?} (is \
-                 RUNIX_NETDEV_ARG/marshal_proof_listener.py actually set up? see this test's own \
-                 doc comment)",
+                 RUNIX_NETDEV_ARG/grid_sandbox_marshal_shadow_listener.py actually set up? see \
+                 this test's own doc comment)",
                 result
             );
             exit_qemu(QemuExitCode::Failed);
@@ -411,59 +469,133 @@ enum TestResult {
 static mut RESULT: TestResult = TestResult::Pending;
 
 /// Runs on the one thread holding the capability scoped to
-/// `marshal_client::SOCK_REQUEST_PORT` — calls `grid_sandbox::spawn_instance`
-/// for the "configured, listener present" case and checks both that the
-/// spawn itself succeeded (never gated by the shadow evaluation) and that
-/// the WormLog recorded the listener's real `REFUSE` answer.
+/// `marshal_client::SOCK_REQUEST_PORT`. Performs both configured-proxy
+/// cases in sequence, REFUSE first and unreachable last (see this file's
+/// own doc comment for why the order matters — an unresolved/timing-out
+/// connect attempt is exactly the state you don't want left on a
+/// `net-driver-host` socket slot before a later case opens its own):
+///
+/// - **Case 2 / Path 3** (`"shadow-refused"`): proxy already pointed (by
+///   `kernel_main`, before this thread was spawned) at the real listener
+///   (always answers `REFUSE`). Confirms `spawn_instance` returns
+///   `Err(SpawnInstanceError::MarshalEnforcement(MarshalEnforcementError::Blocked(ShadowMarshalOutcome::Refuse)))`
+///   (fail-closed — genuinely blocked, no `SpawnedInstance`/token produced)
+///   and the WormLog records `Refuse`.
+/// - **Case 3 / Path 2** (`"shadow-unreachable"`): repoints the proxy at an
+///   address with no `guestfwd` mapping, then confirms `spawn_instance`
+///   still succeeds (fail-open) and the WormLog records `Unreachable`.
 extern "C" fn spawn_configured_instance_thread() -> ! {
     let now = runix_kernel::interrupts::ticks();
     let signing_key = capabilities::demo_signing_key();
 
-    let outcome = match grid_sandbox::spawn_instance(
-        "shadow-configured",
+    // --- Case 2: configured, reachable, REFUSE (Path 3) --------------------
+    let refused_ok = match grid_sandbox::spawn_instance(
+        "shadow-refused",
+        SandboxTier::T2Trusted,
+        now,
+        &signing_key,
+    ) {
+        Ok(_instance) => {
+            serial_println!(
+                "grid_sandbox_marshal_shadow: FAIL — shadow-refused's spawn succeeded, but a \
+                 reachable REFUSE must block it (Path 3 is fail-closed)"
+            );
+            false
+        }
+        Err(SpawnInstanceError::MarshalEnforcement(MarshalEnforcementError::Blocked(
+            ShadowMarshalOutcome::Refuse,
+        ))) => {
+            let entries = grid_sandbox::shadow_marshal_log_entries();
+            let recorded = entries
+                .iter()
+                .find(|e| e.instance_id.as_deref() == Some("shadow-refused"))
+                .and_then(|e| e.shadow_marshal);
+            if recorded == Some(ShadowMarshalOutcome::Refuse) {
+                serial_println!(
+                    "grid_sandbox_marshal_shadow: shadow-refused's spawn was blocked as \
+                     expected (fail-closed) with Refuse recorded in the WormLog"
+                );
+                true
+            } else {
+                serial_println!(
+                    "grid_sandbox_marshal_shadow: shadow-refused's spawn was blocked as \
+                     expected, but expected its WormLog entry to carry Some(Refuse), got {:?}",
+                    recorded
+                );
+                false
+            }
+        }
+        Err(e) => {
+            serial_println!(
+                "grid_sandbox_marshal_shadow: shadow-refused's spawn failed, but not with the \
+                 expected MarshalEnforcementError::Blocked(Refuse): {:?}",
+                e
+            );
+            false
+        }
+    };
+
+    // --- Case 3: configured but unreachable (Path 2) — run last on purpose,
+    // see this function's own doc comment. ----------------------------------
+    grid_sandbox::set_shadow_marshal_proxy(Some(ShadowMarshalProxyConfig {
+        remote_ip: TCP_REMOTE_IP,
+        remote_port: TCP_UNREACHABLE_PORT,
+        local_port: TCP_UNREACHABLE_LOCAL_PORT,
+    }));
+
+    let unreachable_ok = match grid_sandbox::spawn_instance(
+        "shadow-unreachable",
         SandboxTier::T2Trusted,
         now,
         &signing_key,
     ) {
         Ok(instance) => {
-            let resource = capabilities::grid_instance_resource("shadow-configured");
+            let resource = capabilities::grid_instance_resource("shadow-unreachable");
             if capabilities::check(&instance.token, &resource, now).is_err() {
                 serial_println!(
-                    "grid_sandbox_marshal_shadow: shadow-configured's own token was rejected \
+                    "grid_sandbox_marshal_shadow: shadow-unreachable's own token was rejected \
                      against its own resource string"
                 );
-                TestResult::Fail
+                false
             } else {
                 let entries = grid_sandbox::shadow_marshal_log_entries();
                 let recorded = entries
                     .iter()
-                    .find(|e| e.instance_id.as_deref() == Some("shadow-configured"))
+                    .find(|e| e.instance_id.as_deref() == Some("shadow-unreachable"))
                     .and_then(|e| e.shadow_marshal);
-                if recorded == Some(ShadowMarshalOutcome::Refuse) {
-                    TestResult::Pass
+                if recorded == Some(ShadowMarshalOutcome::Unreachable) {
+                    serial_println!(
+                        "grid_sandbox_marshal_shadow: shadow-unreachable spawned successfully \
+                         (fail-open) with Unreachable recorded, as expected"
+                    );
+                    true
                 } else {
                     serial_println!(
-                        "grid_sandbox_marshal_shadow: expected shadow-configured's WormLog entry \
-                         to carry Some(Refuse), got {:?}",
+                        "grid_sandbox_marshal_shadow: expected shadow-unreachable's WormLog \
+                         entry to carry Some(Unreachable), got {:?}",
                         recorded
                     );
-                    TestResult::Fail
+                    false
                 }
             }
         }
         Err(e) => {
             serial_println!(
-                "grid_sandbox_marshal_shadow: shadow-configured's instance authorization was \
-                 denied (it should never be, shadow evaluation must not gate this): {:?}",
+                "grid_sandbox_marshal_shadow: shadow-unreachable's spawn was denied (it should \
+                 never be — Path 2 is fail-open): {:?}",
                 e
             );
-            TestResult::Fail
+            false
         }
     };
 
     #[allow(static_mut_refs)]
     unsafe {
-        RESULT = outcome;
+        RESULT = if unreachable_ok && refused_ok {
+            TestResult::Pass
+        } else {
+            TestResult::Fail
+        };
     }
     loop {
         scheduler::yield_now();

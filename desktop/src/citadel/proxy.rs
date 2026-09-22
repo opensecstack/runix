@@ -4,14 +4,40 @@
 //! socket-based transport speaks, and the exact framing
 //! `kernel/tests/support/marshal_proof_listener.py` answers as a stand-in
 //! today — see that script's doc comment for the wire format this module
-//! must match byte-for-byte), forwards the carried `kerkese_json` to
-//! [`HttpKerkeseTransport`], and writes back a `MarshalResponse` encoding
-//! either the real Decision or a translated [`MarshalError`].
+//! must match byte-for-byte), and forwards to CITADEL.
 //!
-//! This module owns the TCP/decode/encode plumbing (the part that's worth
-//! unit-testing against a mock CITADEL HTTP endpoint, see this module's
-//! `#[cfg(test)]`); `src/bin/citadel_proxy.rs` is a thin `main` that reads
-//! configuration and calls [`serve`].
+//! # No longer a dumb byte-forwarder
+//!
+//! Per `docs/RFC-VERIFIER-IDENTITY.md`'s Option A, this module used to
+//! forward the carried `kerkese_json` to [`HttpKerkeseTransport`] verbatim,
+//! unparsed. It now does three things, in order, for every request:
+//!
+//! 1. **Parses** the kernel's minimal envelope
+//!    ([`super::policy::KernelMinimalEnvelope`] — only `kerkese_version`,
+//!    `dry_run`, `action`, `actor`, `execution_id`; deliberately not the
+//!    full `Kerkese` shape, see that type's own doc comment for why the
+//!    kernel only ever asserts `actor`). A request that fails to parse (or
+//!    is missing `dry_run` — required, no `#[serde(default)]`, see
+//!    [`super::policy`]'s doc comment point 3) is refused before any policy
+//!    check even runs.
+//! 2. **Runs [`super::policy::check`]** — this proxy's own local policy
+//!    decision (action-type recognition, identifier well-formedness, no
+//!    kernel-asserted `verifier`). A refusal here means this proxy never
+//!    attaches its identity and never forwards to CITADEL at all — the
+//!    request is answered with a translated [`MarshalError`] describing
+//!    which policy check failed.
+//! 3. Only once that check passes: **builds the real, enriched
+//!    [`super::identity::Kerkese`] envelope** (real `KerkeseActor`/
+//!    `KerkeseVerifier`/`KerkeseSoD`, a fresh `execution_id` UUID, a real
+//!    UTC timestamp, and this proxy's own `sig_verifier` — see
+//!    [`build_enriched_envelope`]) and forwards *that* — never the
+//!    kernel's original minimal envelope — to [`HttpKerkeseTransport`].
+//!
+//! This module owns the TCP/decode/encode plumbing plus this
+//! parse/check/enrich pipeline (the part that's worth unit-testing against
+//! a mock CITADEL HTTP endpoint, see this module's `#[cfg(test)]`);
+//! `src/bin/citadel_proxy.rs` is a thin `main` that reads configuration and
+//! calls [`serve`].
 //!
 //! # Why parse the real `Decision` type rather than hand-scraping `outcome`
 //!
@@ -38,8 +64,13 @@ use std::net::{TcpListener, TcpStream};
 
 use citadel_kerkese_core::decision::{Decision, Outcome};
 use citadel_kerkese_core::{KerkeseTransport, TransportError};
+use ed25519_dalek::SigningKey;
 use runix_ipc::marshal::{MarshalError, MarshalOutcome, MarshalRequest, MarshalResponse};
 
+use super::identity::{
+    self, Kerkese, KerkeseAction, KerkeseActor, KerkeseEvidence, KerkeseSoD, KerkeseVerifier,
+};
+use super::policy::{self, KernelMinimalEnvelope, PolicyError};
 use super::HttpKerkeseTransport;
 
 /// Environment variable holding the TCP address this proxy listens on.
@@ -123,13 +154,110 @@ fn truncate_message(s: String) -> String {
     s[..end].to_string()
 }
 
+/// Parses `kerkese_json` as [`KernelMinimalEnvelope`]. A `serde_json` parse
+/// failure (including a missing `dry_run` field, since that field has no
+/// `#[serde(default)]` — see [`super::policy`]'s doc comment point 3)
+/// becomes `MarshalError::BadResponse`: not a CITADEL transport failure,
+/// but the same "this proxy could not produce a Decision" contract
+/// [`MarshalResponse::Error`] already covers, so callers don't need a new
+/// error case to distinguish "parse failed" from "CITADEL response was
+/// malformed" — both mean "no usable Decision came back."
+fn parse_kernel_envelope(kerkese_json: &[u8]) -> Result<KernelMinimalEnvelope, MarshalResponse> {
+    serde_json::from_slice::<KernelMinimalEnvelope>(kerkese_json).map_err(|e| {
+        MarshalResponse::Error(MarshalError::BadResponse(truncate_message(format!(
+            "kerkese_json was not a well-formed minimal envelope: {e}"
+        ))))
+    })
+}
+
+/// Translates a [`PolicyError`] into the [`MarshalResponse`] sent back to
+/// the kernel caller when this proxy refuses to vouch for a request —
+/// `MarshalError::Other`, since a policy refusal is neither a transport
+/// failure nor a malformed-response condition, the two cases
+/// [`MarshalError`]'s other variants exist for.
+fn policy_error_response(err: PolicyError) -> MarshalResponse {
+    MarshalResponse::Error(MarshalError::Other(truncate_message(err.to_string())))
+}
+
+/// Builds the real, enriched [`Kerkese`] envelope this proxy forwards to
+/// CITADEL, from an already policy-checked `envelope` — never called
+/// before [`policy::check`] has already returned `Ok`. See this module's
+/// doc comment (point 3) and [`super::identity`]'s doc comment for what's
+/// real here (envelope shape, identity separation, a genuine Ed25519
+/// signature under this proxy's own key) and what's still scoped down
+/// (registering that key with a live CITADEL deployment).
+fn build_enriched_envelope(envelope: &KernelMinimalEnvelope, signing_key: &SigningKey) -> Kerkese {
+    let execution_id = uuid::Uuid::new_v4().to_string();
+    let ts_utc = identity::format_rfc3339_utc(identity::now_unix_secs());
+
+    let mut extra = std::collections::BTreeMap::new();
+    extra.insert(
+        "module_id".to_string(),
+        envelope.action.module_id.clone(),
+    );
+    extra.insert(
+        "instance_id".to_string(),
+        envelope.action.instance_id.clone(),
+    );
+    if !envelope.execution_id.is_empty() {
+        // The kernel's own `execution_id` (today, its `instance_id` reused
+        // — see `grid_sandbox.rs`) isn't a valid UUID, so it can't fill
+        // `Kerkese.execution_id` (a Go `uuid.UUID` — see that field's doc
+        // comment), but it's still worth carrying as evidence linking this
+        // enriched envelope back to the kernel's original request.
+        extra.insert(
+            "kernel_execution_id".to_string(),
+            envelope.execution_id.clone(),
+        );
+    }
+
+    let actor = KerkeseActor {
+        user_id: envelope.actor.user_id.clone(),
+        role: envelope.actor.role.clone(),
+        email: None,
+    };
+    let verifier = KerkeseVerifier::this_proxy();
+    let sod = KerkeseSoD {
+        operator_user_id: actor.user_id.clone(),
+        verifier_user_id: verifier.user_id.clone(),
+    };
+
+    let mut kerkese = Kerkese {
+        kerkese_version: if envelope.kerkese_version.is_empty() {
+            "1.0".to_string()
+        } else {
+            envelope.kerkese_version.clone()
+        },
+        ts_utc,
+        project_id: "runix".to_string(),
+        execution_id,
+        action: KerkeseAction {
+            action_type: envelope.action.action_type.clone(),
+            description: format!(
+                "grid_sandbox.spawn_instance module_id={} instance_id={}",
+                envelope.action.module_id, envelope.action.instance_id
+            ),
+        },
+        actor,
+        verifier,
+        evidence: KerkeseEvidence { extra },
+        sod,
+        dry_run: envelope.dry_run,
+        sig_verifier: String::new(),
+    };
+
+    let payload = identity::canonical_payload(&kerkese);
+    kerkese.sig_verifier = identity::sign_verifier_payload(&payload, signing_key);
+    kerkese
+}
+
 /// Submits `kerkese_json` via `transport` and builds the [`MarshalResponse`]
 /// to send back: a `Decision` (with `outcome` pulled out of the real,
 /// parsed `Decision` JSON) on success, or a translated [`MarshalError`] on
 /// any transport/parse failure. Never panics on a malformed or hostile
 /// response body — a bad decision JSON becomes `MarshalError::BadResponse`,
 /// never a default/guessed outcome.
-fn build_response(transport: &HttpKerkeseTransport, kerkese_json: &[u8]) -> MarshalResponse {
+fn submit_and_translate(transport: &HttpKerkeseTransport, kerkese_json: &[u8]) -> MarshalResponse {
     let decision_json = match transport.submit(kerkese_json) {
         Ok(bytes) => bytes,
         Err(TransportError::Unreachable(msg)) => {
@@ -155,6 +283,37 @@ fn build_response(transport: &HttpKerkeseTransport, kerkese_json: &[u8]) -> Mars
     }
 }
 
+/// Runs this module's full parse -> policy check -> enrich -> forward
+/// pipeline (see this module's own doc comment) against one already-decoded
+/// `kerkese_json` payload and returns the [`MarshalResponse`] to send back.
+/// Never forwards anything to `transport` unless [`policy::check`] passed.
+fn build_response(
+    transport: &HttpKerkeseTransport,
+    signing_key: &SigningKey,
+    kerkese_json: &[u8],
+) -> MarshalResponse {
+    let envelope = match parse_kernel_envelope(kerkese_json) {
+        Ok(envelope) => envelope,
+        Err(response) => return response,
+    };
+
+    if let Err(err) = policy::check(&envelope) {
+        return policy_error_response(err);
+    }
+
+    let enriched = build_enriched_envelope(&envelope, signing_key);
+    let enriched_json = match serde_json::to_vec(&enriched) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return MarshalResponse::Error(MarshalError::Other(truncate_message(format!(
+                "failed to serialize enriched Kerkese envelope: {e}"
+            ))));
+        }
+    };
+
+    submit_and_translate(transport, &enriched_json)
+}
+
 /// Handles exactly one already-accepted connection: reads a full
 /// `MarshalRequest`, submits it, and writes back the encoded
 /// `MarshalResponse`. Returns an `Err` only for I/O-level failures (a
@@ -164,9 +323,10 @@ fn build_response(transport: &HttpKerkeseTransport, kerkese_json: &[u8]) -> Mars
 pub fn handle_connection(
     stream: &mut TcpStream,
     transport: &HttpKerkeseTransport,
+    signing_key: &SigningKey,
 ) -> std::io::Result<()> {
     let request = read_marshal_request(stream)?;
-    let response = build_response(transport, &request.kerkese_json);
+    let response = build_response(transport, signing_key, &request.kerkese_json);
     stream.write_all(&response.encode())?;
     stream.flush()
 }
@@ -175,22 +335,29 @@ pub fn handle_connection(
 /// separately from [`serve`] so tests can drive a single request/response
 /// cycle deterministically instead of spawning (and having to tear down) a
 /// forever-looping server thread.
-pub fn serve_one(listener: &TcpListener, transport: &HttpKerkeseTransport) -> std::io::Result<()> {
+pub fn serve_one(
+    listener: &TcpListener,
+    transport: &HttpKerkeseTransport,
+    signing_key: &SigningKey,
+) -> std::io::Result<()> {
     let (mut stream, _addr) = listener.accept()?;
-    handle_connection(&mut stream, transport)
+    handle_connection(&mut stream, transport, signing_key)
 }
 
-/// Binds `listen_addr` and serves connections one at a time, forever.
-/// Never returns on success; returns `Err` only if binding the listener
-/// itself fails. A per-connection failure (bad request, transport error,
+/// Binds `listen_addr` and serves connections one at a time, forever, using
+/// this proxy's own demo Verifier signing key
+/// ([`super::identity::proxy_signing_key`]). Never returns on success;
+/// returns `Err` only if binding the listener itself fails. A
+/// per-connection failure (bad request, policy refusal, transport error,
 /// I/O error mid-handling) is logged to stderr and the loop moves on to the
 /// next connection rather than tearing down the whole server.
 pub fn serve(listen_addr: &str, transport: HttpKerkeseTransport) -> std::io::Result<()> {
     let listener = TcpListener::bind(listen_addr)?;
+    let signing_key = identity::proxy_signing_key();
     loop {
         match listener.accept() {
             Ok((mut stream, _addr)) => {
-                if let Err(e) = handle_connection(&mut stream, &transport) {
+                if let Err(e) = handle_connection(&mut stream, &transport, &signing_key) {
                     eprintln!("citadel_proxy: connection error: {e}");
                 }
             }
@@ -271,6 +438,18 @@ mod tests {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
 
+    /// The real minimal envelope shape `kernel/src/grid_sandbox.rs`'s
+    /// `shadow_marshal_evaluate` sends post-RFC (see `policy.rs`'s own test
+    /// with the same fixture) — used everywhere these tests need a request
+    /// this proxy's parse + policy check actually accepts.
+    fn minimal_envelope_json() -> Vec<u8> {
+        br#"{"kerkese_version":"1.0","dry_run":true,"action":{"type":"grid_sandbox.spawn_instance","module_id":"grid-sandbox-host","instance_id":"app-1"},"actor":{"user_id":"kernel:grid_sandbox","role":"operator"},"execution_id":"app-1"}"#.to_vec()
+    }
+
+    fn test_signing_key() -> SigningKey {
+        identity::proxy_signing_key()
+    }
+
     // Content-Length (131) is the actual byte length of the JSON body below
     // — unlike `transport.rs`'s otherwise-identical fixture (whose
     // `Content-Length: 96` under-counts it), this test needs the full,
@@ -316,10 +495,12 @@ mod tests {
         let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
         let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
 
-        let handle = std::thread::spawn(move || serve_one(&proxy_listener, &transport));
+        let signing_key = test_signing_key();
+        let handle =
+            std::thread::spawn(move || serve_one(&proxy_listener, &transport, &signing_key));
 
         let req = MarshalRequest {
-            kerkese_json: br#"{"kerkese_version":"1.0"}"#.to_vec(),
+            kerkese_json: minimal_envelope_json(),
         };
         let response = round_trip(proxy_addr, &req);
 
@@ -354,10 +535,12 @@ mod tests {
         let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
         let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
 
-        let handle = std::thread::spawn(move || serve_one(&proxy_listener, &transport));
+        let signing_key = test_signing_key();
+        let handle =
+            std::thread::spawn(move || serve_one(&proxy_listener, &transport, &signing_key));
 
         let req = MarshalRequest {
-            kerkese_json: br#"{"kerkese_version":"1.0"}"#.to_vec(),
+            kerkese_json: minimal_envelope_json(),
         };
         let response = round_trip(proxy_addr, &req);
 
@@ -381,10 +564,12 @@ mod tests {
         let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
         let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
 
-        let handle = std::thread::spawn(move || serve_one(&proxy_listener, &transport));
+        let signing_key = test_signing_key();
+        let handle =
+            std::thread::spawn(move || serve_one(&proxy_listener, &transport, &signing_key));
 
         let req = MarshalRequest {
-            kerkese_json: br#"{"kerkese_version":"1.0"}"#.to_vec(),
+            kerkese_json: minimal_envelope_json(),
         };
         let response = round_trip(proxy_addr, &req);
 
@@ -397,5 +582,141 @@ mod tests {
             MarshalResponse::Error(MarshalError::BadResponse(_)) => {}
             other => panic!("expected Error(BadResponse), got {other:?}"),
         }
+    }
+
+    /// Proves the new enrichment logic actually runs before forwarding, not
+    /// just that the old byte-forwarder still works: captures the exact
+    /// bytes this proxy POSTs to CITADEL (rather than canning a response
+    /// upfront) and asserts they decode as a real [`Kerkese`] envelope with
+    /// `sod.operator_user_id != sod.verifier_user_id`, the proxy's own
+    /// `verifier.user_id`/`role`, and a `sig_verifier` that verifies under
+    /// this proxy's own key over [`identity::canonical_payload`] — i.e. the
+    /// exact SoD-fix claim `docs/RFC-VERIFIER-IDENTITY.md` exists to prove,
+    /// checked against what this proxy *actually sent*, not a hand-built
+    /// fixture.
+    #[test]
+    fn enriches_envelope_with_a_distinct_signed_verifier_identity_before_forwarding() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let mock_addr = listener.local_addr().expect("local_addr");
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let body = read_http_request(&mut stream);
+                *captured_clone.lock().unwrap() = Some(body);
+                let _ = stream.write_all(CANNED_EXECUTE_RESPONSE.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        let transport = HttpKerkeseTransport::new(Some(format!(
+            "http://{mock_addr}/marshal/kerkese"
+        )));
+
+        let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+        let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
+        let signing_key = test_signing_key();
+        let handle =
+            std::thread::spawn(move || serve_one(&proxy_listener, &transport, &signing_key));
+
+        let req = MarshalRequest {
+            kerkese_json: minimal_envelope_json(),
+        };
+        let response = round_trip(proxy_addr, &req);
+        handle
+            .join()
+            .expect("proxy thread panicked")
+            .expect("serve_one");
+        assert!(matches!(response, MarshalResponse::Decision { .. }));
+
+        let forwarded_bytes = captured.lock().unwrap().take().expect("body captured");
+        let forwarded: Kerkese =
+            serde_json::from_slice(&forwarded_bytes).expect("forwarded body is a real Kerkese");
+
+        // The exact SoD-fix claim: operator and verifier are different
+        // principals, not the same identity twice.
+        assert_ne!(forwarded.sod.operator_user_id, forwarded.sod.verifier_user_id);
+        assert_eq!(forwarded.sod.operator_user_id, "kernel:grid_sandbox");
+        assert_eq!(
+            forwarded.sod.verifier_user_id,
+            identity::PROXY_VERIFIER_USER_ID
+        );
+        assert_eq!(forwarded.verifier.role, identity::PROXY_VERIFIER_ROLE);
+        // ...and the role groups actually differ too (gate3NDS's second,
+        // independent same-*group* check) — "operator" -> "privileged",
+        // "auditor" -> "oversight" in CITADEL's real `roleGroupMap`.
+        assert_ne!(forwarded.actor.role, forwarded.verifier.role);
+
+        // The kernel's original (non-UUID) execution_id never leaked into
+        // the field that must be a real UUID — it's carried as evidence
+        // instead.
+        assert!(uuid::Uuid::parse_str(&forwarded.execution_id).is_ok());
+        assert_eq!(
+            forwarded.evidence.extra.get("kernel_execution_id"),
+            Some(&"app-1".to_string())
+        );
+        assert_eq!(
+            forwarded.evidence.extra.get("module_id"),
+            Some(&"grid-sandbox-host".to_string())
+        );
+
+        // A real signature, not a placeholder: verifies under this proxy's
+        // own key over the exact canonical payload CITADEL's Gate
+        // 1/3 would recompute.
+        let payload = identity::canonical_payload(&forwarded);
+        let sig_bytes = hex::decode(&forwarded.sig_verifier).expect("hex signature");
+        let sig_array: [u8; 64] = sig_bytes.try_into().expect("64-byte signature");
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
+        use ed25519_dalek::Verifier as _;
+        assert!(identity::proxy_verifying_key()
+            .verify(payload.as_bytes(), &signature)
+            .is_ok());
+    }
+
+    /// Proves the policy check actually gates forwarding: a request this
+    /// proxy's policy refuses (unrecognized action type) never reaches
+    /// CITADEL at all — the mock server here would panic if it received a
+    /// connection, since nothing should ever connect to it.
+    #[test]
+    fn policy_refusal_never_forwards_to_citadel() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let mock_addr = listener.local_addr().expect("local_addr");
+        std::thread::spawn(move || {
+            if listener.accept().is_ok() {
+                panic!("citadel_proxy forwarded a policy-refused request to CITADEL");
+            }
+        });
+        let transport =
+            HttpKerkeseTransport::new(Some(format!("http://{mock_addr}/marshal/kerkese")));
+
+        let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+        let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
+        let signing_key = test_signing_key();
+        let handle =
+            std::thread::spawn(move || serve_one(&proxy_listener, &transport, &signing_key));
+
+        let bad_json = br#"{"kerkese_version":"1.0","dry_run":true,"action":{"type":"not_a_recognized_action","module_id":"m","instance_id":"i"},"actor":{"user_id":"kernel:grid_sandbox","role":"operator"},"execution_id":"i"}"#.to_vec();
+        let req = MarshalRequest {
+            kerkese_json: bad_json,
+        };
+        let response = round_trip(proxy_addr, &req);
+        handle
+            .join()
+            .expect("proxy thread panicked")
+            .expect("serve_one");
+
+        match response {
+            MarshalResponse::Error(MarshalError::Other(msg)) => {
+                assert!(msg.contains("POLICY_REFUSE"));
+            }
+            other => panic!("expected Error(Other) carrying a policy refusal, got {other:?}"),
+        }
+
+        // Give the (should-never-connect) mock server thread a moment; if
+        // it *did* receive a connection, its `panic!` above would have
+        // already fired by the time `handle.join()` above returned, since
+        // `serve_one` only returns after `submit`/refusal completes
+        // synchronously on the same thread that would have connected.
     }
 }
