@@ -130,6 +130,10 @@ name = "net_driver_dhcp"
 harness = false
 
 [[test]]
+name = "net_driver_dns"
+harness = false
+
+[[test]]
 name = "blk_driver_rw"
 harness = false
 

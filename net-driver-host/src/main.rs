@@ -55,9 +55,11 @@ use alloc::vec::Vec;
 use linked_list_allocator::LockedHeap;
 use runix_ipc::sockets::{SocketError, SocketRequest, SocketResponse};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::{dhcpv4, icmp, tcp};
+use smoltcp::socket::{dhcpv4, dns, icmp, tcp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{
+    DnsQueryType, EthernetAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address,
+};
 use smoltcp_device::{RunixNetDevice, RX_BUFFER_COUNT, TX_BUFFER_COUNT};
 use syscall::{ipc_send, ipc_try_recv, write_all, write_byte, yield_now};
 
@@ -135,6 +137,16 @@ struct NetBootInfo {
     /// which alone verifies a real acquired lease and needs no other
     /// static-address assumption to hold.
     use_dhcp: u8,
+    /// Whether to run a real DNS resolution (`smoltcp::socket::dns`)
+    /// against a real public resolver ([`DNS_SERVER_IP`]) reached through
+    /// QEMU/SLIRP's default NAT, after the ICMP proof above — see
+    /// `DNS_SERVER_IP`'s own doc comment for why that's a real internet
+    /// address rather than SLIRP's own documented DNS-forwarder address.
+    /// `0` on every other path — same "don't add an unused attempt to every
+    /// other boot/test" reasoning `attempt_tcp`/`serve_sockets` already
+    /// give. `1` only in `kernel/tests/net_driver_dns.rs`, which alone
+    /// verifies a real resolved address.
+    use_dns: u8,
 }
 
 const NET_INFO_VA: usize = 0x_1111_3333_0000;
@@ -161,6 +173,26 @@ const TCP_REMOTE_PORT: u16 = 9000;
 const TCP_LOCAL_PORT: u16 = 49152;
 const TCP_PING: &[u8] = b"RUNIX-TCP-PROOF-PING";
 const TCP_PONG: &[u8] = b"RUNIX-TCP-PROOF-PONG";
+
+/// A real public DNS resolver, reached through QEMU/SLIRP's own default NAT
+/// (present on every `-netdev user` instance with no extra flags — SLIRP's
+/// default `restrict=off` already allows outbound traffic, the same "no new
+/// QEMU/CI infrastructure" property the module doc comment's ICMP proof
+/// relies on against the gateway). Deliberately *not* SLIRP's own
+/// documented built-in DNS-forwarder address (`10.0.2.3`, alongside the
+/// gateway [`GATEWAY_IP`]) — confirmed by real packet capture that this
+/// driver's query reaches `10.0.2.3:53` correctly (retransmitted 4 times
+/// over smoltcp's own backoff schedule) but nothing ever answers it in this
+/// project's QEMU/libslirp build, while the exact same query against
+/// `8.8.8.8:53` gets a real answer over the same NAT path -- so this proof
+/// exercises the real DNS socket state machine and a real internet round
+/// trip through SLIRP's NAT, without depending on a SLIRP feature that
+/// isn't reliably available.
+const DNS_SERVER_IP: Ipv4Address = Ipv4Address::new(8, 8, 8, 8);
+/// A real, stable, near-universally-resolvable hostname — this proof only
+/// needs one bounded, real round trip through the DNS socket state machine,
+/// not a resolver exercised against anything unusual.
+const DNS_QUERY_NAME: &str = "example.com";
 
 /// Sockets IPC surface's fixed ports (see `run_socket_ipc_server`'s doc
 /// comment) — same "one fixed port per purpose, decided at spawn time, not
@@ -344,6 +376,16 @@ pub extern "C" fn _start() -> ! {
             &mut device,
             next_iteration + final_iteration + 1,
         );
+    }
+
+    if info.use_dns != 0 {
+        // Same "+ 1, not a fresh 0.." timestamp-continuity reasoning as
+        // `run_tcp_proof`'s own call above -- both are only ever enabled in
+        // mutually exclusive tests today, so reusing the same starting
+        // offset here is safe; a future test enabling both at once would
+        // need to thread the later of the two phases' own consumed
+        // iteration count through instead.
+        run_dns_lookup(&mut iface, &mut device, next_iteration + final_iteration + 1);
     }
 
     if info.serve_sockets != 0 {
@@ -547,6 +589,96 @@ fn run_tcp_proof(iface: &mut Interface, device: &mut RunixNetDevice, start_itera
                 NET_RESULT_FAIL
             },
         );
+    }
+}
+
+/// Resolves [`DNS_QUERY_NAME`] against a real public resolver
+/// ([`DNS_SERVER_IP`]) via a real `smoltcp::socket::dns::Socket` — the same
+/// "one bounded, real round trip proving the capability works end to end"
+/// discipline `run_dhcp` above already applies to DHCP. Called only when
+/// `NetBootInfo::use_dns != 0` — see that field's own doc comment for
+/// exactly which boot/test paths set it. Runs on the same `iface`/`device`
+/// as every prior phase (a fresh `SocketSet` per phase, matching this
+/// file's existing per-phase-loop style).
+fn run_dns_lookup(iface: &mut Interface, device: &mut RunixNetDevice, start_iteration: u32) {
+    // `[DNS_SERVER_IP; 4]`, not a single-element slice: smoltcp's own
+    // `DnsQuery` state machine gives each entry in the server list its own
+    // ~10-second retry/timeout budget before declaring the whole query
+    // failed (see `dns.rs`'s own `dispatch`) -- handing it the same real
+    // address 4 times over (needs the `dns-max-server-count-4` feature;
+    // see `Cargo.toml`'s own comment) multiplies that budget instead of
+    // giving a real-internet round trip only one ~10-second window to land
+    // in.
+    let dns_socket = dns::Socket::new(&[IpAddress::Ipv4(DNS_SERVER_IP); 4], vec![]);
+    let mut sockets = SocketSet::new(vec![]);
+    let dns_handle = sockets.add(dns_socket);
+
+    let query = sockets
+        .get_mut::<dns::Socket>(dns_handle)
+        .start_query(iface.context(), DNS_QUERY_NAME, DnsQueryType::A)
+        .unwrap();
+
+    let mut resolved = false;
+    let mut resolved_ip = Ipv4Address::new(0, 0, 0, 0);
+
+    // Same bound and reasoning as `run_dhcp`'s own poll loop above: a real
+    // answer over a real internet round trip arrives promptly in practice,
+    // so this bound exists purely to make a genuinely unreachable/broken
+    // resolver report failure instead of hanging the boot forever.
+    for offset in 0..2_000_000u32 {
+        let timestamp = Instant::from_millis((start_iteration + offset) as i64);
+        iface.poll(timestamp, device, &mut sockets);
+
+        match sockets
+            .get_mut::<dns::Socket>(dns_handle)
+            .get_query_result(query)
+        {
+            Ok(addrs) => {
+                if let Some(IpAddress::Ipv4(addr)) =
+                    addrs.iter().find(|addr| matches!(addr, IpAddress::Ipv4(_)))
+                {
+                    resolved_ip = *addr;
+                    resolved = true;
+                }
+                break;
+            }
+            Err(dns::GetQueryResultError::Pending) => {}
+            Err(dns::GetQueryResultError::Failed) => break,
+        }
+
+        if offset % 10_000 == 0 {
+            yield_now();
+        }
+    }
+
+    if resolved {
+        write_all(b"net-driver-host: DNS resolved, IP=");
+        for (i, octet) in resolved_ip.octets().iter().enumerate() {
+            write_decimal(*octet as u64);
+            if i != 3 {
+                write_byte(b'.');
+            }
+        }
+        write_all(b" (DNS OK)\n");
+    } else {
+        write_all(b"net-driver-host: no DNS answer within poll bound (DNS FAILED)\n");
+    }
+
+    unsafe {
+        core::ptr::write_volatile(
+            (NET_INFO_VA + NET_DNS_RESULT_OFFSET) as *mut u8,
+            if resolved {
+                NET_RESULT_PASS
+            } else {
+                NET_RESULT_FAIL
+            },
+        );
+        if resolved {
+            let octets = resolved_ip.octets();
+            for (i, octet) in octets.iter().enumerate() {
+                core::ptr::write_volatile((NET_INFO_VA + NET_DNS_ADDR_OFFSET + i) as *mut u8, *octet);
+            }
+        }
     }
 }
 
@@ -898,6 +1030,16 @@ pub const NET_DHCP_RESULT_OFFSET: usize = 130;
 /// immediately after it, still well clear of any other reserved offset in
 /// this page.
 pub const NET_DHCP_ADDR_OFFSET: usize = 131;
+/// DNS resolution result byte — one past [`NET_DHCP_ADDR_OFFSET`]'s 4 bytes
+/// (131..135), so 135; read only by `kernel/tests/net_driver_dns.rs`. `0`
+/// (never written) means `NetBootInfo::use_dns` was never set to `1` or the
+/// DNS phase never ran far enough to write a result at all.
+pub const NET_DNS_RESULT_OFFSET: usize = 135;
+/// The resolved IPv4 address's 4 octets, written only when
+/// [`NET_DNS_RESULT_OFFSET`] reads [`NET_RESULT_PASS`] — the 4 bytes
+/// immediately after it, still well clear of any other reserved offset in
+/// this page.
+pub const NET_DNS_ADDR_OFFSET: usize = 136;
 
 /// Same as `blk-driver-host/src/main.rs`'s function of the same name --
 /// used by `run_socket_ipc_server`'s own summary line.

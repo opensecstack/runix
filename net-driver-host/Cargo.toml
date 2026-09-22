@@ -15,7 +15,16 @@ publish = false
 
 [dependencies]
 linked_list_allocator = "0.10"
-smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-icmp", "socket-tcp", "socket-dhcpv4", "alloc"] }
+smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-icmp", "socket-tcp", "socket-dhcpv4", "socket-dns", "dns-max-server-count-4", "alloc"] }
+# `socket-dns` pulls in `proto-dns` itself (see smoltcp 0.14's own
+# `Cargo.toml`: `socket-dns = ["socket", "proto-dns"]`) -- no separate
+# feature needed, same as `socket-dhcpv4` already pulling in `proto-dhcpv4`.
+# `dns-max-server-count-4` (default is 1 -- smoltcp's own `build.rs`):
+# `run_dns_lookup` deliberately hands the DNS socket the same real address
+# 4 times over (see that constant's own doc comment) so a slow-to-arrive
+# real-internet reply gets multiple ~10-second retry windows instead of
+# just one, without changing this file's "1 loop iteration = 1ms" timestamp
+# convention every other phase already relies on.
 # `default-features = false`: skips `runix-ipc`'s `std` feature (and
 # transitively `serde_json`, a hard-`std` dependency) -- this crate targets
 # `x86_64-unknown-none` with no `std` at all. Only the `sockets` module

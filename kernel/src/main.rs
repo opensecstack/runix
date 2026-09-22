@@ -153,6 +153,13 @@ struct NetBootInfo {
     /// address QEMU/SLIRP's own DHCP server can hand out for real) and for
     /// which test files deliberately leave this `0` instead.
     use_dhcp: u8,
+    /// `0` here on the real boot path -- no DNS-resolution-dependent
+    /// behavior exists yet for this driver's own boot to need, same
+    /// "don't add an unused attempt to every boot" reasoning `attempt_tcp`/
+    /// `serve_sockets` above already give. `1` only in
+    /// `kernel/tests/net_driver_dns.rs`. See
+    /// `net-driver-host/src/main.rs`'s `NetBootInfo::use_dns` doc comment.
+    use_dns: u8,
 }
 
 /// `blk-driver-host`, Phase B9's payload (filesystem driver, Phase 1 —
@@ -907,6 +914,7 @@ fn load_and_run_net_driver_host(io_base: u16, now: u64, signing_key: &ed25519_da
         attempt_tcp: 0,
         serve_sockets: 0,
         use_dhcp: 1,
+        use_dns: 0,
     };
     unsafe {
         (info_content.as_mut_ptr() as *mut NetBootInfo).write(info);
