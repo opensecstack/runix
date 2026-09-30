@@ -12,6 +12,143 @@ roadmap item.
 > this RFC is accepted. Version numbers in particular should be treated as
 > approximate until checked.
 
+> **Phase 1 decision (implemented, 2026-09-26)**: this RFC's entropy design
+> (point 4 of "Context" below, and the `SYS_RANDOM` line under "What changes
+> under Option A") called for `SYS_RANDOM` backed by a kernel-resident
+> virtio-rng driver mixed with RDRAND. That's not what shipped first. Every
+> other virtio device in this repo (`net-driver-host`, `blk-driver-host`) is
+> deliberately ring-3 and capability-isolated over port I/O — a
+> kernel-resident virtio-rng driver would have been the first virtio surface
+> actually living in the kernel, growing the TCB for a marginal
+> entropy-quality gain over RDRAND alone (present in QEMU/KVM and real
+> hardware). Phase 1 ships **RDRAND-only `SYS_RANDOM`** instead
+> (`kernel/src/entropy.rs`, `kernel/src/syscall.rs`'s `SYS_RANDOM`,
+> `kernel/src/capabilities.rs::random_resource`), gated on a `"random"`
+> capability, failing closed (returns the same `u64::MAX` denial sentinel)
+> when RDRAND is absent or exhausted rather than falling back to anything
+> weaker. `net-driver-host` now seeds smoltcp's `Config.random_seed` from it
+> (`net-driver-host/src/main.rs`), closing the deterministic-ISN gap this
+> RFC named as a side benefit, independent of TLS. Everything else in this
+> document — the TLS crate/option decision itself, trust anchors, cert
+> validity checking — is unaffected and still not implemented. Virtio-rng
+> as a second entropy source remains an explicit, separately-scoped
+> follow-up; see `docs/THREAT_MODEL.md`'s entry on the single-source
+> RDRAND trust tradeoff this leaves open.
+
+> **Phase 2 in progress (2026-09-27)**: verifying this RFC's two
+> `[UNVERIFIED]` crate-choice claims (embedded-tls's real cert-verification
+> quality; whether any `rustls` `CryptoProvider` builds for
+> `x86_64-unknown-none`) with actual network access, which the drafting
+> session didn't have. In parallel, the crate-agnostic scaffolding — the
+> "library, not driver" split itself, which the Recommendation section
+> already established is correct regardless of which crate wins — has
+> started: `tls-client/` (`runix-tls-client`), a new root-workspace member,
+> `no_std` + `alloc`, builds clean on both the host target and the real
+> `x86_64-unknown-none` target. It currently defines only two traits —
+> `Transport` (a caller-supplied byte pipe) and `Entropy` (a caller-supplied
+> `SYS_RANDOM`-backed randomness source, taken as a parameter rather than
+> read directly, for the ambient-authority reason this RFC's own
+> Recommendation section 4 already gives) — and deliberately wraps no TLS
+> implementation yet. That part is genuinely staged behind the
+> verification above, not started early: which library owns the handshake/
+> record layer, what its buffer-sizing and RNG-trait requirements actually
+> are, and the resulting heap-grant sizing for whatever ring-3 process
+> first links this crate all depend on its answer.
+
+> **Phase 3 (2026-09-27): a real TLS 1.3 handshake works.** Phase 2's
+> verification came back positive (`embedded-tls` via `rustpki`, `rustls`
+> confirmed unreachable), so the handshake/connection API was built:
+> `tls-client::TlsConnection`, bridging this crate's `Transport`/`Yield`
+> traits to `embedded_tls::blocking`'s `Read`/`Write` requirements
+> (`src/io.rs`) and `Entropy` to `rand_core::CryptoRngCore`, panicking on
+> exhaustion rather than degrading (`src/rng.rs`) — a deliberate fail-closed
+> choice, not an oversight; see that module's own doc comment. Real
+> certificate verification via `rustpki`'s `CertVerifier`, never the
+> crate's default `NoVerify`.
+>
+> **Proven against a live server, not just against `embedded-tls`'s type
+> signatures**: `tests/live_handshake.rs` (`#[ignore]`d, run deliberately
+> with `--ignored`, not on every CI run — see that file's own doc comment
+> for why) connects to `example.com:443` over a real `TcpStream`, completes
+> a genuine TLS 1.3 handshake, verifies the real, live 4-certificate chain
+> (`example.com` -> `Cloudflare TLS Issuing ECC CA 3` ->
+> `SSL.com TLS Transit ECC CA R2` -> `SSL.com TLS ECC Root CA 2022`) against
+> "AAA Certificate Services" (the actual root that fourth cert is
+> cross-signed by, confirmed via `openssl verify -partial_chain`), and
+> decrypts a real HTTP response. Getting the trust anchor right took one
+> real, instructive failure first: trusting the fourth cert directly by its
+> own subject (rather than its actual issuer) made `CertVerifier` try to
+> verify that cert's signature against its own public key, which fails —
+> a mistake in how the test was first written, not in `embedded-tls` or
+> this crate's own code, but worth naming since it's exactly the kind of
+> "which cert is actually the trust anchor" confusion a real consumer could
+> also make.
+>
+> **Still not done, unaffected by this phase**: `TlsClock`
+> (`embedded_tls::blocking::NoClock` is used — certificate expiry checking
+> is explicitly skipped, not silently, since no wall-clock source exists),
+> real trust-anchor provisioning (a caller must already have CA DER bytes;
+> `CertVerifier` only checks one CA per connection, not a root store — a
+> real multi-root store needs either multiple connection attempts or an
+> upstream change), the heap-grant mechanism, and — the thing all of this
+> is actually blocked on now — a real consumer process, since nothing in
+> Runix needs TLS yet.
+>
+> **Open questions resolved by research** (this RFC's own "Open questions"
+> section, updated in place): RDRAND under QEMU/TCG returns genuine
+> host-OS-sourced entropy by default (confirmed from QEMU's own
+> `util/guest-random.c` — a deterministic mode exists but only activates
+> under `-icount`/`-seed`, which this project's `xtask`/CI never pass); a
+> realistic TLS 1.3 handshake with an ECDSA/Ed25519 server certificate runs
+> roughly 1,500-3,000 bytes round-trip, meaning 3,000-6,000+ syscalls under
+> this codebase's one-byte-per-syscall IPC transport — likely to exceed
+> T1's 300ms MARSHAL budget under QEMU/TCG specifically (no per-syscall
+> timing figure exists in this repo yet to confirm the exact margin; this
+> needs an actual measurement before a T1-tier consumer could rely on it).
+
+> **Phase 4 (2026-09-28): the first-consumer question, and the real
+> handshake-cost measurement.** Two threads of work, both closing out this
+> RFC's remaining action items:
+>
+> **Who should be the first real consumer of `tls-client`?** Surveyed every
+> current network-facing code path in Runix (not just roadmap docs).
+> Finding: **nothing existing needs it yet**. The kernel's own MARSHAL
+> evaluation (`kernel/src/marshal_client.rs`) reaches `citadel_proxy`, a
+> co-located trusted helper that already terminates TLS host-side (Option
+> C's plaintext-hop pattern, already in effect and adequate) — and it's
+> kernel-internal code, so linking a TLS stack there would be the wrong
+> direction regardless (T1-path, grows the TCB). `net-driver-host`'s DNS
+> resolver reaches an arbitrary remote (`8.8.8.8`) in plaintext, but a real
+> fix lives in extracting a resolver into its own process, not naming DNS
+> "the first consumer" of this crate. Mobile's eSIM/RSP provisioning is the
+> one candidate that genuinely cannot use a trusted-local-helper (an SM-DP+
+> is a real third party) — but no aarch64 net driver, sockets surface, or
+> MVNO code exists yet to attach it to. **Recommendation if/when a first
+> consumer is wanted**: a small new ring-3 host process (structurally like
+> `grid-sandbox-host`), not an addition to an existing privileged process —
+> proves "library not driver" in ring 3 for real, needs no new kernel
+> surface beyond the already-open heap-grant question, and is the only way
+> to *measure* real IPC-transport cost (see below) rather than guess it.
+> **Until then, deferring is the honest, defensible answer** — every
+> desktop Beta item left (grid sandbox isolation, filesystem driver,
+> MARSHAL integration) needs no arbitrary remote endpoint.
+>
+> **The handshake-cost open question, measured for real**
+> (`kernel/tests/syscall_cost.rs`): the fixed-port IPC model's
+> capability-gated syscalls cost **~12,000-30,000μs each** (Ed25519
+> verification on every call) — 3,000-6,000 syscalls per handshake means
+> **35-180 *seconds***, not milliseconds. The session primitive built
+> earlier this session (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`'s Option C)
+> measured **~51μs/syscall — ~228x cheaper** — putting a 1,500-byte
+> handshake at ~153ms (within budget) and a 3,000-byte one at ~306ms (right
+> at the edge). **This turns "migrate onto the session primitive" from a
+> good idea into a hard prerequisite for any T1-path TLS use** — the old
+> transport isn't slower, it's roughly two orders of magnitude too slow to
+> ever work here, independent of anything else optimized. See this RFC's
+> own "Open questions" section for the full numbers and methodology
+> (including a real QEMU/TCG timer-delivery artifact hit and worked around
+> while measuring this).
+
 ## Context
 
 `net-driver-host/` is a freestanding ring-3 process (`#![no_std]`,
@@ -110,7 +247,7 @@ question is which library.
 
 ## Options
 
-### Option A: `embedded-tls` as a shared `no_std` client crate
+### Option A: `embedded-tls` as a shared `no_std` client crate — **verified, this is what's built**
 
 **Design**: new workspace-adjacent crate (`tls-client/`, `no_std` + `alloc`,
 same `#![cfg_attr(not(test), no_std)]` split `capability-manager`,
@@ -122,51 +259,83 @@ build-time-signed**, mirroring `citadel-integration`'s
 `BootAllowlist`/`ModuleManifestEntry` pattern rather than inventing a
 runtime cert store.
 
-**[UNVERIFIED] properties to confirm**: `embedded-tls` (drogue-iot) is
-`no_std`-native, TLS 1.3 **client only** (no server, no TLS 1.2), generic
-over blocking and async I/O traits, requires the caller to pass an RNG
-implementing `rand_core`'s `CryptoRng`-style trait, and exposes a pluggable
-verifier with a permissive default that must be explicitly replaced.
-Approximate version 0.17.x. Its cipher suite support is narrow
-(AES-128-GCM-SHA256 territory), and its record buffers are caller-provided
-and sized around the 16 KiB record maximum. **Every sentence in this
-paragraph needs checking before acceptance**, especially: (a) whether
-certificate-chain verification is production-usable or still effectively
-opt-out-by-default, (b) exact buffer sizing requirements, (c) which crypto
-backend it pulls and whether that backend builds clean on
-`x86_64-unknown-none` or needs `force-soft`-style workarounds like `sha2`
-did.
+**Verified for real (2026-09-27), not [UNVERIFIED] any longer** — every
+claim in this paragraph confirmed by actually building the crate, cited by
+what was found:
+
+- `embedded-tls` moved from `drogue-iot` to `embassy-rs` (still
+  maintained, just relocated) — latest is 0.19.0, with a certificate-chain
+  robustness PR merged days before this verification pass.
+- It **does** default to no certificate verification (`NoVerify`) — the
+  RFC's original worry was correct. But a real, non-default verifier
+  exists: `embedded_tls::pki::CertVerifier`, real X.509 chain verification
+  against RustCrypto's own signature crates (not a stub), gated behind the
+  crate's `rustpki` feature (+ `ed25519`/`p384`/`rsa` for which signature
+  algorithms to support) — **not** its `webpki` feature, which routes
+  through `ring` and is rejected (see Option B below; the same blocker
+  applies here under a different feature flag).
+- Built clean for the real `x86_64-unknown-none` target with
+  `--no-default-features --features rustpki,ed25519,p384,rsa` — all three
+  major CA-root signature families (Ed25519, ECDSA P-384, RSA) — zero
+  `ring`/`aws-lc-rs`/`getrandom` anywhere in the resulting dependency tree
+  (confirmed by inspecting the actual `cargo add` dependency list, not
+  assumed). Needed three LLVM-codegen-ICE workarounds along the way
+  (`sha2`, `aes`, `curve25519-dalek` — each crate's own `*_force_soft`/
+  backend cfg flag, now in `tls-client/.cargo/config.toml`), the same class
+  of issue `capability-manager`'s existing `sha2` workaround already
+  documents for this target, just hit three more times across different
+  crates.
+- TLS 1.3 client only, confirmed (a server-support PR exists upstream but
+  its merge status was unconfirmed — treat as not landed).
+- Cipher suites/buffer sizing: not yet independently re-verified past what
+  actually building the crate confirms (it compiles, links, and exposes
+  the expected `pki`/`config` modules) — the RFC's original "AES-128-GCM
+  territory, ~16 KiB record buffers" estimate stands unless a later pass
+  finds otherwise.
 
 **Cost**: TLS 1.3 client only — no server, and no fallback if a peer speaks
-only 1.2. Certificate verification quality is the open risk; if it is weak,
-this crate buys encryption without authentication, which against an active
-attacker is close to buying nothing. Memory: the caller process needs a
-heap sized for record buffers, so any process using it needs its `*BootInfo`
-heap grant re-sized (a kernel-side change, since ring-3 processes here
-cannot map their own memory — `main.rs:34-42`). Smaller ecosystem and
-smaller audit history than rustls.
+only 1.2. Certificate verification is real (see above) but narrower in
+scope than a browser-grade verifier — algorithm coverage, not general
+X.509 extension handling, was what got checked; a deeper audit before
+trusting this for anything beyond Beta-scope work is still warranted.
+Memory: the caller process needs a heap sized for record buffers, so any
+process using it needs its `*BootInfo` heap grant re-sized (a kernel-side
+change, since ring-3 processes here cannot map their own memory —
+`main.rs:34-42`) — not yet done, no consumer process exists yet to size it
+for. Smaller ecosystem and audit history than rustls.
 
-### Option B: `rustls` in `no_std` mode with a pure-Rust crypto provider
+### Option B: `rustls` in `no_std` mode with a pure-Rust crypto provider — **rejected, confirmed unreachable**
 
 **Design**: same library-not-driver shape, built on `rustls` 0.23.x with
 `default-features = false` and a `no_std`-compatible `CryptoProvider`.
 
-**[UNVERIFIED] properties to confirm**: `rustls` 0.23 does advertise
-`no_std` + `alloc` support, requiring the caller to supply a time provider
-and a crypto provider, with `rustls-pki-types` supporting `no_std`. The
-decisive question is the provider: `aws-lc-rs` needs CMake and a C
-toolchain and is almost certainly disqualified for `x86_64-unknown-none`;
-`ring` compiles C and assembly through a per-target support list that I do
-not believe includes `x86_64-unknown-none`; the pure-Rust `rustls-rustcrypto`
-provider exists but I believe is explicitly not released as
-production-ready. **If no provider builds for this target, Option B is not
-an option at all**, and confirming that is the single highest-value piece
-of verification this RFC needs.
+**Verified for real (2026-09-27): no `CryptoProvider` builds for this
+target, full stop.** `rustls` 0.23 does genuinely support `no_std` +
+`alloc` (confirmed), but every provider option fails:
+
+- `aws-lc-rs`: confirmed no `no_std` support — needs CMake/a C toolchain,
+  as the RFC originally suspected.
+- `ring`: confirmed disqualified directly, not by analogy — adding
+  `embedded-tls`'s `webpki` feature (which routes cert verification
+  through `ring`) to this exact crate and building it for
+  `x86_64-unknown-none` fails immediately on `ring`'s `getrandom`
+  dependency: `error: target is not supported` (`getrandom` has no
+  implementation path for a freestanding target with no OS entropy
+  source at all — this is a hard disqualification, not an LLVM-ICE class
+  of problem with a known workaround).
+- `rustls-rustcrypto`: pure Rust, but confirmed still pre-production —
+  only release is `0.0.2-alpha`, depends on a `rustls-webpki` version with
+  unpatched CVEs, and has roughly 70% cipher-suite coverage. `no_std`
+  support is a stated future goal, not current reality. One small hobby OS
+  project has an in-progress PR attempting a bare-metal pure-RustCrypto
+  provider across several targets — by its own author's admission, "no
+  handshake has ever completed" yet. Real signal that others hit this
+  exact wall, not evidence of a working solution.
 
 One fact that *is* verified locally and favors this option if a provider
 exists: `rustls-pki-types` 1.15.1 is already in the root `Cargo.lock`, so
 some host-side crate already depends on it — the types are not foreign to
-this tree.
+this tree. Doesn't change the outcome: no provider, no option.
 
 **Cost**: much heavier dependency graph than Option A, on a target where a
 single crate (`sha2`) already required a hand-found workaround for an LLVM
@@ -211,12 +380,13 @@ itself. Not worth a full option slot.
 
 ## Recommendation
 
-**Option A (`embedded-tls`, as a shared library terminating in the caller
-process), sequenced behind an entropy prerequisite — with Option C as the
-explicit fallback if verification shows `embedded-tls`'s certificate
-verification is not production-usable.**
+**Confirmed, 2026-09-27: Option A (`embedded-tls`, `rustpki` feature path,
+as a shared library terminating in the caller process). Option C is no
+longer needed as a fallback — the verification this section originally
+called for came back positive, not negative.**
 
-Reasoning:
+Reasoning (mostly historical at this point — kept for the record, since it
+was right):
 
 1. **The library-not-driver split is the actual architectural decision, and
    it is the same decision under every option.** It keeps X.509 parsing and
@@ -230,35 +400,32 @@ Reasoning:
    reasoning `wasm-runtime/src/lib.rs` used for `wasmi` over `wasmtime`, and
    following an established in-repo precedent beats re-deriving the
    tradeoff from scratch.
-3. **Option B may not even be reachable**, and its blocker is not fixable
-   from this repo — it depends on whether any `rustls` `CryptoProvider`
-   builds for `x86_64-unknown-none`. That should be verified, but it should
-   not be planned around.
-4. **Entropy must land first, and it must be capability-gated.** The
-   tempting shortcut is `RDRAND` directly in the ring-3 process: it is an
-   unprivileged instruction, so it would work with no kernel change at all.
-   That is exactly what makes it wrong here — it is ambient authority by
-   construction, invisible to the capability system, unattributable in
-   WORM, and untestable under a deterministic QEMU harness. The right shape
-   is a new `SYS_RANDOM` gated by a `capability-manager` token, backed by a
-   kernel virtio-rng driver, with `RDRAND` available as a mix-in inside the
-   kernel rather than as a user-space bypass. This also fixes smoltcp's
-   deterministic `random_seed` (`main.rs:218`) as a side effect, and it is
-   a strictly smaller, better-bounded piece of work than TLS itself — a
-   good thing to build and prove alone first.
-5. **It has a falsifiable next step.** Before writing any TLS code: add
-   `embedded-tls` to `net-driver-host`'s dependency graph (or a scratch
-   crate on the same target), build for `x86_64-unknown-none`, and see what
-   breaks. Given `sha2` already needed `force-soft` on this target, a clean
-   build is a real, non-obvious result, and a failed build is a cheap early
-   answer.
+3. **Option B may not even be reachable** — confirmed true. See Option B's
+   own section above for exactly why (`ring`'s `getrandom` dependency,
+   directly, not by analogy).
+4. **Entropy must land first, and it must be capability-gated.** Done —
+   see the "Phase 1 decision" note at the top of this document for
+   `SYS_RANDOM`'s actual shape (RDRAND-only, not virtio-rng — a smaller,
+   deliberate deviation from what this point originally called for, argued
+   there).
+5. **It has a falsifiable next step.** Done, for real, not just planned:
+   `tls-client/`'s dependency was added and built for
+   `x86_64-unknown-none`. It did break, more than once (`sha2`, then `aes`,
+   then `curve25519-dalek` — three separate LLVM-codegen ICEs, not the one
+   this point anticipated), and every one had a known-shape fix. The
+   `webpki`/`ring` path was also tried and confirmed to fail outright
+   (`getrandom`, not an ICE) — which is what settled Option A on
+   `rustpki` specifically rather than leaving that choice implicit.
 
-If verification shows `embedded-tls` cannot authenticate a peer to a
-standard a reviewer would accept, do **not** ship it with a permissive
-verifier and a TODO — fall back to Option C with a written expiry
-condition. Encryption without authentication on a governance path is worse
-than an acknowledged plaintext hop, because it invites everything
-downstream to be designed as if the channel were secure.
+**On the "do not ship a permissive verifier" condition this section
+originally set**: it doesn't apply — `embedded-tls`'s default *is*
+permissive (`NoVerify`, confirmed), but a real, non-default verifier
+(`rustpki`'s `CertVerifier`) is what's actually depended on. Anyone adding
+a consumer of `tls-client` later must not construct `embedded-tls`'s
+config with the default verifier left in place — that would silently
+reintroduce exactly the failure mode this RFC warned against. Worth a
+lint/review-checklist item once a real consumer exists, not just prose
+here.
 
 ## What changes under Option A (prose only — no code written yet)
 
@@ -300,23 +467,41 @@ downstream to be designed as if the channel were secure.
 
 ## Open questions
 
-- **Does `embedded-tls` verify certificate chains to a standard a reviewer
-  would accept today?** This is the single question the recommendation
-  hinges on, and it could not be answered without network access. If the
-  answer is no, the recommendation flips to Option C.
-- **Does any `rustls` `CryptoProvider` build for `x86_64-unknown-none`?** If
-  `rustls-rustcrypto` has matured into something releasable, Option B's
-  audit-maturity advantage may outweigh Option A's simplicity, and this RFC
-  should be reopened rather than quietly followed.
-- **Do `aes-gcm` / `chacha20poly1305` / `p256` need `force-soft`-equivalent
-  workarounds on this target,** the way `sha2` did? A cheap build
-  experiment answers this and materially affects the effort estimate for
-  both A and B.
-- **What is the entropy quality story in QEMU specifically?** virtio-rng in
-  a QEMU guest sources from the host, which is fine; whether `RDRAND` is
-  meaningfully implemented under TCG (as opposed to KVM passthrough) I
-  could not verify, and it matters for whether the kernel-side mix-in is
-  real entropy or theater.
+- ~~**Does `embedded-tls` verify certificate chains to a standard a reviewer
+  would accept today?**~~ — **resolved, yes**: `rustpki`'s `CertVerifier`
+  does real chain verification against RustCrypto signature crates. See
+  Option A's section above.
+- ~~**Does any `rustls` `CryptoProvider` build for `x86_64-unknown-none`?**~~
+  — **resolved, no**: confirmed directly (`ring`'s `getrandom` fails to
+  build for this target at all), not just researched. `rustls-rustcrypto`
+  specifically checked and confirmed still pre-production
+  (`0.0.2-alpha`, unpatched-CVE `rustls-webpki` dependency, `no_std` a
+  stated future goal not current reality) — if that changes later, this
+  RFC should be reopened, but nothing suggests it's close.
+- ~~**Do `aes-gcm` / `chacha20poly1305` / `p256` need `force-soft`-equivalent
+  workarounds on this target,** the way `sha2` did?~~ — **resolved,
+  partially**: `aes` (pulled in for AES-GCM) needed one
+  (`aes_force_soft`), and so did `curve25519-dalek` (pulled in
+  transitively, `curve25519_dalek_backend="serial"` — the same fix
+  `kernel/.cargo/config.toml` already uses). `p256`/`p384`/`rsa` built
+  clean with no additional flags needed. `chacha20poly1305` isn't in this
+  dependency tree at all under the `rustpki` feature set — not checked.
+- ~~**What is the entropy quality story in QEMU specifically?**~~ —
+  **resolved**: confirmed from QEMU's own `util/guest-random.c` that
+  `RDRAND`/`RDSEED` under TCG (software emulation, not KVM) route to
+  `qemu_guest_getrandom()`, which by default takes the real,
+  non-deterministic branch (the host OS's own CSPRNG) — genuine entropy,
+  not a weak/seeded PRNG. A deterministic mode exists (for QEMU's own
+  record/replay regression tooling) but only activates under `-icount`/
+  `-seed`, which this project's `xtask`/CI invocations never pass. The
+  remaining caveat is orthogonal to algorithm quality: a compromised
+  hypervisor could in principle return attacker-chosen bytes instead of
+  calling the real RNG (a trust-in-the-emulator concern, already covered
+  by `kernel/src/entropy.rs`'s and `docs/THREAT_MODEL.md`'s existing
+  single-source-trust caveat). Practically moot today regardless — CI's
+  default `qemu64` CPU model doesn't expose RDRAND as a feature at all, so
+  `kernel/tests/sys_random.rs` already proves the fail-closed path, not
+  the real-entropy path.
 - **Who owns the trust-anchor set, and is it governance-relevant?** If the
   anchors that authenticate a MARSHAL connection are themselves
   CITADEL-provisioned, that deepens `citadel-integration`'s coupling to
@@ -329,13 +514,36 @@ downstream to be designed as if the channel were secure.
   current architecture wants one, but if mobile's provisioning flows or a
   future device-pairing feature do, that is an Option-B-shaped requirement
   discovered late.
-- **Does the one-byte-per-syscall IPC transport (`ipc/src/sockets.rs:10-20`)
-  make a TLS handshake unacceptably slow?** A handshake is several
-  kilobytes of round-tripped data, each byte a syscall, against T1's
-  <300ms MARSHAL constraint. This may be the thing that forces a
-  bulk-transfer IPC path before TLS is usable on a T1 path at all — worth
-  measuring early, because it is a `kernel`-side change with its own design
-  questions.
+- ~~**Does the one-byte-per-syscall IPC transport (`ipc/src/sockets.rs:10-20`)
+  make a TLS handshake unacceptably slow?**~~ — **resolved, measured for
+  real (2026-09-28, `kernel/tests/syscall_cost.rs`), and the answer is far
+  worse than the prior estimate**: in this exact environment (QEMU/TCG,
+  native Windows, no `-cpu`/`-icount` flags), `SYS_IPC_SEND`/`SYS_IPC_RECV`
+  (the fixed-port model, full Ed25519 `authorized_for_port` verification on
+  *every* call) measured **~12,000-30,000μs (12-30ms) per syscall** across
+  two runs — roughly **300-3,000x** the RFC's own prior "pessimistic"
+  100μs/syscall guess, not a rounding difference. A realistic 1,500-byte
+  handshake (3,000 syscalls) over this path costs **~35-90 *seconds***, a
+  3,000-byte handshake **~70-180 seconds** — both catastrophically over the
+  300ms T1 budget, not "over budget" in the mild sense the estimate implied.
+  RDTSC-based timing was needed to get this number at all: an `int 0x80`
+  loop doesn't advance `interrupts::ticks()` visibly when run on the bare
+  boot thread (a real, reproducible QEMU/TCG artifact — see that test's own
+  doc comment — fixed by running the benchmark on a properly spawned
+  thread instead, matching every other kernel test's own pattern).
+  **The same benchmark measured the "Option C" session primitive
+  (`kernel/src/ipc.rs`'s `SESSIONS` table, built this session — see
+  `docs/RFC-IPC-RESPONSE-CAPABILITY.md`) for direct comparison**:
+  `SYS_IPC_SESSION_SEND`/`RECV` (authorizes once at
+  `SESSION_OPEN`/`ACCEPT`, an O(1) `ThreadId` compare on every call after)
+  measured **~51μs/syscall — roughly 228x cheaper**. At that rate, a
+  1,500-byte handshake costs **~153ms (fits within the 300ms budget)**; a
+  3,000-byte handshake **~306ms (just over — close enough that record-size
+  choices or a small further optimization would decide it)**. **This makes
+  migrating TLS's transport onto the session primitive a hard prerequisite
+  for T1-path usability, not an architectural nicety** — the fixed-port
+  model is not merely slower, it is roughly two orders of magnitude too
+  slow to ever fit this budget, regardless of any other optimization.
 
 ## References
 

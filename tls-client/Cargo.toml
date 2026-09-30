@@ -1,0 +1,56 @@
+[package]
+name = "runix-tls-client"
+description = "Runix TLS client library (no_std + alloc) — a shared library any ring-3 process links in for TLS 1.3 over its own SocketRequest-backed transport, never net-driver-host itself. See lib.rs and docs/RFC-TLS-APPROACH.md."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Pinned to the exact major version `embedded-tls` 0.19.0 itself depends on
+# (confirmed via `cargo tree`) — `cargo add`'s default MSRV-aware choice
+# picked 0.6.1 instead (this workspace declares `rust-version = "1.75"`,
+# which 0.7.1 exceeds), but a `Read`/`Write` impl against a *different*
+# major version of this crate doesn't satisfy `embedded_tls`'s own
+# `Socket: embedded_io::Read` bound at all — trait coherence requires the
+# exact same crate version, not just a compatible-looking API. The real
+# toolchain this repo builds with (nightly/current stable, per
+# `docs/BUILDING.md`) is far newer than 1.75 regardless, so this is safe.
+embedded-io = { version = "0.7.1", default-features = false }
+# `webpki` (ring/aws-lc-rs-backed cert verification) is rejected outright —
+# confirmed for real, not assumed from the RFC's own prior research: `ring`
+# pulls in `getrandom`, which hard-fails to build for `x86_64-unknown-none`
+# at all ("target is not supported"), before even reaching the LLVM
+# codegen issues below. `rustpki` + `ed25519`/`p384`/`rsa` is
+# `embedded-tls`'s *other* certificate-verification path
+# (`embedded-tls::pki::CertVerifier`) — real X.509 chain verification
+# against RustCrypto's own signature crates, covering the three signature
+# algorithm families real-world CA roots actually use (Ed25519, ECDSA
+# P-384, RSA), with zero dependency on `ring`/`aws-lc-rs`/`getrandom`.
+# Confirmed to build clean for `x86_64-unknown-none` with this exact
+# feature set — see `.cargo/config.toml` for the LLVM-ICE workarounds that
+# took, and `docs/RFC-TLS-APPROACH.md`'s "Phase 2" note for the full
+# verification account.
+embedded-tls = { version = "0.19.0", default-features = false, features = ["rustpki", "ed25519", "p384", "rsa"] }
+# Same exact-version-pinning reasoning as `embedded-io` above — 0.6.4 is
+# what `embedded-tls` itself re-exports (`pub use rand_core::{CryptoRng,
+# CryptoRngCore}`) and what its `CryptoProvider::rng()` bound actually
+# requires; `cargo add`'s MSRV-aware pick of 0.9.5 (a different major
+# version, incompatible trait-wise) would not satisfy it.
+rand_core = { version = "0.6.4", default-features = false }
+# Pulled in transitively (via `embedded-tls` -> `digest`/`hmac`/etc.), same
+# reasoning `capability-manager/Cargo.toml`'s identical override already
+# documents: the default build hits an LLVM codegen ICE ("Do not know how
+# to split the result of this operator") on `x86_64-unknown-none`.
+# `force-soft` is sha2's scalar-only fallback. Declared explicitly here
+# (not left to transitive feature unification) for the same reason
+# `capability-manager` does it explicitly.
+sha2 = { version = "0.10.9", default-features = false, features = ["force-soft"] }
+
+[lib]
+name = "runix_tls_client"
+
+[dev-dependencies]
+getrandom = { version = "0.3.4", features = ["std"] }

@@ -1312,6 +1312,190 @@ is narrower than "TCP parsing robustness" (that's smoltcp's own concern)
 but still load-bearing: a panic in this interface would crash the ring 3
 driver process, not corrupt it gracefully.
 
+**Network stack, entropy Phase 1: `SYS_RANDOM`, RDRAND-only — the real
+blocker `docs/RFC-TLS-APPROACH.md` named before any TLS code could be
+written.** That RFC's original design called for `SYS_RANDOM` backed by a
+kernel-resident virtio-rng driver mixed with RDRAND. What shipped instead,
+and why: every other virtio device in this codebase
+(`net-driver-host`, `blk-driver-host`) is deliberately ring-3 and
+capability-isolated over port I/O; a kernel-resident virtio-rng driver
+would have been the first virtio surface actually living in the kernel,
+growing the TCB for a marginal entropy-quality gain over RDRAND alone
+(present in QEMU/KVM and real hardware). See the RFC's own "Phase 1
+decision" note for the full argument.
+
+What's real: `kernel/src/entropy.rs` reads RDRAND directly
+(`core::arch::x86_64::_rdrand64_step`, wrapped in a `#[target_feature]`
+function called only after a cached CPUID leaf-1 ECX-bit-30 check confirms
+the running CPU actually has it), retrying up to 10 times per Intel's own
+guidance before giving up. `SYS_RANDOM` (`kernel/src/syscall.rs`) is gated
+on a new `"random"` capability (`capabilities::random_resource`) — the
+same check-then-act, fail-closed shape `SYS_PORT_IN`/`SYS_PORT_OUT` already
+use, denial and "RDRAND absent/exhausted" deliberately collapsing to the
+same `u64::MAX` sentinel rather than a distinguishable error, and never
+falling back to a weaker source (a `SYS_TICKS`-derived counter, say) when
+real entropy isn't available. `net-driver-host` is granted the `random`
+capability as a second, *extra* token alongside its existing ioport-range
+one (`spawn_ring3_process_with_capabilities`, `kernel/src/main.rs`) and
+uses it to seed smoltcp's `Config.random_seed` — closing the
+deterministic-TCP-ISN/ephemeral-port gap the RFC flagged as a side effect
+of the same entropy hole, independent of TLS itself.
+
+Verified in QEMU: `kernel/tests/sys_random.rs` spawns one thread holding a
+`random` token and one with no capability at all, asserting the
+unauthorized thread is always denied and branching on
+`entropy::available()` for the authorized thread's expected outcome — two
+genuinely-differing RDRAND values when present, or the same fail-closed
+`u64::MAX` when absent. xtask's QEMU invocation carries no explicit `-cpu`
+flag, so it runs under the default `qemu64` CPU model, which does **not**
+advertise RDRAND — meaning CI actually exercises the fail-closed branch,
+not the happy path. That's a real, documented gap rather than a silently
+green test proving nothing: this hasn't yet been verified against a CPU
+model that actually has RDRAND (e.g. `-cpu host` with hardware
+virtualization, or `-cpu qemu64,+rdrand` under TCG) in this environment.
+Also verified: `cargo build --workspace`, `cargo clippy --workspace
+--all-targets -- -D warnings`, and a full `xtask run` boot showing no
+regression in the existing boot sequence through net-driver-host's
+DHCP/ICMP round trip.
+
+What this does **not** close: it's a single hardware entropy source with
+no virtio-rng mix-in (see `docs/THREAT_MODEL.md`'s matching "Known gaps"
+entry for the trust-boundary tradeoff this leaves open), and
+`capability-manager`'s demo Ed25519 keypair (`kernel/src/capabilities.rs`'s
+hardcoded `DEMO_SEED`) still does not draw on `SYS_RANDOM` — real key
+provisioning off that fixture is a separate, higher-stakes change. The TLS
+crate/option decision itself (`docs/RFC-TLS-APPROACH.md`'s "Options"
+section), trust anchors, and certificate validity checking remain entirely
+unimplemented — this phase only unblocked the prerequisite the RFC named,
+not TLS itself.
+
+**Network stack, entropy Phase 2: the TLS crate choice — verified for
+real, not researched.** `docs/RFC-TLS-APPROACH.md`'s recommendation
+(Option A, `embedded-tls`) rested on two `[UNVERIFIED]` claims its
+drafting session couldn't check (no network access at the time): whether
+`embedded-tls`'s cert verification is production-usable, and whether any
+`rustls` `CryptoProvider` builds for `x86_64-unknown-none`. Both settled
+by actually building the dependency for the real target, not just reading
+about it: `rustls` is confirmed unreachable (every `CryptoProvider` is
+disqualified — `ring` concretely, via its `getrandom` dependency hard-
+failing to build for this target at all, not an LLVM issue with a known
+workaround). `embedded-tls` is confirmed viable via its `rustpki` feature
+path (`embedded_tls::pki::CertVerifier` — real X.509 chain verification
+against RustCrypto's own signature crates), **not** its `webpki` feature
+(which routes through `ring` the same way `rustls` would and is equally
+disqualified) — built clean for `x86_64-unknown-none` with
+`ed25519`/`p384`/`rsa` all enabled (the three signature families
+real-world CA roots actually use), after three LLVM-codegen-ICE
+workarounds (`sha2`, `aes`, `curve25519-dalek` — each already a known
+class of issue on this target, just newly hit in three more crates).
+
+New `tls-client/` crate (`runix-tls-client`), a root-workspace member,
+`no_std` + `alloc`, builds clean on both the host target and
+`x86_64-unknown-none`. What exists today: the `embedded-tls` dependency
+itself (verified, wired, with its exact feature set and LLVM-ICE
+workarounds documented in `tls-client/Cargo.toml`/`.cargo/config.toml`),
+and two traits (`Transport`, a caller-supplied byte pipe; `Entropy`, a
+caller-supplied `SYS_RANDOM`-backed randomness source, taken as a
+parameter rather than read directly — ambient RDRAND access from ring 3
+is exactly what `docs/RFC-TLS-APPROACH.md`'s Recommendation section 4
+already named as the wrong shortcut). What doesn't exist yet, on purpose:
+the actual handshake/connection API, a `TlsClock` implementation (this
+system has no wall-clock time), trust-anchor provisioning, and any real
+consumer process. Verified: `cargo build --workspace` /
+`clippy --workspace --all-targets -- -D warnings`, and the crate's own
+`--target x86_64-unknown-none` build/clippy, all clean.
+
+**Network stack, entropy Phase 3: a real TLS 1.3 handshake — proven
+against a live server, not just against `embedded-tls`'s types.**
+`tls-client::TlsConnection` now wraps `embedded_tls::blocking`'s
+connection type over this crate's own `Transport`/`Yield` traits (bridged
+via `src/io.rs`, since `embedded_io::Read`'s blocking contract — wait for
+≥1 byte, `Ok(0)` means EOF — is a genuinely different shape than this
+codebase's universal non-blocking `Ok(0)`-means-"try again" IPC
+convention) and `Entropy` to `rand_core::CryptoRngCore` (`src/rng.rs`,
+panicking on exhaustion rather than silently degrading — a deliberate
+fail-closed choice named in that module's own doc comment, not an
+oversight). Certificate verification goes through `rustpki`'s real
+`CertVerifier`, never the crate's default `NoVerify`.
+
+Verified against `example.com:443` over a real `TcpStream`
+(`tests/live_handshake.rs`, `#[ignore]`d — hits the live internet and a
+rotation-prone CA chain, run deliberately with `cargo test -- --ignored`,
+never on ordinary CI runs): a genuine TLS 1.3 handshake completed, the
+real, live 4-certificate chain (`example.com` -> `Cloudflare TLS Issuing
+ECC CA 3` -> `SSL.com TLS Transit ECC CA R2` -> `SSL.com TLS ECC Root CA
+2022`) was verified against "AAA Certificate Services" (confirmed via
+`openssl verify -partial_chain` to be the cert that actually signs the
+fourth entry — getting this wrong on the first attempt, by trusting the
+fourth cert's own subject instead of its real issuer, produced a real,
+instructive `DecodeError` worth knowing about, not a bug in `embedded-tls`
+or this crate), and a real HTTP response was decrypted and read back.
+
+What's still genuinely unbuilt, unaffected by this phase: a `TlsClock`
+with a real wall-clock source (`embedded_tls::blocking::NoClock` is used
+today — certificate expiry checking is explicitly skipped, not silently,
+since no wall-clock source exists anywhere in this system yet), real
+trust-anchor *provisioning* (a caller must already have CA DER bytes from
+somewhere; `CertVerifier` only ever checks one CA per connection, not a
+root store), a kernel-side heap-grant mechanism, and — the actual blocker
+now — any real consumer process, since nothing in Runix needs TLS yet.
+`docs/RFC-TLS-APPROACH.md`'s "Open questions" section also gained two
+resolved answers this session: RDRAND under QEMU/TCG returns genuine
+host-OS-sourced entropy by default (confirmed from QEMU's own source, not
+assumed), and — measured for real in the very next phase below, not left
+as an estimate — a realistic TLS 1.3 handshake's syscall cost under this
+codebase's one-byte-per-syscall IPC model.
+Verified: `cargo build --workspace` / `clippy --workspace --all-targets --
+-D warnings`, and the crate's own `--target x86_64-unknown-none`
+build/clippy, all clean.
+
+**Network stack, entropy Phase 4: the first-TLS-consumer question
+answered (defer), and the handshake-cost estimate replaced with a real
+measurement — which changes the plan.** Two pieces:
+
+Surveyed every current network-facing code path in Runix for a plausible
+first `tls-client` consumer. Finding: nothing existing needs one.
+`kernel/src/marshal_client.rs` already reaches a trusted, co-located
+helper (`citadel_proxy`) that terminates TLS host-side — adequate, and
+wrong to touch anyway (kernel-internal, T1-path, would grow the TCB).
+`net-driver-host`'s DNS resolver reaches an arbitrary remote in plaintext,
+but the real fix is extracting a resolver process, not calling DNS "the
+consumer." Mobile's eSIM/RSP provisioning is the one candidate that
+genuinely cannot use a trusted-local-helper, but no aarch64 net stack
+exists yet to attach it to. Recommendation for if/when a real consumer is
+wanted: a small new ring-3 host process, structurally like
+`grid-sandbox-host` — proves "library not driver" in ring 3 for real and
+needs no new kernel surface beyond the heap-grant question already open.
+Deferring is the honest answer for now; every remaining desktop Beta item
+needs no arbitrary remote endpoint.
+
+**The handshake-cost question, measured for real** —
+`kernel/tests/syscall_cost.rs`, RDTSC-calibrated timing (an `int 0x80`
+loop turned out not to reliably advance `interrupts::ticks()` when run on
+the bare boot thread — a real, reproducible QEMU/TCG artifact, not a bug
+in the measurement's logic; fixed by running the benchmark on a properly
+spawned thread, matching every other kernel test's pattern, and documented
+in that test's own doc comment as a finding in its own right). Result: the
+fixed-port `SYS_IPC_SEND`/`SYS_IPC_RECV` path (Ed25519 verification on
+every call) costs **~12,000-30,000μs per syscall** — 300-3,000x worse than
+this RFC's own prior "pessimistic" 100μs guess. A realistic handshake
+(3,000-6,000 syscalls) costs **35-180 *seconds*** over this path, not
+milliseconds. The same benchmark measured the session primitive
+(`kernel/src/ipc.rs`'s `SESSIONS` table, built earlier this session) for
+direct comparison: **~51μs/syscall, ~228x cheaper** — a 1,500-byte
+handshake at that rate costs ~153ms (within the 300ms T1 budget), a
+3,000-byte one ~306ms (right at the edge).
+
+**This is the most consequential finding of the TLS work so far**: it
+turns "migrate the transport onto the session primitive" from good
+architecture into a hard prerequisite — the fixed-port model isn't
+somewhat slow for this purpose, it's roughly two orders of magnitude too
+slow, regardless of any other optimization applied on top of it. Verified:
+`cargo build --target x86_64-unknown-none` / `clippy --target
+x86_64-unknown-none --bins --lib -- -D warnings` for the kernel, full
+`cargo build --workspace` / `clippy --workspace --all-targets -- -D
+warnings` clean.
+
 **Filesystem driver, Phase 1: the legacy virtio-blk transport, proven with
 a real sector round trip — no filesystem format yet.** Beta backlog item
 4, previously unstarted. Sequenced the same way the network stack was:
@@ -2550,3 +2734,91 @@ attribution (`ipc/src/sockets.rs`'s existing caller-attribution caveat
 still applies). Option C (a real session/handle primitive keyed on a new
 thread identity) remains the named long-term destination, not attempted
 here.
+
+## Option C: the session/handle IPC primitive — kernel side built and proven, consumers not migrated
+
+Follow-up to the section above. `docs/RFC-IPC-RESPONSE-CAPABILITY.md`
+recommended building this in two independent steps — `ThreadId` first,
+then the session table — and that's what happened, in one pass:
+
+- **`ThreadId`** (`kernel/src/scheduler.rs`): a monotonic, never-reused
+  `u64` assigned in `Thread::new` (and `Thread::placeholder` — the boot
+  thread is a real session participant too, several kernel tests already
+  drive IPC directly from it via `grant_current_extra_capability`).
+  `scheduler::current_thread_id()` exposes it the same way
+  `current_capability` already exposes the running thread's token.
+- **The session table** (`kernel/src/ipc.rs`): additive alongside the
+  existing fixed `[Mutex<Channel>; PORT_COUNT]` array, which is completely
+  untouched — `SESSIONS: Mutex<BTreeMap<SessionId, Session>>` plus
+  `PENDING_BY_PORT` (a FIFO of opened-but-not-yet-accepted sessions, keyed
+  by the fixed `server_port` whose capability convention gates them).
+  Bounded (`MAX_LIVE_SESSIONS = 64` global, `MAX_SESSIONS_PER_OWNER = 8`)
+  so a hostile client can't exhaust kernel heap by open-looping.
+  `SessionId`s are never reused, same reasoning `capabilities.rs`'s tokens
+  already have for not being guessable/replayable.
+- **Six syscalls** (`kernel/src/syscall.rs`, numbers 10-15):
+  `SYS_IPC_SESSION_OPEN`/`_ACCEPT`/`_SEND`/`_RECV`/`_SEND_LOCK`/
+  `_SEND_UNLOCK`. The RFC's own prose named three; building it surfaced a
+  real gap the prose didn't resolve — nothing told a server a new session
+  existed to receive from unless it already knew the `SessionId`, so
+  `SESSION_ACCEPT` (a real listen/accept step, not just send/recv) had to
+  exist. The send-lock pair mirrors `SYS_IPC_SEND_LOCK`/`_UNLOCK` exactly,
+  scoped to one session instead of one fixed port — the RFC's own "Cost,
+  honestly" section already named this as needed, just didn't count it in
+  the headline "three syscalls."
+- **A design decision the RFC's prose left ambiguous, resolved and
+  documented**: `Session.server` is `Option<ThreadId>`, bound lazily by
+  whichever thread's `SESSION_ACCEPT` first claims a pending session — not
+  pinned at `OPEN` time, since the kernel has no way to know in advance
+  who (if anyone) will ever accept it.
+- **Teardown on exit**: `scheduler::reap_zombies` now calls
+  `ipc::reap_sessions_for(thread.id)` for every reaped zombie — removes
+  every session that thread owned or served, and purges any of its
+  still-pending opens. This resolves the RFC's own flagged lock-ordering
+  concern directly: `reap_zombies` already holds `SCHEDULER`'s lock and
+  already has the zombie's `id` in hand, so session-table cleanup never
+  needs to re-acquire `SCHEDULER` — `SCHEDULER` → `SESSIONS`/
+  `PENDING_BY_PORT` is the only lock order that occurs anywhere in the
+  kernel; every other caller (the session syscalls) only touches
+  `SCHEDULER` via `current_thread_id()`, which fully releases it before
+  returning.
+
+**Verified in QEMU** (`kernel/tests/ipc_session.rs`, three phases in one
+boot): capability denial (a thread with no `port:<n>` token is denied both
+`SESSION_OPEN` and `SESSION_ACCEPT`); real isolation (two client threads
+open independent sessions against one server thread on the same port,
+each sends its own 4-byte pattern, and each gets back *only* its own bytes
+echoed — the actual property this primitive exists to prove, not argued
+about); and real teardown (a session's owner exits mid-session — sequenced
+via an explicit flag handshake, not a fixed yield count, so the timing is
+deterministic despite this scheduler's real timer preemption — and the
+still-alive server thread's `SESSION_SEND` to that exact session id
+transitions from succeeding to `u64::MAX` once the exit is reaped).
+Re-ran the entire existing kernel test suite afterward (not just the new
+file) since this touches `scheduler.rs`/`ipc.rs`, both load-bearing for
+nearly everything: `basic_boot`, `guard_page`, `thread_reclaim`,
+`watchdog`, `process_isolation`, `elf_loader`, `scheduler_address_space`,
+`ring3_cooperative`, every `grid_sandbox_*` test, `citadel_demo`,
+`pci_scan`, every `net_driver_*`/`blk_*` test, `marshal_tcp_roundtrip`,
+`grid_sandbox_marshal_shadow`, and `sys_random` all still pass unchanged.
+(`net_driver_sockets`/`net_driver_sockets_concurrent`/`net_driver_tcp`/
+`marshal_proxy_e2e` fail the same pre-existing way they always do on native
+Windows — no `guestfwd` support in this machine's Slirp — confirmed by
+diffing against a run with no session-primitive changes at all, not a new
+regression.) Full `cargo build --workspace` /
+`clippy --workspace --all-targets -- -D warnings`, the kernel's own
+`--target x86_64-unknown-none` build/clippy, and a full `xtask run` boot
+(identical serial output through Phase 7's ring 3 transition) all clean.
+
+**What this explicitly does not do**: migrate any consumer onto the new
+primitive. `blk-driver-host`'s fs IPC server (`ipc/src/fs.rs`'s wire
+format), `net-driver-host`'s sockets surface (`ipc/src/sockets.rs`), and
+`kernel/src/marshal_client.rs` — a *third* fixed-sockets-port consumer
+found while scoping this work, previously undocumented anywhere as such —
+all still use the fixed-port model completely unchanged, same additive
+discipline `extra_capabilities` and the Option A recv-side gate already
+followed. Each migration is separate, later work; they're independently
+parallelizable against each other once attempted, but starting any of them
+without this primitive already proven first would have been exactly the
+"partially-applied cross-crate change" this project's own CLAUDE.md warns
+against.

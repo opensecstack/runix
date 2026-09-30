@@ -1,0 +1,24 @@
+# No `[build] target = ...` default here on purpose — same "don't leak an
+# ambient target into a nested host-side invocation" reasoning
+# `kernel/.cargo/config.toml`/`net-driver-host/.cargo/config.toml` already
+# document.
+
+[target.x86_64-unknown-none]
+# `embedded-tls`'s pure-Rust cert-verification path (`rustpki`/`ed25519`/
+# `p384` features — see lib.rs's doc comment on why `webpki` is rejected
+# outright) pulls in several RustCrypto crates that each auto-select a
+# SIMD/hardware-intrinsics backend on x86_64 at compile time, regardless of
+# whether this freestanding target's codegen model actually supports it —
+# the same class of LLVM codegen ICE ("Do not know how to split the result
+# of this operator") `kernel/.cargo/config.toml`'s `curve25519-dalek`
+# workaround already documents, just hit repeatedly here across four
+# separate crates instead of one. Confirmed for real by actually trying to
+# build this crate for this target one failure at a time, not assumed by
+# analogy — see this crate's own lib.rs doc comment for the full account
+# of what that build attempt found. Each crate's own portable scalar-only
+# fallback:
+rustflags = [
+    "--cfg", "polyval_force_soft",
+    "--cfg", "aes_force_soft",
+    "--cfg", "curve25519_dalek_backend=\"serial\"",
+]
