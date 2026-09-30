@@ -970,6 +970,58 @@ mod tests {
                 prop_assert_eq!(fat_entry_at(&bytes, entry_in_sector), Some(0));
             }
         }
+
+        // `cargo fuzz` (`blk-driver-host/fuzz/fuzz_targets/fat32_parse_fuzz.rs`)
+        // cannot actually build on this Windows dev box -- no C++ toolchain
+        // (`g++`) is available to compile libFuzzer's runtime under the GNU
+        // target, and the MSVC target rejects AddressSanitizer entirely --
+        // so this proptest is the fallback: same two properties that fuzz
+        // target exists to check, run here instead. Unlike the individual
+        // fixed-size (32-byte) `dir_entry_parse_never_panics`/
+        // `lfn_fragment_parse_never_panics` proptests above, this scans a
+        // whole variable-length buffer chunk-by-chunk, the same shape every
+        // real directory scan in `main.rs` (`find_entry_in_directory`,
+        // `find_entry_by_long_name`) actually uses.
+        #[test]
+        fn directory_sector_scan_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..2048),
+        ) {
+            for chunk in bytes.chunks_exact(32) {
+                let entry_bytes: [u8; 32] = chunk.try_into().unwrap();
+                if entry_bytes[0] == 0x00 {
+                    break;
+                }
+                if let Some(entry) = parse_short_dir_entry(&entry_bytes) {
+                    let _ = short_name_checksum(&entry.name);
+                }
+                if let Some(fragment) = parse_lfn_fragment(&entry_bytes) {
+                    prop_assert!(fragment.sequence >= 1 && fragment.sequence <= 0x1F);
+                }
+            }
+        }
+
+        // Pins the property every real chain walker in `main.rs`
+        // (`read_file_contents`, `find_entry_in_directory`,
+        // `find_entry_by_long_name`) depends on: repeatedly following
+        // `fat_entry_at` from an arbitrary starting cluster, over arbitrary
+        // (possibly cyclic, possibly out-of-range) FAT bytes, for up to the
+        // same 1024-iteration cap those walkers all use, must never panic
+        // -- proof the cap actually bounds the walk instead of a corrupt or
+        // self-referential FAT entry causing an overflow or an
+        // out-of-bounds read partway through.
+        #[test]
+        fn chain_walk_never_panics(
+            fat_bytes in proptest::collection::vec(any::<u8>(), 0..2048),
+            start_cluster in any::<u32>(),
+        ) {
+            let mut cluster = start_cluster;
+            for _ in 0..1024u32 {
+                match fat_entry_at(&fat_bytes, cluster) {
+                    Some(next) if !is_end_of_chain(next) => cluster = next,
+                    _ => break,
+                }
+            }
+        }
     }
 
     #[test]

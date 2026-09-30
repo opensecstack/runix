@@ -34,3 +34,10 @@ path = "fuzz_targets/first_free_cluster_fuzz.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fat32_parse_fuzz"
+path = "fuzz_targets/fat32_parse_fuzz.rs"
+test = false
+doc = false
+bench = false
