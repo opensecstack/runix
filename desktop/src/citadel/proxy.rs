@@ -25,7 +25,12 @@
 //!    kernel-asserted `verifier`). A refusal here means this proxy never
 //!    attaches its identity and never forwards to CITADEL at all — the
 //!    request is answered with a translated [`MarshalError`] describing
-//!    which policy check failed.
+//!    which policy check failed. Either way, this decision — allow or
+//!    refuse — is itself recorded to a [`WormLog`] via
+//!    [`WormLog::record_proxy_verification`] before the pipeline continues:
+//!    this proxy's own verification act is evidence, not just the kernel
+//!    spawn it's gating (`docs/RFC-VERIFIER-IDENTITY.md`'s "two principals,
+//!    two log entries" goal).
 //! 3. Only once that check passes: **builds the real, enriched
 //!    [`super::identity::Kerkese`] envelope** (real `KerkeseActor`/
 //!    `KerkeseVerifier`/`KerkeseSoD`, a fresh `execution_id` UUID, a real
@@ -61,10 +66,12 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Mutex;
 
 use citadel_kerkese_core::decision::{Decision, Outcome};
 use citadel_kerkese_core::{KerkeseTransport, TransportError};
 use ed25519_dalek::SigningKey;
+use runix_citadel_integration::WormLog;
 use runix_ipc::marshal::{MarshalError, MarshalOutcome, MarshalRequest, MarshalResponse};
 
 use super::identity::{
@@ -168,6 +175,23 @@ fn parse_kernel_envelope(kerkese_json: &[u8]) -> Result<KernelMinimalEnvelope, M
             "kerkese_json was not a well-formed minimal envelope: {e}"
         ))))
     })
+}
+
+/// Appends one [`WormLog::record_proxy_verification`] entry — the thin
+/// lock-and-record wrapper [`build_response`] calls on both the allow and
+/// refuse paths. A poisoned lock (a prior panic while holding it) falls back
+/// to recovering the inner log rather than propagating the poison and
+/// dropping the connection: recording this proxy's own verification
+/// decision must never itself become a reason a request fails.
+fn record_proxy_verification(
+    worm_log: &Mutex<WormLog>,
+    module_id: &str,
+    instance_id: &str,
+    authorized: bool,
+    reason: Option<String>,
+) {
+    let mut log = worm_log.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    log.record_proxy_verification(module_id, instance_id, authorized, reason);
 }
 
 /// Translates a [`PolicyError`] into the [`MarshalResponse`] sent back to
@@ -287,9 +311,18 @@ fn submit_and_translate(transport: &HttpKerkeseTransport, kerkese_json: &[u8]) -
 /// pipeline (see this module's own doc comment) against one already-decoded
 /// `kerkese_json` payload and returns the [`MarshalResponse`] to send back.
 /// Never forwards anything to `transport` unless [`policy::check`] passed.
+///
+/// Records this proxy's own verification decision to `worm_log` immediately
+/// after [`policy::check`] runs — allow or refuse, both recorded, before the
+/// pipeline continues on to enrichment/forwarding (allow case) or returns
+/// (refuse case). A `kerkese_json` that fails to parse at all
+/// ([`parse_kernel_envelope`]) never reaches [`policy::check`], so nothing
+/// is recorded for it — there is no `(module_id, instance_id)` to attribute
+/// the decision to.
 fn build_response(
     transport: &HttpKerkeseTransport,
     signing_key: &SigningKey,
+    worm_log: &Mutex<WormLog>,
     kerkese_json: &[u8],
 ) -> MarshalResponse {
     let envelope = match parse_kernel_envelope(kerkese_json) {
@@ -297,9 +330,14 @@ fn build_response(
         Err(response) => return response,
     };
 
+    let module_id = envelope.action.module_id.clone();
+    let instance_id = envelope.action.instance_id.clone();
+
     if let Err(err) = policy::check(&envelope) {
+        record_proxy_verification(worm_log, &module_id, &instance_id, false, Some(err.to_string()));
         return policy_error_response(err);
     }
+    record_proxy_verification(worm_log, &module_id, &instance_id, true, None);
 
     let enriched = build_enriched_envelope(&envelope, signing_key);
     let enriched_json = match serde_json::to_vec(&enriched) {
@@ -324,9 +362,10 @@ pub fn handle_connection(
     stream: &mut TcpStream,
     transport: &HttpKerkeseTransport,
     signing_key: &SigningKey,
+    worm_log: &Mutex<WormLog>,
 ) -> std::io::Result<()> {
     let request = read_marshal_request(stream)?;
-    let response = build_response(transport, signing_key, &request.kerkese_json);
+    let response = build_response(transport, signing_key, worm_log, &request.kerkese_json);
     stream.write_all(&response.encode())?;
     stream.flush()
 }
@@ -339,25 +378,31 @@ pub fn serve_one(
     listener: &TcpListener,
     transport: &HttpKerkeseTransport,
     signing_key: &SigningKey,
+    worm_log: &Mutex<WormLog>,
 ) -> std::io::Result<()> {
     let (mut stream, _addr) = listener.accept()?;
-    handle_connection(&mut stream, transport, signing_key)
+    handle_connection(&mut stream, transport, signing_key, worm_log)
 }
 
 /// Binds `listen_addr` and serves connections one at a time, forever, using
 /// this proxy's own demo Verifier signing key
-/// ([`super::identity::proxy_signing_key`]). Never returns on success;
-/// returns `Err` only if binding the listener itself fails. A
-/// per-connection failure (bad request, policy refusal, transport error,
-/// I/O error mid-handling) is logged to stderr and the loop moves on to the
-/// next connection rather than tearing down the whole server.
+/// ([`super::identity::proxy_signing_key`]) and a fresh, process-lifetime
+/// [`WormLog`] recording every verification decision this proxy makes (see
+/// [`build_response`]). Never returns on success; returns `Err` only if
+/// binding the listener itself fails. A per-connection failure (bad
+/// request, policy refusal, transport error, I/O error mid-handling) is
+/// logged to stderr and the loop moves on to the next connection rather than
+/// tearing down the whole server.
 pub fn serve(listen_addr: &str, transport: HttpKerkeseTransport) -> std::io::Result<()> {
     let listener = TcpListener::bind(listen_addr)?;
     let signing_key = identity::proxy_signing_key();
+    let worm_log = Mutex::new(WormLog::default());
     loop {
         match listener.accept() {
             Ok((mut stream, _addr)) => {
-                if let Err(e) = handle_connection(&mut stream, &transport, &signing_key) {
+                if let Err(e) =
+                    handle_connection(&mut stream, &transport, &signing_key, &worm_log)
+                {
                     eprintln!("citadel_proxy: connection error: {e}");
                 }
             }
@@ -496,8 +541,10 @@ mod tests {
         let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
 
         let signing_key = test_signing_key();
-        let handle =
-            std::thread::spawn(move || serve_one(&proxy_listener, &transport, &signing_key));
+        let worm_log = Mutex::new(WormLog::default());
+        let handle = std::thread::spawn(move || {
+            serve_one(&proxy_listener, &transport, &signing_key, &worm_log)
+        });
 
         let req = MarshalRequest {
             kerkese_json: minimal_envelope_json(),
@@ -536,8 +583,10 @@ mod tests {
         let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
 
         let signing_key = test_signing_key();
-        let handle =
-            std::thread::spawn(move || serve_one(&proxy_listener, &transport, &signing_key));
+        let worm_log = Mutex::new(WormLog::default());
+        let handle = std::thread::spawn(move || {
+            serve_one(&proxy_listener, &transport, &signing_key, &worm_log)
+        });
 
         let req = MarshalRequest {
             kerkese_json: minimal_envelope_json(),
@@ -565,8 +614,10 @@ mod tests {
         let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
 
         let signing_key = test_signing_key();
-        let handle =
-            std::thread::spawn(move || serve_one(&proxy_listener, &transport, &signing_key));
+        let worm_log = Mutex::new(WormLog::default());
+        let handle = std::thread::spawn(move || {
+            serve_one(&proxy_listener, &transport, &signing_key, &worm_log)
+        });
 
         let req = MarshalRequest {
             kerkese_json: minimal_envelope_json(),
@@ -617,8 +668,11 @@ mod tests {
         let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
         let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
         let signing_key = test_signing_key();
-        let handle =
-            std::thread::spawn(move || serve_one(&proxy_listener, &transport, &signing_key));
+        let worm_log = std::sync::Arc::new(Mutex::new(WormLog::default()));
+        let worm_log_clone = worm_log.clone();
+        let handle = std::thread::spawn(move || {
+            serve_one(&proxy_listener, &transport, &signing_key, &worm_log_clone)
+        });
 
         let req = MarshalRequest {
             kerkese_json: minimal_envelope_json(),
@@ -629,6 +683,21 @@ mod tests {
             .expect("proxy thread panicked")
             .expect("serve_one");
         assert!(matches!(response, MarshalResponse::Decision { .. }));
+
+        // The proxy's own verification decision — allowing this request —
+        // was itself recorded to WORM, distinct from the CITADEL Decision
+        // being gated: exactly `docs/RFC-VERIFIER-IDENTITY.md`'s "two
+        // principals, two log entries" goal.
+        {
+            let log = worm_log.lock().unwrap();
+            let entries = log.entries();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].module_id, "grid-sandbox-host");
+            assert_eq!(entries[0].instance_id.as_deref(), Some("app-1"));
+            assert!(entries[0].authorized);
+            assert!(entries[0].reason.is_none());
+            assert!(log.verify_chain());
+        }
 
         let forwarded_bytes = captured.lock().unwrap().take().expect("body captured");
         let forwarded: Kerkese =
@@ -693,8 +762,11 @@ mod tests {
         let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
         let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
         let signing_key = test_signing_key();
-        let handle =
-            std::thread::spawn(move || serve_one(&proxy_listener, &transport, &signing_key));
+        let worm_log = std::sync::Arc::new(Mutex::new(WormLog::default()));
+        let worm_log_clone = worm_log.clone();
+        let handle = std::thread::spawn(move || {
+            serve_one(&proxy_listener, &transport, &signing_key, &worm_log_clone)
+        });
 
         let bad_json = br#"{"kerkese_version":"1.0","dry_run":true,"action":{"type":"not_a_recognized_action","module_id":"m","instance_id":"i"},"actor":{"user_id":"kernel:grid_sandbox","role":"operator"},"execution_id":"i"}"#.to_vec();
         let req = MarshalRequest {
@@ -711,6 +783,23 @@ mod tests {
                 assert!(msg.contains("POLICY_REFUSE"));
             }
             other => panic!("expected Error(Other) carrying a policy refusal, got {other:?}"),
+        }
+
+        // A policy refusal is a verification decision too — recorded as
+        // `authorized: false` with the policy reason, not silently dropped
+        // just because CITADEL was never reached.
+        {
+            let log = worm_log.lock().unwrap();
+            let entries = log.entries();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].module_id, "m");
+            assert_eq!(entries[0].instance_id.as_deref(), Some("i"));
+            assert!(!entries[0].authorized);
+            assert!(entries[0]
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("POLICY_REFUSE"));
         }
 
         // Give the (should-never-connect) mock server thread a moment; if

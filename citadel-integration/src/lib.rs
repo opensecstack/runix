@@ -573,6 +573,41 @@ impl WormLog {
         );
     }
 
+    /// Records `citadel_proxy`'s own verification decision — whether it was
+    /// willing to attach its own Verifier identity and vouch for
+    /// `module_id`/`instance_id` before ever forwarding to CITADEL.
+    ///
+    /// This is the "two principals, two log entries" evidence
+    /// `docs/RFC-VERIFIER-IDENTITY.md`'s Option A calls for:
+    /// [`record_shadow_marshal_evaluation`](Self::record_shadow_marshal_evaluation)
+    /// captures the *kernel's* shadow observation of a CITADEL Gate outcome;
+    /// this method captures the *proxy's* own decision — a genuinely
+    /// separate process, in a separate address space, choosing whether to
+    /// vouch for the request at all — recorded the moment that decision is
+    /// made (immediately after `desktop/src/citadel/policy::check` runs),
+    /// not after CITADEL's eventual Decision comes back. `desktop/src/citadel/proxy.rs`'s
+    /// `build_response` is the one intended call site.
+    ///
+    /// `authorized` is `true` when the proxy's own policy check passed (and
+    /// it went on to attach its Verifier identity and forward the enriched
+    /// envelope), `false` when it refused — `reason` carries the
+    /// [`Display`](core::fmt::Display) of the policy refusal in the `false`
+    /// case, mirroring how [`BootAllowlist::authorize_module_load`] records
+    /// its own denials. Distinct from [`ShadowMarshalOutcome`] (this isn't a
+    /// CITADEL Gate outcome — CITADEL is never reached when the proxy
+    /// refuses) and from any real authorization record (this proxy issues no
+    /// [`SandboxTier`] grant), so `tier` and `shadow_marshal` are always
+    /// `None` here.
+    pub fn record_proxy_verification(
+        &mut self,
+        module_id: &str,
+        instance_id: &str,
+        authorized: bool,
+        reason: Option<String>,
+    ) {
+        self.record(module_id, Some(instance_id), None, authorized, reason, None);
+    }
+
     /// Every entry recorded so far, oldest first.
     pub fn entries(&self) -> &[WormEntry] {
         &self.entries

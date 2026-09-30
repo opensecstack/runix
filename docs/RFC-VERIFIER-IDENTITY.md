@@ -197,6 +197,99 @@ make Option A's Verifier "real enough."
   evaluation entry — two principals, two log entries, matching the SoD split
   this whole RFC is trying to make real rather than nominal.
 
+## Key registration against a live CITADEL deployment: what it would take, and why it hasn't happened
+
+`desktop/src/citadel/identity.rs`'s doc comment already flags this as scoped
+down rather than faked: `proxy_verifying_key()` is a real, fixed Ed25519 key
+(`PROXY_DEMO_SEED`), genuinely distinct from every key `kernel/` holds, and
+`sig_verifier` is a real signature over a byte-for-byte-correct
+`CanonicalPayload`. None of that is fabricated. What's missing is the step
+that would make a live CITADEL deployment actually check that signature —
+this section names exactly what that step is, using the real Go source
+(`opensecstack/opensecstack`, read for this RFC, not modified), so "register
+the key" isn't a vague future task.
+
+### The real endpoint
+
+CITADEL already has a working registration endpoint:
+`citadel/internal/api/handlers/keys.go`'s `Keys.Register`, `POST
+/api/v1/keys/register`. Its request body is:
+
+```json
+{"user_id": "...", "token": "...", "key_id": "...", "public_key": "..."}
+```
+
+`public_key` is expected as the hex-encoded Ed25519 public key
+(`proxy_verifying_key()`'s bytes, `hex::encode`'d — the same encoding
+`ModuleManifestEntry`/`InstanceManifestEntry` already use for signatures, so
+no new encoding convention is needed on the Rust side). `key_id` is an
+opaque label CITADEL stores alongside the key (`citadel-integration`'s own
+`key_id` field on `ModuleManifestEntry` plays the equivalent role for boot
+manifests) — Runix would mint something like
+`"citadel_proxy-<host>-<generation>"`, not yet decided since no registration
+call exists to need it.
+
+### Why `citadel_proxy` can't call it today — three independent blockers, not one
+
+1. **No live CITADEL deployment reachable from any dev/CI/QEMU environment.**
+   `Keys.Register` is real code, but there is no running `citadel/` instance
+   anywhere in this project's dev, CI, or QEMU setups to POST to — the same
+   gap `docs/MARSHAL-ENFORCEMENT-POLICY.md` names for the Kerkese submission
+   path itself (`SHADOW_MARSHAL_PROXY` defaults to `None` for exactly this
+   reason). Registering a key against a deployment that doesn't exist isn't
+   an engineering task, it's nothing to point the HTTP call at.
+2. **No sinauth deployment to mint the bearer token `Register` requires.**
+   `Keys.Register` calls `k.verifier.Verify(ctx, req.Token)` and requires the
+   verified subject to equal `req.user_id` — i.e. it needs a live sinauth
+   identity provider that has issued a real bearer token for the subject
+   `citadel_proxy:verifier` (`identity::PROXY_VERIFIER_USER_ID`) before this
+   proxy could register a key for that identity at all. No such identity
+   provider is deployed or reachable here either; `desktop/`'s `reqwest`
+   dependency (already present, via `citadel-kerkese-core`'s
+   `HttpKerkeseTransport`) is not the blocker — the HTTP client capability
+   already exists. The absent piece is something to authenticate *to*.
+3. **Even a successfully-registered key wouldn't be checked yet.**
+   `citadel/internal/marshal/marshal.go`'s `Engine::EnforceSignatures`
+   defaults to `false` (see that method's own doc comment, and
+   `adrs/006-split-enforce-identity-and-signatures.md`) — a fresh CITADEL
+   deployment would need this flag explicitly turned on before Gate
+   1/Gate 3's `GetSigningKey` lookup (`marshal.go` lines ~310/441) is even
+   consulted. Registration without `EnforceSignatures=true` is inert.
+
+None of these three are things Runix's own codebase can resolve by writing
+more Rust — (1) and (2) are deployment/infrastructure that doesn't exist yet
+anywhere in this project's environment, and (3) is a CITADEL-side
+configuration decision for whoever operates the deployment. This is
+distinct from the `opensecstack/sdk/rust` blocker `docs/ROADMAP.md`'s "Open
+questions" section tracks for the *Kerkese submission* path (that one is a
+missing client library — `sdk/rust`'s `CITADELClient` is a WORM
+event-delivery client, not a Kerkese submit/decision call, and can't run in
+`kernel/`'s `no_std` target regardless): key registration doesn't need a new
+Rust dependency at all — `reqwest` + `hex` already cover the wire mechanics
+— it needs a deployment and an identity provider to point them at, neither
+of which is an artifact this repository's own build can produce.
+
+### What registration would concretely look like, once both exist
+
+1. Generate (or load, once real key provisioning replaces `PROXY_DEMO_SEED`
+   — see the "Open questions" item below) `citadel_proxy`'s Ed25519 keypair.
+2. Obtain a sinauth bearer token for subject `citadel_proxy:verifier` — this
+   is the step that needs a live sinauth deployment and probably a
+   service-account-style credential for `citadel_proxy`, not a human login
+   flow, since this proxy runs unattended.
+3. `POST /api/v1/keys/register` with `user_id: "citadel_proxy:verifier"`,
+   that bearer token, a chosen `key_id`, and `hex::encode(proxy_verifying_key().to_bytes())`.
+4. Confirm the CITADEL deployment operator has set `EnforceSignatures=true`
+   on the `marshal.Engine` — otherwise the registered key is stored but
+   never consulted.
+5. Only then does `sig_verifier` on outgoing `Kerkese` envelopes become
+   something Gate 1/Gate 3 actually verifies, rather than unchecked evidence.
+
+This sequence is not implemented anywhere in this codebase — not behind a
+feature flag, not as a dead code path, not as a mock. Per this project's
+"don't fabricate a fake registration flow" discipline, nothing beyond this
+document exists for it yet.
+
 ## Open questions
 
 - Does the proxy's local policy check need its own key-provisioning story for
@@ -223,6 +316,9 @@ make Option A's Verifier "real enough."
 - `citadel-integration/src/lib.rs` — "Why not a Kerkese/MARSHAL round-trip"
 - `desktop/src/bin/citadel_proxy.rs`, `desktop/src/citadel/proxy.rs` — Option A's build target
 - `opensecstack/opensecstack/citadel/internal/marshal/types.go` — real `Kerkese`/`KerkeseActor`/`KerkeseVerifier`/`KerkeseSoD` shapes
-- `opensecstack/opensecstack/citadel/internal/marshal/marshal.go` — `gate3NDS`, `roleGroup`/`roleGroupMap`
+- `opensecstack/opensecstack/citadel/internal/marshal/marshal.go` — `gate3NDS`, `roleGroup`/`roleGroupMap`, `Engine::EnforceSignatures`, `GetSigningKey` call sites
+- `opensecstack/opensecstack/citadel/internal/api/handlers/keys.go` — the real `POST /api/v1/keys/register`/`GET /api/v1/keys/{user_id}` endpoints this RFC's key-registration section describes
+- `opensecstack/opensecstack/citadel/internal/db/marshal_store.go` — `MarshalStore::GetSigningKey`, the `marshal.Store` adapter `Engine` reads registered keys through
+- `opensecstack/opensecstack/citadel/adrs/005-sinauth-identity-bridge.md`, `opensecstack/opensecstack/citadel/adrs/006-split-enforce-identity-and-signatures.md` — sinauth bearer-token verification and the `EnforceIdentity`/`EnforceSignatures` rollout-flag split this RFC's registration section depends on
 - `docs/MARSHAL-ENFORCEMENT-POLICY.md` — the fail-open/fail-closed decision this RFC's resolution unblocks testing for
 - `opensecstack/opensecstack#34` — RFC-0005, the still-open umbrella issue this would be posted as a follow-up to, once accepted here
