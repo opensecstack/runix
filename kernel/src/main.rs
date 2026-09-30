@@ -233,23 +233,19 @@ struct BlkBootInfo {
     serve_fs_requests: u8,
 }
 
-/// Filesystem driver, Phase 3's fixed IPC ports -- request (a requester
-/// sends a real `runix_ipc::fs::FsRequest`, one byte per `SYS_IPC_SEND`)
-/// and response (`blk-driver-host` replies with an `FsResponse`, one byte
-/// per `SYS_IPC_SEND`, on whichever port the request's own
-/// `response_port` field names -- see `docs/RFC-IPC-RESPONSE-CAPABILITY.md`
-/// Option A) -- distinct from the transient demo ports (`0`-`2`) Phase
+/// Filesystem driver's one fixed IPC port -- a client opens a session
+/// against it (`SYS_IPC_SESSION_OPEN`) and `blk-driver-host` accepts
+/// (`SYS_IPC_SESSION_ACCEPT`), then both sides freely exchange a real
+/// `runix_ipc::fs::FsRequest`/`FsResponse` over that private session --
+/// see `blk-driver-host/src/main.rs`'s `run_fs_ipc_server` doc comment for
+/// the full migration from the old fixed-port-plus-response-port
+/// transport. Distinct from the transient demo ports (`0`-`2`) Phase
 /// B4/B5's own capability-gate proof already uses during boot, though
-/// those never stay live long enough to actually collide with these.
+/// those never stay live long enough to actually collide with this one.
+/// Must match `blk-driver-host/src/main.rs`'s own `FS_SERVER_PORT`
+/// constant exactly.
 #[allow(dead_code)]
-const BLK_FS_REQUEST_PORT: usize = 8;
-/// Filesystem driver, Phase 8: a second, independently capability-gated
-/// port for write requests -- a caller needs a capability scoped to
-/// `port_resource(BLK_FS_WRITE_REQUEST_PORT)` specifically, separate from
-/// whatever authorizes a read trigger on `BLK_FS_REQUEST_PORT`. Must match
-/// `blk-driver-host/src/main.rs`'s own `FS_WRITE_REQUEST_PORT` constant.
-#[allow(dead_code)]
-const BLK_FS_WRITE_REQUEST_PORT: usize = 10;
+const BLK_FS_SERVER_PORT: usize = 8;
 
 /// Port-allocation map, all 16 of `kernel::ipc::PORT_COUNT` -- kept here,
 /// not scattered across every port constant's own comment, so the next
@@ -259,25 +255,39 @@ const BLK_FS_WRITE_REQUEST_PORT: usize = 10;
 ///
 /// * `0`-`2`: boot-time capability-gate demo ports (Phase B4/B5), never live
 ///   past early boot.
-/// * `3`-`7`: free -- Option A's per-client filesystem response-port pool.
-///   A real dynamic-client deployment would carve these out per spawned
-///   client; today's tests hand-pick one or two of these directly.
-/// * `8`: [`BLK_FS_REQUEST_PORT`] (filesystem read requests, recv-gated to
-///   `blk-driver-host` itself since `SYS_IPC_RECV`'s capability gate
-///   landed).
-/// * `9`: free -- formerly `BLK_FS_RESPONSE_PORT`, the one shared response
-///   port every filesystem client answered on before Option A. Retired:
-///   see `docs/RFC-IPC-RESPONSE-CAPABILITY.md`'s "Context" section for why
-///   a single shared response port was the actual confidentiality leak.
-/// * `10`: [`BLK_FS_WRITE_REQUEST_PORT`] (filesystem write requests, same
-///   recv-gating as `8`).
-/// * `11`: `net_driver_host::SOCK_REQUEST_PORT` / `marshal_client::SOCK_REQUEST_PORT`
-///   (sockets requests, recv-gated to `net-driver-host`).
-/// * `12`: `net_driver_host::SOCK_RESPONSE_PORT` / `marshal_client::SOCK_RESPONSE_PORT`
-///   (sockets responses -- still one port shared by every sockets client;
-///   Option A's per-client separation was only ever applied to the
-///   filesystem surface, not sockets -- see that RFC's "What changes"
-///   section).
+/// * `3`-`7`: free -- formerly Option A's per-client filesystem
+///   response-port pool (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`), retired
+///   now that the filesystem surface is session-based
+///   (`SYS_IPC_SESSION_*`, see [`BLK_FS_SERVER_PORT`]): the session id
+///   itself is the reply channel, so no per-client response port needs
+///   carving out anymore.
+/// * `8`: [`BLK_FS_SERVER_PORT`] (filesystem read *and* write requests,
+///   both flowing over sessions opened against this one port --
+///   session-open/accept-gated to `blk-driver-host` itself the same way
+///   `SYS_IPC_SEND`/`SYS_IPC_RECV` already gate fixed ports).
+/// * `9`-`10`: free -- formerly `BLK_FS_RESPONSE_PORT` (the one shared
+///   response port every filesystem client answered on before Option A)
+///   and `BLK_FS_WRITE_REQUEST_PORT` (the separate fixed write-request
+///   port, collapsed into [`BLK_FS_SERVER_PORT`] once the `FsRequest` enum
+///   tag itself was enough to distinguish reads from writes over one
+///   session). See `docs/RFC-IPC-RESPONSE-CAPABILITY.md`'s "Context"
+///   section for why the shared response port was the actual
+///   confidentiality leak Option A (now itself retired) closed.
+/// * `11`: `net_driver_host::SOCKETS_SERVER_PORT` / `marshal_client::SOCKETS_SERVER_PORT`
+///   (sockets IPC surface, now session-based like [`BLK_FS_SERVER_PORT`]
+///   above: `SYS_IPC_SESSION_OPEN`/`_ACCEPT` are the only capability check
+///   against this port, every send/recv on an accepted session is gated by
+///   session participation instead). Migrated off the old fixed
+///   request/response pair for the same reason `blk-driver-host`'s
+///   filesystem surface migrated earlier -- see
+///   `kernel::marshal_client`'s module doc comment for the syscall-cost
+///   numbers that made this specific migration worth doing (TLS-scale
+///   exchanges over the old transport, not a confidentiality leak like
+///   Option A's).
+/// * `12`: free -- formerly `net_driver_host::SOCK_RESPONSE_PORT` (the
+///   shared sockets response port every client answered on before this
+///   port's own migration to the session primitive; a session id is its
+///   own reply channel, so no separate response port is needed anymore).
 /// * `13`-`15`: free.
 #[allow(dead_code)]
 const PORT_ALLOCATION_MAP_SEE_DOC_COMMENT: () = ();
@@ -978,14 +988,29 @@ fn load_and_run_net_driver_host(io_base: u16, now: u64, signing_key: &ed25519_da
         signing_key,
     );
 
+    // Second, extra capability (alongside the ioport-range token above) so
+    // this process can seed smoltcp's TCP ISN/ephemeral-port randomization
+    // via `SYS_RANDOM` instead of leaving it deterministic across boots —
+    // see `syscall::random_u64`'s call site in `net-driver-host/src/main.rs`
+    // and `docs/RFC-TLS-APPROACH.md`'s "Phase 1 decision" note.
+    let random_token = runix_capability_manager::CapabilityToken::issue(
+        "net-driver-host",
+        runix_kernel::capabilities::random_resource(),
+        now,
+        now + 1_000_000,
+        "demo-key",
+        signing_key,
+    );
+
     #[allow(static_mut_refs)]
     unsafe {
         NET_DRIVER_HOST_ENTRY_POINT = entry.as_u64();
     }
-    runix_kernel::scheduler::spawn_ring3_process_with_capability(
+    runix_kernel::scheduler::spawn_ring3_process_with_capabilities(
         net_driver_host_trampoline,
         space,
         Some(net_token),
+        alloc::vec![random_token],
     );
 
     // Give it plenty of turns to probe the device, TX one ARP request, and
@@ -1115,35 +1140,23 @@ fn load_and_run_blk_driver_host(
     }
 
     // Filesystem driver, Phase 3: only when actually serving requests does
-    // this process need a second capability (the reply port) -- every
+    // this process need a second capability (the server port) -- every
     // other boot/test keeps using the single-capability spawn path
     // unchanged, same "additive, not a behavior change for existing
     // callers" reasoning `Thread::extra_capabilities`'s own doc comment
     // gives.
     if serve_fs_requests {
-        // `SYS_IPC_RECV` is now capability-gated identically to
-        // `SYS_IPC_SEND` (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) --
-        // `blk-driver-host` itself now needs its own tokens to *receive* on
-        // the two request ports it polls (`run_fs_ipc_server`'s
-        // `ipc_try_recv(FS_REQUEST_PORT)`/`ipc_try_recv(FS_WRITE_REQUEST_PORT)`),
-        // not only the response-port send token it already held. Under
-        // Option A the per-client *response* ports are a spawn-time
-        // decision made by whichever caller actually turns
-        // `serve_fs_requests` on (each kernel test that does grants its own
-        // response-port send token(s) to this same `extra_capabilities`
-        // set) -- this function only owns the two fixed, always-shared
-        // request ports.
-        let fs_request_recv_token = runix_capability_manager::CapabilityToken::issue(
+        // `SYS_IPC_SESSION_ACCEPT` is gated identically to
+        // `SYS_IPC_SESSION_OPEN` (same `port:<n>` resource --
+        // `kernel/src/syscall.rs`'s own doc comment on both) --
+        // `blk-driver-host` itself needs this token to accept client
+        // sessions on `run_fs_ipc_server`'s one server port. Now a single
+        // grant covering both read and write requests (the `FsRequest`
+        // enum tag distinguishes them once a session is open), where the
+        // old fixed-port transport needed two separate recv tokens.
+        let fs_server_token = runix_capability_manager::CapabilityToken::issue(
             "blk-driver-host",
-            runix_kernel::capabilities::port_resource(BLK_FS_REQUEST_PORT),
-            now,
-            now + 1_000_000,
-            "demo-key",
-            signing_key,
-        );
-        let fs_write_request_recv_token = runix_capability_manager::CapabilityToken::issue(
-            "blk-driver-host",
-            runix_kernel::capabilities::port_resource(BLK_FS_WRITE_REQUEST_PORT),
+            runix_kernel::capabilities::port_resource(BLK_FS_SERVER_PORT),
             now,
             now + 1_000_000,
             "demo-key",
@@ -1153,7 +1166,7 @@ fn load_and_run_blk_driver_host(
             blk_driver_host_trampoline,
             space,
             Some(blk_token),
-            alloc::vec![fs_request_recv_token, fs_write_request_recv_token],
+            alloc::vec![fs_server_token],
         );
     } else {
         runix_kernel::scheduler::spawn_ring3_process_with_capability(

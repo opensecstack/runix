@@ -87,6 +87,14 @@ pub fn file_resource(name: &str) -> String {
     format!("file:{name}")
 }
 
+/// The resource string a capability must match to authorize `SYS_RANDOM` —
+/// process-wide, unlike [`ioport_range_resource`], since entropy access
+/// isn't tied to any particular device or address range: a process either
+/// holds a token for `"random"` or it doesn't.
+pub fn random_resource() -> String {
+    "random".into()
+}
+
 /// The resource-string convention for port-I/O access: one capability
 /// covers a whole inclusive port range, not one token per port — matching
 /// the granularity `port_resource` already uses for IPC (one token per

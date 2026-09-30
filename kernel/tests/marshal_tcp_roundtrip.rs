@@ -252,25 +252,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "demo-key",
         &signing_key,
     );
-    // `net-driver-host` needs a second capability to reply at all --
-    // `Thread::extra_capabilities`, same shape `net_driver_sockets.rs`
-    // already proves for its own response port.
-    let response_token = runix_capability_manager::CapabilityToken::issue(
+    // `net-driver-host` needs a second capability to serve the sockets IPC
+    // surface at all -- now a single token scoped to
+    // `marshal_client::SOCKETS_SERVER_PORT` (`SYS_IPC_SESSION_ACCEPT`'s own
+    // capability check), not a request/response pair. See
+    // `net_driver_sockets.rs`'s identical fix for the full reasoning
+    // (every operation past accept is gated by session participation, not
+    // a fresh port capability).
+    let accept_token = runix_capability_manager::CapabilityToken::issue(
         "net-driver-host",
-        runix_kernel::capabilities::port_resource(marshal_client::SOCK_RESPONSE_PORT),
-        now,
-        now + 1_000_000,
-        "demo-key",
-        &signing_key,
-    );
-    // `SYS_IPC_RECV` is now capability-gated identically to `SYS_IPC_SEND`
-    // (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) -- `net-driver-host` itself
-    // now needs its own token to *receive* on `SOCK_REQUEST_PORT`, not
-    // only the response-port send token it already held. See
-    // `net_driver_sockets.rs`'s identical fix for the full reasoning.
-    let request_recv_token = runix_capability_manager::CapabilityToken::issue(
-        "net-driver-host",
-        runix_kernel::capabilities::port_resource(marshal_client::SOCK_REQUEST_PORT),
+        runix_kernel::capabilities::port_resource(marshal_client::SOCKETS_SERVER_PORT),
         now,
         now + 1_000_000,
         "demo-key",
@@ -285,7 +276,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         kernel_trampoline,
         space,
         Some(net_token),
-        alloc::vec![response_token, request_recv_token],
+        alloc::vec![accept_token],
     );
 
     // Give it time to probe the device, bring up the interface, and reach
@@ -296,63 +287,58 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     // Negative case first: this test's own boot thread holds no capability
-    // for the sockets request port at all -- the request must never reach
-    // the channel, same expectation every other IPC surface in this
-    // codebase already proves for its own request port.
+    // for the sockets server port at all -- opening a session must never
+    // succeed, same expectation every other IPC surface in this codebase
+    // already proves for its own request port, now checked against
+    // `SYS_IPC_SESSION_OPEN` (the actual gated syscall
+    // `kernel::marshal_client::evaluate` calls first) rather than the old
+    // fixed-port `SYS_IPC_SEND`.
     let denied = unsafe {
         runix_kernel::syscall::syscall(
-            runix_kernel::syscall::SYS_IPC_SEND,
-            marshal_client::SOCK_REQUEST_PORT as u64,
+            runix_kernel::syscall::SYS_IPC_SESSION_OPEN,
+            marshal_client::SOCKETS_SERVER_PORT as u64,
             0,
             0,
         )
     };
     if denied != u64::MAX {
         serial_println!(
-            "marshal_tcp_roundtrip: FAIL — an unauthorized send to the sockets request port was \
-             not denied (returned {}, expected u64::MAX)",
+            "marshal_tcp_roundtrip: FAIL — an unauthorized session open was not denied (returned \
+             {}, expected u64::MAX)",
             denied
         );
         exit_qemu(QemuExitCode::Failed);
     }
     serial_println!(
-        "marshal_tcp_roundtrip: unauthorized send correctly denied (capability gate OK)"
+        "marshal_tcp_roundtrip: unauthorized session open correctly denied (capability gate OK)"
     );
 
-    // Positive case: a thread holding a capability scoped to exactly the
-    // sockets request port drives a full MarshalRequest/MarshalResponse
+    // Positive case: a thread holding a capability scoped to exactly
+    // `SOCKETS_SERVER_PORT` drives a full MarshalRequest/MarshalResponse
     // round trip through `kernel::marshal_client::evaluate`, against the
-    // real TCP listener `marshal_proof_listener.py` behind `guestfwd`.
+    // real TCP listener `marshal_proof_listener.py` behind `guestfwd`. No
+    // second token needed for the receive side any more -- once
+    // `evaluate` opens its session, this thread is that session's owner,
+    // and `SYS_IPC_SESSION_SEND`/`_RECV` are gated by session
+    // participation, not a separate port capability.
     let request_token = runix_capability_manager::CapabilityToken::issue(
         "test-marshal-client",
-        runix_kernel::capabilities::port_resource(marshal_client::SOCK_REQUEST_PORT),
+        runix_kernel::capabilities::port_resource(marshal_client::SOCKETS_SERVER_PORT),
         now,
         now + 1_000_000,
         "demo-key",
         &signing_key,
     );
-    // `marshal_client::evaluate` receives on `SOCK_RESPONSE_PORT`
-    // internally (`recv_socket_response`'s `SYS_IPC_RECV`), which is now
-    // capability-gated too -- `spawn_with_capability` only carries one
-    // token, so this thread grants itself the second one at its own start
-    // (`scheduler::grant_current_extra_capability`), the same fix
-    // `net_driver_sockets.rs` needed for its own client thread.
-    let response_recv_token = runix_capability_manager::CapabilityToken::issue(
-        "test-marshal-client",
-        runix_kernel::capabilities::port_resource(marshal_client::SOCK_RESPONSE_PORT),
-        now,
-        now + 1_000_000,
-        "demo-key",
-        &signing_key,
-    );
-    #[allow(static_mut_refs)]
-    unsafe {
-        PENDING_RESPONSE_RECV_TOKEN = Some(response_recv_token);
-    }
     scheduler::spawn_with_capability(authorized_client_thread, Some(request_token));
 
+    // Bumped from `30_000` alongside `evaluate`'s own bound bump above --
+    // this loop must not give up waiting before the client thread's own
+    // (now larger) internal poll budget has a real chance to play out, same
+    // "retune the two loops together" fix `net_driver_sockets.rs`'s own
+    // outer wait loop needed (`20_000` -> `200_000`) for the identical
+    // reason.
     let mut result = TestResult::Pending;
-    for _ in 0..30_000 {
+    for _ in 0..300_000 {
         scheduler::yield_now();
         #[allow(static_mut_refs)]
         let current = unsafe { RESULT };
@@ -388,17 +374,14 @@ enum TestResult {
 }
 
 static mut RESULT: TestResult = TestResult::Pending;
-static mut PENDING_RESPONSE_RECV_TOKEN: Option<runix_capability_manager::CapabilityToken> = None;
 
 /// Drives the client half entirely through `kernel::marshal_client` -- this
 /// thread holds the one capability scoped to
-/// [`marshal_client::SOCK_REQUEST_PORT`] (`kernel_main`'s own boot thread
-/// deliberately doesn't, proving the capability gate above).
+/// [`marshal_client::SOCKETS_SERVER_PORT`] (`kernel_main`'s own boot thread
+/// deliberately doesn't, proving the capability gate above). No second
+/// token needed — see this file's own capability-setup comment above for
+/// why the session primitive closes that gap.
 extern "C" fn authorized_client_thread() -> ! {
-    #[allow(static_mut_refs)]
-    let response_recv_token =
-        unsafe { PENDING_RESPONSE_RECV_TOKEN.take() }.expect("no pending response-recv token");
-    scheduler::grant_current_extra_capability(response_recv_token);
     let request = MarshalRequest {
         kerkese_json: FAKE_KERKESE_JSON.to_vec(),
     };
@@ -407,7 +390,17 @@ extern "C" fn authorized_client_thread() -> ! {
         TCP_REMOTE_PORT,
         TCP_LOCAL_PORT,
         &request,
-        200_000,
+        // Bumped from `200_000` (the old fixed-port transport's budget) to
+        // `2_000_000`, same bump and same reasoning as
+        // `net_driver_sockets.rs`'s `open_session`/`recv_response`: a
+        // session isn't picked up by `net-driver-host`'s
+        // `run_socket_ipc_server` until that server's own loop reaches a
+        // multiple of 10,000 of *its* iterations (that loop's own doc
+        // comment explains why `SYS_IPC_SESSION_ACCEPT` is checked on that
+        // cadence, not every iteration), so every one of `evaluate`'s
+        // internal poll loops needs a proportionally larger budget than the
+        // old transport did to reliably survive to acceptance.
+        2_000_000,
     ) {
         Some(MarshalResponse::Decision {
             outcome: MarshalOutcome::Refuse,

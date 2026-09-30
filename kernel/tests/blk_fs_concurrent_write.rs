@@ -5,20 +5,28 @@
 //! (single-writer internally remains true ... today's fix closes concurrent
 //! *senders*, not concurrent *allocators*)."
 //!
+//! **Transport migration note**: `blk-driver-host`'s filesystem IPC
+//! surface has since moved off fixed ports onto the `SYS_IPC_SESSION_*`
+//! primitive — see `blk_fs_concurrent.rs`'s own migration note and
+//! `runix_ipc::fs`'s doc comment for the full account. Two clients now get
+//! two private sessions, so their wire bytes can no longer land in the
+//! same buffer at all; what this test actually exercises is unchanged by
+//! that migration (see below).
+//!
 //! What this test establishes, and what it deliberately does not:
 //!
 //! * `blk_fs_concurrent.rs` already proves two genuinely concurrent callers
-//!   on the same *read* port cannot interleave their wire bytes
-//!   (`kernel::ipc::begin_send`/`end_send`). It proves nothing about what
-//!   `blk-driver-host`'s own single execution context does once two full
-//!   requests have both arrived — and read requests never mutate the disk,
-//!   so a serialization bug there could not corrupt anything.
+//!   opening independent sessions cannot interleave their wire bytes. It
+//!   proves nothing about what `blk-driver-host`'s own single execution
+//!   context does once two full requests have both arrived — and read
+//!   requests never mutate the disk, so a serialization bug there could
+//!   not corrupt anything.
 //! * This test is the mutating counterpart: two client threads spawned
 //!   back-to-back with **no yield between the spawns** (so both are
-//!   genuinely runnable before either gets a turn) each send a full
-//!   `FsRequest::Write` to the *same* `FS_WRITE_REQUEST_PORT`, for two
-//!   *different* files (`WRITE.TXT`, `PARTIAL.TXT`), each carrying a byte
-//!   pattern drawn from a **disjoint value range** from the other's
+//!   genuinely runnable before either gets a turn) each open their own
+//!   session against [`FS_SERVER_PORT`] and send a full `FsRequest::Write`
+//!   for two *different* files (`WRITE.TXT`, `PARTIAL.TXT`), each carrying
+//!   a byte pattern drawn from a **disjoint value range** from the other's
 //!   (`b'A'..=b'G'` vs `b'a'..=b'k'`) — so any single byte of one writer's
 //!   payload landing in the other's file is detectable at every offset, not
 //!   merely statistically unlikely. Both writes must report
@@ -63,6 +71,7 @@ use alloc::vec::Vec;
 use bootloader_api::config::{BootloaderConfig, Mapping};
 use bootloader_api::{entry_point, BootInfo};
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, Ordering};
 use runix_capability_manager::CapabilityToken;
 use runix_ipc::fs::{FsRequest, FsResponse};
 use runix_kernel::elf::Elf64;
@@ -70,6 +79,10 @@ use runix_kernel::process::AddressSpace;
 use runix_kernel::qemu_exit::{exit_qemu, QemuExitCode};
 use runix_kernel::scheduler;
 use runix_kernel::serial_println;
+use runix_kernel::syscall::{
+    self, SYS_IPC_SESSION_OPEN, SYS_IPC_SESSION_RECV, SYS_IPC_SESSION_SEND,
+    SYS_IPC_SESSION_SEND_LOCK, SYS_IPC_SESSION_SEND_UNLOCK,
+};
 use runix_kernel::userspace;
 use x86_64::structures::paging::{FrameAllocator, Page, PageTableFlags, PhysFrame};
 use x86_64::VirtAddr;
@@ -96,11 +109,8 @@ const BLK_QUEUE_VA: u64 = 0x_0999_4444_0000;
 const BLK_REQBUF_VA: u64 = 0x_0999_5555_0000;
 const BLK_QUEUE_ALIGN: u64 = 4096;
 
-// Must match `blk-driver-host/src/main.rs`'s own `FS_REQUEST_PORT`/
-// `FS_RESPONSE_PORT`/`FS_WRITE_REQUEST_PORT`.
-const FS_REQUEST_PORT: usize = 8;
-const FS_RESPONSE_PORT: usize = 9;
-const FS_WRITE_REQUEST_PORT: usize = 10;
+// Must match `blk-driver-host/src/main.rs`'s own `FS_SERVER_PORT`.
+const FS_SERVER_PORT: usize = 8;
 
 /// `handle_write_ipc_request` accepts exactly one sector's worth of data
 /// and nothing else — the same fixed length `blk_fs_ipc.rs`'s own write
@@ -262,29 +272,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "demo-key",
         &signing_key,
     );
-    let response_token = CapabilityToken::issue(
+    // `SYS_IPC_SESSION_ACCEPT` is gated identically to
+    // `SYS_IPC_SESSION_OPEN` (same `port:<n>` resource) -- `blk-driver-host`
+    // itself needs this token to accept client sessions on the one server
+    // port it polls.
+    let fs_server_token = CapabilityToken::issue(
         "blk-driver-host",
-        runix_kernel::capabilities::port_resource(FS_RESPONSE_PORT),
-        now,
-        now + 1_000_000,
-        "demo-key",
-        &signing_key,
-    );
-    // `SYS_IPC_RECV` is now capability-gated identically to `SYS_IPC_SEND`
-    // (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) -- `blk-driver-host` itself
-    // now needs its own tokens to *receive* on the two request ports it
-    // polls, not only the response-port send token it already held.
-    let fs_request_recv_token = CapabilityToken::issue(
-        "blk-driver-host",
-        runix_kernel::capabilities::port_resource(FS_REQUEST_PORT),
-        now,
-        now + 1_000_000,
-        "demo-key",
-        &signing_key,
-    );
-    let fs_write_request_recv_token = CapabilityToken::issue(
-        "blk-driver-host",
-        runix_kernel::capabilities::port_resource(FS_WRITE_REQUEST_PORT),
+        runix_kernel::capabilities::port_resource(FS_SERVER_PORT),
         now,
         now + 1_000_000,
         "demo-key",
@@ -299,19 +293,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         kernel_trampoline,
         space,
         Some(blk_token),
-        alloc::vec![
-            response_token.clone(),
-            fs_request_recv_token,
-            fs_write_request_recv_token
-        ],
+        alloc::vec![fs_server_token],
     );
-
-    // This test's own boot thread now also needs a capability to receive
-    // on `FS_RESPONSE_PORT` -- see `blk_fs_ipc.rs`'s identical fix for why
-    // reusing `response_token` (rather than minting a fresh one) is
-    // correct: verification never checks subject, only resource/signature/
-    // expiry.
-    runix_kernel::scheduler::grant_current_extra_capability(response_token.clone());
 
     // Give it time to probe the device and reach its receive loop before
     // either writer attempts anything.
@@ -319,10 +302,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         scheduler::yield_now();
     }
 
-    let port_token = |subject: &str, port: usize| {
+    let server_port_token = |subject: &str| {
         CapabilityToken::issue(
             subject,
-            runix_kernel::capabilities::port_resource(port),
+            runix_kernel::capabilities::port_resource(FS_SERVER_PORT),
             now,
             now + 1_000_000,
             "demo-key",
@@ -353,48 +336,53 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         name: String::from(FILE_A),
         token: file_token("test-write-a", FILE_A),
         data: payload_a,
-        response_port: FS_RESPONSE_PORT as u16,
-        response_token: response_token.clone(),
     };
     let write_b = FsRequest::Write {
         name: String::from(FILE_B),
         token: file_token("test-write-b", FILE_B),
         data: payload_b,
-        response_port: FS_RESPONSE_PORT as u16,
-        response_token: response_token.clone(),
     };
 
     // The actual point: both writers are queued *before either thread has
     // run at all* -- no yield between the two spawns -- so whichever runs
-    // first genuinely races the other for `FS_WRITE_REQUEST_PORT`'s send
-    // lock, and the driver's own request loop genuinely has two complete,
-    // *mutating* requests to serve back-to-back rather than one full
-    // request/response round trip at a time (that sequential shape is what
-    // `blk_fs_ipc.rs` already covers).
+    // first genuinely races the other to open a session against
+    // `FS_SERVER_PORT` and start sending, and the driver's own request loop
+    // genuinely has two complete, *mutating* requests to serve back-to-back
+    // rather than one full request/response round trip at a time (that
+    // sequential shape is what `blk_fs_ipc.rs` already covers).
     #[allow(static_mut_refs)]
     unsafe {
-        PENDING_SEND_A = Some((FS_WRITE_REQUEST_PORT, write_a.encode()));
+        PENDING_SEND_A = Some(write_a.encode());
     }
     scheduler::spawn_with_capability(
         send_request_thread_a,
-        Some(port_token("test-write-a", FS_WRITE_REQUEST_PORT)),
+        Some(server_port_token("test-write-a")),
     );
     #[allow(static_mut_refs)]
     unsafe {
-        PENDING_SEND_B = Some((FS_WRITE_REQUEST_PORT, write_b.encode()));
+        PENDING_SEND_B = Some(write_b.encode());
     }
     scheduler::spawn_with_capability(
         send_request_thread_b,
-        Some(port_token("test-write-b", FS_WRITE_REQUEST_PORT)),
+        Some(server_port_token("test-write-b")),
     );
 
-    // Two responses off the shared response port -- order is whichever
-    // writer won the send lock first, which this test deliberately does not
+    // Wait for both concurrent writers' own independent request/response
+    // round trips to finish -- order is whichever writer's session got
+    // accepted and served first, which this test deliberately does not
     // assume either way (both responses are `FsResponse::Ok`,
     // indistinguishable by construction; the *disk* is where the two
     // writers' work is told apart, below).
-    let first = recv_fs_response(200_000);
-    let second = recv_fs_response(200_000);
+    for _ in 0..400_000u32 {
+        scheduler::yield_now();
+        if DONE_A.load(Ordering::SeqCst) && DONE_B.load(Ordering::SeqCst) {
+            break;
+        }
+    }
+    #[allow(static_mut_refs)]
+    let first = unsafe { RESULT_A.take() };
+    #[allow(static_mut_refs)]
+    let second = unsafe { RESULT_B.take() };
     let both_ok = matches!(first, Some(FsResponse::Ok)) && matches!(second, Some(FsResponse::Ok));
     if !both_ok {
         serial_println!(
@@ -416,15 +404,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // concurrency (already covered by `blk_fs_concurrent.rs`).
     let readback_a = read_file(
         FILE_A,
-        port_token("test-read-a", FS_REQUEST_PORT),
+        server_port_token("test-read-a"),
         file_token("test-read-a", FILE_A),
-        response_token.clone(),
     );
     let readback_b = read_file(
         FILE_B,
-        port_token("test-read-b", FS_REQUEST_PORT),
+        server_port_token("test-read-b"),
         file_token("test-read-b", FILE_B),
-        response_token.clone(),
     );
 
     let a_ok = check_readback(FILE_A, &readback_a, pattern_a_byte);
@@ -432,11 +418,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     if a_ok && b_ok {
         serial_println!(
-            "blk_fs_concurrent_write: PASS — two client threads sending *write* requests to the \
-             same write port at genuinely the same time (no yield between spawns) both completed, \
-             and each file holds exactly its own writer's byte pattern with no byte of the \
-             other's anywhere in it — the driver's single sequential request loop finished \
-             handling one mutating request, device round trips included, before starting the next"
+            "blk_fs_concurrent_write: PASS — two client threads opening sessions and sending \
+             *write* requests against the same server port at genuinely the same time (no yield \
+             between spawns) both completed, and each file holds exactly its own writer's byte \
+             pattern with no byte of the other's anywhere in it — the driver's single sequential \
+             request loop finished handling one mutating request, device round trips included, \
+             before starting the next"
         );
         exit_qemu(QemuExitCode::Success);
     } else {
@@ -494,41 +481,60 @@ fn check_readback(name: &str, response: &Option<FsResponse>, expected: fn(usize)
 }
 
 /// One sequential read request/response round trip, on a freshly spawned
-/// thread holding exactly the two capabilities it needs (the read port, and
-/// the file itself).
+/// thread holding exactly the two capabilities it needs (the server port,
+/// and the file itself), opening its own session and waiting for its own
+/// response.
 fn read_file(
     name: &str,
     read_port_token: CapabilityToken,
     file_token: CapabilityToken,
-    response_token: CapabilityToken,
 ) -> Option<FsResponse> {
     let request = FsRequest::Read {
         name: String::from(name),
         token: file_token,
-        response_port: FS_RESPONSE_PORT as u16,
-        response_token,
     };
     #[allow(static_mut_refs)]
     unsafe {
-        PENDING_SEND_SEQ = Some((FS_REQUEST_PORT, request.encode()));
+        PENDING_SEND_SEQ = Some(request.encode());
     }
+    DONE_SEQ.store(false, Ordering::SeqCst);
     scheduler::spawn_with_capability(send_request_thread_seq, Some(read_port_token));
-    recv_fs_response(200_000)
+    for _ in 0..200_000u32 {
+        scheduler::yield_now();
+        if DONE_SEQ.load(Ordering::SeqCst) {
+            break;
+        }
+    }
+    #[allow(static_mut_refs)]
+    unsafe {
+        RESULT_SEQ.take()
+    }
 }
 
-static mut PENDING_SEND_A: Option<(usize, Vec<u8>)> = None;
-static mut PENDING_SEND_B: Option<(usize, Vec<u8>)> = None;
+static mut PENDING_SEND_A: Option<Vec<u8>> = None;
+static mut PENDING_SEND_B: Option<Vec<u8>> = None;
+static mut RESULT_A: Option<FsResponse> = None;
+static mut RESULT_B: Option<FsResponse> = None;
+static DONE_A: AtomicBool = AtomicBool::new(false);
+static DONE_B: AtomicBool = AtomicBool::new(false);
 /// Reused across the two *sequential* read-backs (never two in flight at
 /// once — each `read_file` call waits for its own full response before the
 /// next one starts), unlike the two concurrent writers above, which need a
 /// slot each precisely because both are queued before either runs.
-static mut PENDING_SEND_SEQ: Option<(usize, Vec<u8>)> = None;
+static mut PENDING_SEND_SEQ: Option<Vec<u8>> = None;
+static mut RESULT_SEQ: Option<FsResponse> = None;
+static DONE_SEQ: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn send_request_thread_a() -> ! {
     #[allow(static_mut_refs)]
-    let (port, bytes) =
+    let bytes =
         unsafe { PENDING_SEND_A.take() }.expect("send_request_thread_a: no pending send");
-    send_locked_message(port, bytes);
+    let response = session_round_trip(bytes);
+    #[allow(static_mut_refs)]
+    unsafe {
+        RESULT_A = response;
+    }
+    DONE_A.store(true, Ordering::SeqCst);
     loop {
         scheduler::yield_now();
     }
@@ -536,9 +542,14 @@ extern "C" fn send_request_thread_a() -> ! {
 
 extern "C" fn send_request_thread_b() -> ! {
     #[allow(static_mut_refs)]
-    let (port, bytes) =
+    let bytes =
         unsafe { PENDING_SEND_B.take() }.expect("send_request_thread_b: no pending send");
-    send_locked_message(port, bytes);
+    let response = session_round_trip(bytes);
+    #[allow(static_mut_refs)]
+    unsafe {
+        RESULT_B = response;
+    }
+    DONE_B.store(true, Ordering::SeqCst);
     loop {
         scheduler::yield_now();
     }
@@ -546,55 +557,56 @@ extern "C" fn send_request_thread_b() -> ! {
 
 extern "C" fn send_request_thread_seq() -> ! {
     #[allow(static_mut_refs)]
-    let (port, bytes) =
+    let bytes =
         unsafe { PENDING_SEND_SEQ.take() }.expect("send_request_thread_seq: no pending send");
-    send_locked_message(port, bytes);
+    let response = session_round_trip(bytes);
+    #[allow(static_mut_refs)]
+    unsafe {
+        RESULT_SEQ = response;
+    }
+    DONE_SEQ.store(true, Ordering::SeqCst);
     loop {
         scheduler::yield_now();
     }
 }
 
-/// Sends every byte of `bytes` on `port`, holding `port`'s send lock for
-/// the entire message — the same one correct calling convention every real
-/// sender in this codebase uses (`kernel::ipc::begin_send`/`end_send`,
-/// `SYS_IPC_SEND_LOCK`/`SYS_IPC_SEND_UNLOCK`).
-fn send_locked_message(port: usize, bytes: Vec<u8>) {
+/// Same as `blk_fs_concurrent.rs`'s function of the same name: opens a
+/// fresh session against [`FS_SERVER_PORT`], sends `bytes` (an
+/// already-encoded [`FsRequest`]) holding the session's send lock for the
+/// entire message, then accumulates bytes back off that same session
+/// until [`FsResponse::decode`] reports a complete message or a generous
+/// bound of polls passes with nothing decodable.
+fn session_round_trip(bytes: Vec<u8>) -> Option<FsResponse> {
+    let session_id = loop {
+        let ret =
+            unsafe { syscall::syscall(SYS_IPC_SESSION_OPEN, FS_SERVER_PORT as u64, 0, 0) };
+        if ret != u64::MAX {
+            break ret;
+        }
+        scheduler::yield_now();
+    };
+
     unsafe {
-        runix_kernel::syscall::syscall(runix_kernel::syscall::SYS_IPC_SEND_LOCK, port as u64, 0, 0);
+        syscall::syscall(SYS_IPC_SESSION_SEND_LOCK, session_id, 0, 0);
     }
     for byte in bytes {
-        unsafe {
-            runix_kernel::syscall::syscall(
-                runix_kernel::syscall::SYS_IPC_SEND,
-                port as u64,
-                byte as u64,
-                0,
-            );
+        loop {
+            let ret =
+                unsafe { syscall::syscall(SYS_IPC_SESSION_SEND, session_id, byte as u64, 0) };
+            if ret != u64::MAX {
+                break;
+            }
+            scheduler::yield_now();
         }
     }
     unsafe {
-        runix_kernel::syscall::syscall(
-            runix_kernel::syscall::SYS_IPC_SEND_UNLOCK,
-            port as u64,
-            0,
-            0,
-        );
+        syscall::syscall(SYS_IPC_SESSION_SEND_UNLOCK, session_id, 0, 0);
     }
-}
 
-/// Same as `blk_fs_concurrent.rs`'s function of the same name.
-fn recv_fs_response(max_iters: u32) -> Option<FsResponse> {
     let mut buf: Vec<u8> = Vec::new();
-    for _ in 0..max_iters {
+    for _ in 0..200_000u32 {
         scheduler::yield_now();
-        let ret = unsafe {
-            runix_kernel::syscall::syscall(
-                runix_kernel::syscall::SYS_IPC_RECV,
-                FS_RESPONSE_PORT as u64,
-                0,
-                0,
-            )
-        };
+        let ret = unsafe { syscall::syscall(SYS_IPC_SESSION_RECV, session_id, 0, 0) };
         if ret != u64::MAX {
             buf.push(ret as u8);
             if let Some((response, _consumed)) = FsResponse::decode(&buf) {

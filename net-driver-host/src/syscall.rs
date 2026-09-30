@@ -7,10 +7,26 @@
 
 const SYS_YIELD: u64 = 0;
 const SYS_WRITE: u64 = 1;
+// Fixed-port `SYS_IPC_SEND`/`SYS_IPC_RECV` (2/3) are unused by this binary
+// as of the sockets IPC surface's migration to the session primitive
+// (`main.rs`'s `run_socket_ipc_server` doc comment) — kept here, not
+// deleted, so this file's own syscall-number table stays a complete,
+// contiguous record of the ABI this binary's `int 0x80` stub speaks, the
+// same reasoning `session_open`'s own doc comment gives for keeping an
+// unused-today wrapper.
+#[allow(dead_code)]
 const SYS_IPC_SEND: u64 = 2;
+#[allow(dead_code)]
 const SYS_IPC_RECV: u64 = 3;
 const SYS_PORT_IN: u64 = 4;
 const SYS_PORT_OUT: u64 = 5;
+const SYS_RANDOM: u64 = 9;
+const SYS_IPC_SESSION_OPEN: u64 = 10;
+const SYS_IPC_SESSION_ACCEPT: u64 = 11;
+const SYS_IPC_SESSION_SEND: u64 = 12;
+const SYS_IPC_SESSION_RECV: u64 = 13;
+const SYS_IPC_SESSION_SEND_LOCK: u64 = 14;
+const SYS_IPC_SESSION_SEND_UNLOCK: u64 = 15;
 
 /// # Safety
 /// Whatever `num`'s own contract requires.
@@ -95,25 +111,91 @@ pub fn port_out(port: u16, width: u8, value: u32) -> bool {
     ret != u64::MAX
 }
 
-/// Sockets IPC surface (see `main.rs`'s `run_socket_ipc_server`): sends one
-/// byte on IPC `port`, gated by whatever capability this process was spawned
-/// with for that port (same `Thread::extra_capabilities` shape
-/// `blk-driver-host/src/syscall.rs`'s own `ipc_send` already documents).
-/// Returns `false` if denied.
-pub fn ipc_send(port: usize, byte: u8) -> bool {
-    let ret = unsafe { syscall(SYS_IPC_SEND, port as u64, byte as u64, 0) };
-    ret != u64::MAX
+/// Opens a new session against `server_port`, gated by whatever capability
+/// this process was spawned with for that port (same
+/// `Thread::extra_capabilities` shape `blk-driver-host/src/syscall.rs`'s
+/// `ipc_send` documented for the old fixed-port transport this session
+/// primitive replaces as this file's own sockets IPC transport — see
+/// `main.rs`'s `run_socket_ipc_server` doc comment for the migration and
+/// why port-based `SYS_IPC_SEND`/`SYS_IPC_RECV` are no longer used by that
+/// server at all). Not currently called anywhere in this binary
+/// (`net-driver-host` is only ever the *server* side of the sockets
+/// surface, never a client of another session-based server) — kept anyway,
+/// same "the six session syscalls are a matched set" reasoning
+/// [`session_accept`]/[`session_send`]/[`session_recv`] below already
+/// justify wrapping even though only some of them are on this binary's own
+/// hot path. See [`session_try_recv`]/[`session_send`] below.
+#[allow(dead_code)]
+pub fn session_open(server_port: usize) -> Option<u64> {
+    let ret = unsafe { syscall(SYS_IPC_SESSION_OPEN, server_port as u64, 0, 0) };
+    if ret == u64::MAX {
+        None
+    } else {
+        Some(ret)
+    }
 }
 
-/// Reads one byte off IPC `port`, non-blocking — `None` if the port is
-/// currently empty. No capability check on the receive side (matching
-/// `kernel/src/syscall.rs`'s real behavior today, same as
-/// `blk-driver-host/src/syscall.rs`'s `ipc_try_recv`).
-pub fn ipc_try_recv(port: usize) -> Option<u8> {
-    let ret = unsafe { syscall(SYS_IPC_RECV, port as u64, 0, 0) };
+/// Non-blocking accept of a pending session opened against `server_port`
+/// (see `kernel::ipc`'s `session_accept`) — gated by whatever capability
+/// this process was spawned with for that port. `None` if denied or
+/// nothing is currently pending.
+pub fn session_accept(server_port: usize) -> Option<u64> {
+    let ret = unsafe { syscall(SYS_IPC_SESSION_ACCEPT, server_port as u64, 0, 0) };
+    if ret == u64::MAX {
+        None
+    } else {
+        Some(ret)
+    }
+}
+
+/// Non-blocking read of one byte off `session_id`, gated by this thread
+/// being a participant (owner or accepted server) of that session — no
+/// separate port capability check, see `kernel::ipc`'s `is_participant`.
+/// `None` if empty *or* this thread isn't a participant, indistinguishable
+/// by design — same fail-closed "denied and empty look the same" convention
+/// every other gated receive syscall in this codebase has.
+pub fn session_try_recv(session_id: u64) -> Option<u8> {
+    let ret = unsafe { syscall(SYS_IPC_SESSION_RECV, session_id, 0, 0) };
     if ret == u64::MAX {
         None
     } else {
         Some(ret as u8)
+    }
+}
+
+/// Sends one byte on `session_id`. Returns `false` if `session_id` doesn't
+/// exist or this thread isn't a participant.
+pub fn session_send(session_id: u64, byte: u8) -> bool {
+    let ret = unsafe { syscall(SYS_IPC_SESSION_SEND, session_id, byte as u64, 0) };
+    ret != u64::MAX
+}
+
+/// Acquires `session_id`'s send lock — see `kernel::syscall::SYS_IPC_SESSION_SEND_LOCK`'s
+/// own doc comment for why a session-scoped message needs one at all
+/// (interleaving hazard between the session's two participants). Returns
+/// `false` if `session_id` doesn't exist or this thread isn't a
+/// participant.
+pub fn session_send_lock(session_id: u64) -> bool {
+    let ret = unsafe { syscall(SYS_IPC_SESSION_SEND_LOCK, session_id, 0, 0) };
+    ret != u64::MAX
+}
+
+/// Releases `session_id`'s send lock acquired by [`session_send_lock`].
+pub fn session_send_unlock(session_id: u64) -> bool {
+    let ret = unsafe { syscall(SYS_IPC_SESSION_SEND_UNLOCK, session_id, 0, 0) };
+    ret != u64::MAX
+}
+
+/// One `u64` of RDRAND-backed hardware randomness from the kernel (see
+/// `kernel/src/entropy.rs`), gated on this process holding a `"random"`
+/// capability. `None` if denied *or* the kernel's RDRAND read failed — both
+/// collapse to `u64::MAX` at the syscall boundary, same fail-closed
+/// convention as every other gated syscall this process calls.
+pub fn random_u64() -> Option<u64> {
+    let ret = unsafe { syscall(SYS_RANDOM, 0, 0, 0) };
+    if ret == u64::MAX {
+        None
+    } else {
+        Some(ret)
     }
 }

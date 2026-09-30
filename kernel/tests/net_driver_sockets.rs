@@ -74,10 +74,9 @@ const NET_QUEUE_ALIGN: u64 = 4096;
 const NET_RX_BUFFER_COUNT: u64 = 8;
 const NET_TX_BUFFER_COUNT: u64 = 4;
 
-// Must match `net-driver-host/src/main.rs`'s own `SOCK_REQUEST_PORT`/
-// `SOCK_RESPONSE_PORT` constants exactly.
-const SOCK_REQUEST_PORT: usize = 11;
-const SOCK_RESPONSE_PORT: usize = 12;
+// Must match `net-driver-host/src/main.rs`'s own `SOCKETS_SERVER_PORT`
+// constant exactly.
+const SOCKETS_SERVER_PORT: usize = 11;
 
 // Same `guestfwd` target and fixed payload `net_driver_tcp.rs` already
 // proves against `tcp_proof_listener.py` -- see that test's own doc
@@ -239,29 +238,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "demo-key",
         &signing_key,
     );
-    // `net-driver-host` needs a second capability to reply at all —
-    // `Thread::extra_capabilities`, same shape `blk_fs_ipc.rs` already
-    // proves for `blk-driver-host`'s own response port.
-    let response_token = runix_capability_manager::CapabilityToken::issue(
+    // `net-driver-host` needs a second capability to serve the sockets IPC
+    // surface at all -- `Thread::extra_capabilities`, same shape
+    // `blk_fs_ipc.rs` already proves for `blk-driver-host`'s own reply
+    // port. Now scoped to a single port (`SOCKETS_SERVER_PORT`), not a
+    // request/response pair: `SYS_IPC_SESSION_ACCEPT` is the only
+    // port-capability check `run_socket_ipc_server` performs any more --
+    // every subsequent send/recv on an accepted session is gated by
+    // session participation (owner-or-accepted-server identity), not a
+    // fresh port-capability check (see `kernel::ipc`'s `is_participant`).
+    let accept_token = runix_capability_manager::CapabilityToken::issue(
         "net-driver-host",
-        runix_kernel::capabilities::port_resource(SOCK_RESPONSE_PORT),
-        now,
-        now + 1_000_000,
-        "demo-key",
-        &signing_key,
-    );
-    // `SYS_IPC_RECV` is now capability-gated identically to `SYS_IPC_SEND`
-    // (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) -- `net-driver-host` itself
-    // now needs its own token to *receive* on `SOCK_REQUEST_PORT`
-    // (`run_socket_ipc_server`'s `ipc_try_recv(SOCK_REQUEST_PORT)`), not
-    // only the response-port send token it already held. This is the
-    // recv-side gate landing "for free" on the sockets surface the RFC's
-    // own "What changes" section predicted -- it closes ambient receive
-    // access to this port, it does not add per-handle owner attribution
-    // (see `runix_ipc::sockets`'s own updated caveat).
-    let request_recv_token = runix_capability_manager::CapabilityToken::issue(
-        "net-driver-host",
-        runix_kernel::capabilities::port_resource(SOCK_REQUEST_PORT),
+        runix_kernel::capabilities::port_resource(SOCKETS_SERVER_PORT),
         now,
         now + 1_000_000,
         "demo-key",
@@ -276,7 +264,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         kernel_trampoline,
         space,
         Some(net_token),
-        alloc::vec![response_token, request_recv_token],
+        alloc::vec![accept_token],
     );
 
     // Give it time to probe the device, bring up the interface (including
@@ -287,60 +275,53 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     // Negative case first: this test's own boot thread holds no capability
-    // at all -- the request must never reach the channel, same expectation
+    // at all -- opening a session must never succeed, same expectation
     // `blk_fs_ipc.rs` already proves for the filesystem driver's request
-    // port.
+    // port, now checked against `SYS_IPC_SESSION_OPEN` (the actual gated
+    // syscall a real client calls first) rather than the old fixed-port
+    // `SYS_IPC_SEND`.
     let denied = unsafe {
         runix_kernel::syscall::syscall(
-            runix_kernel::syscall::SYS_IPC_SEND,
-            SOCK_REQUEST_PORT as u64,
-            SocketRequest::Close { handle: 0 }.encode()[0] as u64,
+            runix_kernel::syscall::SYS_IPC_SESSION_OPEN,
+            SOCKETS_SERVER_PORT as u64,
+            0,
             0,
         )
     };
     if denied != u64::MAX {
         serial_println!(
-            "net_driver_sockets: FAIL — an unauthorized send to the request port was not denied \
-             (returned {}, expected u64::MAX)",
+            "net_driver_sockets: FAIL — an unauthorized session open was not denied (returned \
+             {}, expected u64::MAX)",
             denied
         );
         exit_qemu(QemuExitCode::Failed);
     }
-    serial_println!("net_driver_sockets: unauthorized send correctly denied (capability gate OK)");
+    serial_println!("net_driver_sockets: unauthorized session open correctly denied (capability gate OK)");
 
-    // Positive case: a thread holding a capability scoped to exactly the
-    // request port drives a full connect/send/recv/close round trip.
+    // Positive case: a thread holding a capability scoped to exactly
+    // `SOCKETS_SERVER_PORT` opens a session and drives a full
+    // connect/send/recv/close round trip over it. No second token needed
+    // for the receive side any more -- once the session is open,
+    // `SYS_IPC_SESSION_SEND`/`_RECV` are gated by session participation
+    // (this thread is the session's owner), not a separate port
+    // capability.
     let request_token = runix_capability_manager::CapabilityToken::issue(
         "test-socket-client",
-        runix_kernel::capabilities::port_resource(SOCK_REQUEST_PORT),
+        runix_kernel::capabilities::port_resource(SOCKETS_SERVER_PORT),
         now,
         now + 1_000_000,
         "demo-key",
         &signing_key,
     );
-    // This thread also needs to *receive* on `SOCK_RESPONSE_PORT`
-    // (`recv_response`'s own `SYS_IPC_RECV`) now that that syscall is
-    // capability-gated too -- `spawn_with_capability` only carries one
-    // token, so this one is granted to the thread by itself, at its own
-    // start, via `scheduler::grant_current_extra_capability` (see that
-    // function's doc comment for why that's the right shape here rather
-    // than spawning a second thread purely to hold it).
-    let response_recv_token = runix_capability_manager::CapabilityToken::issue(
-        "test-socket-client",
-        runix_kernel::capabilities::port_resource(SOCK_RESPONSE_PORT),
-        now,
-        now + 1_000_000,
-        "demo-key",
-        &signing_key,
-    );
-    #[allow(static_mut_refs)]
-    unsafe {
-        PENDING_RESPONSE_RECV_TOKEN = Some(response_recv_token);
-    }
     scheduler::spawn_with_capability(authorized_client_thread, Some(request_token));
 
+    // Bumped from `20_000` alongside `open_session`/`recv_response`'s own
+    // bound bumps -- this loop must not give up waiting before the client
+    // thread's own (now larger) budget of internal yields has a real chance
+    // to play out; see those functions' doc comments for the full
+    // reasoning.
     let mut result = SocketTestResult::Pending;
-    for _ in 0..20_000 {
+    for _ in 0..200_000 {
         scheduler::yield_now();
         #[allow(static_mut_refs)]
         let current = unsafe { RESULT };
@@ -374,13 +355,16 @@ enum SocketTestResult {
 }
 
 static mut RESULT: SocketTestResult = SocketTestResult::Pending;
-static mut PENDING_RESPONSE_RECV_TOKEN: Option<runix_capability_manager::CapabilityToken> = None;
 
-/// Drives the whole connect -> send -> recv -> close sequence, entirely
-/// through `runix_ipc::sockets`'s typed request/response wire format —
-/// this thread holds the one capability scoped to [`SOCK_REQUEST_PORT`]
+/// Drives the whole open-session -> connect -> send -> recv -> close
+/// sequence, entirely through `runix_ipc::sockets`'s typed request/response
+/// wire format riding the session primitive (`kernel::syscall::SYS_IPC_SESSION_*`)
+/// — this thread holds the one capability scoped to [`SOCKETS_SERVER_PORT`]
 /// ([`kernel_main`]'s own boot thread deliberately doesn't, proving the
-/// capability gate above). Writes its final verdict to [`RESULT`] rather
+/// capability gate above). No separate token needed for the receive side —
+/// once this thread opens the session, it's that session's owner, and
+/// `SYS_IPC_SESSION_SEND`/`_RECV` are gated by session participation, not a
+/// fresh port capability. Writes its final verdict to [`RESULT`] rather
 /// than returning one, since a `spawn`-ed thread's entry point is
 /// `extern "C" fn() -> !` -- same "write a result byte/flag somewhere the
 /// spawning thread polls" convention every other proof in this codebase
@@ -388,10 +372,6 @@ static mut PENDING_RESPONSE_RECV_TOKEN: Option<runix_capability_manager::Capabil
 /// `static` instead of a shared memory page since both threads already
 /// share this process's address space.
 extern "C" fn authorized_client_thread() -> ! {
-    #[allow(static_mut_refs)]
-    let response_recv_token =
-        unsafe { PENDING_RESPONSE_RECV_TOKEN.take() }.expect("no pending response-recv token");
-    runix_kernel::scheduler::grant_current_extra_capability(response_recv_token);
     let outcome = run_socket_client();
     #[allow(static_mut_refs)]
     unsafe {
@@ -403,8 +383,13 @@ extern "C" fn authorized_client_thread() -> ! {
 }
 
 fn run_socket_client() -> SocketTestResult {
-    send_request(&SocketRequest::Open);
-    let handle = match recv_response() {
+    let Some(session_id) = open_session() else {
+        serial_println!("net_driver_sockets: session open failed or timed out");
+        return SocketTestResult::Fail;
+    };
+
+    send_request(session_id, &SocketRequest::Open);
+    let handle = match recv_response(session_id) {
         Some(SocketResponse::Opened { handle }) => handle,
         other => {
             serial_println!("net_driver_sockets: open failed, got {:?}", other);
@@ -412,13 +397,16 @@ fn run_socket_client() -> SocketTestResult {
         }
     };
 
-    send_request(&SocketRequest::Connect {
-        handle,
-        remote_ip: TCP_REMOTE_IP,
-        remote_port: TCP_REMOTE_PORT,
-        local_port: TCP_LOCAL_PORT,
-    });
-    match recv_response() {
+    send_request(
+        session_id,
+        &SocketRequest::Connect {
+            handle,
+            remote_ip: TCP_REMOTE_IP,
+            remote_port: TCP_REMOTE_PORT,
+            local_port: TCP_LOCAL_PORT,
+        },
+    );
+    match recv_response(session_id) {
         Some(SocketResponse::Connected { handle: h }) if h == handle => {}
         other => {
             serial_println!("net_driver_sockets: connect failed, got {:?}", other);
@@ -426,11 +414,14 @@ fn run_socket_client() -> SocketTestResult {
         }
     }
 
-    send_request(&SocketRequest::Send {
-        handle,
-        data: TCP_PING.to_vec(),
-    });
-    match recv_response() {
+    send_request(
+        session_id,
+        &SocketRequest::Send {
+            handle,
+            data: TCP_PING.to_vec(),
+        },
+    );
+    match recv_response(session_id) {
         Some(SocketResponse::Sent { handle: h, len })
             if h == handle && len as usize == TCP_PING.len() => {}
         other => {
@@ -445,11 +436,14 @@ fn run_socket_client() -> SocketTestResult {
     // resending it, same as this codebase's other bounded wait loops.
     let mut received: Vec<u8> = Vec::new();
     for _ in 0..2000 {
-        send_request(&SocketRequest::Recv {
-            handle,
-            max_len: TCP_PONG.len() as u16,
-        });
-        match recv_response() {
+        send_request(
+            session_id,
+            &SocketRequest::Recv {
+                handle,
+                max_len: TCP_PONG.len() as u16,
+            },
+        );
+        match recv_response(session_id) {
             Some(SocketResponse::Data { handle: h, data }) if h == handle => {
                 received.extend_from_slice(&data);
                 if received.len() >= TCP_PONG.len() {
@@ -475,8 +469,8 @@ fn run_socket_client() -> SocketTestResult {
         return SocketTestResult::Fail;
     }
 
-    send_request(&SocketRequest::Close { handle });
-    match recv_response() {
+    send_request(session_id, &SocketRequest::Close { handle });
+    match recv_response(session_id) {
         Some(SocketResponse::Closed { handle: h }) if h == handle => SocketTestResult::Pass,
         other => {
             serial_println!("net_driver_sockets: close failed, got {:?}", other);
@@ -485,36 +479,89 @@ fn run_socket_client() -> SocketTestResult {
     }
 }
 
-/// Sends `request`'s encoded bytes one at a time on [`SOCK_REQUEST_PORT`] —
-/// same "one byte per `SYS_IPC_SEND`" convention
-/// `blk_fs_ipc.rs`'s `authorized_writer_thread` already uses.
-fn send_request(request: &SocketRequest) {
+/// Opens a session against [`SOCKETS_SERVER_PORT`], bounded-retrying up to
+/// 2,000,000 times (a session table momentarily at capacity is worth a
+/// retry; a caller with no capability for the port never succeeds no
+/// matter how many times this retries — same "bounded poll, not an
+/// unbounded blocking wait" discipline every wait loop in this codebase
+/// uses). Bumped from the old fixed-port transport's `200_000` -- confirmed
+/// necessary, not just cautious, by real measurement: `net-driver-host`'s
+/// own `run_socket_ipc_server` doc comment explains why accepting a session
+/// is checked only once every 10,000 of *its* main-loop iterations rather
+/// than every one (an unconditional per-iteration capability check there
+/// was measured starving the whole exchange); this bound is this test's own
+/// side of retuning the two loops together, the same kind of "confirmed by
+/// real reproduction, not guessed" bump `run_socket_ipc_server`'s own doc
+/// comment already made for its main-loop bound (`2_000_000` -> `500_000_000`)
+/// after an identical class of client/server budget mismatch.
+fn open_session() -> Option<u64> {
+    for i in 0..2_000_000u32 {
+        let ret = unsafe {
+            runix_kernel::syscall::syscall(
+                runix_kernel::syscall::SYS_IPC_SESSION_OPEN,
+                SOCKETS_SERVER_PORT as u64,
+                0,
+                0,
+            )
+        };
+        if ret != u64::MAX {
+            return Some(ret);
+        }
+        if i % 1000 == 0 {
+            scheduler::yield_now();
+        }
+    }
+    None
+}
+
+/// Sends `request`'s encoded bytes one at a time on `session_id`, wrapped
+/// in `SYS_IPC_SESSION_SEND_LOCK`/`_UNLOCK` -- same "one byte per
+/// `SYS_IPC_SESSION_SEND`" convention `blk_fs_ipc.rs`'s
+/// `authorized_writer_thread` already uses for the fixed-port equivalent.
+fn send_request(session_id: u64, request: &SocketRequest) {
+    unsafe {
+        runix_kernel::syscall::syscall(
+            runix_kernel::syscall::SYS_IPC_SESSION_SEND_LOCK,
+            session_id,
+            0,
+            0,
+        );
+    }
     for byte in request.encode() {
         unsafe {
             runix_kernel::syscall::syscall(
-                runix_kernel::syscall::SYS_IPC_SEND,
-                SOCK_REQUEST_PORT as u64,
+                runix_kernel::syscall::SYS_IPC_SESSION_SEND,
+                session_id,
                 byte as u64,
                 0,
             );
         }
     }
+    unsafe {
+        runix_kernel::syscall::syscall(
+            runix_kernel::syscall::SYS_IPC_SESSION_SEND_UNLOCK,
+            session_id,
+            0,
+            0,
+        );
+    }
 }
 
-/// Polls [`SOCK_RESPONSE_PORT`] for one full [`SocketResponse`], decoding
-/// with `runix_ipc::sockets::SocketResponse::decode` (the same typed
-/// wire-format function `net-driver-host` itself uses to decode requests)
-/// rather than a hand-rolled parser here. `None` if nothing arrives within
-/// the bound -- there is no blocking-receive syscall in this codebase (see
+/// Polls `session_id` for one full [`SocketResponse`], decoding with
+/// `runix_ipc::sockets::SocketResponse::decode` (the same typed wire-format
+/// function `net-driver-host` itself uses to decode requests) rather than a
+/// hand-rolled parser here. `None` if nothing arrives within the bound --
+/// there is no blocking-receive syscall in this codebase (see
 /// `blk-driver-host/src/main.rs`'s `poll_recv_byte` doc comment for the
-/// same constraint on the transport this rides over).
-fn recv_response() -> Option<SocketResponse> {
+/// same constraint on the transport this rides over). Bound bumped to
+/// `2_000_000`, same reasoning as [`open_session`]'s own doc comment.
+fn recv_response(session_id: u64) -> Option<SocketResponse> {
     let mut buf: Vec<u8> = Vec::new();
-    for i in 0..200_000u32 {
+    for i in 0..2_000_000u32 {
         let ret = unsafe {
             runix_kernel::syscall::syscall(
-                runix_kernel::syscall::SYS_IPC_RECV,
-                SOCK_RESPONSE_PORT as u64,
+                runix_kernel::syscall::SYS_IPC_SESSION_RECV,
+                session_id,
                 0,
                 0,
             )

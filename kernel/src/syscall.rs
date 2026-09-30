@@ -63,6 +63,52 @@ pub const SYS_IPC_SEND_LOCK: u64 = 7;
 /// is still just a caller bug, not further distinguished — same
 /// "no distinguishable failure" posture the rest of this ABI already has.
 pub const SYS_IPC_SEND_UNLOCK: u64 = 8;
+/// -> one `u64` of hardware randomness in rax, or `u64::MAX` if denied *or*
+/// RDRAND is unavailable/exhausted — deliberately the same sentinel for
+/// both, same fail-closed, indistinguishable-failure convention as every
+/// other gated syscall in this table (see `crate::entropy`'s doc comment
+/// for why this never falls back to a weaker source instead). Gated on the
+/// `"random"` resource (`capabilities::random_resource`) — process-wide,
+/// not scoped like `SYS_PORT_IN`/`SYS_PORT_OUT`'s ioport ranges.
+pub const SYS_RANDOM: u64 = 9;
+
+/// rdi = server_port -> `SessionId` in rax, or `u64::MAX` if denied (no
+/// capability authorizing `server_port` — same `port:<n>` resource
+/// `SYS_IPC_SEND`/`SYS_IPC_RECV` already check) or the session table is at
+/// capacity (`ipc::MAX_LIVE_SESSIONS`/`MAX_SESSIONS_PER_OWNER`). First of
+/// the "Option C" session/handle primitive
+/// (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) — additive alongside the fixed
+/// `PORT_COUNT`-port model every existing IPC user still uses unchanged;
+/// see `kernel/src/ipc.rs`'s own module doc comment on this primitive for
+/// the full design and the lock-ordering invariant it depends on.
+pub const SYS_IPC_SESSION_OPEN: u64 = 10;
+/// rdi = server_port -> `SessionId` in rax, or `u64::MAX` if denied (same
+/// capability check as [`SYS_IPC_SESSION_OPEN`]) or nothing is currently
+/// pending on that port (indistinguishable from denial, same convention
+/// `SYS_IPC_RECV` already has for "denied" vs. "empty"). On success, this
+/// calling thread becomes the session's `server` for the rest of its
+/// lifetime — see `ipc::session_accept`.
+pub const SYS_IPC_SESSION_ACCEPT: u64 = 11;
+/// rdi = session id, rsi = byte -> 0 ok, `u64::MAX` if the session doesn't
+/// exist or the caller is neither its owner nor its accepted server. No
+/// capability check beyond that identity comparison — see `ipc::
+/// is_participant`'s doc comment for why an O(1) `ThreadId` compare is
+/// correct here instead of re-verifying a token on every call.
+pub const SYS_IPC_SESSION_SEND: u64 = 12;
+/// rdi = session id -> byte in rax, or `u64::MAX` if empty *or* the caller
+/// isn't a participant — same fail-closed, indistinguishable-failure
+/// convention as [`SYS_IPC_RECV`].
+pub const SYS_IPC_SESSION_RECV: u64 = 13;
+/// rdi = session id -> 0 ok, `u64::MAX` if the caller isn't a participant.
+/// Session-scoped equivalent of [`SYS_IPC_SEND_LOCK`] — a session has at
+/// most two participants, but nothing stops both from calling
+/// `SYS_IPC_SESSION_SEND` for the same logical message concurrently
+/// without this, the same interleaving hazard `kernel::ipc`'s module doc
+/// comment already describes for fixed ports.
+pub const SYS_IPC_SESSION_SEND_LOCK: u64 = 14;
+/// rdi = session id -> 0 ok, `u64::MAX` if the caller isn't a participant.
+/// Session-scoped equivalent of [`SYS_IPC_SEND_UNLOCK`].
+pub const SYS_IPC_SESSION_SEND_UNLOCK: u64 = 15;
 
 pub const VECTOR: u8 = 0x80;
 
@@ -118,6 +164,26 @@ fn authorized_for_port(port: usize) -> bool {
     // reply port it serves filesystem requests over), so checking it is a
     // no-op allocation-and-empty-scan for every other thread in this
     // kernel.
+    crate::scheduler::current_capability().is_some_and(|token| token_authorizes(&token))
+        || crate::scheduler::current_extra_capabilities()
+            .iter()
+            .any(token_authorizes)
+}
+
+/// Same "check main capability, then extra capabilities" shape
+/// [`authorized_for_port`] uses. `SYS_RANDOM`'s `"random"` resource is
+/// typically granted as an *extra* capability alongside a process's main
+/// device-I/O token (e.g. `net-driver-host` holds an
+/// `ioport_range_resource` token as its primary capability and a `random`
+/// token as an extra one via `spawn_ring3_process_with_capabilities`), not
+/// as the sole capability a process is spawned with.
+fn authorized_for_random() -> bool {
+    let resource = crate::capabilities::random_resource();
+    let now = crate::interrupts::ticks();
+    let token_authorizes = |token: &runix_capability_manager::CapabilityToken| {
+        !crate::capabilities::is_revoked(token)
+            && crate::capabilities::check(token, &resource, now).is_ok()
+    };
     crate::scheduler::current_capability().is_some_and(|token| token_authorizes(&token))
         || crate::scheduler::current_extra_capabilities()
             .iter()
@@ -251,6 +317,74 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                 }
             }
             0
+        }
+        SYS_RANDOM => {
+            if !authorized_for_random() {
+                return u64::MAX;
+            }
+            crate::entropy::read_u64().unwrap_or(u64::MAX)
+        }
+        SYS_IPC_SESSION_OPEN => {
+            let server_port = arg1 as usize;
+            if !authorized_for_port(server_port) {
+                return u64::MAX;
+            }
+            let Some(caller) = crate::scheduler::current_thread_id() else {
+                return u64::MAX;
+            };
+            crate::ipc::session_open(server_port, caller).map_or(u64::MAX, ipc::SessionId::as_u64)
+        }
+        SYS_IPC_SESSION_ACCEPT => {
+            let server_port = arg1 as usize;
+            if !authorized_for_port(server_port) {
+                return u64::MAX;
+            }
+            let Some(caller) = crate::scheduler::current_thread_id() else {
+                return u64::MAX;
+            };
+            crate::ipc::session_accept(server_port, caller)
+                .map_or(u64::MAX, ipc::SessionId::as_u64)
+        }
+        SYS_IPC_SESSION_SEND => {
+            let session_id = ipc::SessionId::from_u64(arg1);
+            let byte = arg2 as u8;
+            let Some(caller) = crate::scheduler::current_thread_id() else {
+                return u64::MAX;
+            };
+            if crate::ipc::session_send(session_id, caller, byte) {
+                0
+            } else {
+                u64::MAX
+            }
+        }
+        SYS_IPC_SESSION_RECV => {
+            let session_id = ipc::SessionId::from_u64(arg1);
+            let Some(caller) = crate::scheduler::current_thread_id() else {
+                return u64::MAX;
+            };
+            crate::ipc::session_try_recv(session_id, caller).map_or(u64::MAX, u64::from)
+        }
+        SYS_IPC_SESSION_SEND_LOCK => {
+            let session_id = ipc::SessionId::from_u64(arg1);
+            let Some(caller) = crate::scheduler::current_thread_id() else {
+                return u64::MAX;
+            };
+            if crate::ipc::session_begin_send(session_id, caller) {
+                0
+            } else {
+                u64::MAX
+            }
+        }
+        SYS_IPC_SESSION_SEND_UNLOCK => {
+            let session_id = ipc::SessionId::from_u64(arg1);
+            let Some(caller) = crate::scheduler::current_thread_id() else {
+                return u64::MAX;
+            };
+            if crate::ipc::session_end_send(session_id, caller) {
+                0
+            } else {
+                u64::MAX
+            }
         }
         _ => u64::MAX,
     }

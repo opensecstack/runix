@@ -19,6 +19,7 @@ pub mod boot;
 pub mod capabilities;
 pub mod citadel;
 pub mod elf;
+pub mod entropy;
 pub mod gdt;
 pub mod grid_sandbox;
 pub mod interrupts;

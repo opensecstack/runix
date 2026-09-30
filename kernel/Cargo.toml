@@ -165,6 +165,18 @@ harness = false
 name = "grid_sandbox_marshal_shadow"
 harness = false
 
+[[test]]
+name = "sys_random"
+harness = false
+
+[[test]]
+name = "ipc_session"
+harness = false
+
+[[test]]
+name = "syscall_cost"
+harness = false
+
 [profile.dev]
 panic = "abort"
 

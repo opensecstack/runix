@@ -116,39 +116,6 @@ fn verify_file_token(token: &CapabilityToken, name: &str) -> bool {
         .is_ok()
 }
 
-/// The resource-string convention a response-port capability token must
-/// match — exactly `kernel/src/capabilities.rs`'s own `port_resource`
-/// (`format!("port:{port}")`), reused rather than inventing a distinct
-/// resource kind. `docs/RFC-IPC-RESPONSE-CAPABILITY.md`'s Open Questions
-/// section flags the alternative (a dedicated `respond-on:<n>` kind, so a
-/// token that authorizes *receiving* a response can't also be presented to
-/// authorize *sending* on that same port) as a real question the repo owner
-/// hasn't settled — reusing `port:<n>` here is the simpler, one-convention
-/// choice made for this pass, not a claim that the alternative was
-/// considered and rejected.
-fn response_port_resource(port: u16) -> String {
-    format!("port:{port}")
-}
-
-/// Verifies `token` was validly signed by the demo trust root, hasn't
-/// expired, and is scoped to exactly `port:<port>` — the actual point of
-/// Option A's second embedded token: proof that whoever sent this request
-/// really holds (was spawned with, or was otherwise granted) the
-/// authorization to receive on `port`, so this driver never sends a
-/// response's bytes — potentially another client's file contents — to a
-/// port the requester merely *claimed* as its own. A request whose
-/// response token fails this check is dropped by [`run_fs_ipc_server`],
-/// never answered anywhere: replying on the claimed port at that point
-/// would be exactly the leak this whole mechanism exists to close. Same
-/// "no revocation-list access from this driver" limitation
-/// [`verify_file_token`]'s own doc comment already names.
-fn verify_response_token(token: &CapabilityToken, port: u16) -> bool {
-    let now = syscall::ticks();
-    token
-        .verify(&demo_verifying_key(), &response_port_resource(port), now)
-        .is_ok()
-}
-
 /// Small — this driver does no dynamic allocation at all (no `alloc`
 /// crate even linked); kept only because `LockedHeap` needs *some*
 /// backing region to exist even though nothing here calls into the
@@ -192,31 +159,28 @@ struct BlkBootInfo {
     /// of running Phase 1's or Phase 2's own self-contained proof. `0` on
     /// the real boot path and every earlier test; `1` only in
     /// `kernel/tests/blk_fs_ipc.rs`, which alone spawns a second process
-    /// to actually send a request over [`FS_REQUEST_PORT`].
+    /// to actually open a session against [`FS_SERVER_PORT`] and send a
+    /// request.
     serve_fs_requests: u8,
 }
 
-/// Filesystem driver, Phase 3's fixed request IPC port — must match
-/// `kernel/src/main.rs`'s own `BLK_FS_REQUEST_PORT` constant exactly (same
+/// Filesystem driver's one fixed IPC port — must match
+/// `kernel/src/main.rs`'s own `BLK_FS_SERVER_PORT` constant exactly (same
 /// "no shared type, just an agreed ABI/protocol" convention as every other
-/// kernel/ring-3 boundary in this codebase). The *response* side no longer
-/// has a fixed constant here at all — `docs/RFC-IPC-RESPONSE-CAPABILITY.md`
-/// Option A: each request now names its own response port
-/// (`FsRequest::Read`/`Write`'s `response_port` field), verified per-request
-/// against an embedded `response_token` (see [`verify_response_token`])
-/// rather than every client sharing one fixed, ambiently-readable port.
-const FS_REQUEST_PORT: usize = 8;
-/// Filesystem driver, Phase 8: a second, independently capability-gated
-/// port for write requests against [`WRITE_FILE_NAME`] — a caller needs a
-/// capability scoped to `port_resource(FS_WRITE_REQUEST_PORT)` specifically,
-/// separate from whatever authorizes reading [`TARGET_FILE_NAME`] on
-/// [`FS_REQUEST_PORT`]. One port per file, reusing the existing
-/// `port_resource` convention exactly as `SYS_IPC_SEND` already enforces
-/// it — not a new resource-string kind (a real path-scoped capability
-/// convention for arbitrary/dynamic filenames stays open, see
-/// `docs/THREAT_MODEL.md`). Must match `kernel/src/main.rs`'s own
-/// `BLK_FS_WRITE_REQUEST_PORT` constant exactly.
-const FS_WRITE_REQUEST_PORT: usize = 10;
+/// kernel/ring-3 boundary in this codebase). Read and write requests both
+/// flow over sessions opened against this one port (`SYS_IPC_SESSION_OPEN`/
+/// `SYS_IPC_SESSION_ACCEPT`) — which operation a session's messages perform
+/// is already encoded in the `FsRequest` enum tag itself
+/// (`runix_ipc::fs`), so unlike the old fixed-port transport there's no
+/// need for a second port just to distinguish reads from writes. Formerly
+/// two separate ports (`FS_REQUEST_PORT` = 8, `FS_WRITE_REQUEST_PORT` = 10)
+/// plus a third, per-request-dynamic response port
+/// (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`'s Option A) — collapsed into this
+/// one port now that the session primitive itself supplies a private,
+/// kernel-authenticated reply channel per client (see
+/// `runix_ipc::fs`'s own doc comment for why `FsRequest`'s
+/// `response_port`/`response_token` fields are gone).
+const FS_SERVER_PORT: usize = 8;
 
 const BLK_INFO_VA: usize = 0x_0999_3333_0000;
 const BLK_QUEUE_VA: usize = 0x_0999_4444_0000;
@@ -2228,64 +2192,108 @@ fn handle_write_ipc_request(
 /// meaningful limit on any legitimate message.
 const FS_MAX_PENDING_BYTES: usize = 8192;
 
-/// `port` is the *caller's own* response port (`FsRequest`'s
-/// `response_port` field), not a fixed constant — `docs/RFC-IPC-RESPONSE-CAPABILITY.md`
-/// Option A. Every call site in [`run_fs_ipc_server`] reaches this only
-/// after [`verify_response_token`] has already confirmed the caller holds
-/// a valid capability for exactly this port; this function itself performs
-/// no check, same "verify once, at the one call site that needs to, not
-/// redundantly everywhere" posture [`verify_file_token`]'s callers already
-/// follow. This driver must itself hold a `SYS_IPC_SEND` capability for
-/// `port` (granted at spawn time — see `kernel/src/main.rs`'s port
-/// allocation map) or the underlying syscall denies the send exactly like
-/// any other unauthorized sender's would.
-fn send_fs_response(port: u16, response: &FsResponse) {
+/// Sends `response` back on `session_id`, locked for the whole message —
+/// same reasoning `kernel/src/ipc.rs`'s module doc comment gives for the
+/// fixed-port send lock, now applied for symmetry with the client side's
+/// own locked send (`kernel/tests/ipc_session.rs`'s
+/// `send_locked_pattern`): a session has exactly two participants, and
+/// nothing about that guarantees this driver's own multi-byte send can't
+/// be preempted mid-message, even though the client is turn-based and
+/// never writes while waiting on a response. Unlike the old fixed-port
+/// transport, `session_id` itself already proves who this driver is
+/// replying to (the kernel's owner/server participant check on
+/// `SYS_IPC_SESSION_SEND`) — there is no caller-suppliable "port" to get
+/// wrong anymore.
+fn send_fs_response(session_id: u64, response: &FsResponse) {
+    syscall::session_send_lock(session_id);
     for byte in response.encode() {
-        let _ = syscall::ipc_send(port as usize, byte);
+        let _ = syscall::session_send(session_id, byte);
     }
+    syscall::session_send_unlock(session_id);
 }
 
-/// Filesystem driver, Phase 3/8's fixed-port, fixed-filename IPC surface,
-/// generalized: **dynamic filenames plus per-request, per-file
-/// authorization**, closing the two gaps `docs/STATUS.md`'s Phase 8
-/// section named as the next trigger ("an arbitrary path sent at request
-/// time instead of one fixed target name... a real path-scoped capability
-/// convention"). [`FS_REQUEST_PORT`]/[`FS_WRITE_REQUEST_PORT`] are still
-/// fixed, kernel-capability-gated ports (a caller still needs a
-/// `port:<n>` grant to reach this server at all — unchanged, see
-/// `kernel/src/syscall.rs`'s `SYS_IPC_SEND`), but each now carries a real
+/// Bound on how many client sessions [`run_fs_ipc_server`] serves at once.
+/// Small and fixed, not tuned against any real deployment target: today's
+/// only callers are `kernel/tests/blk_fs_ipc.rs` (up to a handful of
+/// sequential requests) and `blk_fs_concurrent*.rs` (exactly two genuinely
+/// concurrent clients) — 4 is generous headroom over the two concurrently
+/// open sessions those tests ever need at once, while still bounding the
+/// per-iteration accept-then-poll work this loop does (unlike
+/// `kernel::ipc::MAX_SESSIONS_PER_OWNER`/`MAX_LIVE_SESSIONS`, which bound
+/// the *kernel's* session table system-wide, this bounds only how many of
+/// those live sessions this one server thread tracks and polls at once).
+const MAX_FS_SESSIONS: usize = 4;
+
+/// How often [`run_fs_ipc_server`] polls `SYS_IPC_SESSION_ACCEPT` for a
+/// newly opened session, in main-loop iterations — see that loop's own
+/// doc comment for why this exists at all (that syscall's capability
+/// check is a real, uncached Ed25519 verification on every call, unlike
+/// `SYS_IPC_RECV`'s cheap empty-port peek). `50_000` keeps the total
+/// number of verifications paid over the loop's full
+/// `20_000_000`-iteration range to a few hundred rather than tens of
+/// millions, while still noticing a new session within, at most, 50,000
+/// iterations — comfortably inside any test's own much larger
+/// response-wait bound.
+const ACCEPT_POLL_INTERVAL: u32 = 50_000;
+
+/// One client's session-scoped accumulation state — the direct analogue of
+/// the old fixed-port loop's single shared `read_buf`/`write_buf`, now one
+/// per open session instead of one per port, since each session is its own
+/// private byte stream.
+struct FsSession {
+    session_id: u64,
+    buf: Vec<u8>,
+}
+
+/// Filesystem driver: dynamic filenames plus per-request, per-file
+/// authorization, now served over the `SYS_IPC_SESSION_*` primitive
+/// instead of the old fixed-port-plus-embedded-response-token transport
+/// (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`'s Option A, retired — see
+/// `runix_ipc::fs`'s own doc comment). [`FS_SERVER_PORT`] is still a
+/// fixed, kernel-capability-gated port (a caller still needs a `port:<n>`
+/// grant to *open* a session against it at all — unchanged, see
+/// `kernel/src/syscall.rs`'s `SYS_IPC_SESSION_OPEN`), but past that point
+/// every client gets its own private session — a real
 /// [`runix_ipc::fs::FsRequest`] naming *which* file and presenting a
-/// [`CapabilityToken`] scoped to exactly that file — verified by this
-/// driver itself ([`verify_file_token`]) on every single request, not
-/// once at spawn time. Two different files served over the same read
-/// port in one boot is the actual proof this closes (see
-/// `kernel/tests/blk_fs_ipc.rs`), where Phase 8 could only ever serve one.
+/// [`CapabilityToken`] scoped to exactly that file, verified by this
+/// driver itself ([`verify_file_token`]) on every single request, not once
+/// at spawn time. Two different files served over the same server port in
+/// one boot is the actual proof this closes (see
+/// `kernel/tests/blk_fs_ipc.rs`), where Phase 8's original fixed-port
+/// design could only ever serve one.
 ///
 /// **Concurrency: what this loop does and does not guarantee, verified in
 /// QEMU rather than assumed.** This loop is strictly sequential — one
-/// in-flight request at a time across *both* ports. The two
-/// `ipc_try_recv` blocks below run one after the other in the same
-/// iteration, and each one's handler is called inline and runs to
-/// completion (device round trips and response send included) before
-/// anything else is decoded; there is no second thread, no async executor
-/// and no interrupt-driven re-entry into this process to overlap two
-/// handlers.
+/// in-flight request at a time across every open session. Each pass
+/// accepts at most one newly opened session, then polls every session's
+/// queue in turn; a session whose buffer completes a full `FsRequest` is
+/// dispatched and answered (device round trips and response send
+/// included) inline, before the next session is even looked at. There is
+/// no second thread, no async executor, and no interrupt-driven re-entry
+/// into this process to overlap two handlers.
 ///
-/// Two separate hazards, both now closed:
+/// Two separate hazards, both closed, though the *mechanism* for the first
+/// one changed with this migration:
 ///
 /// * *Concurrent senders* — two callers' multi-byte messages interleaving
-///   their bytes in the underlying fixed-capacity channel
-///   (`kernel/src/ipc.rs`'s `Channel`) before either decodes, producing a
-///   well-formed but wrong "franken-request". Fixed in the IPC layer by
-///   the per-port advisory send lock (`kernel::ipc::begin_send`/
-///   `end_send`, `SYS_IPC_SEND_LOCK`/`SYS_IPC_SEND_UNLOCK`); proven by
-///   `kernel/tests/blk_fs_concurrent.rs`.
+///   into a single well-formed-but-wrong "franken-request". Under the old
+///   fixed-port transport this needed an explicit advisory send lock
+///   (`SYS_IPC_SEND_LOCK`/`UNLOCK`) because every client shared one port's
+///   one channel. Under sessions, each client gets its own private
+///   session/channel — two different clients' bytes can no longer land in
+///   the same buffer at all, so this hazard is closed *structurally*, not
+///   by a lock. `kernel/tests/blk_fs_concurrent.rs` still uses
+///   `SYS_IPC_SESSION_SEND_LOCK`/`UNLOCK` around each client's own send,
+///   for the same symmetry [`send_fs_response`]'s doc comment gives —
+///   guarding one sender against its own preemption, not against a second
+///   sender it no longer shares a channel with.
 /// * *Concurrent handlers* — two fully-arrived requests being served at
 ///   once, which is what would matter for anything mutating (a write, and
 ///   in principle an allocation). Foreclosed by this loop's own shape
-///   above; proven by `kernel/tests/blk_fs_concurrent_write.rs`, where two
-///   racing callers each land a full-sector write on a *different* file
-///   and both files afterwards hold exactly their own writer's bytes.
+///   above, unchanged by the transport migration; proven by
+///   `kernel/tests/blk_fs_concurrent_write.rs`, where two racing callers
+///   each land a full-sector write on a *different* file and both files
+///   afterwards hold exactly their own writer's bytes.
 ///
 /// See [`allocate_cluster_chain`]'s doc comment for why "concurrent
 /// allocators" specifically cannot arise today (allocation isn't reachable
@@ -2295,110 +2303,105 @@ fn send_fs_response(port: u16, response: &FsResponse) {
 fn run_fs_ipc_server(dev: &mut BlkDevice, info: &BootSectorInfo) {
     write_all(b"blk-driver-host: FS server ready, serving read/write requests\n");
 
-    let mut read_buf: Vec<u8> = Vec::new();
-    let mut write_buf: Vec<u8> = Vec::new();
+    let mut sessions: Vec<FsSession> = Vec::new();
     let mut requests_served = 0u32;
 
     // Same poll-bound discipline as every other wait loop in this
     // codebase: real requests arrive promptly in practice, so this bound
     // exists purely to make "a test that sends N requests" report a clean
     // result instead of hanging the boot forever waiting for an N+1th
-    // request that was never going to come.
-    //
-    // Bumped from `2_000_000` to `20_000_000`, confirmed by real
-    // reproduction (not guessed) the same way `poll_for_completion`'s own
-    // bound already had to grow once: with per-request Ed25519 signature
-    // verification now in the mix (`verify_file_token`) and each request
-    // arriving byte-by-byte through a 32-byte channel
-    // (`kernel/src/ipc.rs`'s `CHANNEL_CAPACITY`), five sequential
-    // request/response round trips in one boot (the actual shape
-    // `kernel/tests/blk_fs_ipc.rs` now exercises) accumulate enough
-    // cooperative-scheduler round-trip overhead — more so under TCG, which
-    // interprets guest instructions far slower than KVM, the same
-    // "`poll_for_completion`'s own bound had to grow for exactly this
-    // reason" note already on this file — that the unbumped budget ran out
-    // mid-way through the fifth request: its sender got stuck forever
-    // (`SYS_IPC_SEND`'s internal spin-yield keeps waiting for room a
-    // receiver that already exited its own loop will never make), never
-    // completing, while this loop itself reported "4 requests served" and
-    // returned normally. Not a logic bug in the request-handling code
-    // itself — every byte that *did* arrive decoded and served correctly;
-    // this loop simply stopped listening too soon.
+    // request that was never going to come. Kept at the same `20_000_000`
+    // the fixed-port transport needed (see that history in this file's own
+    // git blame).
     for i in 0..20_000_000u32 {
-        if let Some(byte) = syscall::ipc_try_recv(FS_REQUEST_PORT) {
-            read_buf.push(byte);
-            if let Some((request, consumed)) = FsRequest::decode(&read_buf) {
-                read_buf.drain(..consumed);
-                if let FsRequest::Read {
-                    name,
-                    token,
-                    response_port,
-                    response_token,
-                } = request
-                {
-                    if !verify_response_token(&response_token, response_port) {
-                        // Dropped, not answered anywhere -- per
-                        // `docs/RFC-IPC-RESPONSE-CAPABILITY.md`, replying on
-                        // a port the caller merely *claimed* is exactly the
-                        // leak Option A closes. Logged so a legitimate
-                        // caller with a stale/misissued response token has
-                        // something to look at, same as every other
-                        // "untrusted input fails closed" path in this
-                        // module.
-                        write_all(
-                            b"blk-driver-host: FS server dropped a read request with an invalid response token for port ",
-                        );
-                        write_decimal(response_port as u64);
-                        write_byte(b'\n');
-                    } else {
-                        write_all(b"blk-driver-host: FS server got a read request for ");
-                        write_all(name.as_bytes());
-                        write_byte(b'\n');
-                        let response = handle_read_ipc_request(dev, info, &name, &token);
-                        send_fs_response(response_port, &response);
-                        requests_served += 1;
-                    }
-                }
-                // A `Write` variant arriving on the read port is malformed
-                // by construction (a well-behaved client only ever encodes
-                // `FsRequest::Write` towards `FS_WRITE_REQUEST_PORT`) --
-                // silently dropped, matching every other "untrusted input
-                // fails closed, not loudly" parser in this module.
-            } else if read_buf.len() > FS_MAX_PENDING_BYTES {
-                read_buf.clear();
+        // `SYS_IPC_SESSION_ACCEPT`'s capability check (`authorized_for_port`,
+        // `kernel/src/syscall.rs`) is a real Ed25519 verification on *every*
+        // call, unlike `SYS_IPC_RECV`'s cheap empty-port peek before paying
+        // that same cost (that peek is exactly why the old fixed-port
+        // `ipc_try_recv` polled every single iteration safely) --
+        // `SYS_IPC_SESSION_ACCEPT` has no such peek to skip an empty pending
+        // queue for free. Confirmed as a real, not theoretical, cost: an
+        // earlier version of this loop called it unconditionally every
+        // iteration and the whole test never finished -- millions of
+        // Ed25519 verifications under TCG, not the scheduling overhead the
+        // `20_000_000` bound above was actually sized for. Throttled to
+        // once every [`ACCEPT_POLL_INTERVAL`] iterations instead: still
+        // frequent enough that a newly opened session is noticed well
+        // within any test's own response-wait bound, but three orders of
+        // magnitude fewer signature verifications over the loop's full
+        // range.
+        if sessions.len() < MAX_FS_SESSIONS && i % ACCEPT_POLL_INTERVAL == 0 {
+            if let Some(session_id) = syscall::session_try_accept(FS_SERVER_PORT) {
+                sessions.push(FsSession {
+                    session_id,
+                    buf: Vec::new(),
+                });
             }
         }
 
-        if let Some(byte) = syscall::ipc_try_recv(FS_WRITE_REQUEST_PORT) {
-            write_buf.push(byte);
-            if let Some((request, consumed)) = FsRequest::decode(&write_buf) {
-                write_buf.drain(..consumed);
-                if let FsRequest::Write {
-                    name,
-                    token,
-                    data,
-                    response_port,
-                    response_token,
-                } = request
-                {
-                    if !verify_response_token(&response_token, response_port) {
-                        write_all(
-                            b"blk-driver-host: FS server dropped a write request with an invalid response token for port ",
-                        );
-                        write_decimal(response_port as u64);
-                        write_byte(b'\n');
-                    } else {
-                        write_all(b"blk-driver-host: FS server got a write request for ");
-                        write_all(name.as_bytes());
-                        write_byte(b'\n');
-                        let response = handle_write_ipc_request(dev, info, &name, &token, &data);
-                        send_fs_response(response_port, &response);
-                        requests_served += 1;
-                    }
+        // Indices of sessions this pass fully served -- removed from
+        // `sessions` *after* this inner loop (below), not the moment each
+        // is found, so mutating the Vec never perturbs `iter_mut`'s own
+        // indices mid-iteration.
+        //
+        // Removing a served session here is load-bearing, not just
+        // housekeeping: a `Session`'s queue (`kernel/src/ipc.rs`) is a
+        // single shared byte stream both participants call
+        // `SYS_IPC_SESSION_RECV` against -- there is no separate
+        // "request" lane and "response" lane. `send_fs_response` (below)
+        // just finished *pushing* the reply into that same queue; if this
+        // session stayed in `sessions` for the *next* iteration, this
+        // loop's own `session_try_recv` call above would start racing the
+        // client for those exact same bytes -- and, being a tight
+        // in-kernel loop against a client that also has to cooperatively
+        // yield, reliably wins that race and steals the client's own
+        // response out from under it. Confirmed as a real bug this way,
+        // not a theoretical one: an earlier version of this loop kept
+        // every accepted session alive indefinitely and a client
+        // consistently received only the first `SESSION_CHANNEL_CAPACITY`-
+        // sized prefix of its own response, the rest silently vanishing
+        // into this driver's own next-iteration `buf` (which never
+        // decoded as a new `FsRequest`, so the stolen bytes were simply
+        // dropped once `FS_MAX_PENDING_BYTES` was hit). Each session here
+        // is single-request-per-open by construction (every real caller
+        // opens a fresh session per `FsRequest`, same as
+        // `kernel/tests/ipc_session.rs`'s own server never re-`RECV`s a
+        // session it already answered) — removing it from this table the
+        // moment it's answered costs nothing a real multi-request-per-
+        // session client would need, since none exists.
+        let mut served_indices: Vec<usize> = Vec::new();
+        for (idx, session) in sessions.iter_mut().enumerate() {
+            let Some(byte) = syscall::session_try_recv(session.session_id) else {
+                continue;
+            };
+            session.buf.push(byte);
+            let Some((request, consumed)) = FsRequest::decode(&session.buf) else {
+                if session.buf.len() > FS_MAX_PENDING_BYTES {
+                    session.buf.clear();
                 }
-            } else if write_buf.len() > FS_MAX_PENDING_BYTES {
-                write_buf.clear();
-            }
+                continue;
+            };
+            session.buf.drain(..consumed);
+            let response = match request {
+                FsRequest::Read { name, token } => {
+                    write_all(b"blk-driver-host: FS server got a read request for ");
+                    write_all(name.as_bytes());
+                    write_byte(b'\n');
+                    handle_read_ipc_request(dev, info, &name, &token)
+                }
+                FsRequest::Write { name, token, data } => {
+                    write_all(b"blk-driver-host: FS server got a write request for ");
+                    write_all(name.as_bytes());
+                    write_byte(b'\n');
+                    handle_write_ipc_request(dev, info, &name, &token, &data)
+                }
+            };
+            send_fs_response(session.session_id, &response);
+            requests_served += 1;
+            served_indices.push(idx);
+        }
+        for idx in served_indices.into_iter().rev() {
+            sessions.remove(idx);
         }
 
         if i % 10_000 == 0 {

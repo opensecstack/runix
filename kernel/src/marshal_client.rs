@@ -42,70 +42,136 @@
 //! needs the desktop-side HTTP transport a separate, parallel change is
 //! building).
 //!
-//! # Sockets IPC ports
+//! # Transport: one session per [`evaluate`] call
 //!
-//! [`SOCK_REQUEST_PORT`]/[`SOCK_RESPONSE_PORT`] must match
-//! `net-driver-host/src/main.rs`'s own `SOCK_REQUEST_PORT`/
-//! `SOCK_RESPONSE_PORT` constants exactly — the same fixed-port convention
-//! every client of that surface in this codebase already follows (see
-//! `kernel/tests/net_driver_sockets.rs`). A real deployment would still need
-//! to decide who is authorized to hold the capability for each port; this
-//! module doesn't make that policy decision, it only names the ports and
-//! issues the syscalls — an unauthorized caller's send is silently denied
-//! at the syscall gate the same way any other unauthorized `SYS_IPC_SEND`
-//! is, and (since `docs/RFC-IPC-RESPONSE-CAPABILITY.md` landed) the same is
-//! now true of [`recv_socket_response`]'s `SYS_IPC_RECV` on
-//! [`SOCK_RESPONSE_PORT`] — a caller of [`evaluate`] needs a capability for
-//! *both* ports, not just the request one, or its own receive silently
-//! sees nothing.
+//! This module used to ride the fixed-port `SYS_IPC_SEND`/`SYS_IPC_RECV`
+//! transport (`SOCK_REQUEST_PORT`/`SOCK_RESPONSE_PORT`, 11/12) every other
+//! sockets-IPC client in this codebase still used at the time — see this
+//! module's now-stale git history for that version's own doc comment on the
+//! attribution gap that model had: a shared response port meant any two
+//! concurrent callers of [`evaluate`] would race to receive each other's
+//! bytes, with no way for either side to tell whose response was whose.
+//!
+//! A syscall-cost benchmark (`kernel/tests/syscall_cost.rs`) also measured
+//! the old fixed-port transport at roughly 228x the per-syscall cost of the
+//! session primitive below (~11,633 us vs. ~51 us per round trip) — for a
+//! real TLS handshake (thousands of syscalls, 1500-3000 bytes) that
+//! difference is the gap between "fits inside the 300ms T1 real-time
+//! budget" and "exceeds it by 100x+."
+//!
+//! Both gaps close by riding [`SYS_IPC_SESSION_OPEN`](crate::syscall::SYS_IPC_SESSION_OPEN)
+//! and its companion syscalls instead: [`evaluate`] opens exactly one
+//! session per call against [`SOCKETS_SERVER_PORT`], and every request/
+//! response for that call's socket lifecycle (open/connect/send/recv/close)
+//! rides that same session id. A session has at most two participants (this
+//! call's own thread, and whichever `net-driver-host` server thread
+//! accepted it) — two concurrent [`evaluate`] calls get two independent
+//! sessions, each with its own private byte channel, so there is no shared
+//! response port left to race on. See `kernel/tests/ipc_session.rs` for the
+//! primitive's own isolation/capability-denial/teardown proof, and
+//! `docs/RFC-IPC-RESPONSE-CAPABILITY.md` for the full design.
+//!
+//! [`SOCKETS_SERVER_PORT`] must match `net-driver-host/src/main.rs`'s own
+//! `SOCKETS_SERVER_PORT` constant exactly — the same fixed-port convention
+//! every client of that surface in this codebase already follows for
+//! *opening* a session (see `kernel/tests/net_driver_sockets.rs`). A caller
+//! of [`evaluate`] needs a capability authorizing that one port to open a
+//! session at all (`SYS_IPC_SESSION_OPEN`'s own capability check); once the
+//! session exists, every further operation on it is gated by session
+//! participation (owner-or-accepted-server identity), not a fresh port
+//! capability check per call — see `kernel::ipc`'s `is_participant`.
 
 use alloc::vec::Vec;
 use runix_ipc::marshal::{MarshalRequest, MarshalResponse};
 use runix_ipc::sockets::{SocketRequest, SocketResponse, MAX_PAYLOAD_LEN};
 
-/// Fixed sockets IPC request port — see this module's own doc comment for
-/// why it must match `net-driver-host`'s constant of the same name.
-pub const SOCK_REQUEST_PORT: usize = 11;
-/// Fixed sockets IPC response port — see [`SOCK_REQUEST_PORT`]'s doc
-/// comment.
-pub const SOCK_RESPONSE_PORT: usize = 12;
+/// Fixed sockets IPC server port — see this module's own doc comment for
+/// why it must match `net-driver-host`'s constant of the same name. Only
+/// used to *open* a session ([`SYS_IPC_SESSION_OPEN`](crate::syscall::SYS_IPC_SESSION_OPEN));
+/// every subsequent operation for that session addresses it by session id,
+/// not this port.
+pub const SOCKETS_SERVER_PORT: usize = 11;
 
-/// Sends `request`'s encoded bytes, one byte per
-/// [`crate::syscall::SYS_IPC_SEND`], on [`SOCK_REQUEST_PORT`] — the caller
-/// must already hold a capability authorizing `SYS_IPC_SEND` on that port,
-/// same posture every function in this module has toward capability
-/// checks: none of them perform one themselves, they rely on the syscall
-/// gate.
-fn send_socket_request(request: &SocketRequest) {
-    for byte in request.encode() {
-        unsafe {
+/// Opens a new session against [`SOCKETS_SERVER_PORT`], bounded-retrying
+/// (same "bounded poll, not an unbounded blocking wait" discipline every
+/// wait loop in this codebase uses) up to `max_iters` times — a session
+/// table momentarily at capacity (`ipc::MAX_LIVE_SESSIONS`/
+/// `MAX_SESSIONS_PER_OWNER`) is worth a retry; a caller with no capability
+/// for the port never succeeds no matter how many times this retries, same
+/// as every other capability-gated syscall in this codebase. `None` if
+/// nothing succeeded within `max_iters`.
+fn open_session(max_iters: u32) -> Option<u64> {
+    for i in 0..max_iters {
+        let ret = unsafe {
             crate::syscall::syscall(
-                crate::syscall::SYS_IPC_SEND,
-                SOCK_REQUEST_PORT as u64,
-                byte as u64,
+                crate::syscall::SYS_IPC_SESSION_OPEN,
+                SOCKETS_SERVER_PORT as u64,
                 0,
-            );
+                0,
+            )
+        };
+        if ret != u64::MAX {
+            return Some(ret);
+        }
+        if i % 64 == 0 {
+            crate::scheduler::yield_now();
         }
     }
+    None
 }
 
-/// Polls [`SOCK_RESPONSE_PORT`] for one full [`SocketResponse`], decoding
-/// with [`SocketResponse::decode`] — same "accumulate bytes, retry decode"
+/// Sends `request`'s encoded bytes, one byte per
+/// [`crate::syscall::SYS_IPC_SESSION_SEND`], on `session_id`, wrapped in
+/// [`crate::syscall::SYS_IPC_SESSION_SEND_LOCK`]/`_UNLOCK` — a session has
+/// at most two participants, but nothing stops both from calling
+/// `SYS_IPC_SESSION_SEND` for the same logical message concurrently without
+/// this, same interleaving hazard `kernel::ipc`'s module doc comment
+/// describes for the fixed-port transport this module used to ride. `false`
+/// if the lock, or any byte send, is denied (`session_id` doesn't exist, or
+/// this thread isn't a participant) — every function in this module relies
+/// entirely on the session syscalls' own participant check, same posture
+/// toward capability/identity checks this module always had.
+fn send_socket_request(session_id: u64, request: &SocketRequest) -> bool {
+    let locked = unsafe {
+        crate::syscall::syscall(crate::syscall::SYS_IPC_SESSION_SEND_LOCK, session_id, 0, 0)
+    };
+    if locked == u64::MAX {
+        return false;
+    }
+    let mut ok = true;
+    for byte in request.encode() {
+        let ret = unsafe {
+            crate::syscall::syscall(
+                crate::syscall::SYS_IPC_SESSION_SEND,
+                session_id,
+                byte as u64,
+                0,
+            )
+        };
+        if ret == u64::MAX {
+            ok = false;
+            break;
+        }
+    }
+    unsafe {
+        crate::syscall::syscall(crate::syscall::SYS_IPC_SESSION_SEND_UNLOCK, session_id, 0, 0);
+    }
+    ok
+}
+
+/// Polls `session_id` for one full [`SocketResponse`] via
+/// [`crate::syscall::SYS_IPC_SESSION_RECV`], decoding with
+/// [`SocketResponse::decode`] — same "accumulate bytes, retry decode"
 /// pattern `kernel/tests/net_driver_sockets.rs`'s own `recv_response`
 /// already uses, and the same "no blocking receive in this codebase" reason
 /// (`blk-driver-host/src/main.rs`'s `poll_recv_byte` doc comment) that
 /// pattern exists at all. `None` if nothing decodable arrives within
 /// `max_iters` polls.
-fn recv_socket_response(max_iters: u32) -> Option<SocketResponse> {
+fn recv_socket_response(session_id: u64, max_iters: u32) -> Option<SocketResponse> {
     let mut buf: Vec<u8> = Vec::new();
     for i in 0..max_iters {
         let ret = unsafe {
-            crate::syscall::syscall(
-                crate::syscall::SYS_IPC_RECV,
-                SOCK_RESPONSE_PORT as u64,
-                0,
-                0,
-            )
+            crate::syscall::syscall(crate::syscall::SYS_IPC_SESSION_RECV, session_id, 0, 0)
         };
         if ret != u64::MAX {
             buf.push(ret as u8);
@@ -120,51 +186,65 @@ fn recv_socket_response(max_iters: u32) -> Option<SocketResponse> {
     None
 }
 
-/// Allocates a new socket handle via [`SocketRequest::Open`]. `None` if
-/// `net-driver-host` refused (every handle already in use) or didn't answer
-/// within `max_iters` polls.
-pub fn open_socket(max_iters: u32) -> Option<u8> {
-    send_socket_request(&SocketRequest::Open);
-    match recv_socket_response(max_iters) {
+/// Allocates a new socket handle via [`SocketRequest::Open`] on `session_id`.
+/// `None` if `net-driver-host` refused (every handle already in use) or
+/// didn't answer within `max_iters` polls.
+fn open_socket(session_id: u64, max_iters: u32) -> Option<u8> {
+    if !send_socket_request(session_id, &SocketRequest::Open) {
+        return None;
+    }
+    match recv_socket_response(session_id, max_iters) {
         Some(SocketResponse::Opened { handle }) => Some(handle),
         _ => None,
     }
 }
 
 /// Connects `handle` (already allocated by [`open_socket`]) to
-/// `remote_ip`:`remote_port`, bound locally to `local_port`. `true` only on
-/// a confirmed [`SocketResponse::Connected`] naming this same `handle`.
-pub fn connect_socket(
+/// `remote_ip`:`remote_port`, bound locally to `local_port`, over
+/// `session_id`. `true` only on a confirmed [`SocketResponse::Connected`]
+/// naming this same `handle`.
+fn connect_socket(
+    session_id: u64,
     handle: u8,
     remote_ip: [u8; 4],
     remote_port: u16,
     local_port: u16,
     max_iters: u32,
 ) -> bool {
-    send_socket_request(&SocketRequest::Connect {
-        handle,
-        remote_ip,
-        remote_port,
-        local_port,
-    });
+    if !send_socket_request(
+        session_id,
+        &SocketRequest::Connect {
+            handle,
+            remote_ip,
+            remote_port,
+            local_port,
+        },
+    ) {
+        return false;
+    }
     matches!(
-        recv_socket_response(max_iters),
+        recv_socket_response(session_id, max_iters),
         Some(SocketResponse::Connected { handle: h }) if h == handle
     )
 }
 
-/// Sends `bytes` on `handle`'s open connection, splitting into
-/// [`MAX_PAYLOAD_LEN`]-sized chunks as needed (a [`MarshalRequest`]'s
+/// Sends `bytes` on `handle`'s open connection over `session_id`, splitting
+/// into [`MAX_PAYLOAD_LEN`]-sized chunks as needed (a [`MarshalRequest`]'s
 /// encoded `kerkese_json` may be up to `runix_ipc::marshal::MAX_JSON_LEN`
 /// — larger than one [`SocketRequest::Send`] can carry). `false` if any
 /// chunk isn't fully acknowledged by a matching [`SocketResponse::Sent`].
-fn send_bytes(handle: u8, bytes: &[u8], max_iters: u32) -> bool {
+fn send_bytes(session_id: u64, handle: u8, bytes: &[u8], max_iters: u32) -> bool {
     for chunk in bytes.chunks(MAX_PAYLOAD_LEN) {
-        send_socket_request(&SocketRequest::Send {
-            handle,
-            data: chunk.to_vec(),
-        });
-        match recv_socket_response(max_iters) {
+        if !send_socket_request(
+            session_id,
+            &SocketRequest::Send {
+                handle,
+                data: chunk.to_vec(),
+            },
+        ) {
+            return false;
+        }
+        match recv_socket_response(session_id, max_iters) {
             Some(SocketResponse::Sent { handle: h, len })
                 if h == handle && len as usize == chunk.len() => {}
             _ => return false,
@@ -173,17 +253,17 @@ fn send_bytes(handle: u8, bytes: &[u8], max_iters: u32) -> bool {
     true
 }
 
-/// Closes `handle`, freeing it for reuse. Best-effort: doesn't report
-/// failure, since a caller reaching this point is already tearing down
-/// (either after a successful evaluation, or after giving up on a failed
-/// one) and has nothing useful left to do with a close failure.
-fn close_socket(handle: u8, max_iters: u32) {
-    send_socket_request(&SocketRequest::Close { handle });
-    let _ = recv_socket_response(max_iters);
+/// Closes `handle` over `session_id`, freeing it for reuse. Best-effort:
+/// doesn't report failure, since a caller reaching this point is already
+/// tearing down (either after a successful evaluation, or after giving up
+/// on a failed one) and has nothing useful left to do with a close failure.
+fn close_socket(session_id: u64, handle: u8, max_iters: u32) {
+    let _ = send_socket_request(session_id, &SocketRequest::Close { handle });
+    let _ = recv_socket_response(session_id, max_iters);
 }
 
-/// Polls `handle` for one full [`MarshalResponse`], issuing
-/// [`SocketRequest::Recv`] repeatedly (it never blocks — see
+/// Polls `handle` for one full [`MarshalResponse`] over `session_id`,
+/// issuing [`SocketRequest::Recv`] repeatedly (it never blocks — see
 /// [`runix_ipc::sockets::SocketResponse::Data`]'s doc comment) and
 /// accumulating the returned bytes into a growing buffer decoded with
 /// [`MarshalResponse::decode`] — resumable across however many
@@ -191,14 +271,21 @@ fn close_socket(handle: u8, max_iters: u32) {
 /// segments) the response actually arrives in, exactly the partial-data
 /// problem that decoder was built to handle. `None` if nothing decodable
 /// arrives within `max_polls` rounds.
-pub fn recv_marshal_response(handle: u8, max_polls: u32) -> Option<MarshalResponse> {
+fn recv_marshal_response(session_id: u64, handle: u8, max_polls: u32) -> Option<MarshalResponse> {
     let mut buf: Vec<u8> = Vec::new();
     for i in 0..max_polls {
-        send_socket_request(&SocketRequest::Recv {
-            handle,
-            max_len: MAX_PAYLOAD_LEN as u16,
-        });
-        if let Some(SocketResponse::Data { handle: h, data }) = recv_socket_response(2000) {
+        if !send_socket_request(
+            session_id,
+            &SocketRequest::Recv {
+                handle,
+                max_len: MAX_PAYLOAD_LEN as u16,
+            },
+        ) {
+            return None;
+        }
+        if let Some(SocketResponse::Data { handle: h, data }) =
+            recv_socket_response(session_id, 2000)
+        {
             if h == handle {
                 buf.extend_from_slice(&data);
                 if let Some((response, _consumed)) = MarshalResponse::decode(&buf) {
@@ -213,19 +300,25 @@ pub fn recv_marshal_response(handle: u8, max_polls: u32) -> Option<MarshalRespon
     None
 }
 
-/// Full round trip: opens a socket, connects it to `remote_ip`:`remote_port`
-/// (bound locally to `local_port`), sends `request`'s encoded bytes, polls
-/// for the answering [`MarshalResponse`], and closes the socket — the
-/// two-step "ask the MARSHAL proxy, wait for its Decision" operation a
-/// future Gate-evaluation call site would actually want, now over a real
-/// TCP connection to a proxy process outside this boot image, rather than
-/// this codebase's internal port-channel IPC.
+/// Full round trip: opens a session against [`SOCKETS_SERVER_PORT`], opens
+/// a socket handle on it, connects it to `remote_ip`:`remote_port` (bound
+/// locally to `local_port`), sends `request`'s encoded bytes, polls for the
+/// answering [`MarshalResponse`], and closes the socket — the two-step "ask
+/// the MARSHAL proxy, wait for its Decision" operation a future
+/// Gate-evaluation call site would actually want, now over a real TCP
+/// connection to a proxy process outside this boot image, rather than this
+/// codebase's internal port-channel IPC.
 ///
-/// `None` if any step (open/connect/send/receive) fails or times out —
-/// there is no blocking-receive syscall in this codebase, so a caller
-/// either treats `None` as "not answered yet" and retries the whole
-/// evaluation, or (for a real Gate-evaluation call site) as a fail-closed
-/// timeout.
+/// One session per call, not a session reused across calls — see this
+/// module's own doc comment on why that's the natural lifetime boundary
+/// (it maps exactly to one socket-open-through-close lifecycle) and what it
+/// buys over the old shared-port transport.
+///
+/// `None` if any step (session open/socket open/connect/send/receive)
+/// fails or times out — there is no blocking-receive syscall in this
+/// codebase, so a caller either treats `None` as "not answered yet" and
+/// retries the whole evaluation, or (for a real Gate-evaluation call site)
+/// as a fail-closed timeout.
 pub fn evaluate(
     remote_ip: [u8; 4],
     remote_port: u16,
@@ -233,16 +326,17 @@ pub fn evaluate(
     request: &MarshalRequest,
     max_iters: u32,
 ) -> Option<MarshalResponse> {
-    let handle = open_socket(max_iters)?;
-    if !connect_socket(handle, remote_ip, remote_port, local_port, max_iters) {
-        close_socket(handle, max_iters);
+    let session_id = open_session(max_iters)?;
+    let handle = open_socket(session_id, max_iters)?;
+    if !connect_socket(session_id, handle, remote_ip, remote_port, local_port, max_iters) {
+        close_socket(session_id, handle, max_iters);
         return None;
     }
-    if !send_bytes(handle, &request.encode(), max_iters) {
-        close_socket(handle, max_iters);
+    if !send_bytes(session_id, handle, &request.encode(), max_iters) {
+        close_socket(session_id, handle, max_iters);
         return None;
     }
-    let response = recv_marshal_response(handle, max_iters);
-    close_socket(handle, max_iters);
+    let response = recv_marshal_response(session_id, handle, max_iters);
+    close_socket(session_id, handle, max_iters);
     response
 }

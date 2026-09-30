@@ -61,7 +61,10 @@ use smoltcp::wire::{
     DnsQueryType, EthernetAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address,
 };
 use smoltcp_device::{RunixNetDevice, RX_BUFFER_COUNT, TX_BUFFER_COUNT};
-use syscall::{ipc_send, ipc_try_recv, write_all, write_byte, yield_now};
+use syscall::{
+    session_accept, session_send, session_send_lock, session_send_unlock, session_try_recv,
+    write_all, write_byte, yield_now,
+};
 
 /// Must match `kernel/src/main.rs`'s own `NET_HEAP_START`/`NET_HEAP_SIZE` —
 /// same "the loader sets this up, this binary has no privilege to map its
@@ -194,13 +197,19 @@ const DNS_SERVER_IP: Ipv4Address = Ipv4Address::new(8, 8, 8, 8);
 /// not a resolver exercised against anything unusual.
 const DNS_QUERY_NAME: &str = "example.com";
 
-/// Sockets IPC surface's fixed ports (see `run_socket_ipc_server`'s doc
-/// comment) — same "one fixed port per purpose, decided at spawn time, not
-/// negotiated in-band" convention `blk-driver-host/src/main.rs`'s
-/// `FS_REQUEST_PORT`/`FS_RESPONSE_PORT` already established. Must match
-/// `kernel/tests/net_driver_sockets.rs`'s own constants exactly.
-const SOCK_REQUEST_PORT: usize = 11;
-const SOCK_RESPONSE_PORT: usize = 12;
+/// Sockets IPC surface's fixed server port (see `run_socket_ipc_server`'s
+/// doc comment) — used only to accept newly opened sessions
+/// (`SYS_IPC_SESSION_ACCEPT`); every request/response after that rides the
+/// accepted session id, not this port. Must match
+/// `kernel/tests/net_driver_sockets.rs`'s own constant exactly. Replaces the
+/// old fixed `SOCK_REQUEST_PORT`/`SOCK_RESPONSE_PORT` pair (11/12) the
+/// syscall-cost benchmark in `kernel/tests/syscall_cost.rs` measured at
+/// ~228x the per-syscall cost of the session primitive — see
+/// `kernel::marshal_client`'s module doc comment for the full numbers and
+/// why that matters for a real TLS-scale exchange. Port 12 is retired
+/// entirely: a session is bidirectional over one id, so there is no
+/// separate response port left to need.
+const SOCKETS_SERVER_PORT: usize = 11;
 
 /// Number of concurrently open TCP socket handles the sockets IPC server
 /// supports — must match `runix_ipc::sockets::MAX_SOCKETS` exactly (the
@@ -247,7 +256,18 @@ pub extern "C" fn _start() -> ! {
     net.mark_ready();
     device.notify_rx();
 
-    let config = Config::new(EthernetAddress(mac).into());
+    let mut config = Config::new(EthernetAddress(mac).into());
+    // Seed smoltcp's TCP initial-sequence-number and ephemeral-port
+    // randomization from the kernel's RDRAND-backed `SYS_RANDOM` (see
+    // `syscall::random_u64`) instead of leaving it at smoltcp's default
+    // (unseeded, so both were deterministic across boots -- a pre-existing
+    // weakness `docs/RFC-TLS-APPROACH.md` flagged as a side effect of the
+    // same entropy gap that blocked TLS). Fails closed to the deterministic
+    // default only if the kernel denies the capability or RDRAND itself is
+    // unavailable -- there's no weaker fallback worth preferring over that.
+    if let Some(seed) = crate::syscall::random_u64() {
+        config.random_seed = seed;
+    }
     let mut iface = Interface::new(config, &mut device, Instant::from_millis(0));
 
     // Bring up this interface's address either via a real DHCP handshake
@@ -684,19 +704,40 @@ fn run_dns_lookup(iface: &mut Interface, device: &mut RunixNetDevice, start_iter
 
 /// Sockets IPC surface: the "sockets API/IPC surface for other ring 3
 /// processes to use this stack" gap `docs/STATUS.md`'s network-stack
-/// section calls out as deferred. Serves [`SOCK_REQUEST_PORT`] requests
-/// against up to [`MAX_SOCKETS`] concurrently open `smoltcp` TCP sockets,
-/// addressed by the handle [`SocketRequest::Open`] hands back — see that
-/// module's doc comment for why a handle must be allocated before
-/// [`SocketRequest::Connect`] can target it, and for the capability-scoping
-/// caveat inherent to sharing one fixed request/response port pair across
-/// callers (this server itself can't distinguish *which* caller opened a
-/// given handle; the capability gate is on the port, same as every other
-/// IPC surface in this codebase, not on the handle number). Requests/
-/// responses are the typed wire format `runix_ipc::sockets` defines, not a
+/// section calls out as deferred. Accepts sessions opened against
+/// [`SOCKETS_SERVER_PORT`] (`SYS_IPC_SESSION_OPEN`/`_ACCEPT`) and serves
+/// requests against up to [`MAX_SOCKETS`] concurrently open `smoltcp` TCP
+/// sockets, addressed by the handle [`SocketRequest::Open`] hands back —
+/// see that module's doc comment for why a handle must be allocated before
+/// [`SocketRequest::Connect`] can target it.
+///
+/// One accepted session maps 1:1 to one socket slot, sharing the same
+/// index (`live_sessions[i]`/`slots[i]`) — a deliberate simplification for
+/// this first migration off the old fixed-port transport, not an inherent
+/// property of the session primitive itself: a client's whole
+/// open/connect/send/recv/close sequence for one socket is exactly one
+/// session's natural lifetime (`kernel::marshal_client::evaluate`'s own
+/// "one session per call" doc comment makes the same call), so there's no
+/// present need for a socket handle to outlive the session that opened it,
+/// or vice versa. Every request naming a handle is forced to name its own
+/// session's index (see `pin_to_own_session`) rather than trusted as
+/// written — this is the real capability-scoping improvement sessions
+/// bring over the old shared-port transport, where this server had no way
+/// to tell *which* caller opened a given handle at all (see this file's
+/// pre-session-migration git history for that caveat). Requests/responses
+/// are still the typed wire format `runix_ipc::sockets` defines, not a
 /// hand-rolled byte layout of this driver's own — see that module's doc
 /// comment for the wire shape and why it's encoded the way it is (one byte
 /// per IPC syscall, no blocking receive).
+///
+/// A session's slot is only ever freed on an explicit
+/// [`SocketRequest::Close`] — there is no syscall this server can poll to
+/// learn "the owning thread exited/abandoned this session without
+/// closing," so an abandoned-mid-open session permanently pins its slot
+/// for the lifetime of this process. Not a regression versus the old
+/// fixed-port transport (which had no handle-level cleanup story either);
+/// every real caller in this codebase (`kernel::marshal_client::evaluate`)
+/// already closes unconditionally on every exit path, success or failure.
 ///
 /// Mirrors `blk-driver-host/src/main.rs`'s `run_fs_ipc_server` in shape: a
 /// bounded poll loop, same discipline every wait loop in this codebase
@@ -710,10 +751,17 @@ fn run_socket_ipc_server(iface: &mut Interface, device: &mut RunixNetDevice, sta
     // `SocketHandle`) is open; `None` means `h` is free for a future
     // [`SocketRequest::Open`] to allocate.
     let mut slots: [Option<SocketHandle>; MAX_SOCKETS] = [None; MAX_SOCKETS];
+    // `live_sessions[i]` is `Some(session_id)` while slot `i` is bound to an
+    // accepted session -- see this function's own doc comment for why this
+    // shares indexing with `slots` rather than tracking independently.
+    let mut live_sessions: [Option<u64>; MAX_SOCKETS] = [None; MAX_SOCKETS];
+    // Per-session request accumulator, same role `request_buf` played for
+    // the old single shared port -- one per slot now, since up to
+    // `MAX_SOCKETS` sessions can have a request in flight concurrently.
+    let mut request_bufs: [Vec<u8>; MAX_SOCKETS] = core::array::from_fn(|_| Vec::new());
 
     write_all(b"net-driver-host: sockets IPC server ready\n");
 
-    let mut request_buf: Vec<u8> = Vec::new();
     let mut requests_served = 0u32;
     // `Connect` alone needs several polls to resolve (ARP + the TCP
     // handshake, same as `run_tcp_proof`'s own connect above) -- tracked
@@ -781,45 +829,98 @@ fn run_socket_ipc_server(iface: &mut Interface, device: &mut RunixNetDevice, sta
                 continue;
             };
             let socket = sockets.get_mut::<tcp::Socket>(sock_handle);
+            // A pending connect always has a live session behind it too --
+            // the slot was only ever bound to `ConnectPending` by the
+            // dispatch loop below, which requires `live_sessions[h]` to be
+            // `Some` to have run `handle_socket_request` at all. Fail
+            // closed (drop the answer, free the slot) rather than index a
+            // `None` on the untrusted-input-adjacent chance that isn't
+            // actually true.
+            let Some(session_id) = live_sessions[h] else {
+                pending_connect_since[h] = None;
+                continue;
+            };
             if socket.state() == tcp::State::Established {
-                send_response(&SocketResponse::Connected { handle: h as u8 });
+                send_session_response(session_id, &SocketResponse::Connected { handle: h as u8 });
                 pending_connect_since[h] = None;
                 requests_served += 1;
             } else if socket.state() == tcp::State::Closed
                 || offset.wrapping_sub(since) > CONNECT_TIMEOUT_ITERATIONS
             {
-                send_response(&SocketResponse::ConnectFailed {
-                    handle: h as u8,
-                    error: SocketError::ConnectFailed,
-                });
+                send_session_response(
+                    session_id,
+                    &SocketResponse::ConnectFailed {
+                        handle: h as u8,
+                        error: SocketError::ConnectFailed,
+                    },
+                );
                 pending_connect_since[h] = None;
                 requests_served += 1;
             }
         }
 
-        if let Some(byte) = ipc_try_recv(SOCK_REQUEST_PORT) {
-            request_buf.push(byte);
+        // Pick up at most one newly opened session per check, only if a
+        // slot is actually free (an already-accepted session is never
+        // silently dropped for lack of anywhere to put it -- there is no
+        // way to "un-accept" one) -- and only every 10,000 iterations
+        // (the same cadence this loop already yields at below), not every
+        // single one. Confirmed necessary, not just cautious:
+        // `SYS_IPC_SESSION_ACCEPT`'s capability check (`authorized_for_port`,
+        // a real Ed25519 verification) has no cheap "nothing pending"
+        // pre-check the way `SYS_IPC_RECV`'s `ipc::is_empty` does -- calling
+        // it on every one of this loop's up to 500,000,000 iterations paid
+        // that full verification cost every time, the exact "near-free spin
+        // into a real, measured multi-minute-under-TCG slowdown" `SYS_IPC_RECV`'s
+        // own doc comment already warns `SYS_IPC_RECV` itself would suffer
+        // without its pre-check -- and it starved this loop of ever
+        // reaching the request-dispatch loop below in practice (a real
+        // `net_driver_sockets.rs` run timed out with the client's own
+        // request never served). A session is a coarse-grained, once-per-
+        // `evaluate()`-call event, not a hot path -- a few-thousand-
+        // iteration acceptance latency costs nothing real callers notice.
+        if offset % 10_000 == 0 {
+            if let Some(idx) = live_sessions.iter().position(Option::is_none) {
+                if let Some(session_id) = session_accept(SOCKETS_SERVER_PORT) {
+                    live_sessions[idx] = Some(session_id);
+                }
+            }
         }
 
-        if let Some((request, consumed)) = SocketRequest::decode(&request_buf) {
-            // Only accept a request naming a handle with a `Connect`
-            // already pending on it once that connect has been answered --
-            // requests naming any *other* handle (including a fresh
-            // `Open`) proceed immediately, the concurrency this function
-            // exists to add over the old single-connection server.
-            let blocked = request_handle(&request)
-                .map(|h| pending_connect_since[h as usize].is_some())
-                .unwrap_or(false);
-            if !blocked {
-                request_buf.drain(..consumed);
-                match handle_socket_request(iface, &mut sockets, &mut slots, request) {
+        for idx in 0..MAX_SOCKETS {
+            let Some(session_id) = live_sessions[idx] else {
+                continue;
+            };
+            // Same "don't service a handle with a `Connect` already
+            // pending on it" rule the old transport had, now keyed by slot
+            // index directly since a session and its socket slot share one
+            // index -- see this function's own doc comment.
+            if pending_connect_since[idx].is_some() {
+                continue;
+            }
+
+            if let Some(byte) = session_try_recv(session_id) {
+                request_bufs[idx].push(byte);
+            }
+
+            if let Some((request, consumed)) = SocketRequest::decode(&request_bufs[idx]) {
+                request_bufs[idx].drain(..consumed);
+                let is_close = matches!(request, SocketRequest::Close { .. });
+                let request = pin_to_own_session(request, idx as u8);
+                match handle_socket_request(iface, &mut sockets, &mut slots, idx, request) {
                     RequestOutcome::Immediate(response) => {
-                        send_response(&response);
+                        send_session_response(session_id, &response);
                         requests_served += 1;
                     }
-                    RequestOutcome::ConnectPending { handle } => {
-                        pending_connect_since[handle as usize] = Some(offset);
+                    RequestOutcome::ConnectPending => {
+                        pending_connect_since[idx] = Some(offset);
                     }
+                }
+                // Free this slot for a future session only once the
+                // client has explicitly closed its socket -- see this
+                // function's own doc comment on why that's the only signal
+                // available to reclaim it.
+                if is_close {
+                    live_sessions[idx] = None;
                 }
             }
         }
@@ -837,49 +938,90 @@ fn run_socket_ipc_server(iface: &mut Interface, device: &mut RunixNetDevice, sta
 /// What [`handle_socket_request`] wants the caller to do next: either send
 /// `response` back immediately, or (only for
 /// [`SocketRequest::Connect`]) wait for the handshake to resolve on a later
-/// poll before responding at all.
+/// poll before responding at all. No `handle` payload on `ConnectPending`
+/// (unlike the pre-session-migration version of this enum) — the caller
+/// already knows which slot's connect is pending from its own loop index
+/// (`own_index`/`idx`), which is now always equal to the handle a
+/// `Connect` request named (see [`pin_to_own_session`]).
 enum RequestOutcome {
     Immediate(SocketResponse),
-    ConnectPending { handle: u8 },
+    ConnectPending,
 }
 
-/// The handle a request names, if any — [`SocketRequest::Open`] is the one
-/// variant with no handle yet (it's the request that allocates one).
-fn request_handle(request: &SocketRequest) -> Option<u8> {
-    match *request {
-        SocketRequest::Open => None,
-        SocketRequest::Connect { handle, .. }
-        | SocketRequest::Send { handle, .. }
-        | SocketRequest::Recv { handle, .. }
-        | SocketRequest::Close { handle } => Some(handle),
+/// Forces every request naming a handle to name `own_index` instead of
+/// whatever handle the client claimed — since one accepted session shares
+/// its index 1:1 with one socket slot (see [`run_socket_ipc_server`]'s own
+/// doc comment on this design choice), a session's client has no
+/// legitimate reason to ever address a handle other than its own slot, and
+/// trusting an out-of-range or mismatched claim instead would reopen
+/// exactly the cross-client handle confusion the old shared-port transport
+/// had, and sessions exist to close (see [`run_socket_ipc_server`]'s doc
+/// comment again for that history). [`SocketRequest::Open`] has no handle
+/// to rewrite — it's the request that allocates one.
+fn pin_to_own_session(request: SocketRequest, own_index: u8) -> SocketRequest {
+    match request {
+        SocketRequest::Open => SocketRequest::Open,
+        SocketRequest::Connect {
+            remote_ip,
+            remote_port,
+            local_port,
+            ..
+        } => SocketRequest::Connect {
+            handle: own_index,
+            remote_ip,
+            remote_port,
+            local_port,
+        },
+        SocketRequest::Send { data, .. } => SocketRequest::Send {
+            handle: own_index,
+            data,
+        },
+        SocketRequest::Recv { max_len, .. } => SocketRequest::Recv {
+            handle: own_index,
+            max_len,
+        },
+        SocketRequest::Close { .. } => SocketRequest::Close { handle: own_index },
     }
 }
 
-/// Applies one already-decoded [`SocketRequest`] against `slots`/`sockets`.
+/// Applies one already-decoded [`SocketRequest`] against `slots`/`sockets`,
+/// for the session bound to slot `own_index` — `request` has already been
+/// rewritten by [`pin_to_own_session`] to only ever name `own_index`, so
+/// every non-`Open` arm below still keys off the wire-format `handle` field
+/// it carries, that field is just guaranteed equal to `own_index` now.
 /// `slots[h]` maps a wire-format handle to smoltcp's own internal
 /// `SocketHandle` — see [`run_socket_ipc_server`]'s own doc comment for why
-/// a request naming a handle outside `0..MAX_SOCKETS`, or one that was
-/// never opened (or already closed), is answered with
+/// a handle that was never opened (or already closed) is answered with
 /// [`SocketError::InvalidHandle`] rather than trusted: naming a number
 /// isn't the same as being entitled to whatever it might refer to.
 fn handle_socket_request(
     iface: &mut Interface,
     sockets: &mut SocketSet,
     slots: &mut [Option<SocketHandle>; MAX_SOCKETS],
+    own_index: usize,
     request: SocketRequest,
 ) -> RequestOutcome {
     match request {
-        SocketRequest::Open => match slots.iter().position(Option::is_none) {
-            Some(idx) => {
-                let tcp_rx_buffer = tcp::SocketBuffer::new(vec![0; 256]);
-                let tcp_tx_buffer = tcp::SocketBuffer::new(vec![0; 256]);
-                let mut tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
-                tcp_socket.set_nagle_enabled(false);
-                slots[idx] = Some(sockets.add(tcp_socket));
-                RequestOutcome::Immediate(SocketResponse::Opened { handle: idx as u8 })
+        SocketRequest::Open => {
+            if slots[own_index].is_some() {
+                // Can't happen in practice (a session only ever gets
+                // `own_index` once, and `run_socket_ipc_server`'s accept
+                // logic only binds a fresh session to a slot `slots` itself
+                // shows free) — fail closed rather than clobber whatever's
+                // already open there.
+                return RequestOutcome::Immediate(SocketResponse::OpenFailed(
+                    SocketError::TooManyOpen,
+                ));
             }
-            None => RequestOutcome::Immediate(SocketResponse::OpenFailed(SocketError::TooManyOpen)),
-        },
+            let tcp_rx_buffer = tcp::SocketBuffer::new(vec![0; 256]);
+            let tcp_tx_buffer = tcp::SocketBuffer::new(vec![0; 256]);
+            let mut tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
+            tcp_socket.set_nagle_enabled(false);
+            slots[own_index] = Some(sockets.add(tcp_socket));
+            RequestOutcome::Immediate(SocketResponse::Opened {
+                handle: own_index as u8,
+            })
+        }
         SocketRequest::Connect {
             handle,
             remote_ip,
@@ -906,7 +1048,7 @@ fn handle_socket_request(
                 remote_ip[3],
             ));
             match socket.connect(iface.context(), (remote, remote_port), local_port) {
-                Ok(()) => RequestOutcome::ConnectPending { handle },
+                Ok(()) => RequestOutcome::ConnectPending,
                 Err(_) => RequestOutcome::Immediate(SocketResponse::ConnectFailed {
                     handle,
                     error: SocketError::ConnectFailed,
@@ -999,13 +1141,25 @@ fn handle_socket_request(
     }
 }
 
-/// Sends `response`'s encoded bytes one at a time on
-/// [`SOCK_RESPONSE_PORT`], same "one byte per `SYS_IPC_SEND`" convention
-/// `blk-driver-host/src/main.rs`'s own reply path already uses.
-fn send_response(response: &SocketResponse) {
-    for byte in response.encode() {
-        let _ = ipc_send(SOCK_RESPONSE_PORT, byte);
+/// Sends `response`'s encoded bytes one at a time on `session_id`, wrapped
+/// in `SESSION_SEND_LOCK`/`_UNLOCK` — a session has at most two
+/// participants, but nothing stops both from calling `SESSION_SEND` for the
+/// same logical message concurrently without this, same interleaving
+/// hazard `kernel::ipc`'s module doc comment describes for fixed ports.
+/// Best-effort past the lock itself: this server has nothing useful to do
+/// with a mid-message send failure (the session's owner already isn't
+/// receiving, so there's no one left to retry for) beyond not sending the
+/// remaining bytes.
+fn send_session_response(session_id: u64, response: &SocketResponse) {
+    if !session_send_lock(session_id) {
+        return;
     }
+    for byte in response.encode() {
+        if !session_send(session_id, byte) {
+            break;
+        }
+    }
+    let _ = session_send_unlock(session_id);
 }
 
 /// Offset into the `NetBootInfo` page reserved for this process's own

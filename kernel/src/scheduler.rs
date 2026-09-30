@@ -47,7 +47,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use runix_capability_manager::CapabilityToken;
 use spin::Mutex;
 use x86_64::registers::control::Cr3;
@@ -187,7 +187,23 @@ pub(crate) struct TrapFrame {
     ss: u64,
 }
 
+/// A stable per-thread identity — did not exist before the IPC session
+/// primitive needed one (`kernel/src/ipc.rs`'s `Session.owner`/`.server`):
+/// every existing consumer of "the current thread" (`current_capability`,
+/// `current_extra_capabilities`) identifies it only implicitly, as whichever
+/// `Thread` currently sits in `Scheduler::current` — fine for a capability
+/// check ("does *this* thread's token authorize X"), but no good for a
+/// session, which needs to remember *which* thread opened or accepted it
+/// across many separate syscalls. Monotonic, never reused — a reused id
+/// would let a new, unrelated thread inherit a stale session's ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ThreadId(u64);
+
+static NEXT_THREAD_ID: AtomicU64 = AtomicU64::new(1);
+
 struct Thread {
+    /// Stable identity for this thread — see [`ThreadId`]'s own doc comment.
+    id: ThreadId,
     /// Base of this thread's guard page (not the stack itself — the guard
     /// page sits immediately below it). Used by `reap_zombies` to recompute
     /// exactly which pages this thread's stack occupied, so they can be
@@ -314,6 +330,7 @@ impl Thread {
         }
 
         Thread {
+            id: ThreadId(NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed)),
             guard_page_base,
             stack_pointer: frame_ptr as usize,
             capability: None,
@@ -326,9 +343,13 @@ impl Thread {
     /// Placeholder standing in for a real execution context that already
     /// has a stack we don't own and shouldn't touch (the kernel's boot
     /// stack). Never populated with a real `stack_pointer` up front — that
-    /// only happens the first time this context yields away.
+    /// only happens the first time this context yields away. Still gets a
+    /// real, distinct `id` — the boot thread is a real participant that can
+    /// hold sessions like any other (several kernel tests drive IPC directly
+    /// from the boot thread today, via `grant_current_extra_capability`).
     fn placeholder() -> Self {
         Thread {
+            id: ThreadId(NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed)),
             guard_page_base: VirtAddr::new(0),
             stack_pointer: 0,
             capability: None,
@@ -362,8 +383,28 @@ impl Scheduler {
 /// Unmaps every stack page a zombie thread was using and hands its frames
 /// back to the frame allocator. Never called on the thread whose own stack
 /// is being reaped — see `zombies`' doc comment.
+///
+/// Also reaps every IPC session the zombie thread owned or served
+/// (`ipc::reap_sessions_for`) — a session outliving both its participants
+/// would otherwise be a permanent kernel-memory leak and a confused-deputy
+/// risk (a later, unrelated thread could in principle be handed the same
+/// small integer id space to reuse... it can't, `SessionId`s are never
+/// reused, but a *stale* session no one will ever finish would sit in the
+/// table forever regardless). This call is why `reap_sessions_for` may run
+/// with `SCHEDULER`'s lock already held (this function is called from
+/// inside `reschedule`, itself holding that lock) — it must never, itself
+/// or transitively, try to re-acquire `SCHEDULER`'s lock or call anything
+/// that does (e.g. `current_thread_id`): the zombie's own `id` is already
+/// in hand here, so it never needs to. This fixes the lock-ordering
+/// question at its root — `ipc.rs`'s session-table locks are taken *under*
+/// `SCHEDULER`'s, never the other way around, and every other caller of
+/// those locks (the session syscalls) only ever takes them after any
+/// `SCHEDULER`-locking call (e.g. `current_thread_id`) has already
+/// returned and released it — so the two locks are never both held by the
+/// same thread in the reverse order anywhere in this kernel.
 fn reap_zombies(sched: &mut Scheduler) {
     while let Some(zombie) = sched.zombies.pop_front() {
+        crate::ipc::reap_sessions_for(zombie.id);
         let stack_start = zombie.guard_page_base + GUARD_PAGE_SIZE as u64;
         let stack_end = stack_start + STACK_SIZE as u64 - 1u64;
         memory::with_mapper_and_frame_allocator(|mapper, frame_allocator| {
@@ -597,6 +638,20 @@ pub fn current_capability() -> Option<CapabilityToken> {
             .as_ref()
             .and_then(|sched| sched.current.as_ref())
             .and_then(|thread| thread.capability.clone())
+    })
+}
+
+/// The stable identity of whichever thread is currently running — see
+/// [`ThreadId`]'s own doc comment. `None` only before [`init`] has run (no
+/// scheduler yet) or, in principle, if `current` is ever briefly vacated —
+/// neither happens on any path that could call this today.
+pub fn current_thread_id() -> Option<ThreadId> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        SCHEDULER
+            .lock()
+            .as_ref()
+            .and_then(|sched| sched.current.as_ref())
+            .map(|thread| thread.id)
     })
 }
 

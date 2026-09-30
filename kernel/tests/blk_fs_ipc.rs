@@ -3,37 +3,47 @@
 //! `blk-driver-host` itself could ask it for a file. Spawns
 //! `blk-driver-host` in its new request-serving mode
 //! (`serve_fs_requests: 1`) against the Phase 2 FAT32 fixture, then proves
-//! both directions of capability scoping over the real IPC syscalls
-//! (`SYS_IPC_SEND`/`SYS_IPC_RECV`, `kernel/src/syscall.rs`): a thread
-//! holding no capability at all is denied when it tries to send a
-//! request (the same way `kernel/src/main.rs`'s own Phase B4 demo proves
+//! both directions of capability scoping over the real session IPC
+//! syscalls (`SYS_IPC_SESSION_OPEN`/`SYS_IPC_SESSION_SEND`/
+//! `SYS_IPC_SESSION_RECV`, `kernel/src/syscall.rs`): a thread holding no
+//! capability at all is denied when it tries to open a session (the same
+//! way `kernel/src/main.rs`'s own Phase B4 demo proves
 //! `thread_sender_unauthorized` is denied), and a thread holding a
-//! capability scoped to exactly the request port gets the exact file
-//! bytes back over the response port.
+//! capability scoped to exactly the server port gets the exact file bytes
+//! back over that same session.
 //!
 //! This is also the first real exercise of `Thread::extra_capabilities`
 //! (`kernel/src/scheduler.rs`) — `blk-driver-host` itself now holds *two*
 //! capabilities at once (its usual virtio-blk io-port range, plus a new
-//! one scoped to the response port it replies on), which is exactly the
-//! scenario that field exists for.
+//! one scoped to the filesystem server port it accepts sessions on), which
+//! is exactly the scenario that field exists for.
 //!
-//! Filesystem driver, Phase 8 extended this same boot with a second,
-//! independently capability-gated port (`FS_WRITE_REQUEST_PORT`) for
-//! write requests, and the structural gap closed here generalizes both
-//! ports' wire format from "one fixed file per port, one trigger byte"
-//! into a real, typed [`runix_ipc::fs::FsRequest`] carrying an arbitrary
-//! filename *and* a per-file [`runix_capability_manager::CapabilityToken`]
-//! on every single request — verified by `blk-driver-host` itself
-//! (`verify_file_token`), not just by the kernel's own port-level
-//! `SYS_IPC_SEND` gate. Proven three ways past what Phase 8 already
-//! covered: **two different files** (`HELLO.TXT`, `BIG.TXT`) served
-//! successfully over the *same* read port in one boot (Phase 8 could only
-//! ever serve one fixed file); a caller holding a perfectly valid
-//! port-level capability but a file-scoped token minted for a *different*
-//! file gets [`runix_ipc::fs::FsError::Unauthorized`], not the file's
-//! contents — the actual point of per-request authorization, since the
-//! coarse port-level gate alone would have let this caller through; and
-//! the same mismatched-token denial proven again for the write path.
+//! Filesystem driver, Phase 8 extended this same boot with write requests,
+//! and the structural gap closed here generalizes the wire format from
+//! "one fixed file per port, one trigger byte" into a real, typed
+//! [`runix_ipc::fs::FsRequest`] carrying an arbitrary filename *and* a
+//! per-file [`runix_capability_manager::CapabilityToken`] on every single
+//! request — verified by `blk-driver-host` itself (`verify_file_token`),
+//! not just by the kernel's own port-level `SYS_IPC_SESSION_OPEN` gate.
+//! Proven three ways past what Phase 8 already covered: **two different
+//! files** (`HELLO.TXT`, `BIG.TXT`) served successfully over the *same*
+//! session-server port in one boot (Phase 8 could only ever serve one
+//! fixed file); a caller holding a perfectly valid port-level capability
+//! but a file-scoped token minted for a *different* file gets
+//! [`runix_ipc::fs::FsError::Unauthorized`], not the file's contents — the
+//! actual point of per-request authorization, since the coarse port-level
+//! gate alone would have let this caller through; and the same
+//! mismatched-token denial proven again for the write path.
+//!
+//! **Transport**: migrated off the old fixed-port-plus-embedded-
+//! response-token transport onto the `SYS_IPC_SESSION_*` primitive
+//! (`kernel/tests/ipc_session.rs` proves the primitive itself) — each
+//! logical client below opens its own session against
+//! [`FS_SERVER_PORT`], sends one `FsRequest`, and reads back one
+//! `FsResponse` on that same session, rather than sharing one fixed
+//! request port and naming a response port inside the request. See
+//! `runix_ipc::fs`'s own doc comment for why `FsRequest` no longer carries
+//! `response_port`/`response_token` fields at all.
 //!
 //! **Requires the same real FAT32 fixture image** `blk_fat32_read.rs`
 //! does, via `RUNIX_BLK_IMG` — `blk-driver-host` locates the same
@@ -56,6 +66,7 @@ use alloc::vec::Vec;
 use bootloader_api::config::{BootloaderConfig, Mapping};
 use bootloader_api::{entry_point, BootInfo};
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, Ordering};
 use runix_capability_manager::CapabilityToken;
 use runix_ipc::fs::{FsError, FsRequest, FsResponse};
 use runix_kernel::elf::Elf64;
@@ -63,6 +74,10 @@ use runix_kernel::process::AddressSpace;
 use runix_kernel::qemu_exit::{exit_qemu, QemuExitCode};
 use runix_kernel::scheduler;
 use runix_kernel::serial_println;
+use runix_kernel::syscall::{
+    self, SYS_IPC_SESSION_OPEN, SYS_IPC_SESSION_RECV, SYS_IPC_SESSION_SEND,
+    SYS_IPC_SESSION_SEND_LOCK, SYS_IPC_SESSION_SEND_UNLOCK,
+};
 use runix_kernel::userspace;
 use x86_64::structures::paging::{FrameAllocator, Page, PageTableFlags, PhysFrame};
 use x86_64::VirtAddr;
@@ -98,11 +113,8 @@ const BLK_QUEUE_VA: u64 = 0x_0999_4444_0000;
 const BLK_REQBUF_VA: u64 = 0x_0999_5555_0000;
 const BLK_QUEUE_ALIGN: u64 = 4096;
 
-// Must match `blk-driver-host/src/main.rs`'s own `FS_REQUEST_PORT`/
-// `FS_RESPONSE_PORT`/`FS_WRITE_REQUEST_PORT`.
-const FS_REQUEST_PORT: usize = 8;
-const FS_RESPONSE_PORT: usize = 9;
-const FS_WRITE_REQUEST_PORT: usize = 10;
+// Must match `blk-driver-host/src/main.rs`'s own `FS_SERVER_PORT`.
+const FS_SERVER_PORT: usize = 8;
 
 const IPC_WRITE_LEN: usize = 512;
 fn ipc_write_pattern_byte(i: usize) -> u8 {
@@ -247,34 +259,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "demo-key",
         &signing_key,
     );
-    // The second capability `blk-driver-host` needs to reply at all —
-    // `Thread::extra_capabilities`'s whole reason for existing (see
-    // `kernel/src/scheduler.rs`'s doc comment).
-    let response_token = CapabilityToken::issue(
+    // The second capability `blk-driver-host` needs to accept client
+    // sessions at all — `Thread::extra_capabilities`'s whole reason for
+    // existing (see `kernel/src/scheduler.rs`'s doc comment). One grant
+    // now covers both read and write requests (the `FsRequest` enum tag
+    // distinguishes them once a session is open) — the old fixed-port
+    // transport needed a separate recv token per port.
+    let fs_server_token = CapabilityToken::issue(
         "blk-driver-host",
-        runix_kernel::capabilities::port_resource(FS_RESPONSE_PORT),
-        now,
-        now + 1_000_000,
-        "demo-key",
-        &signing_key,
-    );
-    // `SYS_IPC_RECV` is now capability-gated identically to `SYS_IPC_SEND`
-    // (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) -- `blk-driver-host` itself
-    // now needs its own tokens to *receive* on the two request ports it
-    // polls (`run_fs_ipc_server`'s `ipc_try_recv(FS_REQUEST_PORT)`/
-    // `ipc_try_recv(FS_WRITE_REQUEST_PORT)`), not only the response-port
-    // send token it already held.
-    let fs_request_recv_token = CapabilityToken::issue(
-        "blk-driver-host",
-        runix_kernel::capabilities::port_resource(FS_REQUEST_PORT),
-        now,
-        now + 1_000_000,
-        "demo-key",
-        &signing_key,
-    );
-    let fs_write_request_recv_token = CapabilityToken::issue(
-        "blk-driver-host",
-        runix_kernel::capabilities::port_resource(FS_WRITE_REQUEST_PORT),
+        runix_kernel::capabilities::port_resource(FS_SERVER_PORT),
         now,
         now + 1_000_000,
         "demo-key",
@@ -289,22 +282,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         kernel_trampoline,
         space,
         Some(blk_token),
-        alloc::vec![
-            response_token.clone(),
-            fs_request_recv_token,
-            fs_write_request_recv_token
-        ],
+        alloc::vec![fs_server_token],
     );
-
-    // This test's own boot thread now also needs a capability to receive
-    // on `FS_RESPONSE_PORT` -- `SYS_IPC_RECV`'s new gate
-    // (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) applies to it exactly like
-    // any other caller. Reusing `response_token`'s own resource
-    // (`port:FS_RESPONSE_PORT`) rather than minting a fresh one --
-    // `CapabilityToken` verification only checks resource/signature/expiry,
-    // never subject, so the same token that authorizes `blk-driver-host` to
-    // *send* on this port also authorizes this thread to *receive* on it.
-    runix_kernel::scheduler::grant_current_extra_capability(response_token.clone());
 
     // Give it time to probe the device, locate HELLO.TXT, and reach its
     // receive loop before either requester attempts anything.
@@ -312,76 +291,44 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         scheduler::yield_now();
     }
 
-    // Negative case first: this test's own boot thread holds no capability
-    // at all (same "denied" expectation `thread_sender_unauthorized` in
-    // `kernel/src/main.rs`'s own Phase B4 demo already proves for a plain
-    // `spawn`-ed thread) — the request must never reach the channel.
-    let denied = unsafe {
-        runix_kernel::syscall::syscall(
-            runix_kernel::syscall::SYS_IPC_SEND,
-            FS_REQUEST_PORT as u64,
-            1,
-            0,
-        )
-    };
+    // Negative case first: a thread holding no capability at all is denied
+    // `SYS_IPC_SESSION_OPEN` against `FS_SERVER_PORT` (same "denied"
+    // expectation `thread_sender_unauthorized` in `kernel/src/main.rs`'s
+    // own Phase B4 demo already proves for a plain `spawn`-ed thread, now
+    // for session-open instead of a fixed-port send) — no session is ever
+    // created, so there is nothing further to poll for (unlike the old
+    // shared-response-port transport, there's no separate "confirm nothing
+    // leaked" check needed: a session that was never opened has no
+    // channel a response could possibly arrive on). Since reads and
+    // writes now share this one server port (see `FS_SERVER_PORT`'s own
+    // doc comment), this single check covers what used to be two separate
+    // denied-send checks, one per port.
+    let denied =
+        unsafe { syscall::syscall(SYS_IPC_SESSION_OPEN, FS_SERVER_PORT as u64, 0, 0) };
     if denied != u64::MAX {
         serial_println!(
-            "blk_fs_ipc: FAIL — an unauthorized send to the request port was not denied \
-             (returned {}, expected u64::MAX)",
+            "blk_fs_ipc: FAIL — an unauthorized session open was not denied \
+             (returned {:#x}, expected u64::MAX)",
             denied
         );
         exit_qemu(QemuExitCode::Failed);
     }
-
-    for _ in 0..20 {
-        scheduler::yield_now();
-    }
-
-    // Confirm the denied send really never reached blk-driver-host: no
-    // response should exist yet.
-    let premature = unsafe {
-        runix_kernel::syscall::syscall(
-            runix_kernel::syscall::SYS_IPC_RECV,
-            FS_RESPONSE_PORT as u64,
-            0,
-            0,
-        )
-    };
-    if premature != u64::MAX {
-        serial_println!(
-            "blk_fs_ipc: FAIL — a response arrived on the response port before any authorized \
-             request was ever sent"
-        );
-        exit_qemu(QemuExitCode::Failed);
-    }
-    serial_println!(
-        "blk_fs_ipc: unauthorized send correctly denied, no response leaked (capability gate OK)"
-    );
+    serial_println!("blk_fs_ipc: unauthorized session open correctly denied (capability gate OK)");
 
     // Structural gap closed: dynamic filenames + per-request authorization.
-    // A port-level capability (`port_resource(FS_REQUEST_PORT)`) is now
-    // only a coarse "may talk to the filesystem service at all" grant --
-    // which *file* that talking is allowed to touch is authorized
-    // separately, per request, by a `CapabilityToken` scoped to
-    // `file:<name>` that `blk-driver-host` itself verifies
+    // A port-level capability (`port_resource(FS_SERVER_PORT)`) is now
+    // only a coarse "may open a session against the filesystem service at
+    // all" grant -- which *file* that session's requests are allowed to
+    // touch is authorized separately, per request, by a `CapabilityToken`
+    // scoped to `file:<name>` that `blk-driver-host` itself verifies
     // (`verify_file_token`). Every case below issues its own fresh
     // port-level token (a real system would let many callers share one,
     // but a fresh one per case keeps each proof independent) plus
     // whatever file-scoped token that case actually needs.
-    let request_port_token = |subject: &str| {
+    let server_port_token = |subject: &str| {
         CapabilityToken::issue(
             subject,
-            runix_kernel::capabilities::port_resource(FS_REQUEST_PORT),
-            now,
-            now + 1_000_000,
-            "demo-key",
-            &signing_key,
-        )
-    };
-    let write_port_token = |subject: &str| {
-        CapabilityToken::issue(
-            subject,
-            runix_kernel::capabilities::port_resource(FS_WRITE_REQUEST_PORT),
+            runix_kernel::capabilities::port_resource(FS_SERVER_PORT),
             now,
             now + 1_000_000,
             "demo-key",
@@ -400,21 +347,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     };
 
     // Case 1 (item 1 -- dynamic filenames): read `HELLO.TXT` by name over
-    // the same request port Phase 3/8 already proved, now carrying a real
-    // `FsRequest::Read` instead of a fixed trigger byte.
+    // the same server port Phase 3/8 already proved, now over a real
+    // session carrying a real `FsRequest::Read` instead of a fixed trigger
+    // byte on a fixed port.
     let hello_token = file_token("test-hello", "HELLO.TXT");
     let hello_request = FsRequest::Read {
         name: String::from("HELLO.TXT"),
         token: hello_token,
-        response_port: FS_RESPONSE_PORT as u16,
-        response_token: response_token.clone(),
     };
-    send_fs_request(
-        FS_REQUEST_PORT,
-        request_port_token("test-hello"),
-        hello_request.encode(),
-    );
-    let hello_response = recv_fs_response(40000);
+    let hello_response =
+        send_fs_request_and_recv(server_port_token("test-hello"), hello_request.encode());
     let hello_pass = matches!(&hello_response, Some(FsResponse::Data(bytes)) if bytes.as_slice() == EXPECTED_FILE_CONTENTS);
     if hello_pass {
         serial_println!(
@@ -437,15 +379,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let big_request = FsRequest::Read {
         name: String::from("BIG.TXT"),
         token: big_token,
-        response_port: FS_RESPONSE_PORT as u16,
-        response_token: response_token.clone(),
     };
-    send_fs_request(
-        FS_REQUEST_PORT,
-        request_port_token("test-big"),
-        big_request.encode(),
-    );
-    let big_response = recv_fs_response(40000);
+    let big_response =
+        send_fs_request_and_recv(server_port_token("test-big"), big_request.encode());
     let big_pass = match &big_response {
         Some(FsResponse::Data(bytes)) => {
             bytes.len() == BIG_FILE_LEN
@@ -477,15 +413,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mismatched_request = FsRequest::Read {
         name: String::from("BIG.TXT"),
         token: mismatched_token,
-        response_port: FS_RESPONSE_PORT as u16,
-        response_token: response_token.clone(),
     };
-    send_fs_request(
-        FS_REQUEST_PORT,
-        request_port_token("test-mismatch"),
+    let mismatched_response = send_fs_request_and_recv(
+        server_port_token("test-mismatch"),
         mismatched_request.encode(),
     );
-    let mismatched_response = recv_fs_response(40000);
     let mismatched_pass = matches!(
         mismatched_response,
         Some(FsResponse::Error(FsError::Unauthorized))
@@ -505,27 +437,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         exit_qemu(QemuExitCode::Failed);
     }
 
-    // Filesystem driver, Phase 8, negative case, generalized: same shape
-    // as the unauthorized-read check above, now for the write port --
-    // this thread holds no capability for `FS_WRITE_REQUEST_PORT` at all,
-    // so even a well-formed write request must never reach the channel.
-    let write_denied = unsafe {
-        runix_kernel::syscall::syscall(
-            runix_kernel::syscall::SYS_IPC_SEND,
-            FS_WRITE_REQUEST_PORT as u64,
-            1,
-            0,
-        )
-    };
-    if write_denied != u64::MAX {
-        serial_println!(
-            "blk_fs_ipc: FAIL — an unauthorized send to the write port was not denied \
-             (returned {}, expected u64::MAX)",
-            write_denied
-        );
-        exit_qemu(QemuExitCode::Failed);
-    }
-    serial_println!("blk_fs_ipc: unauthorized write correctly denied (capability gate OK)");
+    // Filesystem driver, Phase 8, negative case, generalized: the earlier
+    // unauthorized-session-open check already covers the write path too
+    // now that reads and writes share one server port (`FS_SERVER_PORT`'s
+    // own doc comment) -- no separate write-port denial to re-prove here.
 
     // Case 4 (item 2, write path): a valid port-level capability, but a
     // file-scoped token minted for the wrong file (`HELLO.TXT` instead of
@@ -539,15 +454,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         name: String::from("WRITE.TXT"),
         token: mismatched_write_token,
         data: mismatched_payload,
-        response_port: FS_RESPONSE_PORT as u16,
-        response_token: response_token.clone(),
     };
-    send_fs_request(
-        FS_WRITE_REQUEST_PORT,
-        write_port_token("test-write-mismatch"),
+    let mismatched_write_response = send_fs_request_and_recv(
+        server_port_token("test-write-mismatch"),
         mismatched_write_request.encode(),
     );
-    let mismatched_write_response = recv_fs_response(40000);
     let mismatched_write_pass = matches!(
         mismatched_write_response,
         Some(FsResponse::Error(FsError::Unauthorized))
@@ -581,15 +492,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         name: String::from("WRITE.TXT"),
         token: write_token,
         data: write_payload,
-        response_port: FS_RESPONSE_PORT as u16,
-        response_token: response_token.clone(),
     };
-    send_fs_request(
-        FS_WRITE_REQUEST_PORT,
-        write_port_token("test-writer"),
-        write_request.encode(),
-    );
-    let write_response = recv_fs_response(40000);
+    let write_response =
+        send_fs_request_and_recv(server_port_token("test-writer"), write_request.encode());
     let write_pass = matches!(write_response, Some(FsResponse::Ok));
 
     if write_pass {
@@ -609,111 +514,103 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 }
 
-/// Encodes and sends `bytes` (an already-encoded [`FsRequest`]) one byte
-/// per `SYS_IPC_SEND` syscall on `port`, from a freshly spawned thread
-/// holding `port_token` -- the same per-syscall capability check every
-/// other sender in this codebase goes through, now carrying a real
-/// multi-byte structured message instead of a single trigger byte. Reuses
-/// one pair of statics across sequential calls (never two calls in
-/// flight at once in this test -- every call here is followed by a full
-/// [`recv_fs_response`] wait before the next one starts). Every real
-/// sender, including this one, wraps its byte loop in
-/// `SYS_IPC_SEND_LOCK`/`SYS_IPC_SEND_UNLOCK` (`kernel::ipc`'s own doc
-/// comment) -- this test's own sends are already sequential, so the lock
-/// is a no-op contention-wise here, but `blk_fs_concurrent.rs` is the one
-/// that actually needs it, and there is exactly one correct calling
-/// convention, not two.
-fn send_fs_request(port: usize, port_token: CapabilityToken, bytes: Vec<u8>) {
+/// One full request/response round trip over a fresh session: opens a
+/// session against [`FS_SERVER_PORT`] (retry-looping on `u64::MAX`, same
+/// convention `kernel/tests/ipc_session.rs`'s own `open_session_blocking`
+/// uses), sends `bytes` (an already-encoded [`FsRequest`]) locked as one
+/// message, then accumulates bytes back off that same session until
+/// [`FsResponse::decode`] reports a complete message or a generous bound
+/// of polls passes with nothing decodable. All of this runs on one freshly
+/// spawned thread holding `port_token` -- necessarily so, since a
+/// session's `SEND`/`RECV` is only ever available to its own owner or
+/// accepted server (`kernel/src/ipc.rs`'s `is_participant`), identified by
+/// `ThreadId`, not by which thread merely knows the session id. Reuses one
+/// pair of statics across sequential calls (never two calls in flight at
+/// once in this test -- every call here waits for its own full response
+/// before the next one starts; `blk_fs_concurrent.rs`/
+/// `blk_fs_concurrent_write.rs` are the ones that actually need two
+/// requests in flight, and use their own per-thread slots for that
+/// reason).
+fn send_fs_request_and_recv(port_token: CapabilityToken, bytes: Vec<u8>) -> Option<FsResponse> {
     #[allow(static_mut_refs)]
     unsafe {
-        PENDING_SEND_PORT = port;
-        PENDING_SEND_BYTES = bytes;
+        PENDING_REQUEST_BYTES = bytes;
     }
-    scheduler::spawn_with_capability(send_request_thread, Some(port_token));
+    RESPONSE_READY.store(false, Ordering::SeqCst);
+    scheduler::spawn_with_capability(session_request_thread, Some(port_token));
+    for _ in 0..200_000u32 {
+        scheduler::yield_now();
+        if RESPONSE_READY.load(Ordering::SeqCst) {
+            break;
+        }
+    }
+    #[allow(static_mut_refs)]
+    unsafe {
+        RESPONSE_BUF.take()
+    }
 }
 
-static mut PENDING_SEND_PORT: usize = 0;
-static mut PENDING_SEND_BYTES: Vec<u8> = Vec::new();
+static mut PENDING_REQUEST_BYTES: Vec<u8> = Vec::new();
+static RESPONSE_READY: AtomicBool = AtomicBool::new(false);
+static mut RESPONSE_BUF: Option<FsResponse> = None;
 
-extern "C" fn send_request_thread() -> ! {
-    // Copies both statics into locals *before* doing anything else, so
-    // `send_fs_request` is free to overwrite them for its next call the
-    // moment this thread has started running -- this thread never touches
-    // either static again afterward.
+extern "C" fn session_request_thread() -> ! {
+    // Copies the pending-request static into a local *before* doing
+    // anything else, so the next `send_fs_request_and_recv` call is free
+    // to overwrite it the moment this thread has started running -- this
+    // thread never touches that static again afterward.
     #[allow(static_mut_refs)]
-    let (port, bytes) = unsafe { (PENDING_SEND_PORT, core::mem::take(&mut PENDING_SEND_BYTES)) };
+    let bytes = unsafe { core::mem::take(&mut PENDING_REQUEST_BYTES) };
+
+    let session_id = loop {
+        let ret = unsafe { syscall::syscall(SYS_IPC_SESSION_OPEN, FS_SERVER_PORT as u64, 0, 0) };
+        if ret != u64::MAX {
+            break ret;
+        }
+        scheduler::yield_now();
+    };
     serial_println!(
-        "blk_fs_ipc: send_request_thread starting, port={} len={}",
-        port,
+        "blk_fs_ipc: session_request_thread opened session {} len={}",
+        session_id,
         bytes.len()
     );
-    let lock_denied = unsafe {
-        runix_kernel::syscall::syscall(runix_kernel::syscall::SYS_IPC_SEND_LOCK, port as u64, 0, 0)
-    } == u64::MAX;
-    let mut sent = 0usize;
-    let mut denied = if lock_denied { bytes.len() } else { 0 };
-    if !lock_denied {
-        for byte in bytes {
-            let ret = unsafe {
-                runix_kernel::syscall::syscall(
-                    runix_kernel::syscall::SYS_IPC_SEND,
-                    port as u64,
-                    byte as u64,
-                    0,
-                )
-            };
-            if ret == u64::MAX {
-                denied += 1;
-            } else {
-                sent += 1;
-            }
-        }
-        unsafe {
-            runix_kernel::syscall::syscall(
-                runix_kernel::syscall::SYS_IPC_SEND_UNLOCK,
-                port as u64,
-                0,
-                0,
-            );
-        }
-    }
-    serial_println!(
-        "blk_fs_ipc: send_request_thread done, port={} sent={} denied={}",
-        port,
-        sent,
-        denied
-    );
-    loop {
-        scheduler::yield_now();
-    }
-}
 
-/// Accumulates bytes off [`FS_RESPONSE_PORT`] until [`FsResponse::decode`]
-/// reports a complete message, or `max_iters` polls pass with nothing
-/// decodable -- same bounded-wait discipline every other poll loop in this
-/// codebase uses, generalized from a fixed-shape reply
-/// (`kernel/tests/blk_fs_ipc.rs`'s previous length-header-then-bytes
-/// parsing) to a real typed decode.
-fn recv_fs_response(max_iters: u32) -> Option<FsResponse> {
+    unsafe {
+        syscall::syscall(SYS_IPC_SESSION_SEND_LOCK, session_id, 0, 0);
+    }
+    for byte in bytes {
+        loop {
+            let ret =
+                unsafe { syscall::syscall(SYS_IPC_SESSION_SEND, session_id, byte as u64, 0) };
+            if ret != u64::MAX {
+                break;
+            }
+            scheduler::yield_now();
+        }
+    }
+    unsafe {
+        syscall::syscall(SYS_IPC_SESSION_SEND_UNLOCK, session_id, 0, 0);
+    }
+
     let mut buf: Vec<u8> = Vec::new();
-    for _ in 0..max_iters {
+    for _ in 0..200_000u32 {
         scheduler::yield_now();
-        let ret = unsafe {
-            runix_kernel::syscall::syscall(
-                runix_kernel::syscall::SYS_IPC_RECV,
-                FS_RESPONSE_PORT as u64,
-                0,
-                0,
-            )
-        };
+        let ret = unsafe { syscall::syscall(SYS_IPC_SESSION_RECV, session_id, 0, 0) };
         if ret != u64::MAX {
             buf.push(ret as u8);
             if let Some((response, _consumed)) = FsResponse::decode(&buf) {
-                return Some(response);
+                #[allow(static_mut_refs)]
+                unsafe {
+                    RESPONSE_BUF = Some(response);
+                }
+                RESPONSE_READY.store(true, Ordering::SeqCst);
+                break;
             }
         }
     }
-    None
+    loop {
+        scheduler::yield_now();
+    }
 }
 
 /// Same as `kernel/src/main.rs`'s function of the same name.

@@ -12,25 +12,33 @@
 //! to interleave their bytes into a single franken-message neither sender
 //! intended and the receiver had no way to detect after the fact.
 //!
-//! `kernel::ipc::begin_send`/`end_send` (backed by the new
-//! `SYS_IPC_SEND_LOCK`/`SYS_IPC_SEND_UNLOCK` syscalls, capability-gated
-//! identically to `SYS_IPC_SEND` itself) close this: a sender holds a
-//! port's advisory lock for its entire message, so a second, concurrent
-//! sender's `begin_send` on that same port blocks until the first calls
-//! `end_send` — the two byte streams can only ever land back-to-back, never
-//! interleaved.
+//! **Transport migration note**: `blk-driver-host`'s filesystem IPC
+//! surface has since moved off that shared fixed port onto the
+//! `SYS_IPC_SESSION_*` primitive (`kernel/tests/ipc_session.rs` proves the
+//! primitive itself; `runix_ipc::fs`'s own doc comment covers why) — each
+//! client now gets its own private session/channel, so two different
+//! clients' bytes can no longer land in the same buffer *at all*, closing
+//! this hazard structurally rather than by an advisory lock shared clients
+//! have to cooperate on. This test still exercises
+//! `SYS_IPC_SESSION_SEND_LOCK`/`SYS_IPC_SESSION_SEND_UNLOCK` around each
+//! client's own multi-byte send, for the same reason
+//! `blk-driver-host/src/main.rs`'s `send_fs_response` doc comment gives:
+//! guarding one sender against its own preemption mid-message, not against
+//! a second sender it no longer shares a channel with — `kernel::ipc`'s
+//! module doc comment still names that as the mechanism's reason for
+//! existing.
 //!
 //! This test spawns **two** client threads back-to-back (no yield between
 //! the two spawns, so both are genuinely ready to run before either gets a
 //! turn — the actual "concurrent" scenario `run_fs_ipc_server`'s doc
-//! comment described), each sending a `Read` request for a *different*
-//! file over the *same* `FS_REQUEST_PORT`, and confirms both get back
-//! their own, correct, uncorrupted file contents — not each other's, not a
-//! decode failure, not a hang. Reuses the same fixture files
-//! `blk_fs_ipc.rs` already proves individually (`HELLO.TXT`/`BIG.TXT`), so
-//! a regression here is unambiguous: if this test fails while
-//! `blk_fs_ipc.rs` still passes, the bug is specifically in concurrent
-//! handling, not in the read path itself.
+//! comment described), each opening its own session against
+//! [`FS_SERVER_PORT`] and sending a `Read` request for a *different* file,
+//! and confirms both get back their own, correct, uncorrupted file
+//! contents — not each other's, not a decode failure, not a hang. Reuses
+//! the same fixture files `blk_fs_ipc.rs` already proves individually
+//! (`HELLO.TXT`/`BIG.TXT`), so a regression here is unambiguous: if this
+//! test fails while `blk_fs_ipc.rs` still passes, the bug is specifically
+//! in concurrent handling, not in the read path itself.
 //!
 //! **Requires the same real FAT32 fixture image** `blk_fat32_read.rs`/
 //! `blk_fs_ipc.rs` do, via `RUNIX_BLK_IMG`.
@@ -59,6 +67,10 @@ use runix_kernel::process::AddressSpace;
 use runix_kernel::qemu_exit::{exit_qemu, QemuExitCode};
 use runix_kernel::scheduler;
 use runix_kernel::serial_println;
+use runix_kernel::syscall::{
+    self, SYS_IPC_SESSION_OPEN, SYS_IPC_SESSION_RECV, SYS_IPC_SESSION_SEND,
+    SYS_IPC_SESSION_SEND_LOCK, SYS_IPC_SESSION_SEND_UNLOCK,
+};
 use runix_kernel::userspace;
 use x86_64::structures::paging::{FrameAllocator, Page, PageTableFlags, PhysFrame};
 use x86_64::VirtAddr;
@@ -85,10 +97,8 @@ const BLK_QUEUE_VA: u64 = 0x_0999_4444_0000;
 const BLK_REQBUF_VA: u64 = 0x_0999_5555_0000;
 const BLK_QUEUE_ALIGN: u64 = 4096;
 
-// Must match `blk-driver-host/src/main.rs`'s own `FS_REQUEST_PORT`/
-// `FS_RESPONSE_PORT`.
-const FS_REQUEST_PORT: usize = 8;
-const FS_RESPONSE_PORT: usize = 9;
+// Must match `blk-driver-host/src/main.rs`'s own `FS_SERVER_PORT`.
+const FS_SERVER_PORT: usize = 8;
 
 // Same fixture files `blk_fs_ipc.rs` already proves individually.
 const EXPECTED_HELLO_CONTENTS: &[u8] =
@@ -227,21 +237,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "demo-key",
         &signing_key,
     );
-    let response_token = CapabilityToken::issue(
+    // `SYS_IPC_SESSION_ACCEPT` is gated identically to
+    // `SYS_IPC_SESSION_OPEN` (same `port:<n>` resource) -- `blk-driver-host`
+    // itself needs this token to accept client sessions on the one server
+    // port it polls.
+    let fs_server_token = CapabilityToken::issue(
         "blk-driver-host",
-        runix_kernel::capabilities::port_resource(FS_RESPONSE_PORT),
-        now,
-        now + 1_000_000,
-        "demo-key",
-        &signing_key,
-    );
-    // `SYS_IPC_RECV` is now capability-gated identically to `SYS_IPC_SEND`
-    // (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) -- `blk-driver-host` itself
-    // now needs its own token to *receive* on the request port it polls,
-    // not only the response-port send token it already held.
-    let fs_request_recv_token = CapabilityToken::issue(
-        "blk-driver-host",
-        runix_kernel::capabilities::port_resource(FS_REQUEST_PORT),
+        runix_kernel::capabilities::port_resource(FS_SERVER_PORT),
         now,
         now + 1_000_000,
         "demo-key",
@@ -256,15 +258,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         kernel_trampoline,
         space,
         Some(blk_token),
-        alloc::vec![response_token.clone(), fs_request_recv_token],
+        alloc::vec![fs_server_token],
     );
-
-    // This test's own boot thread now also needs a capability to receive
-    // on `FS_RESPONSE_PORT` -- see `blk_fs_ipc.rs`'s identical fix for why
-    // reusing `response_token` (rather than minting a fresh one) is
-    // correct: verification never checks subject, only resource/signature/
-    // expiry.
-    runix_kernel::scheduler::grant_current_extra_capability(response_token.clone());
 
     // Give it time to probe the device and reach its receive loop before
     // either requester attempts anything.
@@ -272,10 +267,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         scheduler::yield_now();
     }
 
-    let request_port_token = |subject: &str| {
+    let server_port_token = |subject: &str| {
         CapabilityToken::issue(
             subject,
-            runix_kernel::capabilities::port_resource(FS_REQUEST_PORT),
+            runix_kernel::capabilities::port_resource(FS_SERVER_PORT),
             now,
             now + 1_000_000,
             "demo-key",
@@ -296,42 +291,52 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let hello_request = FsRequest::Read {
         name: String::from("HELLO.TXT"),
         token: file_token("test-hello", "HELLO.TXT"),
-        response_port: FS_RESPONSE_PORT as u16,
-        response_token: response_token.clone(),
     };
     let big_request = FsRequest::Read {
         name: String::from("BIG.TXT"),
         token: file_token("test-big", "BIG.TXT"),
-        response_port: FS_RESPONSE_PORT as u16,
-        response_token: response_token.clone(),
     };
 
-    // The actual point: both sends are queued *before either thread has run
-    // at all* -- no yield between the two spawns -- so whichever runs first
-    // genuinely races the other for `FS_REQUEST_PORT`'s send lock, instead
-    // of completing a full request/response round trip before the second
-    // request is even sent (that sequential shape is what `blk_fs_ipc.rs`
-    // already covers).
+    // The actual point: both clients are queued *before either thread has
+    // run at all* -- no yield between the two spawns -- so whichever runs
+    // first genuinely races the other to open a session and start sending,
+    // instead of completing a full request/response round trip before the
+    // second request is even sent (that sequential shape is what
+    // `blk_fs_ipc.rs` already covers). Each gets its own private session
+    // once opened, so unlike the old fixed-port transport there is no
+    // shared channel left for their bytes to race *into* -- only the race
+    // to open in the first place.
     #[allow(static_mut_refs)]
     unsafe {
-        PENDING_SEND_A = Some((FS_REQUEST_PORT, hello_request.encode()));
+        PENDING_SEND_A = Some(hello_request.encode());
     }
     scheduler::spawn_with_capability(
         send_request_thread_a,
-        Some(request_port_token("test-hello")),
+        Some(server_port_token("test-hello")),
     );
     #[allow(static_mut_refs)]
     unsafe {
-        PENDING_SEND_B = Some((FS_REQUEST_PORT, big_request.encode()));
+        PENDING_SEND_B = Some(big_request.encode());
     }
-    scheduler::spawn_with_capability(send_request_thread_b, Some(request_port_token("test-big")));
+    scheduler::spawn_with_capability(send_request_thread_b, Some(server_port_token("test-big")));
 
-    // Collect exactly two responses off the shared response port -- order
-    // is whichever thread won the send lock first, which this test
-    // deliberately doesn't assume either way (see the set-membership check
-    // below instead of an ordered one).
-    let first = recv_fs_response(80_000);
-    let second = recv_fs_response(80_000);
+    // Wait for both client threads to finish their own independent
+    // request/response round trip -- order is whichever thread's session
+    // got accepted and served first, which this test deliberately doesn't
+    // assume either way (see the set-membership check below instead of an
+    // ordered one).
+    for _ in 0..160_000u32 {
+        scheduler::yield_now();
+        if DONE_A.load(core::sync::atomic::Ordering::SeqCst)
+            && DONE_B.load(core::sync::atomic::Ordering::SeqCst)
+        {
+            break;
+        }
+    }
+    #[allow(static_mut_refs)]
+    let first = unsafe { RESULT_A.take() };
+    #[allow(static_mut_refs)]
+    let second = unsafe { RESULT_B.take() };
 
     let matches_hello = |resp: &Option<FsResponse>| matches!(resp, Some(FsResponse::Data(bytes)) if bytes.as_slice() == EXPECTED_HELLO_CONTENTS);
     let matches_big = |resp: &Option<FsResponse>| match resp {
@@ -350,10 +355,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     if both_correct {
         serial_println!(
-            "blk_fs_concurrent: PASS — two client threads sending to the same request port at \
-             genuinely the same time (no yield between spawns) each got back their own, exact, \
-             uncorrupted file contents — the send lock serialized them correctly instead of \
-             letting their bytes interleave"
+            "blk_fs_concurrent: PASS — two client threads opening sessions against the same \
+             server port at genuinely the same time (no yield between spawns) each got back \
+             their own, exact, uncorrupted file contents over their own private session -- no \
+             interleaving possible, since the two never shared a channel to interleave into"
         );
         exit_qemu(QemuExitCode::Success);
     } else {
@@ -367,14 +372,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 }
 
-static mut PENDING_SEND_A: Option<(usize, Vec<u8>)> = None;
-static mut PENDING_SEND_B: Option<(usize, Vec<u8>)> = None;
+static mut PENDING_SEND_A: Option<Vec<u8>> = None;
+static mut PENDING_SEND_B: Option<Vec<u8>> = None;
+static mut RESULT_A: Option<FsResponse> = None;
+static mut RESULT_B: Option<FsResponse> = None;
+static DONE_A: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static DONE_B: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 extern "C" fn send_request_thread_a() -> ! {
     #[allow(static_mut_refs)]
-    let (port, bytes) =
+    let bytes =
         unsafe { PENDING_SEND_A.take() }.expect("send_request_thread_a: no pending send");
-    send_locked_message(port, bytes);
+    let response = session_round_trip(bytes);
+    #[allow(static_mut_refs)]
+    unsafe {
+        RESULT_A = response;
+    }
+    DONE_A.store(true, core::sync::atomic::Ordering::SeqCst);
     loop {
         scheduler::yield_now();
     }
@@ -382,55 +396,59 @@ extern "C" fn send_request_thread_a() -> ! {
 
 extern "C" fn send_request_thread_b() -> ! {
     #[allow(static_mut_refs)]
-    let (port, bytes) =
+    let bytes =
         unsafe { PENDING_SEND_B.take() }.expect("send_request_thread_b: no pending send");
-    send_locked_message(port, bytes);
+    let response = session_round_trip(bytes);
+    #[allow(static_mut_refs)]
+    unsafe {
+        RESULT_B = response;
+    }
+    DONE_B.store(true, core::sync::atomic::Ordering::SeqCst);
     loop {
         scheduler::yield_now();
     }
 }
 
-/// Sends every byte of `bytes` on `port`, holding `port`'s send lock for
-/// the entire message — the actual mechanism this test exists to prove
-/// (`kernel::ipc::begin_send`/`end_send`, `SYS_IPC_SEND_LOCK`/
-/// `SYS_IPC_SEND_UNLOCK`).
-fn send_locked_message(port: usize, bytes: Vec<u8>) {
+/// Opens a fresh session against [`FS_SERVER_PORT`] (retry-looping on
+/// `u64::MAX`), sends `bytes` (an already-encoded [`FsRequest`]) holding
+/// the session's send lock for the entire message, then accumulates bytes
+/// back off that same session until [`FsResponse::decode`] reports a
+/// complete message or a generous bound of polls passes with nothing
+/// decodable. Must run on the same thread for its whole lifetime — a
+/// session's `SEND`/`RECV` are only ever available to its own owner or
+/// accepted server (`kernel/src/ipc.rs`'s `is_participant`), identified by
+/// `ThreadId`.
+fn session_round_trip(bytes: Vec<u8>) -> Option<FsResponse> {
+    let session_id = loop {
+        let ret =
+            unsafe { syscall::syscall(SYS_IPC_SESSION_OPEN, FS_SERVER_PORT as u64, 0, 0) };
+        if ret != u64::MAX {
+            break ret;
+        }
+        scheduler::yield_now();
+    };
+
     unsafe {
-        runix_kernel::syscall::syscall(runix_kernel::syscall::SYS_IPC_SEND_LOCK, port as u64, 0, 0);
+        syscall::syscall(SYS_IPC_SESSION_SEND_LOCK, session_id, 0, 0);
     }
     for byte in bytes {
-        unsafe {
-            runix_kernel::syscall::syscall(
-                runix_kernel::syscall::SYS_IPC_SEND,
-                port as u64,
-                byte as u64,
-                0,
-            );
+        loop {
+            let ret =
+                unsafe { syscall::syscall(SYS_IPC_SESSION_SEND, session_id, byte as u64, 0) };
+            if ret != u64::MAX {
+                break;
+            }
+            scheduler::yield_now();
         }
     }
     unsafe {
-        runix_kernel::syscall::syscall(
-            runix_kernel::syscall::SYS_IPC_SEND_UNLOCK,
-            port as u64,
-            0,
-            0,
-        );
+        syscall::syscall(SYS_IPC_SESSION_SEND_UNLOCK, session_id, 0, 0);
     }
-}
 
-/// Same as `blk_fs_ipc.rs`'s function of the same name.
-fn recv_fs_response(max_iters: u32) -> Option<FsResponse> {
     let mut buf: Vec<u8> = Vec::new();
-    for _ in 0..max_iters {
+    for _ in 0..80_000u32 {
         scheduler::yield_now();
-        let ret = unsafe {
-            runix_kernel::syscall::syscall(
-                runix_kernel::syscall::SYS_IPC_RECV,
-                FS_RESPONSE_PORT as u64,
-                0,
-                0,
-            )
-        };
+        let ret = unsafe { syscall::syscall(SYS_IPC_SESSION_RECV, session_id, 0, 0) };
         if ret != u64::MAX {
             buf.push(ret as u8);
             if let Some((response, _consumed)) = FsResponse::decode(&buf) {

@@ -7,11 +7,19 @@
 
 const SYS_YIELD: u64 = 0;
 const SYS_WRITE: u64 = 1;
-const SYS_IPC_SEND: u64 = 2;
-const SYS_IPC_RECV: u64 = 3;
 const SYS_PORT_IN: u64 = 4;
 const SYS_PORT_OUT: u64 = 5;
 const SYS_TICKS: u64 = 6;
+// `SYS_IPC_SESSION_OPEN` (10) is deliberately not listed/wrapped here —
+// this process is always the *server* side of the filesystem session
+// (`SYS_IPC_SESSION_ACCEPT`), never the client that opens one, matching
+// `kernel/src/syscall.rs`'s own doc comment split between "OPEN" and
+// "ACCEPT" callers.
+const SYS_IPC_SESSION_ACCEPT: u64 = 11;
+const SYS_IPC_SESSION_SEND: u64 = 12;
+const SYS_IPC_SESSION_RECV: u64 = 13;
+const SYS_IPC_SESSION_SEND_LOCK: u64 = 14;
+const SYS_IPC_SESSION_SEND_UNLOCK: u64 = 15;
 
 /// # Safety
 /// Whatever `num`'s own contract requires.
@@ -79,16 +87,6 @@ pub fn port_out(port: u16, width: u8, value: u32) -> bool {
     ret != u64::MAX
 }
 
-/// Filesystem driver, Phase 3: sends one byte on IPC `port`, gated by
-/// whatever capability this process was spawned with for that port (see
-/// `kernel/src/scheduler.rs`'s `Thread::extra_capabilities` — this process
-/// holds a second capability specifically for its reply port, alongside
-/// its usual virtio-blk io-port one). Returns `false` if denied.
-pub fn ipc_send(port: usize, byte: u8) -> bool {
-    let ret = unsafe { syscall(SYS_IPC_SEND, port as u64, byte as u64, 0) };
-    ret != u64::MAX
-}
-
 /// PIT ticks since boot -- see `kernel/src/syscall.rs`'s `SYS_TICKS` doc
 /// comment for why this driver needs it (per-request capability-token
 /// expiry checking, `main.rs`'s `verify_file_token`).
@@ -96,22 +94,62 @@ pub fn ticks() -> u64 {
     unsafe { syscall(SYS_TICKS, 0, 0, 0) }
 }
 
-/// Reads one byte off IPC `port`, non-blocking — `None` if the port is
-/// currently empty *or* this process holds no capability authorizing
-/// `SYS_IPC_RECV` on it. `kernel/src/syscall.rs`'s `SYS_IPC_RECV` arm now
-/// gates the receive side identically to the send side
-/// (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`) — this process needs its own
-/// `port:<n>` capability for every port it calls this on
-/// (`FS_REQUEST_PORT`/`FS_WRITE_REQUEST_PORT`, granted at spawn time by
-/// `kernel/src/main.rs`), not only the response-port *send* capability it
-/// already held. An unauthorized receive and an empty port are
-/// deliberately indistinguishable here, same as at the syscall gate
-/// itself.
-pub fn ipc_try_recv(port: usize) -> Option<u8> {
-    let ret = unsafe { syscall(SYS_IPC_RECV, port as u64, 0, 0) };
+/// `SYS_IPC_SESSION_ACCEPT` — non-blocking: claims the oldest session
+/// opened (via `SYS_IPC_SESSION_OPEN`) against `server_port` but not yet
+/// accepted, or `None` if nothing is pending *or* this process holds no
+/// `port:<server_port>` capability (same `authorized_for_port` gate
+/// `SYS_IPC_SEND`/`SYS_IPC_RECV` already use, per `kernel/src/syscall.rs`'s
+/// own doc comment) — indistinguishable, same fail-closed convention as
+/// every other gated syscall in this ABI. `main.rs`'s `run_fs_ipc_server`
+/// polls this once per loop iteration against `FS_SERVER_PORT` to pick up
+/// newly opened client sessions.
+pub fn session_try_accept(server_port: usize) -> Option<u64> {
+    let ret = unsafe { syscall(SYS_IPC_SESSION_ACCEPT, server_port as u64, 0, 0) };
+    if ret == u64::MAX {
+        None
+    } else {
+        Some(ret)
+    }
+}
+
+/// `SYS_IPC_SESSION_RECV` — non-blocking: one byte off `session_id`'s
+/// queue, or `None` if it's currently empty *or* this process isn't a
+/// participant (owner or accepted server) of that session — see
+/// `kernel/src/ipc.rs`'s `is_participant` doc comment for why that's an
+/// O(1) identity check rather than a re-verified capability token on every
+/// call.
+pub fn session_try_recv(session_id: u64) -> Option<u8> {
+    let ret = unsafe { syscall(SYS_IPC_SESSION_RECV, session_id, 0, 0) };
     if ret == u64::MAX {
         None
     } else {
         Some(ret as u8)
     }
+}
+
+/// `SYS_IPC_SESSION_SEND` — sends one byte on `session_id`, blocking
+/// (spin-yielding) if its queue is momentarily full. Returns `false` if
+/// the session doesn't exist or this process isn't a participant.
+pub fn session_send(session_id: u64, byte: u8) -> bool {
+    let ret = unsafe { syscall(SYS_IPC_SESSION_SEND, session_id, byte as u64, 0) };
+    ret != u64::MAX
+}
+
+/// `SYS_IPC_SESSION_SEND_LOCK` — claims `session_id`'s advisory send lock
+/// for the duration of a multi-byte message, same reasoning
+/// `kernel/src/syscall.rs`'s `SYS_IPC_SEND_LOCK` doc comment gives for
+/// fixed ports: a session has at most two participants, but nothing stops
+/// both from calling `session_send` for the same logical message
+/// concurrently without this. Returns `false` if this process isn't a
+/// participant.
+pub fn session_send_lock(session_id: u64) -> bool {
+    let ret = unsafe { syscall(SYS_IPC_SESSION_SEND_LOCK, session_id, 0, 0) };
+    ret != u64::MAX
+}
+
+/// `SYS_IPC_SESSION_SEND_UNLOCK` — releases a lock claimed by
+/// [`session_send_lock`] on the same session from the same thread.
+pub fn session_send_unlock(session_id: u64) -> bool {
+    let ret = unsafe { syscall(SYS_IPC_SESSION_SEND_UNLOCK, session_id, 0, 0) };
+    ret != u64::MAX
 }

@@ -7,6 +7,39 @@ confidentiality on this IPC layer is built — which
 `docs/RFC-TLS-APPROACH.md` already names as a dependency of its own
 recommendation.
 
+> **Option C, kernel primitive (implemented, 2026-09-27)**: this RFC's
+> Option A ("`SYS_IPC_RECV` gains the same `authorized_for_port` check")
+> was implemented earlier and is what "What's actually enforced today"
+> below now describes. This update is about the second half — Option C
+> itself, "a real session/handle IPC primitive." Built: `ThreadId`
+> (`kernel/src/scheduler.rs`), a dynamic session table alongside the fixed
+> port array (`kernel/src/ipc.rs`'s `SESSIONS`/`PENDING_BY_PORT`), and six
+> syscalls — `SYS_IPC_SESSION_OPEN`/`_ACCEPT`/`_SEND`/`_RECV`/`_SEND_LOCK`/
+> `_SEND_UNLOCK` (`kernel/src/syscall.rs`) — plus teardown-on-exit wired
+> into `scheduler::reap_zombies`. Two real deviations from this section's
+> prose, found while building it rather than assumed away: **six syscalls,
+> not three** (`SESSION_ACCEPT` for discovery — the prose didn't explain
+> how a server learns a new `SessionId` exists at all — and the send-lock
+> pair this doc's own "Cost, honestly" section already called for but
+> didn't count), and **`server` is bound lazily at `ACCEPT`, not pinned at
+> `OPEN`** (the kernel has no way to know who, if anyone, will ever accept
+> a freshly opened session). Proven in QEMU end to end
+> (`kernel/tests/ipc_session.rs`): two independent client sessions against
+> one server thread, each seeing only its own bytes echoed back; a
+> capability-denial case; and a real teardown proof (a session's owner
+> exits mid-session, deliberately sequenced via a flag handshake for
+> deterministic timing despite real timer preemption, and the still-alive
+> server's `SESSION_SEND` to that session id flips from succeeding to
+> `u64::MAX` once the exit is reaped).
+>
+> **Explicitly not done in this pass**: `blk-driver-host` (`ipc/src/fs.rs`),
+> `net-driver-host`'s sockets surface (`ipc/src/sockets.rs`), and
+> `kernel/src/marshal_client.rs` — a third fixed-sockets-port consumer
+> found while scoping this work, not previously named anywhere in this
+> RFC — all still use the fixed-port model completely unchanged. Migrating
+> each onto sessions is separate, later work; see
+> `docs/THREAT_MODEL.md`'s revisit-trigger entry for this primitive.
+
 ## Context
 
 CLAUDE.md's capability-security rule is "never reach for a resource with
