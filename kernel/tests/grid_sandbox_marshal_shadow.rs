@@ -406,6 +406,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         scheduler::yield_now();
     }
 
+    // This test needs the *real* round trip (session open through close)
+    // against a real listener on the other end of a `guestfwd` bridge to
+    // actually complete, the same budget `marshal_tcp_roundtrip.rs`/
+    // `marshal_proxy_e2e.rs` need for the identical reason -- but
+    // `grid_sandbox.rs`'s own `SHADOW_MARSHAL_MAX_ITERS` stays small on
+    // purpose (it's a real production fail-fast budget for a hard T1
+    // real-time spawn path, not a test knob -- see that constant's own doc
+    // comment). `set_shadow_marshal_max_iters_override` exists for exactly
+    // this: ask for a larger budget in this test only, without loosening
+    // what every other caller (including a real deployment) gets.
+    grid_sandbox::set_shadow_marshal_max_iters_override(Some(2_000_000));
+
     // Case 2 (Path 3): configured, pointed at the real listener that always
     // answers REFUSE.
     grid_sandbox::set_shadow_marshal_proxy(Some(ShadowMarshalProxyConfig {
@@ -434,8 +446,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
     scheduler::spawn_with_capability(spawn_configured_instance_thread, Some(request_token));
 
+    // Bumped from `30_000` (the old fixed-port transport's budget) to
+    // `3_000_000`, same reasoning as `set_shadow_marshal_max_iters_override`
+    // above and `net_driver_sockets.rs`'s identical bump: a session isn't
+    // picked up by `net-driver-host`'s `run_socket_ipc_server` until that
+    // loop's own cadence catches it, so this thread's own wait needs to
+    // outlast both of `spawn_configured_instance_thread`'s real round trips
+    // (case 2 and case 3), not just one.
     let mut result = TestResult::Pending;
-    for _ in 0..30_000 {
+    for _ in 0..3_000_000 {
         scheduler::yield_now();
         #[allow(static_mut_refs)]
         let current = unsafe { RESULT };

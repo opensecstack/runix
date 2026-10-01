@@ -336,6 +336,13 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         }
         SYS_IPC_SESSION_ACCEPT => {
             let server_port = arg1 as usize;
+            // Cheap peek before paying for `authorized_for_port`'s real
+            // Ed25519 verification — same precedent and same reason as
+            // `SYS_IPC_RECV`'s `ipc::is_empty` check above; see
+            // `ipc::session_pending`'s own doc comment.
+            if !ipc::session_pending(server_port) {
+                return u64::MAX;
+            }
             if !authorized_for_port(server_port) {
                 return u64::MAX;
             }

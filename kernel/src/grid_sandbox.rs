@@ -118,14 +118,41 @@ pub fn set_shadow_marshal_proxy(config: Option<ShadowMarshalProxyConfig>) {
 }
 
 /// Bounded, fail-fast poll budget for [`spawn_instance`]'s shadow MARSHAL
-/// evaluation — deliberately much smaller than `marshal_proxy_e2e.rs`'s
-/// 200_000-iteration budget (a test can afford to wait for a real listener
-/// on the other end of a `guestfwd` bridge; a production spawn must not
-/// meaningfully slow down over an absent or slow proxy). At this budget, a
-/// completely unreachable proxy costs on the order of a couple thousand
-/// syscall attempts and a handful of `yield_now` calls, not a stall visible
-/// to whatever's waiting on this instance to spawn.
+/// evaluation — deliberately much smaller than `marshal_proxy_e2e.rs`'s/
+/// `marshal_tcp_roundtrip.rs`'s own 2_000_000-iteration budget (those tests
+/// can afford to wait out a full session-open-through-close round trip
+/// against a real listener on the other end of a `guestfwd` bridge; a
+/// production spawn, gated by this value, must not meaningfully slow down
+/// over an absent or slow proxy — this is this codebase's one hard,
+/// documented T1 real-time constraint, see `docs/THREAT_MODEL.md`). At this
+/// budget, a completely unreachable proxy costs on the order of a couple
+/// thousand syscall attempts and a handful of `yield_now` calls, not a
+/// stall visible to whatever's waiting on this instance to spawn.
+///
+/// Deliberately **not** raised to match those other tests' budgets just to
+/// make `grid_sandbox_marshal_shadow.rs`'s own "proxy answers REFUSE"
+/// case pass faster under QEMU/`nc` overhead — doing that would loosen a
+/// real production safety constant for a reason that has nothing to do
+/// with production (test-environment overhead, not real proxy latency).
+/// [`set_shadow_marshal_max_iters_override`] exists so that one test case
+/// can ask for a larger budget explicitly, without changing what every
+/// other caller (including every other test, and any real deployment)
+/// gets.
 const SHADOW_MARSHAL_MAX_ITERS: u32 = 2_000;
+
+static SHADOW_MARSHAL_MAX_ITERS_OVERRIDE: Mutex<Option<u32>> = Mutex::new(None);
+
+/// Overrides (or clears, with `None`) [`shadow_marshal_evaluate`]'s poll
+/// budget away from [`SHADOW_MARSHAL_MAX_ITERS`] — see that constant's own
+/// doc comment for why this exists as an explicit opt-in rather than just
+/// raising the constant itself. Same "exists mainly for tests, but nothing
+/// stops a real deployment from using it" posture as
+/// [`set_shadow_marshal_proxy`], which a real deployment would only ever
+/// call with `None` anyway — the fail-fast budget is the correct default
+/// for a hard real-time spawn path.
+pub fn set_shadow_marshal_max_iters_override(max_iters: Option<u32>) {
+    *SHADOW_MARSHAL_MAX_ITERS_OVERRIDE.lock() = max_iters;
+}
 
 // Every shadow MARSHAL evaluation `spawn_instance` performs is recorded
 // here, through the same tamper-evident `WormLog` mechanism
@@ -165,8 +192,9 @@ pub fn shadow_marshal_log_entries() -> alloc::vec::Vec<runix_citadel_integration
 /// Builds a minimal, genuinely well-formed Kerkese-shaped request
 /// (`dry_run: true` — see `runix_ipc::marshal`'s own doc comment for why
 /// `kerkese_json` is an opaque blob no hop in this chain parses) and calls
-/// [`marshal_client::evaluate`] with [`SHADOW_MARSHAL_MAX_ITERS`], the
-/// bounded, fail-fast budget appropriate for a spawn path rather than a
+/// [`marshal_client::evaluate`] with [`SHADOW_MARSHAL_MAX_ITERS`] (unless
+/// [`set_shadow_marshal_max_iters_override`] has set a different budget),
+/// the bounded, fail-fast budget appropriate for a spawn path rather than a
 /// test.
 fn shadow_marshal_evaluate(module_id: &str, instance_id: &str) -> ShadowMarshalOutcome {
     let config = *SHADOW_MARSHAL_PROXY.lock();
@@ -189,12 +217,14 @@ fn shadow_marshal_evaluate(module_id: &str, instance_id: &str) -> ShadowMarshalO
             let request = MarshalRequest {
                 kerkese_json: kerkese_json.into_bytes(),
             };
+            let max_iters =
+                SHADOW_MARSHAL_MAX_ITERS_OVERRIDE.lock().unwrap_or(SHADOW_MARSHAL_MAX_ITERS);
             match marshal_client::evaluate(
                 config.remote_ip,
                 config.remote_port,
                 config.local_port,
                 &request,
-                SHADOW_MARSHAL_MAX_ITERS,
+                max_iters,
             ) {
                 Some(MarshalResponse::Decision { outcome, .. }) => match outcome {
                     MarshalOutcome::Execute => ShadowMarshalOutcome::Execute,

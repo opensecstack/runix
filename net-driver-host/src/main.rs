@@ -859,30 +859,27 @@ fn run_socket_ipc_server(iface: &mut Interface, device: &mut RunixNetDevice, sta
             }
         }
 
-        // Pick up at most one newly opened session per check, only if a
+        // Pick up at most one newly opened session per iteration, only if a
         // slot is actually free (an already-accepted session is never
         // silently dropped for lack of anywhere to put it -- there is no
-        // way to "un-accept" one) -- and only every 10,000 iterations
-        // (the same cadence this loop already yields at below), not every
-        // single one. Confirmed necessary, not just cautious:
-        // `SYS_IPC_SESSION_ACCEPT`'s capability check (`authorized_for_port`,
-        // a real Ed25519 verification) has no cheap "nothing pending"
-        // pre-check the way `SYS_IPC_RECV`'s `ipc::is_empty` does -- calling
-        // it on every one of this loop's up to 500,000,000 iterations paid
-        // that full verification cost every time, the exact "near-free spin
-        // into a real, measured multi-minute-under-TCG slowdown" `SYS_IPC_RECV`'s
-        // own doc comment already warns `SYS_IPC_RECV` itself would suffer
-        // without its pre-check -- and it starved this loop of ever
-        // reaching the request-dispatch loop below in practice (a real
-        // `net_driver_sockets.rs` run timed out with the client's own
-        // request never served). A session is a coarse-grained, once-per-
-        // `evaluate()`-call event, not a hot path -- a few-thousand-
-        // iteration acceptance latency costs nothing real callers notice.
-        if offset % 10_000 == 0 {
-            if let Some(idx) = live_sessions.iter().position(Option::is_none) {
-                if let Some(session_id) = session_accept(SOCKETS_SERVER_PORT) {
-                    live_sessions[idx] = Some(session_id);
-                }
+        // way to "un-accept" one). Used to be throttled to once every
+        // 10,000 iterations, purely to avoid paying a full Ed25519
+        // verification (`SYS_IPC_SESSION_ACCEPT`'s `authorized_for_port`
+        // check) on every otherwise-empty poll -- a real, measured
+        // multi-minute-under-TCG slowdown without it, the same hazard
+        // `SYS_IPC_RECV`'s own `ipc::is_empty` pre-check already exists to
+        // avoid. That throttle was itself a real cost, though: it put a
+        // hard ~10,000-iteration floor on how fast any client's session
+        // ever got accepted at all, incompatible with
+        // `grid_sandbox.rs`'s `SHADOW_MARSHAL_MAX_ITERS`'s <300ms T1
+        // real-time budget. `ipc::session_pending` (kernel-side, checked
+        // inside `SYS_IPC_SESSION_ACCEPT` itself before `authorized_for_port`
+        // runs) closes the actual gap instead of working around it here --
+        // this can poll every iteration again, same as every other server
+        // in this codebase polls `SYS_IPC_RECV`.
+        if let Some(idx) = live_sessions.iter().position(Option::is_none) {
+            if let Some(session_id) = session_accept(SOCKETS_SERVER_PORT) {
+                live_sessions[idx] = Some(session_id);
             }
         }
 

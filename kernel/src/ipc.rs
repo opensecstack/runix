@@ -314,6 +314,26 @@ pub fn session_open(server_port: usize, owner: ThreadId) -> Option<SessionId> {
     Some(id)
 }
 
+/// Peeks whether anything is currently pending (opened, not yet accepted)
+/// for `server_port`, without popping — `syscall.rs`'s
+/// `SYS_IPC_SESSION_ACCEPT` arm checks this *before* paying for
+/// `authorized_for_port`'s real Ed25519 verification, the same precedent
+/// [`is_empty`] already set for `SYS_IPC_RECV`. Without this,
+/// `net-driver-host`'s `run_socket_ipc_server` had to throttle its own
+/// `SESSION_ACCEPT` polling to once every 10,000 loop iterations purely to
+/// avoid paying a full signature check on every otherwise-empty poll — a
+/// real, measured latency floor on how quickly any client's session gets
+/// accepted at all, incompatible with `grid_sandbox.rs`'s
+/// `SHADOW_MARSHAL_MAX_ITERS`'s hard <300ms T1 real-time budget. With this
+/// pre-check, a server can poll `SESSION_ACCEPT` every iteration again, the
+/// same way every other server in this codebase polls `SYS_IPC_RECV`.
+pub fn session_pending(server_port: usize) -> bool {
+    PENDING_BY_PORT
+        .lock()
+        .get(&server_port)
+        .is_some_and(|queue| !queue.is_empty())
+}
+
 /// `SYS_IPC_SESSION_ACCEPT`'s implementation — same trust posture as
 /// [`session_open`] (caller already authorized for `server_port`).
 /// Non-blocking: `None` if nothing is currently pending for this port.
