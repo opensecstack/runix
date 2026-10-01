@@ -106,12 +106,20 @@ const TCP_REMOTE_IP: [u8; 4] = [10, 0, 2, 100];
 const TCP_REMOTE_PORT: u16 = 9000;
 const TCP_LOCAL_PORT: u16 = 49157;
 
-// This test's own Kerkese envelope is opaque to every hop it passes
-// through (`kernel::marshal_client`, the sockets IPC surface, and
-// `citadel_proxy`'s own TCP/decode layer never parse it) -- only the mock
-// CITADEL HTTP endpoint's *response* is asserted on exactly, since that's
-// the only hop this test can prove actually happened by its content.
-const FAKE_KERKESE_JSON: &[u8] = br#"{"kerkese_version":"1.0","action":{"type":"TEST_ACTION"}}"#;
+// This envelope is no longer opaque to every hop: per
+// `docs/RFC-VERIFIER-IDENTITY.md`'s Option A, `citadel_proxy` now actually
+// parses it (`desktop/src/citadel/policy::KernelMinimalEnvelope`) and runs
+// its own local policy check before ever forwarding to CITADEL -- an
+// unrecognized `action.type` (this used to be the placeholder "TEST_ACTION")
+// or a missing `dry_run`/`actor`/`execution_id` field gets refused right
+// there, never reaching the mock CITADEL endpoint at all, which would make
+// this test's `EXPECTED_DECISION_JSON` assertion fail for the wrong reason
+// (a policy refusal, not a broken chain). Mirrors the shape
+// `kernel/src/grid_sandbox.rs`'s `shadow_marshal_evaluate` actually sends
+// (see `policy::RECOGNIZED_ACTION_TYPES`) and
+// `desktop/src/citadel/proxy.rs`'s own `minimal_envelope_json` test
+// fixture byte-for-byte.
+const FAKE_KERKESE_JSON: &[u8] = br#"{"kerkese_version":"1.0","dry_run":true,"action":{"type":"grid_sandbox.spawn_instance","module_id":"grid-sandbox-host","instance_id":"app-1"},"actor":{"user_id":"kernel:grid_sandbox","role":"operator"},"execution_id":"app-1"}"#;
 
 // Copied byte-for-byte from `tests/support/mock_citadel_server.py`'s
 // `DECISION_JSON` (itself copied from
