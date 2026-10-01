@@ -172,6 +172,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "citadel-kerkese-core"
+version = "1.0.0"
+source = "git+https://github.com/opensecstack/opensecstack?rev=c24b32064f9d01ef872e325bef9b6c21e5908ce2#c24b32064f9d01ef872e325bef9b6c21e5908ce2"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1448,6 +1460,7 @@ dependencies = [
 name = "runix-citadel-integration"
 version = "0.0.1"
 dependencies = [
+ "citadel-kerkese-core 1.0.0",
  "ed25519-dalek",
  "hex",
  "rand_core 0.6.4",
@@ -1459,7 +1472,7 @@ dependencies = [
 name = "runix-desktop"
 version = "0.0.1"
 dependencies = [
- "citadel-kerkese-core",
+ "citadel-kerkese-core 0.1.0",
  "ed25519-dalek",
  "hex",
  "reqwest",

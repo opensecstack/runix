@@ -1,6 +1,6 @@
 [package]
 name = "runix-citadel-integration"
-description = "CITADEL boundary: signed boot-time module authorization today; MARSHAL 5-gate evaluation, WORM audit chain, and VIGIL health monitoring remain Beta/RC work pending opensecstack/sdk/rust."
+description = "CITADEL boundary: signed boot-time module authorization today. citadel-kerkese-core 1.0.0 closes the opensecstack/sdk/rust gap this crate's KerkeseTransport used to wait on; wiring a live MARSHAL 5-gate evaluation, WORM audit chain, and VIGIL health monitoring into an actual call site remains Beta/RC work."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,6 +19,13 @@ hex = { version = "0.4", default-features = false, features = ["alloc"] }
 # force-soft: see capability-manager/Cargo.toml's comment — same LLVM ICE
 # on x86_64-unknown-none with the default SIMD-selecting backend.
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+# opensecstack/opensecstack#34 is resolved: citadel-kerkese-core 1.0.0 is
+# cut. Pinned to an exact rev (commit), never a floating branch — same
+# discipline desktop/Cargo.toml already uses for this same dependency; see
+# docs/ROADMAP.md's Open Questions and deny.toml's `[sources]` section.
+# `no_std` + `alloc` itself, so it costs this crate nothing on the
+# freestanding-kernel target this crate exists for.
+citadel-kerkese-core = { git = "https://github.com/opensecstack/opensecstack", rev = "c24b32064f9d01ef872e325bef9b6c21e5908ce2" }
 
 [dev-dependencies]
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "rand_core"] }
