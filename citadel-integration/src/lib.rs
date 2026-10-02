@@ -21,9 +21,11 @@
 //!    `citadel/internal/marshal/types.go` and Gate 3/NDS). A kernel boot
 //!    has no second human to verify a module load. Filling both roles with
 //!    the same identity (e.g. `"kernel"`) would satisfy the schema while
-//!    violating the exact invariant Gate 3 exists to enforce — root
-//!    CLAUDE.md is explicit that this is a defect, not a shortcut: *"Do not
-//!    add code paths that let one identity satisfy both roles."*
+//!    violating the exact invariant Gate 3 exists to enforce. This crate's
+//!    own architectural requirement — that one identity must not satisfy both
+//!    roles — is foundational to `docs/RFC-VERIFIER-IDENTITY.md`'s Option A
+//!    design, so accepting same-identity submissions would be a defect, not
+//!    a shortcut.
 //! 2. **There's no network stack in `kernel/` yet** (Beta roadmap item,
 //!    still in early PCI-enumeration bring-up — see the top-level README).
 //!    A live HTTP round-trip to MARSHAL isn't reachable from boot-time

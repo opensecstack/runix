@@ -1,10 +1,16 @@
 # RFC: who is the Verifier for an automated, kernel-driven Kerkese submission?
 
-**Status**: proposal for repo owner review. No code written yet. This is the gate
-before `docs/MARSHAL-ENFORCEMENT-POLICY.md`'s Option B can mean anything in
-practice — Path 3 of that doc's verification plan (a reachable MARSHAL actually
-refusing a real submission) is untestable against a real CITADEL deployment
-until this is resolved, independent of rbacMap coverage.
+**Status**: Option A implemented. The parse/check/enrich pipeline is live:
+`desktop/src/citadel/identity.rs` holds `citadel_proxy`'s distinct Verifier keypair
+and identity (`PROXY_VERIFIER_USER_ID` / `PROXY_VERIFIER_ROLE`);
+`desktop/src/citadel/policy.rs` implements the proxy's local policy checks (action-type
+recognition, identifier well-formedness, no kernel-asserted verifier);
+`desktop/src/citadel/proxy.rs` implements the full pipeline (`build_enriched_envelope`,
+`record_proxy_verification` via `WormLog::record_proxy_verification` for "two principals,
+two log entries"), with tests proving distinct identities and real Ed25519 signatures. This
+unblocks Path 3 of `docs/MARSHAL-ENFORCEMENT-POLICY.md` to the extent CITADEL's own key
+registration and `EnforceSignatures` flag permit (see "Key registration" section below for
+remaining infrastructure blockers).
 
 ## Context
 
