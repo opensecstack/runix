@@ -73,20 +73,31 @@
 //!   fetch. Confining the bit to a small, dedicated page range instead of
 //!   the whole block sidesteps the bug entirely -- see `mmu.rs`'s doc
 //!   comment on `Level3Table` for the full investigation and root cause.
-//! - **Basic SIM provisioning** (see `sim.rs`): the last unstarted item on
-//!   Alpha mobile's roadmap line. A minimal per-slot profile state
-//!   machine (`Uninitialized -> Provisioned -> Activated`), gated by the
-//!   *same* capability check the RIL syscalls use, generalized in this
-//!   slice from RIL-only (`ril_capability.rs`, now `capabilities.rs`,
-//!   holding a *set* of tokens for the one EL0 context rather than a
-//!   single RIL-only slot) to any resource kind. `el0_demo` walks an
-//!   authorized slot through the whole state machine
-//!   (`SYS_SIM_STATUS`/`SYS_SIM_PROVISION`/`SYS_SIM_ACTIVATE`) and gets
-//!   denied on an unauthorized one -- proving the capability boundary is
-//!   uniform across resource kinds, not something special-cased for RIL.
-//!   Deliberately not a real SIM/eSIM implementation (no APDU protocol,
-//!   no real ICCID/IMSI digit strings -- see `sim.rs`'s doc comment for
-//!   why and what a real version needs next).
+//! - **eSIM profile lifecycle** (see `sim.rs`): started as Alpha mobile's
+//!   "basic SIM provisioning" item -- a minimal per-slot `Uninitialized ->
+//!   Provisioned -> Activated` state machine -- and since replaced
+//!   outright by Beta's multi-profile model (`ProfileState { Created,
+//!   Disabled, Enabled, Deleted }`, bounded profiles per slot, with
+//!   exactly-one-`Enabled` and no-direct-`Enabled`->`Deleted` enforced in
+//!   one place). Gated by the *same* capability check the RIL syscalls
+//!   use, generalized in the Alpha slice from RIL-only
+//!   (`ril_capability.rs`, now `capabilities.rs`, holding a *set* of
+//!   tokens for the one EL0 context rather than a single RIL-only slot) to
+//!   any resource kind, and now scoped three ways within the SIM kind
+//!   alone (slot-level, per-profile, and delete-specific -- see `svc.rs`'s
+//!   doc comment). `el0_demo` walks an authorized slot's first profile
+//!   through the whole lifecycle
+//!   (`SYS_SIM_CREATE`/`INSTALL`/`ENABLE`/`DISABLE`/`DELETE`/`STATUS`),
+//!   including an expected-to-fail delete of a still-`Enabled` profile,
+//!   and gets denied on an unauthorized slot -- proving the capability
+//!   boundary is uniform across resource kinds, not something
+//!   special-cased for RIL. `ENABLE`/`DELETE` additionally route through
+//!   `esim_marshal.rs`, a structurally-complete but fail-open MARSHAL gate
+//!   (no transport on this crate yet), and every real transition is
+//!   appended to a `citadel-integration` `WormLog`. Deliberately not a
+//!   real SIM/eSIM implementation (no APDU protocol, no GSMA SGP.22, no
+//!   real ICCID/IMSI digit strings -- see `sim.rs`'s doc comment for why
+//!   and what a real version needs next).
 //!
 //! Not yet started: the real RIL/SIM *protocol* work itself (talking to
 //! actual radio/SIM hardware, not just proving the isolation boundary they
@@ -146,6 +157,7 @@ extern crate alloc;
 mod capabilities;
 mod el0;
 mod el1_vectors;
+mod esim_marshal;
 mod gic;
 mod heap;
 mod mmu;

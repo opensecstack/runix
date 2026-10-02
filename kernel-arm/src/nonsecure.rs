@@ -219,7 +219,8 @@ fn el1_setup() -> ! {
     }
     serial_println!("Runix ARM kernel: heap initialized");
 
-    // Issue demo capabilities authorizing RIL channel 0 and SIM slot 0 --
+    // Issue demo capabilities authorizing RIL channel 0 and SIM slot 0
+    // (plus, below, slot 0's profile 0 and its separate delete scope) --
     // stands in for a real issuer (CITADEL MARSHAL) the same way every
     // other demo trust root in this repo does. el0_demo (el0.rs) will
     // request channel/slot 0 (authorized) and channel/slot 99 (not, for
@@ -232,6 +233,27 @@ fn el1_setup() -> ! {
     serial_println!("Runix ARM kernel: RIL capability issued (channel 0, demo trust root)");
     crate::capabilities::issue_and_hold(crate::capabilities::sim_resource(0), now);
     serial_println!("Runix ARM kernel: SIM capability issued (slot 0, demo trust root)");
+    // The eSIM lifecycle needs two *more* resources beyond slot 0, because
+    // `svc.rs` scopes its SIM syscalls three ways, not one (see its doc
+    // comment): slot-level `sim:0` authorizes only SYS_SIM_CREATE, the
+    // per-profile `sim:0:0` authorizes install/enable/disable/status on the
+    // profile that CREATE produces, and the delete-specific `sim:delete:0:0`
+    // authorizes SYS_SIM_DELETE and nothing else. Issuing all three here --
+    // rather than one broad token -- is what makes el0_demo's walk a real
+    // test of that scoping instead of a test of a single ambient grant.
+    //
+    // Profile 0 specifically: `sim::create` assigns IDs sequentially from
+    // 0, and el0_demo's CREATE is the first one in slot 0, so the ID it
+    // gets back is 0. Issuing for profile 0 before it exists is fine -- a
+    // capability names a resource string, not a live object.
+    crate::capabilities::issue_and_hold(crate::capabilities::sim_profile_resource(0, 0), now);
+    serial_println!(
+        "Runix ARM kernel: eSIM profile capability issued (slot 0 profile 0, demo trust root)"
+    );
+    crate::capabilities::issue_and_hold(crate::capabilities::sim_delete_resource(0, 0), now);
+    serial_println!(
+        "Runix ARM kernel: eSIM delete capability issued (slot 0 profile 0, demo trust root)"
+    );
 
     // The RIL isolation boundary and basic SIM provisioning: drop to EL0,
     // capability-gated through the SVC syscall gate (svc.rs) exactly like

@@ -55,10 +55,42 @@ pub fn ril_resource(channel: usize) -> String {
     alloc::format!("ril:{channel}")
 }
 
-/// The resource string a capability must match to authorize
-/// `SYS_SIM_PROVISION`/`SYS_SIM_ACTIVATE`/`SYS_SIM_STATUS` on `slot`.
+/// The resource string a capability must match to authorize slot-level
+/// SIM operations -- today just `SYS_SIM_CREATE`, which allocates a new
+/// profile container in `slot`. Deliberately still slot-level rather than
+/// folded into [`sim_profile_resource`]: `CREATE`'s whole job is to bring a
+/// profile into existence, so there is no profile ID to scope its check to
+/// at the moment it runs. Every *subsequent* operation on that profile
+/// checks the finer-grained per-profile resource instead.
 pub fn sim_resource(slot: usize) -> String {
     alloc::format!("sim:{slot}")
+}
+
+/// The resource string a capability must match to authorize general
+/// per-profile access (status queries, enable/disable) on `profile` within
+/// `slot` -- `sim.rs`'s data model holds multiple `EsimProfile`s per slot
+/// now, so `sim_resource`'s slot-level granularity is too coarse to grant
+/// access to one profile without implicitly granting it to every other
+/// profile sharing that slot. The resource is just an opaque string as far
+/// as `capability-manager` is concerned -- no special parsing, same as
+/// `ril_resource`/`sim_resource` -- so adding a `:{profile}` segment is
+/// enough to scope it.
+pub fn sim_profile_resource(slot: usize, profile: u8) -> String {
+    alloc::format!("sim:{slot}:{profile}")
+}
+
+/// The resource string a capability must match to authorize *deleting*
+/// `profile` within `slot` specifically -- deliberately a distinct resource
+/// string from `sim_profile_resource`'s, not a boolean "can-delete" flag or
+/// separate field on the same token, because deletion is the one
+/// irreversible eSIM operation: a context holding general profile access
+/// (status/enable/disable) should not thereby also hold delete authority.
+/// Since the resource is just an opaque string to `capability-manager`
+/// (same design point as `sim_profile_resource`'s), keeping it a wholly
+/// separate string is sufficient to require a separately issued token
+/// before `check` will authorize the delete path.
+pub fn sim_delete_resource(slot: usize, profile: u8) -> String {
+    alloc::format!("sim:delete:{slot}:{profile}")
 }
 
 /// Small, fixed-scope set rather than `Option<CapabilityToken>` (the

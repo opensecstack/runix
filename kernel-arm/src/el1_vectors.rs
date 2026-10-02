@@ -23,7 +23,17 @@
 //! # `SVC` resume, added once `el0.rs` needed it
 //!
 //! Vector 8 ("Synchronous, lower EL, AArch64") is where `el0.rs`'s `SVC
-//! #0` calls land. Unlike every other vector here (diagnose and halt
+//! #0` calls land. EL0's `x0` carries the syscall number and `x1`/`x2`/`x3`
+//! its three arguments -- three, not the two this gate originally carried,
+//! because the eSIM lifecycle syscalls (`svc.rs`'s `SYS_SIM_INSTALL`) need
+//! `slot`, `profile_id`, *and* `identity` at once. Widening the ABI by one
+//! register was chosen over bit-packing `slot`/`profile_id` into a single
+//! argument: packed fields need an agreed-on encoding duplicated on both
+//! sides of the boundary (`svc.rs` and `el0.rs`), whereas one more register
+//! is free -- AAPCS64 has eight argument registers and
+//! `el1_exception_handler` was using four. See
+//! [`el1_vector_common`]'s doc comment for the stack-offset derivation that
+//! widening required. Unlike every other vector here (diagnose and halt
 //! forever), an `SVC` needs to *resume EL0*, with a real return value in
 //! `x0` -- so `el1_vector_common`'s epilogue restores every saved
 //! register from `x1` onward, but deliberately does *not* restore the
@@ -64,15 +74,42 @@ pub unsafe extern "C" fn el1_exception_vectors() {
 }
 
 /// Save-context-then-call-Rust trampoline, same reasoning as
-/// `vectors.rs`'s `vector_common`. After the stub's `str x0` and this
-/// function's own 10 `stp`s, the saved context sits on the stack (from
-/// current `sp` at the `bl`, ascending): `x29,x30` at `+0`/`+8`, ...,
-/// `x1,x2` at `+144`/`+152`, the stub's original `x0` at `+160`. EL0's
-/// original `x0`/`x1`/`x2` (`SVC`'s syscall number, `arg1`, `arg2`) are
-/// loaded into `x1`/`x2`/`x3` *before* the `bl`, landing exactly where
-/// `el1_exception_handler(vector, num, arg1, arg2)`'s AAPCS64 argument
-/// registers expect them -- no register shuffling needed beyond the
-/// three loads.
+/// `vectors.rs`'s `vector_common`. Every push below is a pre-decrement
+/// (`[sp, #-16]!`), so the *last* push sits lowest and each earlier push
+/// sits 16 bytes higher. Counting back from `sp` as it stands at the `bl`
+/// (the stub's `str x0` plus this function's own 10 `stp`s = 11 pushes =
+/// 176 bytes below where the stub was entered), the saved context is, in
+/// ascending order:
+///
+/// ```text
+/// +0  /+8    x29,x30   (10th/last stp -- pushed lowest)
+/// +16 /+24   x17,x18
+/// +32 /+40   x15,x16
+/// +48 /+56   x13,x14
+/// +64 /+72   x11,x12
+/// +80 /+88   x9,x10
+/// +96 /+104  x7,x8
+/// +112/+120  x5,x6
+/// +128/+136  x3,x4     (2nd stp)
+/// +144/+152  x1,x2     (1st stp -- pushed highest of the ten)
+/// +160       x0        (the vector stub's own `str x0`, highest of all)
+/// ```
+///
+/// EL0's original `x0`/`x1`/`x2`/`x3` (`SVC`'s syscall number, `arg1`,
+/// `arg2`, `arg3`) therefore live at `+160`/`+144`/`+152`/`+128`
+/// respectively -- note `+128` for `x3` comes from the *second* `stp`'s
+/// first register, which is why the third argument's slot sits *below*
+/// the first two rather than continuing upward past them. They are loaded
+/// into `x1`/`x2`/`x3`/`x4` *before* the `bl`, landing exactly where
+/// `el1_exception_handler(vector, num, arg1, arg2, arg3)`'s AAPCS64
+/// argument registers expect them -- no register shuffling needed beyond
+/// the four loads.
+///
+/// Clobbering `x1`..`x4` with those loads is safe precisely because this
+/// function already pushed all four (`x1,x2` at `+144`/`+152`, `x3,x4` at
+/// `+128`/`+136`) -- the epilogue restores them from the stack, not from
+/// whatever the loads left behind, so the argument registers are free
+/// scratch space between the `stp`s and the `ldp`s.
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
 unsafe extern "C" fn el1_vector_common() {
@@ -90,6 +127,7 @@ unsafe extern "C" fn el1_vector_common() {
         "ldr x1, [sp, #160]", // EL0's original x0 (syscall number) -> handler's arg 2 (x1)
         "ldr x2, [sp, #144]", // EL0's original x1 (arg1) -> handler's arg 3 (x2)
         "ldr x3, [sp, #152]", // EL0's original x2 (arg2) -> handler's arg 4 (x3)
+        "ldr x4, [sp, #128]", // EL0's original x3 (arg3) -> handler's arg 5 (x4)
         "bl {h}",
         // Only reached if el1_exception_handler actually returned (the
         // SVC-resume case -- every other vector loops wfe forever inside
@@ -142,7 +180,13 @@ const ESR_EC_SVC64: u64 = 0x15;
 /// before -- this handler doesn't yet know what a safe resume means for
 /// anything else.
 #[unsafe(no_mangle)]
-extern "C" fn el1_exception_handler(vector: u64, syscall_num: u64, arg1: u64, arg2: u64) -> u64 {
+extern "C" fn el1_exception_handler(
+    vector: u64,
+    syscall_num: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+) -> u64 {
     let esr_el1: u64;
     unsafe {
         core::arch::asm!("mrs {}, ESR_EL1", out(reg) esr_el1);
@@ -150,7 +194,7 @@ extern "C" fn el1_exception_handler(vector: u64, syscall_num: u64, arg1: u64, ar
     let ec = (esr_el1 >> 26) & 0x3F;
 
     if vector == 8 && ec == ESR_EC_SVC64 {
-        return crate::svc::dispatch(syscall_num, arg1, arg2);
+        return crate::svc::dispatch(syscall_num, arg1, arg2, arg3);
     }
 
     let far_el1: u64;

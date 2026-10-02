@@ -23,6 +23,16 @@ publish = false
 # -- see kernel/src/capabilities.rs / kernel/src/syscall.rs for the pattern
 # this crate's own capability-gated SVC mirrors.
 runix-capability-manager = { path = "../capability-manager" }
+# Same path-dependency shape as kernel/Cargo.toml's own line (one `..` hop,
+# since kernel-arm/ sits beside citadel-integration/ exactly as kernel/
+# does). Pulled in for `WormLog` only: svc.rs's eSIM lifecycle syscalls
+# append their real state transitions to a tamper-evident WORM chain rather
+# than to a second, parallel audit path of this crate's own -- the rule in
+# CLAUDE.md's "Architecture rules". Already `no_std` + `alloc` (see that
+# crate's own Cargo.toml comment on why it must stay so, for exactly this
+# kind of freestanding caller), and verified to build for
+# `aarch64-unknown-none` and not just `x86_64-unknown-none`.
+runix-citadel-integration = { path = "../citadel-integration" }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
 # The same heap-allocator crate grid-sandbox-host uses for its own ring 3
 # (x86_64) private heap -- capability-manager needs `alloc` (String/Vec),

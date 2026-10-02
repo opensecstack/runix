@@ -443,6 +443,18 @@ pub struct WormLog {
 }
 
 impl WormLog {
+    /// Constructs a standalone, empty log — the freestanding counterpart to
+    /// `BootAllowlist`/`InstanceAllowlist`'s private `evidence: RefCell<WormLog>`
+    /// fields. Those two types still own their own log exactly as before
+    /// (recording only ever happens as a side effect of an actual
+    /// authorization decision there); this constructor exists for callers
+    /// outside this crate that have their own decisions to record — e.g. a
+    /// lifecycle state machine with no module/instance authorization of its
+    /// own — via [`Self::record_lifecycle_transition`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
@@ -545,6 +557,37 @@ impl WormLog {
         reason: Option<String>,
     ) {
         self.record(module_id, Some(instance_id), None, authorized, reason, None);
+    }
+
+    /// Records an arbitrary lifecycle-transition decision — e.g. an eSIM
+    /// profile moving `Disabled` -> `Enabled` on a given slot — through this
+    /// same tamper-evident log, for callers that have their own state
+    /// machine to audit but no module/instance boot-authorization decision
+    /// of their own. `subject_id` is deliberately generic (not
+    /// SIM-specific): anything identifying the thing whose state changed,
+    /// e.g. `"sim:0:2"` (slot:profile). Reuses [`Self::record`]'s existing
+    /// `module_id` slot for `subject_id` and leaves `instance_id`/`tier`
+    /// `None` (this isn't a module/instance authorization, so there is
+    /// nothing to fill those with) — `from_state`/`to_state` are folded into
+    /// `reason` (`"<reason> [<from_state> -> <to_state>]"`, or just
+    /// `"[<from_state> -> <to_state>]"` when `reason` is `None`) rather than
+    /// as new [`WormEntry`] fields, so the existing hash-chain coverage in
+    /// [`WormEntry::compute_hash`] already covers them with no further
+    /// change needed — tampering with either state after the fact tampers
+    /// the same `reason` field `verify_chain` already detects changes to.
+    pub fn record_lifecycle_transition(
+        &mut self,
+        subject_id: &str,
+        from_state: &str,
+        to_state: &str,
+        authorized: bool,
+        reason: Option<String>,
+    ) {
+        let reason = match reason {
+            Some(r) => format!("{r} [{from_state} -> {to_state}]"),
+            None => format!("[{from_state} -> {to_state}]"),
+        };
+        self.record(subject_id, None, None, authorized, Some(reason), None);
     }
 
     /// Every entry recorded so far, oldest first.
@@ -1177,5 +1220,35 @@ mod tests {
             .authorize_instance_load(&verifying_key, "grid-sandbox-host", "app-2", bytes)
             .unwrap_err();
         assert!(matches!(err, CitadelError::InvalidSignature));
+    }
+
+    #[test]
+    fn lifecycle_transition_recorded_on_a_freestanding_log() {
+        let mut log = WormLog::new();
+        log.record_lifecycle_transition(
+            "sim:0:2",
+            "Disabled",
+            "Enabled",
+            true,
+            Some("user requested activation".into()),
+        );
+
+        let entries = log.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].module_id, "sim:0:2");
+        assert!(entries[0].instance_id.is_none());
+        assert!(entries[0].tier.is_none());
+        assert!(entries[0].authorized);
+        assert_eq!(
+            entries[0].reason.as_deref(),
+            Some("user requested activation [Disabled -> Enabled]")
+        );
+        assert!(log.verify_chain());
+
+        // Tamper-evidence: mutating the folded from/to state inside `reason`
+        // after the fact must break the chain, the same way tampering with
+        // any other recorded field does.
+        log.entries[0].reason = Some("user requested activation [Disabled -> Blocked]".into());
+        assert!(!log.verify_chain());
     }
 }

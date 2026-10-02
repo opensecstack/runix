@@ -15,12 +15,46 @@
 //! distinguishes the two); `SYS_RIL_SEND`/`SYS_RIL_RECV` round-tripping a
 //! real byte through the authorized channel and getting denied on the
 //! unauthorized one (proves the check gates actual I/O, `ril_channel.rs`,
-//! not just a bare decision); then `SYS_SIM_STATUS`/`SYS_SIM_PROVISION`/
-//! `SYS_SIM_ACTIVATE` walking an authorized SIM slot through its real
-//! state machine (`Uninitialized -> Provisioned -> Activated`, `sim.rs`)
-//! and getting denied on an unauthorized one -- proving the *same*
-//! capability check gates a second, differently-shaped resource kind, not
-//! something special-cased for RIL.
+//! not just a bare decision); then the eSIM profile lifecycle
+//! (`SYS_SIM_CREATE`/`INSTALL`/`ENABLE`/`DISABLE`/`DELETE`/`STATUS`)
+//! walking an authorized slot's first profile through its real state
+//! machine (`sim.rs`) and getting denied on an unauthorized slot --
+//! proving the *same* capability check gates a second,
+//! differently-shaped resource kind, not something special-cased for RIL.
+//!
+//! # What the eSIM part of the walk is actually proving
+//!
+//! The sequence is `CREATE(0)` -> `STATUS` (`Created`) -> `INSTALL(0, 0,
+//! 0x1234)` -> `STATUS` (`Disabled`) -> `ENABLE` -> `STATUS` (`Enabled`)
+//! -> **`DELETE` (must fail)** -> `DISABLE` -> `STATUS` (`Disabled`) ->
+//! `DELETE` (succeeds) -> `STATUS` (`Deleted`), then `CREATE(99)` and
+//! `STATUS(99, 0)` on an unauthorized slot. Three things in there are load
+//! -bearing rather than decorative:
+//!
+//! - The **first `DELETE` is expected to fail.** The profile is still
+//!   `Enabled`, and `sim.rs`'s state machine forbids a direct `Enabled ->
+//!   Deleted` transition (see its doc comment on why that isn't an
+//!   implicit disable-then-delete). Running it here proves that invariant
+//!   holds *at the syscall boundary* -- i.e. that `svc.rs` actually
+//!   propagates the rejection to EL0 rather than swallowing it -- not just
+//!   inside `sim.rs` in isolation.
+//! - **`ENABLE` succeeding** proves `esim_marshal.rs`'s fail-open gate
+//!   does not block a legitimate authorized operation. A gate that denied
+//!   everything would pass a "denials happen" test and fail this one.
+//! - `INSTALL` is the **first caller of the third syscall argument**
+//!   (`identity`, in `x3`) -- the one `el1_vectors.rs`'s ABI widening
+//!   exists for. Nothing else in this demo uses `x3`, so if that load's
+//!   stack offset were wrong, this is the syscall that would show it (as a
+//!   garbage identity in `svc.rs`'s `SYS_SIM_INSTALL` print).
+//!
+//! The denial half intentionally uses `CREATE(99)`/`STATUS(99, 0)` rather
+//! than repeating every operation on slot 99: the point is that the
+//! capability check is consulted per operation on a resource the context
+//! holds no token for, which two operations establish as well as six.
+//! Separately, the *delete-specific* capability scoping
+//! (`capabilities::sim_delete_resource`) is what makes the successful
+//! `DELETE` on slot 0 meaningful -- it only passes because `nonsecure.rs`
+//! issues that second, distinct token alongside the general profile one.
 
 use core::arch::naked_asm;
 
@@ -117,9 +151,12 @@ const SYS_WRITE: u64 = 1;
 const SYS_RIL_ACCESS: u64 = 2;
 const SYS_RIL_SEND: u64 = 3;
 const SYS_RIL_RECV: u64 = 4;
-const SYS_SIM_PROVISION: u64 = 5;
-const SYS_SIM_ACTIVATE: u64 = 6;
-const SYS_SIM_STATUS: u64 = 7;
+const SYS_SIM_CREATE: u64 = 5;
+const SYS_SIM_INSTALL: u64 = 6;
+const SYS_SIM_ENABLE: u64 = 7;
+const SYS_SIM_DISABLE: u64 = 8;
+const SYS_SIM_DELETE: u64 = 9;
+const SYS_SIM_STATUS: u64 = 10;
 
 /// The EL0 demo itself. `.balign 4096` for the same reason
 /// `userspace::user_hello` does: this crate's EL0 permissions *are*
@@ -196,41 +233,89 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x0, {sys_ril_recv}",
         "mov x1, #99",
         "svc #0",
-        // SYS_SIM_STATUS(0) -- authorized, slot not provisioned yet:
-        // expect state 0 (Uninitialized).
+        // SYS_SIM_CREATE(0) -- authorized at slot level (sim:0); allocates
+        // slot 0's first profile container. x0 on return is the new profile
+        // ID (0, being the first) -- not a 0/1 status code, see svc.rs's
+        // SIM_CREATE_FAILED for the sentinel that distinguishes the two.
+        "mov x0, {sys_sim_create}",
+        "mov x1, #0",
+        "svc #0",
+        // SYS_SIM_STATUS(0, 0) -- expect state 0 (Created): a container
+        // with nothing installed into it yet.
         "mov x0, {sys_sim_status}",
         "mov x1, #0",
+        "mov x2, #0",
         "svc #0",
-        // SYS_SIM_PROVISION(0, identity) -- authorized, Uninitialized ->
-        // Provisioned. `identity` stands in for ICCID/IMSI (see sim.rs's
-        // doc comment on why this is one opaque u64, not a real digit
-        // string).
-        "mov x0, {sys_sim_provision}",
+        // SYS_SIM_INSTALL(0, 0, 0x1234) -- Created -> Disabled. The *only*
+        // syscall here that uses the third argument (x3): `identity` stands
+        // in for ICCID/IMSI (see sim.rs's doc comment on why this is one
+        // opaque u64, not a real digit string), and carrying it alongside
+        // slot and profile at once is what the ABI widening in
+        // el1_vectors.rs exists for.
+        "mov x0, {sys_sim_install}",
         "mov x1, #0",
-        "mov x2, #0x1234",
+        "mov x2, #0",
+        "mov x3, #0x1234",
         "svc #0",
-        // SYS_SIM_STATUS(0) again -- expect state 1 (Provisioned).
+        // SYS_SIM_STATUS(0, 0) -- expect state 1 (Disabled): installed, but
+        // deliberately not made the slot's active profile by install alone.
         "mov x0, {sys_sim_status}",
         "mov x1, #0",
+        "mov x2, #0",
         "svc #0",
-        // SYS_SIM_ACTIVATE(0) -- authorized, Provisioned -> Activated.
-        "mov x0, {sys_sim_activate}",
+        // SYS_SIM_ENABLE(0, 0) -- Disabled -> Enabled, routed through
+        // esim_marshal's gate. Expected to SUCCEED: proves the fail-open
+        // stub doesn't block a legitimate authorized operation.
+        "mov x0, {sys_sim_enable}",
         "mov x1, #0",
+        "mov x2, #0",
         "svc #0",
-        // SYS_SIM_STATUS(0) once more -- expect state 2 (Activated).
+        // SYS_SIM_STATUS(0, 0) -- expect state 2 (Enabled).
         "mov x0, {sys_sim_status}",
         "mov x1, #0",
+        "mov x2, #0",
         "svc #0",
-        // SYS_SIM_PROVISION(99, ...) -- unauthorized slot: denied before
-        // sim::provision ever runs, same "checked on every operation, not
+        // SYS_SIM_DELETE(0, 0) -- expected to FAIL, and that failure is the
+        // point: the capability check passes (sim:delete:0:0 is held) and
+        // the MARSHAL gate passes, but the profile is still Enabled and
+        // sim.rs forbids Enabled -> Deleted outright. See this module's doc
+        // comment.
+        "mov x0, {sys_sim_delete}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "svc #0",
+        // SYS_SIM_DISABLE(0, 0) -- Enabled -> Disabled. No MARSHAL gate
+        // (recoverable direction), still audited.
+        "mov x0, {sys_sim_disable}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "svc #0",
+        // SYS_SIM_STATUS(0, 0) -- expect state 1 (Disabled) again.
+        "mov x0, {sys_sim_status}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "svc #0",
+        // SYS_SIM_DELETE(0, 0) again -- now legal from Disabled, so this
+        // one succeeds where the identical call above was rejected.
+        "mov x0, {sys_sim_delete}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "svc #0",
+        // SYS_SIM_STATUS(0, 0) -- expect state 3 (Deleted), terminal.
+        "mov x0, {sys_sim_status}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "svc #0",
+        // SYS_SIM_CREATE(99) -- unauthorized slot: denied before
+        // sim::create ever runs, same "checked on every operation, not
         // cached from an open call" property SYS_RIL_SEND(99) proves.
-        "mov x0, {sys_sim_provision}",
+        "mov x0, {sys_sim_create}",
         "mov x1, #99",
-        "mov x2, #0x5678",
         "svc #0",
-        // SYS_SIM_STATUS(99) -- likewise denied.
+        // SYS_SIM_STATUS(99, 0) -- likewise denied.
         "mov x0, {sys_sim_status}",
         "mov x1, #99",
+        "mov x2, #0",
         "svc #0",
         "1:",
         "wfe",
@@ -252,8 +337,11 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         sys_ril_access = const SYS_RIL_ACCESS,
         sys_ril_send = const SYS_RIL_SEND,
         sys_ril_recv = const SYS_RIL_RECV,
-        sys_sim_provision = const SYS_SIM_PROVISION,
-        sys_sim_activate = const SYS_SIM_ACTIVATE,
+        sys_sim_create = const SYS_SIM_CREATE,
+        sys_sim_install = const SYS_SIM_INSTALL,
+        sys_sim_enable = const SYS_SIM_ENABLE,
+        sys_sim_disable = const SYS_SIM_DISABLE,
+        sys_sim_delete = const SYS_SIM_DELETE,
         sys_sim_status = const SYS_SIM_STATUS,
     );
 }
