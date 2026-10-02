@@ -91,11 +91,19 @@ pub enum ShadowMarshalOutcome {
 
 /// Evaluates whether a destructive eSIM lifecycle operation (`"enable"` or
 /// `"delete"` — see this module's doc comment) should be allowed to
-/// proceed, for the given `slot`/`profile`.
+/// proceed, for the given `slot`/`profile`, as requested by `principal`.
 ///
 /// `operation`, `slot`, and `profile` are accepted now (rather than added
 /// later) so a real transport's body can use them to shape a real request
-/// without changing this function's signature or any caller.
+/// without changing this function's signature or any caller. `principal`
+/// is accepted for the same reason: a real MARSHAL request has an `actor`
+/// field, and that field needs to name *who* is asking, not just *what* is
+/// being asked. See `svc.rs`'s call sites for what value is actually passed
+/// today and why — `kernel-arm` has only one EL0 context today
+/// (`capabilities.rs`'s own doc comment calls this out: "one flat set of
+/// capabilities for the one EL0 context," not yet a per-thread/per-process
+/// model), so there is at most one meaningful "current principal," not a
+/// dynamic per-call identity to look up here.
 ///
 /// **Always returns [`ShadowMarshalOutcome::Unreachable`] today.** There is
 /// no MARSHAL transport of any kind in `kernel-arm` yet — no network stack,
@@ -105,8 +113,14 @@ pub enum ShadowMarshalOutcome {
 /// happens to always take one branch of a real check. See this module's own
 /// doc comment for exactly what to change here (mirroring
 /// `kernel/src/grid_sandbox.rs`'s `shadow_marshal_evaluate`) once
-/// `kernel-arm` has real networking.
-pub fn evaluate(_operation: &str, _slot: usize, _profile: u8) -> ShadowMarshalOutcome {
+/// `kernel-arm` has real networking — at that point `principal` becomes the
+/// real request's `actor` field.
+pub fn evaluate(
+    _operation: &str,
+    _slot: usize,
+    _profile: u8,
+    _principal: &str,
+) -> ShadowMarshalOutcome {
     ShadowMarshalOutcome::Unreachable
 }
 

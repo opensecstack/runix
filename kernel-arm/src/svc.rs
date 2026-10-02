@@ -111,6 +111,26 @@ const SIM_STATUS_DENIED: u64 = 4;
 /// `1` would have been indistinguishable from "profile 1 was created."
 const SIM_CREATE_FAILED: u64 = 256;
 
+/// The `principal` passed to `esim_marshal::evaluate` at both its call
+/// sites below.
+///
+/// This is a **placeholder**, not a real identity lookup: `check()` (this
+/// module's own wrapper around `capabilities::check`) only ever returns
+/// `Result<(), CapabilityError>`, never the `CapabilityToken` it matched,
+/// so there is no token in hand at either call site to pull a real
+/// `subject` out of (`CapabilityToken` does carry one — see
+/// `capability-manager/src/lib.rs` — but it isn't surfaced here). Rather
+/// than invent a return-value plumbing change to `check()` for a crate
+/// that has exactly one EL0 context today (`capabilities.rs`'s own doc
+/// comment: "one flat set of capabilities," not a per-thread/per-process
+/// model), this names that one context the same way
+/// `capabilities::issue_and_hold`'s only caller does for its demo
+/// token's `subject`. This becomes a real per-caller value once
+/// `kernel-arm` grows a per-context/per-thread capability model — at
+/// that point, thread the matched token's `subject` through from
+/// `check()`'s call site instead of hardcoding this.
+const ESIM_MARSHAL_PRINCIPAL: &str = "el0:arm-demo";
+
 /// The audit chain every real eSIM lifecycle transition appends to.
 ///
 /// `Option`-wrapped and lazily initialized rather than constructed inline,
@@ -367,7 +387,8 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                     // comment). A `Refuse`/`HardStop` denies the syscall
                     // outright -- `sim::enable` is never reached, exactly as
                     // for a capability denial.
-                    let outcome = esim_marshal::evaluate("enable", slot, profile_id);
+                    let outcome =
+                        esim_marshal::evaluate("enable", slot, profile_id, ESIM_MARSHAL_PRINCIPAL);
                     if let Err(MarshalEnforcementError::Blocked(blocked)) =
                         esim_marshal::enforce(outcome)
                     {
@@ -478,7 +499,8 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                 Ok(()) => {
                     // Same MARSHAL gate as enable, for the other half of the
                     // consequential pair -- deletion is irreversible.
-                    let outcome = esim_marshal::evaluate("delete", slot, profile_id);
+                    let outcome =
+                        esim_marshal::evaluate("delete", slot, profile_id, ESIM_MARSHAL_PRINCIPAL);
                     if let Err(MarshalEnforcementError::Blocked(blocked)) =
                         esim_marshal::enforce(outcome)
                     {
