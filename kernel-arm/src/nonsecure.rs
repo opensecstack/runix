@@ -210,6 +210,34 @@ fn el1_setup() -> ! {
         translated_pa
     );
 
+    // virtio-mmio device discovery (see `virtio_mmio.rs`): scan the `virt`
+    // machine's 32-slot MMIO window for a network device and read its MAC.
+    // Needs the MMU's Device block (installed above) but nothing else --
+    // no heap, no EL0, no interrupts. Informational only: a missing device
+    // is reported, not fatal, since nothing downstream depends on it yet
+    // (QEMU only attaches one when `-netdev`/`-device virtio-net-device`
+    // are on the command line).
+    let scan = crate::virtio_mmio::probe();
+    match scan.net {
+        Some(dev) => serial_println!(
+            "Runix ARM kernel: virtio-mmio net device at slot {}, version {}, vendor {:#x}, \
+             MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            dev.slot,
+            dev.version,
+            dev.vendor_id,
+            dev.mac[0],
+            dev.mac[1],
+            dev.mac[2],
+            dev.mac[3],
+            dev.mac[4],
+            dev.mac[5],
+        ),
+        None => serial_println!(
+            "Runix ARM kernel: virtio-mmio no net device found ({} populated slot(s) of 32)",
+            scan.populated_slots
+        ),
+    }
+
     // Heap: needed from here on -- capability-manager's CapabilityToken
     // uses String/Vec internally. Safe now (not before): the heap range
     // falls inside mmu.rs's Normal block, which is mapped and writable as

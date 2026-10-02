@@ -480,6 +480,7 @@ jobs:
           timeout 10 qemu-system-aarch64 \
             -M virt,secure=on,gic-version=2 -cpu cortex-a53 -nographic \
             -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
+            -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
             | tee /tmp/arm-boot.log || true
           grep -q "Runix ARM kernel: boot OK" /tmp/arm-boot.log
           grep -q "Runix ARM kernel: CurrentEL = EL3" /tmp/arm-boot.log
@@ -504,6 +505,20 @@ jobs:
           # SCTLR_EL1.M's write didn't crash: AT S1E1R asks the hardware
           # itself to translate UART0's VA and report the result.
           grep -q "fault=false, PA=0x9000000" /tmp/arm-boot.log
+          # virtio-mmio device discovery (Stage 0 of kernel-arm networking,
+          # docs/BETA_MOBILE_PROGRESS.md item 2.1): the `-netdev`/`-device
+          # virtio-net-device` pair above is what makes one of the `virt`
+          # machine's 32 MMIO slots non-empty at all. Deliberately asserts
+          # neither the slot index nor the transport version: QEMU assigns
+          # these slots top-down (locally the device lands at slot 31, not
+          # 0) and whether it comes up legacy (version 1) or modern
+          # (version 2) depends on the QEMU build's
+          # `virtio-mmio.force-legacy` default. The MAC is the real check
+          # that config space at slot_base+0x100 was read correctly --
+          # 52:54:00:12:34:56 is QEMU's own default guest MAC, so a wrong
+          # offset or stride cannot produce it by accident.
+          grep -q "Runix ARM kernel: virtio-mmio net device at slot " /tmp/arm-boot.log
+          grep -q "MAC 52:54:00:12:34:56" /tmp/arm-boot.log
           # The RIL isolation boundary: EL1->EL0 drop, SVC gate, and a real
           # capability-manager token check distinguishing an authorized
           # channel from an unauthorized one — not just that EL0 code ran.
@@ -571,6 +586,7 @@ jobs:
           timeout 8 qemu-system-aarch64 \
             -M virt,gic-version=2 -cpu cortex-a53 -nographic \
             -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
+            -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
             | tee /tmp/arm-boot-nosecure.log || true
           grep -q "Runix ARM kernel: boot OK" /tmp/arm-boot-nosecure.log
           grep -q "Runix ARM kernel: CurrentEL = EL1" /tmp/arm-boot-nosecure.log
@@ -579,6 +595,12 @@ jobs:
           grep -q "no EL3 ever ran, so no security-state switch to report" \
             /tmp/arm-boot-nosecure.log
           grep -q "Runix ARM kernel: MMU enabled" /tmp/arm-boot-nosecure.log
+          # Same virtio-mmio discovery assertion as the secure boot above
+          # (see its comment for why slot/version aren't asserted) -- the
+          # probe runs in `nonsecure.rs`'s shared EL1 bring-up, so it must
+          # work on both entry paths, not just the EL3 one.
+          grep -q "Runix ARM kernel: virtio-mmio net device at slot " /tmp/arm-boot-nosecure.log
+          grep -q "MAC 52:54:00:12:34:56" /tmp/arm-boot-nosecure.log
           grep -q "^UB$" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_RIL_ACCESS channel 0 authorized" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_RIL_RECV channel 0 authorized, byte 0x41" \

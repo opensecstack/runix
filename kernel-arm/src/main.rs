@@ -167,6 +167,7 @@ mod serial;
 mod sim;
 mod svc;
 mod vectors;
+mod virtio_mmio;
 
 use core::arch::naked_asm;
 use core::panic::PanicInfo;
