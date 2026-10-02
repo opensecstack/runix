@@ -165,6 +165,9 @@ mod nonsecure;
 mod ril_channel;
 mod serial;
 mod sim;
+// Spike-only (see docs/BETA_MOBILE_PROGRESS.md Item 2 / 2.3): never called
+// from this boot sequence, exists only to force real smoltcp codegen.
+mod smoltcp_spike;
 mod svc;
 mod vectors;
 mod virtio_mmio;

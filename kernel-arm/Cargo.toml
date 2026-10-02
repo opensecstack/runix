@@ -39,6 +39,11 @@ ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] 
 # and nothing in this crate has ever needed a heap before now.
 linked_list_allocator = "0.10"
 spin = "0.9"
+# SPIKE (see docs/BETA_MOBILE_PROGRESS.md Item 2 / 2.3): checking that
+# smoltcp actually codegens clean for aarch64-unknown-none on stable before
+# committing to it for the real networking stage. src/smoltcp_spike.rs is
+# the scratch usage that forces real codegen, not just dependency resolution.
+smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "alloc"] }
 
 [profile.dev]
 panic = "abort"
