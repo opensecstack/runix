@@ -30,17 +30,34 @@
 //! response across multiple reads is the same kind of partial-data problem
 //! it was built to handle), then close the handle.
 //!
-//! **Not called from anywhere in a real boot/authorization path.** This is
-//! infrastructure a future, carefully-reviewed change would wire into one
-//! of the three candidate Gate-evaluation call sites already documented
-//! (`kernel/src/syscall.rs`'s `SYS_IPC_SEND`/`SYS_PORT_IN`/`SYS_PORT_OUT`,
-//! or `kernel/src/grid_sandbox.rs`'s `spawn_instance`) — this module adds
-//! the client function those call sites would use, without changing any of
-//! their actual behavior. See `kernel/tests/marshal_tcp_roundtrip.rs` for a
-//! proof this plumbing works, against a test-only Python listener standing
-//! in for the real proxy, not a real MARSHAL/desktop integration (which
-//! needs the desktop-side HTTP transport a separate, parallel change is
-//! building).
+//! **Wired into one of the three originally-candidate Gate-evaluation call
+//! sites, not all three.** This module's [`evaluate`] is called by
+//! `kernel/src/grid_sandbox.rs`'s `shadow_marshal_evaluate`, in turn called
+//! by `spawn_instance` — real enforcement (fail-open on `Unreachable`,
+//! fail-closed on a reachable `Refuse`/`HardStop`), proven by
+//! `kernel/tests/grid_sandbox_marshal_shadow.rs` against a real listener,
+//! and `kernel_main`'s real boot sequence now has a build-time hook
+//! (`RUNIX_MARSHAL_PROXY_ADDR`) to point `spawn_instance`'s evaluation at an
+//! actual deployment once one exists. `kernel/src/syscall.rs`'s
+//! `SYS_IPC_SEND`/`SYS_PORT_IN`/`SYS_PORT_OUT` remain just the other two
+//! documented candidates — ordinary capability-gated syscalls today, with
+//! no MARSHAL involvement at all.
+//!
+//! Two gaps remain, deliberately out of this module's scope: no live
+//! MARSHAL deployment exists to point `RUNIX_MARSHAL_PROXY_ADDR` at (see
+//! `docs/ROADMAP.md`'s open questions), and nothing outside test code
+//! (`kernel/tests/grid_sandbox_marshal_shadow.rs`,
+//! `kernel/tests/grid_sandbox_multi_instance.rs`) ever actually *calls*
+//! `spawn_instance` — this kernel's own boot sequence loads
+//! `grid-sandbox-host` itself through the separate CITADEL boot-allowlist
+//! path (`citadel::demo_authorize`), not through `spawn_instance`, which
+//! exists for spawning app *instances* inside an already-running
+//! `grid-sandbox-host` — a real trigger for that (a launcher, a shell, some
+//! other runtime-driven request) doesn't exist yet. See
+//! `kernel/tests/marshal_tcp_roundtrip.rs` for a proof this plumbing works
+//! against a test-only Python listener standing in for the real proxy, and
+//! `kernel/tests/marshal_proxy_e2e.rs` for the same proof against the real
+//! `citadel_proxy` binary.
 //!
 //! # Transport: one session per [`evaluate`] call
 //!

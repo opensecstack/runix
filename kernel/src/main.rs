@@ -292,6 +292,37 @@ const BLK_FS_SERVER_PORT: usize = 8;
 #[allow(dead_code)]
 const PORT_ALLOCATION_MAP_SEE_DOC_COMMENT: () = ();
 
+/// This kernel's own fixed ephemeral source port for the outbound
+/// connection `grid_sandbox::spawn_instance`'s MARSHAL evaluation opens
+/// against `RUNIX_MARSHAL_PROXY_ADDR` (see that boot-time hook's own doc
+/// comment, below). Not configurable: nothing about a real deployment
+/// needs this to vary, it plays the same "just needs to be a plausible,
+/// unused local port" role `TCP_LOCAL_PORT` plays in every test that opens
+/// one.
+const MARSHAL_PROXY_LOCAL_PORT: u16 = 54_321;
+
+/// Parses `spec` as `ip.ip.ip.ip:port` for `RUNIX_MARSHAL_PROXY_ADDR`'s
+/// boot-time hook (see `kernel_main`'s own call site). `None` on anything
+/// malformed (missing/extra `:`, a non-numeric or out-of-`u8`-range octet,
+/// an unparsable port) -- the same fail-closed posture as everywhere else
+/// in this codebase that parses input it can't fully trust: a
+/// misconfigured build gets a loud boot-log message and a provably `None`
+/// (unconfigured, fail-open) MARSHAL proxy, never a panic or a guessed
+/// address.
+fn parse_marshal_proxy_addr(spec: &str) -> Option<([u8; 4], u16)> {
+    let (ip_part, port_part) = spec.split_once(':')?;
+    let port: u16 = port_part.parse().ok()?;
+    let mut octets = ip_part.split('.');
+    let mut ip = [0u8; 4];
+    for slot in &mut ip {
+        *slot = octets.next()?.parse().ok()?;
+    }
+    if octets.next().is_some() {
+        return None;
+    }
+    Some((ip, port))
+}
+
 /// Offset into the `BLK_INFO_VA` page `blk-driver-host` writes its own
 /// write-then-read-back result byte to -- same convention `NET_RESULT_OFFSET`
 /// already established (kernel writes the request into the page, the ring-3
@@ -606,6 +637,50 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
         None => {
             serial_println!("Runix kernel: no virtio-net I/O-space BAR0 found — Phase B8 skipped");
+        }
+    }
+
+    // Real boot-time MARSHAL proxy wiring: closes the one remaining gap in
+    // `grid_sandbox::spawn_instance`'s real enforcement machinery. That
+    // machinery itself (fail-open on `Unreachable`, fail-closed on a
+    // reachable `Refuse`/`HardStop`) is real and already proven correct
+    // (`kernel/tests/grid_sandbox_marshal_shadow.rs`) -- what was missing is
+    // that nothing in *this* real boot sequence ever called
+    // `grid_sandbox::set_shadow_marshal_proxy`, so `SHADOW_MARSHAL_PROXY`
+    // stayed `None` forever here and every real spawn silently fail-opened,
+    // not because enforcement was fake but because nothing ever pointed it
+    // at anything.
+    //
+    // No live MARSHAL deployment exists yet (see docs/ROADMAP.md's open
+    // questions) -- this doesn't invent one. `RUNIX_MARSHAL_PROXY_ADDR` is
+    // unset by default, so boot behavior is byte-for-byte identical to
+    // before this change unless a future build explicitly sets it (the
+    // same `option_env!` build-time-config pattern `xtask` already uses for
+    // `RUNIX_NETDEV_ARG`) -- once a real deployment exists, pointing this
+    // kernel at it becomes a build-config change, not a code change.
+    if let Some(spec) = option_env!("RUNIX_MARSHAL_PROXY_ADDR") {
+        match parse_marshal_proxy_addr(spec) {
+            Some((remote_ip, remote_port)) => {
+                runix_kernel::grid_sandbox::set_shadow_marshal_proxy(Some(
+                    runix_kernel::grid_sandbox::ShadowMarshalProxyConfig {
+                        remote_ip,
+                        remote_port,
+                        local_port: MARSHAL_PROXY_LOCAL_PORT,
+                    },
+                ));
+                serial_println!(
+                    "Runix kernel: MARSHAL shadow proxy configured at {:?}:{} from RUNIX_MARSHAL_PROXY_ADDR",
+                    remote_ip,
+                    remote_port
+                );
+            }
+            None => {
+                serial_println!(
+                    "Runix kernel: RUNIX_MARSHAL_PROXY_ADDR={:?} is not a valid ip:port -- MARSHAL \
+                     stays unconfigured (fail-open)",
+                    spec
+                );
+            }
         }
     }
 
