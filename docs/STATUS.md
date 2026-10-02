@@ -3001,3 +3001,56 @@ kernel-direct over `citadel_proxy` (the implementation that actually exists
 and works today) as this system's real transport — see
 `docs/ROADMAP.md`'s open questions for that still-fully-open architectural
 decision.
+
+## A live CITADEL/MARSHAL deployment exists and is reachable — but a real round trip needs identity work that doesn't exist yet
+
+As of 2026-10-02, a real CITADEL deployment is reachable over the network
+(Cloudflare tunnels fronting CITADEL and sinauth), independently verified,
+not just reported: `GET /api/v1/health` on both returns `200` with a real
+body (`{"status":"ok","db":"ok",...}` for CITADEL); `POST
+/api/v1/marshal/evaluate` with an empty body returns a real, structured
+`REFUSE`/`HARD_STOP` `Decision` (not a transport-level error) — Gate 1
+(AuthN) `WARN`s on missing credentials rather than failing closed (this
+deployment doesn't have `EnforceIdentity`/`EnforceSignatures` set), Gate 2
+(AuthZ) `FAIL`s on an empty role, Gate 3 (NDS) `HARD_STOP`s on
+same-identity-by-default. This closes the "no live MARSHAL deployment
+exists anywhere" half of every open item that previously named it
+(`docs/ROADMAP.md`, `docs/THREAT_MODEL.md`'s MARSHAL/WORM trigger,
+`docs/MARSHAL-ENFORCEMENT-POLICY.md`) — there is now something real to
+point `RUNIX_MARSHAL_PROXY_ADDR`/`RUNIX_CITADEL_URL` at.
+
+**What this does not close, and why it's a bigger gap than it looks**:
+getting a real `EXECUTE` (or even a real, non-warn-mode `REFUSE`) requires
+operator-side identity credentials that nothing in this codebase has ever
+constructed. `HttpKerkeseTransport` (`desktop/src/citadel/transport.rs`)
+adds zero credentials of its own — confirmed by its own doc comment,
+"forward the carried `kerkese_json` to `HttpKerkeseTransport` verbatim" —
+it's a pure bytes-in/bytes-out HTTP POST. `citadel_proxy`
+(`desktop/src/citadel/proxy.rs`) only ever attaches `sig_verifier` (its own
+proxy identity, signing as the Verifier principal per
+`docs/RFC-VERIFIER-IDENTITY.md`'s Option A) — nothing anywhere constructs
+an `actor_token` (a sinauth-issued bearer JWT for the *operator* identity)
+or a `sig_operator` (an Ed25519 signature registered via `POST
+/api/v1/keys/register` for that same operator). Both are required inputs
+Gate 1 checks; today's envelope simply never carries them.
+
+**Deliberately not provisioned yet, on purpose, not an oversight**: seeding
+two sinauth accounts (operator + verifier) and registering an Ed25519 key
+for the operator is roughly 20 minutes of infrastructure work — but it
+would sit unused until `citadel_proxy` (or whatever ends up holding this
+responsibility) is taught to actually carry operator-side credentials, and
+*that* is a real identity-architecture decision, not a stub to bolt on:
+where does an operator's bearer token come from at request time (does the
+kernel hand it to the proxy somehow? does the proxy hold a service-account
+identity and impersonate the real operator?), and where does an operator's
+private signing key live (almost certainly never inside the kernel itself —
+so where, and how does the proxy get access to sign with it on the
+operator's behalf without becoming a single point of total compromise for
+every operator identity it can sign as?). Provisioning accounts before that
+design question is answered would front-run the decision, not advance it.
+This is RC-scope work (real identity integration), not Beta-scope
+(transport/enforcement plumbing, which — see the sections above — is done
+and correct). The precise, honest state of this gap, worth repeating
+exactly: **live, reachable, evaluating correctly — refusing for the right
+reasons — but nothing in this codebase can yet construct a request that
+should be allowed to succeed.**

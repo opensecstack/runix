@@ -100,6 +100,38 @@ of Alpha's scope (and beyond it) is done, in progress, or not started.
     in `kernel/Cargo.toml`'s `panic = "abort"` comment); treat kernel-direct
     as a deliberate future project specifically because it could give
     `tls-client` its first real consumer, not as a default migration target.
+- **Operator identity for a real MARSHAL round trip — open, RC-scope, not
+  started (2026-10-02).** A real CITADEL/MARSHAL deployment is reachable
+  (independently verified: `/api/v1/health` returns `200` on both CITADEL
+  and sinauth; `POST /api/v1/marshal/evaluate` returns a real, structured
+  `REFUSE`/`HARD_STOP` Decision for an empty request, not a transport
+  error) — see `docs/STATUS.md`'s own section on this. But no real
+  `EXECUTE` is possible yet: Gate 1 (AuthN) needs an `actor_token`
+  (sinauth-issued bearer JWT for the *operator* identity) and a
+  `sig_operator` (Ed25519 signature checked against a key registered via
+  `POST /api/v1/keys/register`), and nothing anywhere in this codebase
+  constructs either — `HttpKerkeseTransport` adds zero credentials of its
+  own (pure bytes-in/bytes-out), and `citadel_proxy` only ever attaches
+  `sig_verifier` (its own Verifier-identity signature, per
+  `docs/RFC-VERIFIER-IDENTITY.md`'s Option A).
+  - **Deliberately not provisioned ahead of a design decision.** Seeding
+    sinauth accounts and registering a key is ~20 minutes of infrastructure
+    work, but it would sit unused until something is taught to carry
+    operator-side credentials — and that's a real identity-architecture
+    question, not a stub: where does an operator's bearer token come from
+    at request time (kernel hands it to the proxy? the proxy holds a
+    service-account identity and impersonates?), and where does an
+    operator's private signing key live (almost certainly never inside the
+    kernel — so where, and how does whatever signs with it avoid becoming a
+    single point of total compromise for every operator identity it can
+    sign as)? Resolve this first; provisioning before it would front-run
+    the decision, not advance it.
+  - **Not Beta scope.** The transport/enforcement layer this decision sits
+    on top of (session-primitive IPC, `citadel_proxy`, `spawn_instance`'s
+    real fail-open/fail-closed enforcement, the boot-time
+    `RUNIX_MARSHAL_PROXY_ADDR` hook) is done and verified — see
+    `docs/STATUS.md`. This is real identity integration against a live
+    governance platform, squarely RC-scope work.
 - **SDK dependency — supply-chain policy for when #34 unblocks this.** This
   dependency sits on the boot-time authorization path: a compromised or
   maliciously-updated version doesn't just add a bug, it can make MARSHAL
