@@ -81,6 +81,45 @@ explicitly instead:
 rustup run nightly-x86_64-pc-windows-gnu cargo run -- build
 ```
 
+## `kernel-arm` (ARM/TrustZone, mobile)
+
+A separate standalone freestanding crate from `kernel/` — different
+architecture (`aarch64-unknown-none`), different toolchain channel
+(**stable**, not nightly; no `extern "x86-interrupt"`-style unstable
+features here), own `.cargo/config.toml`. Build and boot from *inside* the
+crate directory:
+
+```
+cd kernel-arm
+cargo build --target aarch64-unknown-none --release
+qemu-system-aarch64 -M virt,secure=on,gic-version=2 -cpu cortex-a53 \
+  -nographic -kernel target/aarch64-unknown-none/release/runix-kernel-arm
+```
+
+**Must be built from inside `kernel-arm/`, not via `--manifest-path`
+from the repo root — the latter silently produces a non-booting image.**
+`cargo build --manifest-path kernel-arm/Cargo.toml --target
+aarch64-unknown-none` run from the repo root leaves
+`kernel-arm/.cargo/config.toml`'s relative `-C link-arg=-Tlinker.ld`
+unresolvable, and `rust-lld` does not error on this — it links anyway,
+just wrong. The resulting ELF's entry point comes out at an arbitrary
+low address instead of `linker.ld`'s real load address, and QEMU boots
+straight into undefined instructions at reset with **zero UART output** —
+indistinguishable from a kernel hang, not a build failure, which is what
+makes this easy to lose time to. There is no warning; the only symptom is
+silence at the serial port. If a `kernel-arm` boot produces no output at
+all despite a "successful" build, suspect this before suspecting the
+kernel code itself — confirm by `cd`ing into `kernel-arm/` and rebuilding
+from there.
+
+On a Windows dev box with no MSVC Build Tools, the same GNU-toolchain
+workaround the x86_64 side needs applies here too (stable, not nightly,
+per this crate's own channel):
+
+```
+rustup run stable-x86_64-pc-windows-gnu cargo build --target aarch64-unknown-none --release
+```
+
 ## Kernel build stages (Alpha)
 
 1. Toolchain & target bring-up — `x86_64-unknown-none`, `no_std`/`no_main`,
