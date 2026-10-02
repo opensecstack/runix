@@ -39,6 +39,43 @@ recommendation.
 > RFC — all still use the fixed-port model completely unchanged. Migrating
 > each onto sessions is separate, later work; see
 > `docs/THREAT_MODEL.md`'s revisit-trigger entry for this primitive.
+>
+> **All three migrated (2026-09-30)**: a `kernel/tests/syscall_cost.rs`
+> benchmark measured the fixed-port transport at ~11,633us/syscall
+> round-trip versus ~51us/syscall for sessions — ~228x cheaper, and the
+> difference between a TLS-scale exchange fitting a 300ms T1 real-time
+> budget or exceeding it by 100x+ (see `docs/RFC-TLS-APPROACH.md`). That
+> finding, not the trigger conditions listed above, is what actually forced
+> the migration. `blk-driver-host`'s filesystem IPC, `net-driver-host`'s
+> sockets IPC, and `kernel::marshal_client` (its only client) all now ride
+> sessions exclusively; each driver collapsed its separate request/response
+> fixed ports into one session-accept port, and `ipc/src/fs.rs`'s
+> `response_port`/`response_token` fields (Option A's own workaround) were
+> retired as redundant once the session id itself became the authenticated
+> reply channel.
+>
+> **A real bug in the primitive itself was found and fixed during this
+> migration**: `Session` was one shared `VecDeque<u8>` for both directions,
+> and `session_try_recv` checked only that the caller was *a* participant
+> (owner or server), never that a queued byte was written by the *other*
+> one. A caller that sent a request and immediately polled `RECV` for the
+> reply — the obvious way to write a client — could race the peer's own
+> `ACCEPT`+`RECV` and dequeue its own just-sent bytes back out, silently
+> destroying its own request before the real peer ever saw it. This file's
+> own `kernel/tests/ipc_session.rs` isolation proof never caught it: it's an
+> echo test (client sends "AAAA", expects "AAAA" back), and a client reading
+> back its own bytes instead of a real echo produces the identical passing
+> assertion. Fixed by splitting `Session` into two directional queues
+> (`owner_to_server`/`server_to_owner`) with independent send-locks, making
+> the bug structurally impossible rather than dependent on caller-side
+> timing discipline. A second, related finding: `SYS_IPC_SESSION_ACCEPT`'s
+> capability check was an unconditional Ed25519 verification with no cheap
+> "nothing pending" pre-check (unlike `SYS_IPC_RECV`'s `ipc::is_empty`),
+> which forced `net-driver-host` to throttle its own `ACCEPT` polling to
+> once every 10,000 loop iterations — a real latency floor incompatible
+> with `kernel/src/grid_sandbox.rs`'s `SHADOW_MARSHAL_MAX_ITERS`'s <300ms
+> budget. Closed with `ipc::session_pending`, the same precedent `is_empty`
+> already set.
 
 ## Context
 

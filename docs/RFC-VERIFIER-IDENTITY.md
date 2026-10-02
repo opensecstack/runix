@@ -261,12 +261,12 @@ more Rust — (1) and (2) are deployment/infrastructure that doesn't exist yet
 anywhere in this project's environment, and (3) is a CITADEL-side
 configuration decision for whoever operates the deployment. This is
 distinct from the `opensecstack/sdk/rust` blocker `docs/ROADMAP.md`'s "Open
-questions" section tracks for the *Kerkese submission* path (that one is a
-missing client library — `sdk/rust`'s `CITADELClient` is a WORM
-event-delivery client, not a Kerkese submit/decision call, and can't run in
-`kernel/`'s `no_std` target regardless): key registration doesn't need a new
-Rust dependency at all — `reqwest` + `hex` already cover the wire mechanics
-— it needs a deployment and an identity provider to point them at, neither
+questions" section used to track for the *Kerkese submission* path — that
+one is now resolved (`citadel-kerkese-core` 1.0.0, a `no_std`-compatible
+Kerkese client core, see that doc's current entry); key registration was
+never blocked on it in the first place, since it doesn't need a new Rust
+dependency at all — `reqwest` + `hex` already cover the wire mechanics —
+it needs a deployment and an identity provider to point them at, neither
 of which is an artifact this repository's own build can produce.
 
 ### What registration would concretely look like, once both exist

@@ -4,8 +4,27 @@ This document proposes a failure-mode policy for turning `kernel/src/grid_sandbo
 current shadow-mode MARSHAL evaluation into real enforcement — a decision that has
 genuine security tradeoffs and needs explicit reasoning before code gets written.
 
-**Status**: proposal for repo owner review. No code written yet. This is the gate
-before any `spawn_instance` implementation changes.
+**Status**: **implemented, repo-owner-approved.** Option B (below) was the
+decision made and is what `kernel/src/grid_sandbox.rs`'s `spawn_instance`
+actually does today — proven end to end by
+`kernel/tests/grid_sandbox_marshal_shadow.rs` (all three paths: unconfigured/
+fail-open, a genuinely reachable `Refuse`/fail-closed against a real
+listener, and unreachable/fail-open), whose own `PASS` message names this
+document by name ("matching Option B"). The rest of this document is kept
+as the original proposal/rationale, not rewritten into past tense — treat
+every "would"/"proposes" below as "did," and see
+`docs/STATUS.md`'s "MARSHAL boot-time proxy wiring" and "MARSHAL test
+fixes" sections for what was found and fixed while verifying it (a real
+self-read bug in the IPC session primitive, a production fail-fast budget
+that needed a test-only override rather than loosening, and a boot-time
+`RUNIX_MARSHAL_PROXY_ADDR` hook that replaces this section's "proxy
+configuration defaults to `None`" framing below — still the *default*, now
+an explicit, documented build-time override exists for it). What's still
+genuinely true from this proposal's "Context" below: no live CITADEL
+deployment exists in any dev/CI/QEMU scenario, and nothing outside test
+code ever calls `spawn_instance` at all — see `docs/THREAT_MODEL.md`'s
+MARSHAL/WORM revisit trigger for the current, precise list of what that
+leaves open.
 
 ## Context
 

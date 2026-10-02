@@ -2822,3 +2822,182 @@ parallelizable against each other once attempted, but starting any of them
 without this primitive already proven first would have been exactly the
 "partially-applied cross-crate change" this project's own CLAUDE.md warns
 against.
+
+## Option C consumers migrated: blk-driver-host and net-driver-host off the fixed-port transport
+
+Follow-up to the section above. The syscall-cost benchmark it references
+(`kernel/tests/syscall_cost.rs`, see "Network stack, entropy Phase 4") is
+what actually forced this, not the ceiling/attribution gaps named as
+Option A's limits: a real TLS-scale exchange (1500-3000 bytes, thousands of
+syscalls) over the fixed-port transport (~11,633us/syscall round trip)
+exceeds the 300ms T1 real-time budget by 100x+; the session primitive
+(~51us/syscall, ~228x cheaper) fits comfortably. `blk-driver-host`'s
+filesystem IPC, `net-driver-host`'s sockets IPC, and `kernel::marshal_client`
+(the only client of the latter) all now ride sessions exclusively.
+
+- **`blk-driver-host`**: `FS_REQUEST_PORT`(8)/`FS_WRITE_REQUEST_PORT`(10)
+  collapsed into one `FS_SERVER_PORT`(8) — reads and writes both flow as
+  `FsRequest` variants over whatever session a client opened, since the
+  enum tag itself already distinguishes them. `ipc/src/fs.rs`'s
+  `response_port`/`response_token` fields (Option A's own workaround for a
+  shared response port with no per-caller identity) were retired as
+  redundant — a session id is already a kernel-authenticated reply channel,
+  verified by participant identity rather than a caller-supplied token.
+  Verified: `blk_fs_ipc`, `blk_fs_concurrent`, `blk_fs_concurrent_write`,
+  `blk_driver_rw`, `blk_fat32_read` all pass on fresh QEMU images; workspace
+  build and `cargo test -p runix-ipc` (29 tests) clean.
+- **`net-driver-host`**: `SOCK_REQUEST_PORT`(11)/`SOCK_RESPONSE_PORT`(12)
+  collapsed into one `SOCKETS_SERVER_PORT`(11). `kernel::marshal_client`'s
+  `evaluate()` now opens exactly one session per call (mapping naturally to
+  one socket-open-through-close lifecycle) instead of racing on a shared
+  port pair — closing `ipc/src/sockets.rs`'s long-standing "can't attribute
+  a handle to its caller" gap as a side effect, not just the performance
+  problem this migration set out to fix. Verified: `net_driver_sockets`,
+  `net_driver_sockets_concurrent`, `marshal_tcp_roundtrip`,
+  `marshal_proxy_e2e` all pass on fresh QEMU images (via WSL Fedora, which
+  has the `nc`/`guestfwd` support native Windows Slirp lacks).
+
+**A real isolation bug in the session primitive itself was found and fixed
+during this migration — not a driver bug, a kernel bug.** `Session` was one
+shared `VecDeque<u8>` for both directions; `session_try_recv` checked only
+that the caller was *a* participant (owner or server), never that a queued
+byte was written by the *other* one. A client that sent a request and
+immediately polled `RECV` for the reply — the obvious, correct-looking way
+to write a client (see `kernel::marshal_client::evaluate`'s own shape) —
+could race the server's `ACCEPT`+`RECV` and dequeue its own just-sent bytes
+back out, silently destroying its own request before the real server ever
+saw it. Root-caused via a temporary `serial_println!` in
+`session_try_recv` showing a client's own `RECV` firing with a non-empty
+queue *before* the session had even been accepted (`server: None`) —
+unambiguous proof of a self-read, not a timing coincidence.
+`kernel/tests/ipc_session.rs`'s own isolation proof never caught this: it's
+an echo test (client sends "AAAA", expects "AAAA" back), and a client
+reading back its own bytes instead of a real server echo produces the
+identical passing assertion — the test was blind to this failure mode by
+construction, not merely unlucky not to hit it.
+
+Fixed by splitting `Session` into two directional queues
+(`owner_to_server`/`server_to_owner`) with independent send-locks
+(`kernel/src/ipc.rs`), routed by a new `Role` (`Owner`/`Server`) resolved
+once per call via `role_of` — an owner's `SEND` always lands in
+`owner_to_server`, a server's always in `server_to_owner`, and each side's
+`RECV` only ever reads the *other* lane. This makes the bug structurally
+impossible rather than dependent on caller-side timing discipline.
+`kernel/tests/ipc_session.rs` still passes unchanged, now proving a real
+echo rather than accidentally passing for the wrong reason.
+
+**A second, related bug — a real latency floor, not a correctness bug —
+was found and fixed while getting `grid_sandbox_marshal_shadow.rs` to pass
+against the migrated transport.** `SYS_IPC_SESSION_ACCEPT`'s capability
+check (`authorized_for_port`, a real Ed25519 verification) had no cheap
+"nothing pending" pre-check the way `SYS_IPC_RECV`'s `ipc::is_empty`
+already does — calling it on every iteration of `net-driver-host`'s
+up-to-500,000,000-iteration server loop paid that full verification cost
+every time, which is what originally forced a workaround throttling
+`SESSION_ACCEPT` polling to once every 10,000 iterations. That throttle
+was itself a real cost: a hard ~10,000-iteration floor on how fast *any*
+client's session ever got accepted, regardless of how fast the rest of the
+system was — incompatible with `kernel/src/grid_sandbox.rs`'s
+`SHADOW_MARSHAL_MAX_ITERS`'s <300ms T1 real-time budget for MARSHAL shadow
+evaluation. Fixed properly, not worked around again: `ipc::session_pending`
+(checked in `SYS_IPC_SESSION_ACCEPT`'s dispatch arm, before
+`authorized_for_port` runs) gives servers the same cheap pre-check
+`SYS_IPC_RECV` already has, so `net-driver-host` polls `ACCEPT` every
+iteration again with no throttle at all.
+
+## MARSHAL test fixes: a stale fixture, and a budget that needed a test-only override, not a loosened production constant
+
+Two tests broken by this session's transport migration, for two unrelated
+reasons:
+
+- **`marshal_proxy_e2e.rs`**: its `FAKE_KERKESE_JSON` fixture predated
+  `docs/RFC-VERIFIER-IDENTITY.md`'s Option A, which made `citadel_proxy`
+  actually parse and policy-check the kernel's minimal envelope instead of
+  forwarding it opaquely. The old fixture (just `kerkese_version` plus an
+  unrecognized `"TEST_ACTION"` type) got refused by `citadel_proxy`'s own
+  `policy::check` before ever reaching the mock CITADEL endpoint — surfacing
+  as a `BadResponse("missing field \`dry_run\`")` instead of the expected
+  Decision. Fixed by replacing it with the same real minimal-envelope shape
+  `desktop/src/citadel/proxy.rs`'s own test fixture
+  (`minimal_envelope_json`) and `grid_sandbox.rs`'s `shadow_marshal_evaluate`
+  actually send. Verified passing end to end against the real `citadel_proxy`
+  binary and `mock_citadel_server.py`.
+- **`grid_sandbox_marshal_shadow.rs`**: its "shadow-refused" case needs a
+  full session-open-through-close round trip against a real listener to
+  complete — the same real-round-trip budget `marshal_tcp_roundtrip.rs`/
+  `marshal_proxy_e2e.rs` needed raised from 200,000 to 2,000,000 iterations
+  earlier in this same migration — but `grid_sandbox.rs`'s own
+  `SHADOW_MARSHAL_MAX_ITERS` is a genuine **production** fail-fast budget
+  (2,000 iterations) for a hard T1 real-time spawn path, not a test knob,
+  and isn't simply raised to match: doing that would loosen a documented
+  <300ms safety constant for a reason that has nothing to do with
+  production (QEMU/`nc` test-environment overhead, not real proxy latency).
+  Fixed by adding `grid_sandbox::set_shadow_marshal_max_iters_override`
+  (same "exists mainly for tests, but nothing stops a real deployment from
+  using it" posture as `set_shadow_marshal_proxy`) so this one test case can
+  ask for a larger budget explicitly, leaving every other caller — every
+  other test, and any real deployment — at the tight default. Verified: all
+  three cases (`shadow-unconfigured`/fail-open, a genuinely reachable
+  `Refuse`/fail-closed against a real listener, `shadow-unreachable`/
+  fail-open) pass; `net_driver_sockets`/`net_driver_sockets_concurrent`/
+  `marshal_tcp_roundtrip` all still pass with the `ACCEPT` throttle removed.
+
+## MARSHAL boot-time proxy wiring: closing the one remaining gap in spawn_instance's real enforcement
+
+`grid_sandbox::spawn_instance`'s enforcement (fail-open on `Unreachable`,
+fail-closed on a reachable `Refuse`/`HardStop`) was already real and proven
+by the test above — but nothing in `kernel_main`'s actual boot sequence
+ever called `set_shadow_marshal_proxy`, only test files did. So in any real
+boot, `SHADOW_MARSHAL_PROXY` stayed `None` forever and every real spawn
+silently fail-opened: not because the enforcement logic was fake, but
+because nothing in boot ever pointed it at anything.
+
+Closed with a build-time hook, `RUNIX_MARSHAL_PROXY_ADDR` (`ip:port`), read
+via `option_env!` the same way `xtask` already threads `RUNIX_NETDEV_ARG`
+through to QEMU — unset by default, so boot behavior is byte-for-byte
+identical to before this change. Verified both ways: booting without the
+var produces no MARSHAL log line at all; booting with
+`RUNIX_MARSHAL_PROXY_ADDR=10.0.2.100:9104` set logs "MARSHAL shadow proxy
+configured at [10, 0, 2, 100]:9104 from RUNIX_MARSHAL_PROXY_ADDR", and
+`grid_sandbox_marshal_shadow.rs` still passes.
+
+**Two gaps remain, deliberately out of scope for this change**: no live
+MARSHAL deployment exists anywhere to point `RUNIX_MARSHAL_PROXY_ADDR` at
+(see `docs/ROADMAP.md`'s open questions); and nothing outside test code
+(`kernel/tests/grid_sandbox_marshal_shadow.rs`, `kernel/tests/
+grid_sandbox_multi_instance.rs`) ever actually calls `spawn_instance` —
+this kernel's own boot loads `grid-sandbox-host` through the separate
+CITADEL boot-allowlist path (`citadel::demo_authorize`), not through
+`spawn_instance`, which exists for spawning app *instances* inside an
+already-running `grid-sandbox-host`. A real trigger for that (a launcher, a
+shell, some other runtime-driven request) doesn't exist yet. The boot-time
+proxy configuration is now genuinely complete; it isn't yet load-bearing in
+practice, for two independent reasons that were already open before this
+change and aren't closed by it.
+
+## Rust MARSHAL SDK dependency resolved upstream: `citadel-kerkese-core` 1.0.0
+
+`opensecstack/sdk/rust` cut `citadel-kerkese-core` as v1.0.0 — a `no_std` +
+`alloc` core for building, signing, and submitting CITADEL MARSHAL Kerkese
+requests, built specifically for hosts like this kernel that can't pull in
+Tokio/reqwest, verified against the Go reference implementation
+(`citadel/internal/marshal/{types,sig}.go`) with a known-answer test. This
+closes [opensecstack/opensecstack#34](https://github.com/opensecstack/opensecstack/issues/34),
+the external blocker `docs/ROADMAP.md`'s open questions previously
+described as unresolved — see that doc for the full account.
+
+`citadel-integration` already depends on it: its own locally-duplicated
+`KerkeseTransport` trait and `TransportError` enum (which existed only as a
+documented "shape to code against later") were deleted and replaced with
+`pub use citadel_kerkese_core::{KerkeseTransport, TransportError}` — same
+trait shape, same error variants, verified identical before swapping.
+**Purely mechanical, not a capability unlock**: nothing calls
+`KerkeseTransport` anywhere in `citadel-integration` or `kernel/` — there
+was no implementation before, there's no implementation now. Boot-time
+module authorization is completely unaffected (still offline Ed25519
+verification, no network round-trip). This removed the reason a
+kernel-direct MARSHAL client used to be blocked; it didn't advance
+kernel-direct over `citadel_proxy` (the implementation that actually exists
+and works today) as this system's real transport — see
+`docs/ROADMAP.md`'s open questions for that still-fully-open architectural
+decision.

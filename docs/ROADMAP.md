@@ -50,25 +50,56 @@ of Alpha's scope (and beyond it) is done, in progress, or not started.
     third-party signature has to the signer.
   - **Real revisit trigger, not a vague "later"**: if/when this crate
     grows actual MARSHAL policy/Gate evaluation logic client-side (not
-    just signature verification against a pre-signed artifact) — the
-    "Full MARSHAL/WORM runtime logic" work blocked on
-    `opensecstack/sdk/rust` below — re-run this analysis then. That would
-    cross from "verifies a governance platform's output" into "reimplements
-    governance platform logic," which is a materially different question
-    this same reasoning doesn't answer.
+    just signature verification against a pre-signed artifact) — re-run
+    this analysis then. The dependency that used to block this
+    (`opensecstack/sdk/rust`'s no-`std` Kerkese core) now exists — see the
+    SDK-dependency entry below — but the logic itself hasn't been written;
+    `citadel-integration`'s `KerkeseTransport`/`TransportError` today are
+    only re-exported type definitions with zero implementations anywhere in
+    this repo (see that entry). Crossing from "verifies a governance
+    platform's output" into "reimplements governance platform logic" is
+    still a materially different question this same reasoning doesn't
+    answer, and still hasn't happened.
 - **`repository` field**: resolved — `Cargo.toml` now points at the real
   remote (`https://github.com/opensecstack/runix`), matching `git remote
   origin`. No longer a placeholder.
-- **SDK dependency**: `citadel-integration` will depend on
-  `opensecstack/sdk/rust` once the real CITADEL binding is built. Until then
-  it's a stub with no external dependency. `sdk/rust` now exists, but its
-  `CITADELClient` doesn't unblock this yet — it's a WORM *event-delivery*
-  client (`send_event`/`get_events`/`verify_chain`, async on Tokio +
-  `reqwest`, needs a host OS), not a MARSHAL Kerkese submit/decision call,
-  and it can't compile inside `kernel/`'s `no_std` freestanding target
-  regardless. Tracked upstream:
-  [opensecstack/opensecstack#34](https://github.com/opensecstack/opensecstack/issues/34).
-  This is an external blocker, not something Runix's own roadmap controls.
+- **SDK dependency — resolved (2026-10-01)**: `opensecstack/sdk/rust` cut
+  `citadel-kerkese-core` as v1.0.0, a `no_std` + `alloc` core for building,
+  signing, and submitting CITADEL MARSHAL Kerkese requests — built
+  specifically for hosts like Runix's freestanding kernel that can't pull in
+  Tokio/reqwest, verified against the Go reference implementation
+  (`citadel/internal/marshal/{types,sig}.go`) with a known-answer test. This
+  closes [opensecstack/opensecstack#34](https://github.com/opensecstack/opensecstack/issues/34),
+  the external blocker the old text here described. `citadel-integration`
+  already depends on it (`a3cbe2a`): its own locally-duplicated
+  `KerkeseTransport` trait and `TransportError` enum were deleted and
+  replaced with `pub use citadel_kerkese_core::{KerkeseTransport,
+  TransportError}` — verified identical shape before swapping.
+  - **What that change was, and wasn't**: purely a type-identity swap.
+    Nothing calls `KerkeseTransport` anywhere in `citadel-integration` or
+    `kernel/` — there was no implementation before, there's still none now.
+    Boot-time module authorization is unaffected (still offline Ed25519
+    verification, no network round-trip). It removed the reason Option 1
+    below used to be blocked; it didn't advance Option 1 over Option 2.
+  - **Option 1 (kernel-direct) vs. Option 2 (user-space proxy) is still
+    fully open**, and is now the real decision, not a future one gated on a
+    dependency that didn't exist. Option 2 is the one with a real,
+    end-to-end-proven implementation today: `desktop/src/bin/citadel_proxy.rs`
+    (`std`/`reqwest`/Tokio, real HTTP to CITADEL), reached from the kernel
+    over `kernel/src/marshal_client.rs`'s session-based sockets IPC
+    transport — see `kernel/tests/marshal_proxy_e2e.rs`. Option 1
+    (`citadel-kerkese-core` used directly from `kernel/`, with no proxy
+    hop) is now technically *possible* for the first time — `sdk/rust`'s
+    own `examples/kernel_direct_sketch.rs` sketches the shape — but
+    unimplemented: it would need a `no_std` HTTP(S) client inside the
+    kernel, for which `tls-client` (built this session, currently
+    consumer-less — see `docs/RFC-TLS-APPROACH.md`) would be the natural
+    TLS layer. Current recommendation: keep `citadel_proxy` as the real
+    transport (it works, and keeps `unsafe`/panic-abort kernel code out of
+    TLS+HTTP+JSON parsing on a privileged path — see this repo's own stance
+    in `kernel/Cargo.toml`'s `panic = "abort"` comment); treat kernel-direct
+    as a deliberate future project specifically because it could give
+    `tls-client` its first real consumer, not as a default migration target.
 - **SDK dependency — supply-chain policy for when #34 unblocks this.** This
   dependency sits on the boot-time authorization path: a compromised or
   maliciously-updated version doesn't just add a bug, it can make MARSHAL
