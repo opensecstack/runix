@@ -171,6 +171,7 @@ mod smoltcp_spike;
 mod svc;
 mod vectors;
 mod virtio_mmio;
+mod virtio_net;
 
 use core::arch::naked_asm;
 use core::panic::PanicInfo;

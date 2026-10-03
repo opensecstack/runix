@@ -219,19 +219,50 @@ fn el1_setup() -> ! {
     // are on the command line).
     let scan = crate::virtio_mmio::probe();
     match scan.net {
-        Some(dev) => serial_println!(
-            "Runix ARM kernel: virtio-mmio net device at slot {}, version {}, vendor {:#x}, \
-             MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            dev.slot,
-            dev.version,
-            dev.vendor_id,
-            dev.mac[0],
-            dev.mac[1],
-            dev.mac[2],
-            dev.mac[3],
-            dev.mac[4],
-            dev.mac[5],
-        ),
+        Some(dev) => {
+            serial_println!(
+                "Runix ARM kernel: virtio-mmio net device at slot {}, version {}, vendor {:#x}, \
+                 MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                dev.slot,
+                dev.version,
+                dev.vendor_id,
+                dev.mac[0],
+                dev.mac[1],
+                dev.mac[2],
+                dev.mac[3],
+                dev.mac[4],
+                dev.mac[5],
+            );
+
+            // Stage 1 (see `virtio_net.rs` and
+            // `docs/BETA_MOBILE_PROGRESS.md` item 2.2): virtqueue
+            // bring-up plus one hand-built ARP round trip against
+            // QEMU/SLIRP, proving the virtqueue mechanism end to end.
+            // Same "informational, not fatal" stance as the discovery
+            // above -- nothing downstream of here depends on networking
+            // yet, and a kernel that refuses to finish booting because an
+            // optional emulated NIC didn't answer would be strictly worse
+            // for every other boot path (the no-`-netdev` case included).
+            match crate::virtio_net::arp_round_trip(&dev) {
+                Ok(reply) => serial_println!(
+                    "Runix ARM kernel: virtio-net ARP reply from {}.{}.{}.{}, sender MAC \
+                     {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (used_len {}, tx_completed {})",
+                    reply.sender_ip[0],
+                    reply.sender_ip[1],
+                    reply.sender_ip[2],
+                    reply.sender_ip[3],
+                    reply.sender_mac[0],
+                    reply.sender_mac[1],
+                    reply.sender_mac[2],
+                    reply.sender_mac[3],
+                    reply.sender_mac[4],
+                    reply.sender_mac[5],
+                    reply.used_len,
+                    reply.tx_completed,
+                ),
+                Err(err) => serial_println!("Runix ARM kernel: virtio-net ARP FAILED -- {}", err),
+            }
+        }
         None => serial_println!(
             "Runix ARM kernel: virtio-mmio no net device found ({} populated slot(s) of 32)",
             scan.populated_slots

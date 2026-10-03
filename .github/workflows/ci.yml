@@ -481,6 +481,7 @@ jobs:
             -M virt,secure=on,gic-version=2 -cpu cortex-a53 -nographic \
             -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
             -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
+            -global virtio-mmio.force-legacy=false \
             | tee /tmp/arm-boot.log || true
           grep -q "Runix ARM kernel: boot OK" /tmp/arm-boot.log
           grep -q "Runix ARM kernel: CurrentEL = EL3" /tmp/arm-boot.log
@@ -509,16 +510,26 @@ jobs:
           # docs/BETA_MOBILE_PROGRESS.md item 2.1): the `-netdev`/`-device
           # virtio-net-device` pair above is what makes one of the `virt`
           # machine's 32 MMIO slots non-empty at all. Deliberately asserts
-          # neither the slot index nor the transport version: QEMU assigns
-          # these slots top-down (locally the device lands at slot 31, not
-          # 0) and whether it comes up legacy (version 1) or modern
-          # (version 2) depends on the QEMU build's
-          # `virtio-mmio.force-legacy` default. The MAC is the real check
-          # that config space at slot_base+0x100 was read correctly --
-          # 52:54:00:12:34:56 is QEMU's own default guest MAC, so a wrong
-          # offset or stride cannot produce it by accident.
+          # no particular slot index: QEMU assigns these slots top-down
+          # (locally the device lands at slot 31, not 0). The MAC is the
+          # real check that config space at slot_base+0x100 was read
+          # correctly -- 52:54:00:12:34:56 is QEMU's own default guest MAC,
+          # so a wrong offset or stride cannot produce it by accident.
           grep -q "Runix ARM kernel: virtio-mmio net device at slot " /tmp/arm-boot.log
           grep -q "MAC 52:54:00:12:34:56" /tmp/arm-boot.log
+          # virtqueue bring-up + one hand-built ARP round trip (Stage 1,
+          # item 2.2). `-global virtio-mmio.force-legacy=false` above is
+          # load-bearing, not cosmetic: virtio_net.rs requires MMIO
+          # transport version 2 (separate per-queue ring-address registers)
+          # and refuses to run on legacy, so without that flag this prints
+          # its failure line instead. 10.0.2.2 is SLIRP's gateway and
+          # 52:55:0a:00:02:02 is the MAC SLIRP answers with (its
+          # `52:55:` + the four address bytes convention) -- asserting the
+          # *specific* MAC, not just "some reply", is what makes this proof
+          # that a real frame crossed the virtqueue rather than that this
+          # driver echoed back something it made up itself.
+          grep -q "Runix ARM kernel: virtio-net ARP reply from 10.0.2.2, sender MAC 52:55:0a:00:02:02" \
+            /tmp/arm-boot.log
           # The RIL isolation boundary: EL1->EL0 drop, SVC gate, and a real
           # capability-manager token check distinguishing an authorized
           # channel from an unauthorized one — not just that EL0 code ran.
@@ -587,6 +598,7 @@ jobs:
             -M virt,gic-version=2 -cpu cortex-a53 -nographic \
             -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
             -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
+            -global virtio-mmio.force-legacy=false \
             | tee /tmp/arm-boot-nosecure.log || true
           grep -q "Runix ARM kernel: boot OK" /tmp/arm-boot-nosecure.log
           grep -q "Runix ARM kernel: CurrentEL = EL1" /tmp/arm-boot-nosecure.log
@@ -595,12 +607,14 @@ jobs:
           grep -q "no EL3 ever ran, so no security-state switch to report" \
             /tmp/arm-boot-nosecure.log
           grep -q "Runix ARM kernel: MMU enabled" /tmp/arm-boot-nosecure.log
-          # Same virtio-mmio discovery assertion as the secure boot above
-          # (see its comment for why slot/version aren't asserted) -- the
-          # probe runs in `nonsecure.rs`'s shared EL1 bring-up, so it must
-          # work on both entry paths, not just the EL3 one.
+          # Same virtio-mmio discovery + ARP round-trip assertions as the
+          # secure boot above (see its comments) -- both run in
+          # `nonsecure.rs`'s shared EL1 bring-up, so they must work on both
+          # entry paths, not just the EL3 one.
           grep -q "Runix ARM kernel: virtio-mmio net device at slot " /tmp/arm-boot-nosecure.log
           grep -q "MAC 52:54:00:12:34:56" /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: virtio-net ARP reply from 10.0.2.2, sender MAC 52:55:0a:00:02:02" \
+            /tmp/arm-boot-nosecure.log
           grep -q "^UB$" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_RIL_ACCESS channel 0 authorized" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_RIL_RECV channel 0 authorized, byte 0x41" \

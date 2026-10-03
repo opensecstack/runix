@@ -90,6 +90,16 @@ pub struct NetDevice {
     pub mac: [u8; 6],
 }
 
+impl NetDevice {
+    /// Base address of this device's register window. Exposed so Stage 1
+    /// (`virtio_net.rs`) can drive the same device without duplicating
+    /// `VIRTIO_MMIO_BASE`/`SLOT_STRIDE`, which would be two places for the
+    /// same machine-layout fact to drift apart.
+    pub fn base(&self) -> usize {
+        VIRTIO_MMIO_BASE + self.slot * SLOT_STRIDE
+    }
+}
+
 /// Result of one full scan of the MMIO window.
 pub struct Scan {
     /// How many slots held *any* device (non-zero `DeviceID`) -- lets the
