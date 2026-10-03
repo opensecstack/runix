@@ -27,9 +27,9 @@
 use crate::io::BlockingIo;
 use crate::rng::EntropyRng;
 use crate::{Entropy, Transport, Yield};
+pub use embedded_tls::blocking::{Aes128GcmSha256 as CipherSuite, NoClock};
 use embedded_tls::blocking::{Certificate, CryptoProvider, TlsContext, TlsVerifier};
 use embedded_tls::pki::CertVerifier;
-pub use embedded_tls::blocking::{Aes128GcmSha256 as CipherSuite, NoClock};
 pub use embedded_tls::TlsConfig as Config;
 pub use embedded_tls::TlsError as HandshakeError;
 

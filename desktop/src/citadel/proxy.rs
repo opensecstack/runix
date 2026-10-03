@@ -190,7 +190,9 @@ fn record_proxy_verification(
     authorized: bool,
     reason: Option<String>,
 ) {
-    let mut log = worm_log.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut log = worm_log
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     log.record_proxy_verification(module_id, instance_id, authorized, reason);
 }
 
@@ -215,10 +217,7 @@ fn build_enriched_envelope(envelope: &KernelMinimalEnvelope, signing_key: &Signi
     let ts_utc = identity::format_rfc3339_utc(identity::now_unix_secs());
 
     let mut extra = std::collections::BTreeMap::new();
-    extra.insert(
-        "module_id".to_string(),
-        envelope.action.module_id.clone(),
-    );
+    extra.insert("module_id".to_string(), envelope.action.module_id.clone());
     extra.insert(
         "instance_id".to_string(),
         envelope.action.instance_id.clone(),
@@ -334,7 +333,13 @@ fn build_response(
     let instance_id = envelope.action.instance_id.clone();
 
     if let Err(err) = policy::check(&envelope) {
-        record_proxy_verification(worm_log, &module_id, &instance_id, false, Some(err.to_string()));
+        record_proxy_verification(
+            worm_log,
+            &module_id,
+            &instance_id,
+            false,
+            Some(err.to_string()),
+        );
         return policy_error_response(err);
     }
     record_proxy_verification(worm_log, &module_id, &instance_id, true, None);
@@ -400,8 +405,7 @@ pub fn serve(listen_addr: &str, transport: HttpKerkeseTransport) -> std::io::Res
     loop {
         match listener.accept() {
             Ok((mut stream, _addr)) => {
-                if let Err(e) =
-                    handle_connection(&mut stream, &transport, &signing_key, &worm_log)
+                if let Err(e) = handle_connection(&mut stream, &transport, &signing_key, &worm_log)
                 {
                     eprintln!("citadel_proxy: connection error: {e}");
                 }
@@ -661,9 +665,8 @@ mod tests {
                 let _ = stream.flush();
             }
         });
-        let transport = HttpKerkeseTransport::new(Some(format!(
-            "http://{mock_addr}/marshal/kerkese"
-        )));
+        let transport =
+            HttpKerkeseTransport::new(Some(format!("http://{mock_addr}/marshal/kerkese")));
 
         let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
         let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
@@ -705,7 +708,10 @@ mod tests {
 
         // The exact SoD-fix claim: operator and verifier are different
         // principals, not the same identity twice.
-        assert_ne!(forwarded.sod.operator_user_id, forwarded.sod.verifier_user_id);
+        assert_ne!(
+            forwarded.sod.operator_user_id,
+            forwarded.sod.verifier_user_id
+        );
         assert_eq!(forwarded.sod.operator_user_id, "kernel:grid_sandbox");
         assert_eq!(
             forwarded.sod.verifier_user_id,

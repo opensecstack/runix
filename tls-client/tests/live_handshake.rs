@@ -91,12 +91,7 @@ fn real_tls13_handshake_against_example_com() {
     let mut read_buf = vec![0u8; 16640];
     let mut write_buf = vec![0u8; 16640];
 
-    let mut conn = TlsConnection::new(
-        StdTransport(stream),
-        NoYield,
-        &mut read_buf,
-        &mut write_buf,
-    );
+    let mut conn = TlsConnection::new(StdTransport(stream), NoYield, &mut read_buf, &mut write_buf);
 
     let config = runix_tls_client::Config::new().with_server_name("example.com");
 

@@ -202,10 +202,7 @@ impl FsRequest {
                 }
                 let data = rest[2..2 + len].to_vec();
                 off += 2 + len;
-                Some((
-                    FsRequest::Write { name, token, data },
-                    off,
-                ))
+                Some((FsRequest::Write { name, token, data }, off))
             }
             _ => None,
         }
