@@ -119,22 +119,24 @@
 //! comment on non-cacheable table walks).
 
 use crate::mmu::{
-    normal_4kib_page_descriptor, table_descriptor, AP_EL0_RW, DESC_TABLE_OR_PAGE, GRANULE_1GIB,
-    GRANULE_4KIB, PXN, UXN,
+    normal_4kib_page_descriptor, table_descriptor, AP_EL0_RW, DESC_TABLE_OR_PAGE, GRANULE_4KIB,
+    PXN, UXN,
 };
 use crate::serial_println;
 use alloc::alloc::{alloc_zeroed, Layout};
 use alloc::collections::BTreeSet;
 use core::fmt;
 
-/// Base of the process-private VA window -- level-1 index 2, which
-/// `mmu.rs` never populates. See this module's doc comment for why private
-/// mappings get their own level-1 slot rather than sharing the kernel's.
-pub const PRIVATE_REGION_BASE: u64 = 2 * GRANULE_1GIB;
-/// One past the end of the private window (exclusive) -- one level-1 slot,
-/// 1 GiB, which is far more private VA space than any plausible first
-/// process needs.
-pub const PRIVATE_REGION_END: u64 = PRIVATE_REGION_BASE + GRANULE_1GIB;
+/// The process-private VA window (`0x8000_0000`..`0xC000_0000`) -- level-1
+/// index 2, which `mmu.rs` never populates. See this module's doc comment
+/// for why private mappings get their own level-1 slot rather than sharing
+/// the kernel's.
+///
+/// Defined in the library half of this crate (`vm.rs`) and re-exported
+/// here, because `loader.rs` -- which is host-tested and therefore cannot
+/// see this module -- subdivides the same window into a segment region, a
+/// guard gap, and the EL0 stack. One definition, two consumers.
+pub use runix_kernel_arm::vm::{PRIVATE_REGION_BASE, PRIVATE_REGION_END};
 
 /// Output-address field of a translation descriptor, bits `[47:12]`. Used
 /// both to build a `TTBR0_EL1` value's table address and to read a
@@ -165,16 +167,27 @@ pub enum AddressSpaceError {
     OutOfMemory,
 }
 
-impl fmt::Display for AddressSpaceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let msg = match self {
+impl AddressSpaceError {
+    /// This error's message as a `&'static str`, so a caller can carry the
+    /// real reason across a crate boundary that cannot name this type --
+    /// `loader.rs` lives in the library half of this crate and its
+    /// `LoaderError::MapFailed` stores exactly this (see
+    /// `load_proof.rs`'s `PrivatePageMapper` impl). [`fmt::Display`] is
+    /// implemented in terms of this, so the two can't drift.
+    pub fn message(&self) -> &'static str {
+        match self {
             AddressSpaceError::VaOutsidePrivateRegion => {
                 "virtual address is outside the process-private region"
             }
             AddressSpaceError::VaMisaligned => "virtual address is not 4 KiB-aligned",
             AddressSpaceError::OutOfMemory => "out of memory for a page or translation table",
-        };
-        f.write_str(msg)
+        }
+    }
+}
+
+impl fmt::Display for AddressSpaceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message())
     }
 }
 
@@ -278,13 +291,34 @@ impl AddressSpace {
     /// Descriptor bits: Normal non-cacheable (`ATTRINDX_NORMAL`), Inner
     /// Shareable, `AF` set, `AP[2:1] = 0b01` (read/write from both EL1 and
     /// EL0), and `UXN | PXN` -- a data page, never executable from either
-    /// exception level. The loader slice is where per-segment `PF_X` turns
-    /// into clearing `UXN`; doing it here, for a page nothing executes,
-    /// would be a gap for no reason (`mmu.rs` applies the same W^X
-    /// reasoning to `EL0_STACK`).
+    /// exception level. That is the right default for a page nothing
+    /// executes, and it is what this crate's own isolation proof
+    /// ([`prove_isolation`]) relies on; a *loaded* `.text` page needs
+    /// different bits, which is what
+    /// [`map_private_page_with`](Self::map_private_page_with) is for.
     pub fn map_private_page(
         &mut self,
         va: u64,
+    ) -> Result<&'static mut [u8; 4096], AddressSpaceError> {
+        self.map_private_page_with(va, AP_EL0_RW | UXN | PXN)
+    }
+
+    /// [`map_private_page`](Self::map_private_page) with explicit
+    /// permission bits -- the `extra` argument of
+    /// `mmu::normal_4kib_page_descriptor`, i.e. `AP[2:1]` plus `UXN`/`PXN`.
+    ///
+    /// Added for `loader.rs` (slice 3), which computes those bits per
+    /// segment from its real `PF_R`/`PF_W`/`PF_X` flags -- the same
+    /// generalization x86_64's `AddressSpace::map_private_page` went
+    /// through when its loader landed, and for the same reason: hardcoding
+    /// one flag set here makes every mapped page simultaneously writable
+    /// and (at best accidentally) non-executable, which cannot express W^X.
+    /// Memory *attributes* (cacheability, shareability) stay fixed; only
+    /// permissions are the caller's choice.
+    pub fn map_private_page_with(
+        &mut self,
+        va: u64,
+        permissions: u64,
     ) -> Result<&'static mut [u8; 4096], AddressSpaceError> {
         if va % GRANULE_4KIB != 0 {
             return Err(AddressSpaceError::VaMisaligned);
@@ -302,8 +336,7 @@ impl AddressSpace {
 
         let frame = alloc_page()?;
         unsafe {
-            entry_ptr(l3, l3_index)
-                .write_volatile(normal_4kib_page_descriptor(frame, AP_EL0_RW | UXN | PXN));
+            entry_ptr(l3, l3_index).write_volatile(normal_4kib_page_descriptor(frame, permissions));
         }
         // The hardware table walker must observe every descriptor written
         // above before any translation uses them. `dsb ishst` is sufficient
@@ -344,6 +377,46 @@ impl AddressSpace {
     /// x86_64's `AddressSpace::p4_frame` exists.
     pub fn root(&self) -> u64 {
         self.root
+    }
+
+    /// The raw level-3 page descriptor this space maps `va` with, or `None`
+    /// if `va` is not mapped by a privately owned level-3 entry.
+    ///
+    /// Introspection, added for `load_proof.rs`: checking that the loader's
+    /// W^X bits actually landed means reading the real descriptor back, not
+    /// re-deriving what it *should* be from the same translation function
+    /// that wrote it. Deliberately walks only *owned* tables, the same rule
+    /// [`descend`](Self::descend) enforces on the write path, so this can
+    /// never report a kernel-shared mapping as this space's own private
+    /// one.
+    ///
+    /// Complements, not replaces, the hardware's own account: `AT S1E0R`/
+    /// `AT S1E0W` (see `load_proof.rs`) ask the MMU whether EL0 may read or
+    /// write an address, which is the behavioural check. This is the bit
+    /// pattern behind that behaviour.
+    pub fn page_descriptor(&self, va: u64) -> Option<u64> {
+        let mut table = self.root;
+        // Level 1 and level 2 must both be owned table descriptors; level 3
+        // is the page descriptor itself.
+        for shift in [30u32, 21] {
+            let index = ((va >> shift) & 0x1ff) as usize;
+            let descriptor = unsafe { entry_ptr(table, index).read_volatile() };
+            if descriptor & 0b11 != DESC_TABLE_OR_PAGE {
+                return None;
+            }
+            let next = descriptor & DESC_ADDR_MASK;
+            if !self.owned_tables.contains(&next) {
+                return None;
+            }
+            table = next;
+        }
+        let index = ((va >> 12) & 0x1ff) as usize;
+        let descriptor = unsafe { entry_ptr(table, index).read_volatile() };
+        if descriptor & 0b11 == DESC_TABLE_OR_PAGE {
+            Some(descriptor)
+        } else {
+            None
+        }
     }
 
     /// Loads this address space into `TTBR0_EL1` for real, returning the

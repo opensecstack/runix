@@ -160,6 +160,10 @@ mod el1_vectors;
 mod esim_marshal;
 mod gic;
 mod heap;
+// The hardware half of the ELF loader (slice 3 of item 2.4): the
+// `PrivatePageMapper` impl binding `runix_kernel_arm::loader`'s pure logic
+// to `process::AddressSpace`, plus its boot-time proof.
+mod load_proof;
 mod mmu;
 mod nonsecure;
 mod process;

@@ -35,10 +35,16 @@
 //! this module is the prerequisite for, not something it builds itself.
 
 use crate::el0;
+// Granule sizes and the EL0-facing permission bits now live in the library
+// half of this crate (`vm.rs`), unchanged in value and with their prose
+// moved alongside them -- `loader.rs` translates ELF `PF_*` flags into
+// exactly these bits and is host-tested, so having two definitions of the
+// same hardware encoding was the real risk. Re-exported `pub(crate)` so
+// every existing `crate::mmu::UXN`-style path in this crate (notably
+// `process.rs`'s) keeps working and keeps meaning the same thing.
+pub(crate) use runix_kernel_arm::vm::{AP_EL0_RW, GRANULE_1GIB, GRANULE_4KIB, PXN, UXN};
 
-pub(crate) const GRANULE_1GIB: u64 = 1 << 30;
 const GRANULE_2MIB: u64 = 1 << 21;
-pub(crate) const GRANULE_4KIB: u64 = 1 << 12;
 
 /// Base VA/PA of the Normal region -- also `LEVEL1_TABLE`'s index-1 output
 /// address, and the base every 2 MiB/4 KiB granule offset below is
@@ -72,13 +78,6 @@ pub(crate) const DESC_TABLE_OR_PAGE: u64 = 0b11;
 /// takes an Access Flag fault. Software (not hardware) managing this flag
 /// is a real optimization some OSes use; not relevant at this scope.
 const AF: u64 = 1 << 10;
-/// `UXN`/`PXN` (bits 54/53): Execute-Never for unprivileged/privileged
-/// contexts. Set on the Device block always, and on `EL0_STACK`'s pages
-/// below (data, never code -- the same W^X reasoning `kernel/src/elf.rs`
-/// applies on the x86_64 side) -- everything else stays executable, since
-/// leaving code non-executable for no reason is its own kind of gap.
-pub(crate) const UXN: u64 = 1 << 54;
-pub(crate) const PXN: u64 = 1 << 53;
 /// `SH` (Shareability, bits `[9:8]`): `0b10` Outer Shareable for Device
 /// memory (the conventional choice -- MMIO access ordering vs. other
 /// observers matters even though caching doesn't), `0b11` Inner Shareable
@@ -87,12 +86,13 @@ pub(crate) const PXN: u64 = 1 << 53;
 /// get right now instead of revisiting once a second CPU exists).
 const SH_OUTER: u64 = 0b10 << 8;
 const SH_INNER: u64 = 0b11 << 8;
-/// `AP[2:1]` (Access Permissions, bits `[7:6]`), `0b01` (`AP[2]`=bit7=0,
-/// `AP[1]`=bit6=1): read/write from *both* EL1 and EL0. Applied only to
-/// the specific 4 KiB pages below that actually need EL0 access -- see
-/// `NORMAL_SPLIT_GRANULE_2MIB`'s doc comment for why this is never set on
-/// anything block-granular.
-pub(crate) const AP_EL0_RW: u64 = 0b01 << 6;
+// `UXN`/`PXN` (bits 54/53, Execute-Never for EL0/EL1) and `AP_EL0_RW`
+// (`AP[2:1] = 0b01`, read/write from both EL1 and EL0) are the three
+// EL0-facing bits re-exported from `vm.rs` above; `vm.rs` carries their
+// full explanation, including the `AP[2:1]` encoding table. Within *this*
+// module they are applied only to the specific 4 KiB pages below that
+// actually need EL0 access -- see `Level3Table`'s doc comment for why they
+// are never set on anything block-granular.
 
 fn device_block_descriptor(output_addr: u64) -> u64 {
     output_addr | DESC_BLOCK | AF | (ATTRINDX_DEVICE << 2) | SH_OUTER | UXN | PXN

@@ -289,6 +289,18 @@ fn el1_setup() -> ! {
     // role `kernel/tests/process_isolation.rs` plays on x86_64.
     crate::process::prove_isolation();
 
+    // The ELF loader (`loader.rs` + `load_proof.rs`, Stage 5 slice 3 of
+    // docs/BETA_MOBILE_PROGRESS.md item 2.4): load a hand-assembled
+    // two-segment AArch64 image into a fresh address space with real
+    // per-segment W^X permissions and a zero-filled BSS tail, then read it
+    // back through the loaded VAs after a genuine TTBR0_EL1 switch and ask
+    // the MMU itself (AT S1E0R/S1E0W) what EL0 may do with each page.
+    // Directly after the isolation proof because it needs exactly the same
+    // prerequisites -- the MMU and the heap -- and nothing is executed:
+    // there is still no scheduler and no EL0 drop of a loaded image, which
+    // is the next slice.
+    crate::load_proof::prove_load();
+
     // Issue demo capabilities authorizing RIL channel 0 and SIM slot 0
     // (plus, below, slot 0's profile 0 and its separate delete scope) --
     // stands in for a real issuer (CITADEL MARSHAL) the same way every

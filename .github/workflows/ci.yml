@@ -546,6 +546,30 @@ jobs:
           grep -q "Runix ARM kernel: address-space isolation VA 0x80123000 A=0xaa B=0xbb" \
             /tmp/arm-boot.log
           grep -q "Runix ARM kernel: address-space isolation PASS" /tmp/arm-boot.log
+          # The ELF loader (kernel-arm/src/loader.rs + load_proof.rs, Stage 5
+          # slice 3 of docs/BETA_MOBILE_PROGRESS.md item 2.4): a hand-
+          # assembled two-segment AArch64 image loaded into a real address
+          # space. Three independent properties, the same three
+          # kernel/tests/elf_loader.rs proves on x86_64:
+          #   (a) content — the text bytes (1f2003d5, a real `nop`) and the
+          #       data string are read back through the *loaded VAs* after a
+          #       genuine TTBR0_EL1 switch, not out of kernel bookkeeping,
+          #       and bss_nonzero_bytes=0 is the BSS tail actually zeroed
+          #       rather than left holding a recycled frame's contents;
+          #   (b) W^X in the real descriptors — text AP=0b11 (not writable)
+          #       with UXN=0 (fetchable at EL0), data AP=0b01 with UXN=1, and
+          #       PXN=1 on everything (a process page is never EL1 code);
+          #   (c) W^X as the *hardware* reports it — AT S1E0R/S1E0W asking
+          #       the MMU whether EL0 may read/write each page, where
+          #       "text read=ok write=fault" is the W half of W^X enforced
+          #       by translation rather than inferred from our own bits.
+          grep -q "Runix ARM kernel: ELF load content text=1f2003d5 data=runix bss_nonzero_bytes=0" \
+            /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: ELF load W^X text AP=0b11 UXN=0 PXN=1, data AP=0b01 UXN=1 PXN=1, stack AP=0b01 UXN=1 PXN=1" \
+            /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: ELF load EL0 access (AT S1E0R/S1E0W) text read=ok write=fault, data read=ok write=ok" \
+            /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: ELF loader PASS" /tmp/arm-boot.log
           grep -q "Runix ARM kernel: RIL capability issued" /tmp/arm-boot.log
           # "U" (SYS_WRITE gate proof) immediately followed by "B" (0x42,
           # a real EL0 stack strb/ldrb round-trip) on the same line, since
@@ -634,6 +658,16 @@ jobs:
           grep -q "Runix ARM kernel: address-space isolation VA 0x80123000 A=0xaa B=0xbb" \
             /tmp/arm-boot-nosecure.log
           grep -q "Runix ARM kernel: address-space isolation PASS" /tmp/arm-boot-nosecure.log
+          # Same ELF loader proof as the secure boot above (see its comments
+          # for what each line means) -- loader.rs is EL1-side and
+          # security-state-independent, so it must hold on both entry paths.
+          grep -q "Runix ARM kernel: ELF load content text=1f2003d5 data=runix bss_nonzero_bytes=0" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: ELF load W^X text AP=0b11 UXN=0 PXN=1, data AP=0b01 UXN=1 PXN=1, stack AP=0b01 UXN=1 PXN=1" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: ELF load EL0 access (AT S1E0R/S1E0W) text read=ok write=fault, data read=ok write=ok" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: ELF loader PASS" /tmp/arm-boot-nosecure.log
           grep -q "^UB$" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_RIL_ACCESS channel 0 authorized" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_RIL_RECV channel 0 authorized, byte 0x41" \
