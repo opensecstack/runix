@@ -36,9 +36,9 @@
 
 use crate::el0;
 
-const GRANULE_1GIB: u64 = 1 << 30;
+pub(crate) const GRANULE_1GIB: u64 = 1 << 30;
 const GRANULE_2MIB: u64 = 1 << 21;
-const GRANULE_4KIB: u64 = 1 << 12;
+pub(crate) const GRANULE_4KIB: u64 = 1 << 12;
 
 /// Base VA/PA of the Normal region -- also `LEVEL1_TABLE`'s index-1 output
 /// address, and the base every 2 MiB/4 KiB granule offset below is
@@ -66,7 +66,7 @@ const ATTRINDX_NORMAL: u64 = 1;
 /// directly) -- same bits, different meaning, purely a function of which
 /// level is being processed.
 const DESC_BLOCK: u64 = 0b01;
-const DESC_TABLE_OR_PAGE: u64 = 0b11;
+pub(crate) const DESC_TABLE_OR_PAGE: u64 = 0b11;
 /// `AF` (Access Flag, bit 10): hardware requires this set on first use of
 /// any translation, or every access -- not just a missing/invalid one --
 /// takes an Access Flag fault. Software (not hardware) managing this flag
@@ -77,8 +77,8 @@ const AF: u64 = 1 << 10;
 /// below (data, never code -- the same W^X reasoning `kernel/src/elf.rs`
 /// applies on the x86_64 side) -- everything else stays executable, since
 /// leaving code non-executable for no reason is its own kind of gap.
-const UXN: u64 = 1 << 54;
-const PXN: u64 = 1 << 53;
+pub(crate) const UXN: u64 = 1 << 54;
+pub(crate) const PXN: u64 = 1 << 53;
 /// `SH` (Shareability, bits `[9:8]`): `0b10` Outer Shareable for Device
 /// memory (the conventional choice -- MMIO access ordering vs. other
 /// observers matters even though caching doesn't), `0b11` Inner Shareable
@@ -92,13 +92,13 @@ const SH_INNER: u64 = 0b11 << 8;
 /// the specific 4 KiB pages below that actually need EL0 access -- see
 /// `NORMAL_SPLIT_GRANULE_2MIB`'s doc comment for why this is never set on
 /// anything block-granular.
-const AP_EL0_RW: u64 = 0b01 << 6;
+pub(crate) const AP_EL0_RW: u64 = 0b01 << 6;
 
 fn device_block_descriptor(output_addr: u64) -> u64 {
     output_addr | DESC_BLOCK | AF | (ATTRINDX_DEVICE << 2) | SH_OUTER | UXN | PXN
 }
 
-fn table_descriptor(next_level_table: u64) -> u64 {
+pub(crate) fn table_descriptor(next_level_table: u64) -> u64 {
     next_level_table | DESC_TABLE_OR_PAGE
 }
 
@@ -109,7 +109,7 @@ fn normal_2mib_block_descriptor(output_addr: u64) -> u64 {
 /// `extra` folds in whatever the specific page needs beyond the shared
 /// Normal-memory attributes -- `AP_EL0_RW` for EL0-accessible pages, `UXN`
 /// for data pages, both, or neither (the EL1-only, executable default).
-fn normal_4kib_page_descriptor(output_addr: u64, extra: u64) -> u64 {
+pub(crate) fn normal_4kib_page_descriptor(output_addr: u64, extra: u64) -> u64 {
     output_addr | DESC_TABLE_OR_PAGE | AF | (ATTRINDX_NORMAL << 2) | SH_INNER | extra
 }
 

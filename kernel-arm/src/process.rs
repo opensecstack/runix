@@ -1,0 +1,572 @@
+//! Per-process address spaces for `kernel-arm` -- a real, hardware-enforced
+//! privacy boundary, not a bookkeeping struct. The ARM counterpart of
+//! `kernel/src/process.rs` on the x86_64 side, and the prerequisite that
+//! gives `elf.rs`'s parser (slice 1 of this same item) something to
+//! actually load *into*.
+//!
+//! Deliberately scoped exactly as narrow as x86_64's own first slice was:
+//! build an address space, map one private page into it, switch into it for
+//! real, and prove the *same* virtual address resolves to *different*
+//! physical memory depending on which address space is active
+//! ([`prove_isolation`]). No ELF loading, no scheduler, no IPC, no EL0
+//! execution inside one of these -- all later slices. The proof is entirely
+//! EL1-side, for the same reason `kernel/tests/process_isolation.rs` is
+//! entirely ring 0: the address-space primitive does not need any of those
+//! things to be demonstrably correct.
+//!
+//! # The `TTBR0_EL1`/`TTBR1_EL1` decision -- and why the obvious split
+//! doesn't apply here
+//!
+//! AArch64 EL1 has two translation table base registers, and the
+//! conventional OS design is "`TTBR1_EL1` = kernel (high half, identical in
+//! every context), `TTBR0_EL1` = process (low half, swapped per context
+//! switch)," which looks like a strictly cleaner primitive than the
+//! top-level-entry copying x86_64 has to do with a single `Cr3`.
+//!
+//! It does not apply to this kernel as it exists today, for an
+//! architectural reason, not a convenience one: **which TTBR a lookup uses
+//! is decided by the *top* bits of the VA.** `TTBR1_EL1` is selected only
+//! when `VA[63:64-T1SZ]` are all ones -- its region is always anchored at
+//! the top of the 64-bit address space (`TCR_EL1.T1SZ` only chooses how far
+//! down it extends), and `TTBR0_EL1`'s is always anchored at the bottom
+//! (`TCR_EL1.T0SZ`). `mmu.rs` maps everything **identity-mapped (VA == PA)**
+//! -- MMIO at `0x0000_0000`-`0x3FFF_FFFF`, and this crate's own code, data,
+//! stacks, and heap in RAM at `0x4000_0000`+. Those are *low* VAs by
+//! definition of being identity mappings of low physical addresses, so they
+//! are structurally unreachable through `TTBR1_EL1` no matter how `T1SZ` is
+//! set. Putting the kernel under `TTBR1_EL1` means giving up identity
+//! mapping: relinking the image to a high-half VA and fixing every place in
+//! this crate that treats a pointer as a physical address -- `virtio_net.rs`
+//! handing ring/buffer addresses to the device, `virtio_mmio.rs`'s slot
+//! bases, `heap.rs`'s hardcoded `0x4100_0000`, `mmu.rs`'s own descriptor
+//! output addresses. That is a far larger change than this slice, and it
+//! would buy nothing here.
+//!
+//! So: **the kernel stays identity-mapped under `TTBR0_EL1`, exactly as
+//! `mmu.rs` installs it, and `TTBR1_EL1` stays disabled
+//! (`TCR_EL1.EPD1 = 1`, unchanged).** A per-process address space is a
+//! fresh level-1 table whose kernel-space entries are *copied* from the
+//! currently active table -- x86_64's design, transliterated honestly
+//! rather than dressed up as a TTBR split it isn't. Copying by value means
+//! the kernel's level-2/level-3 sub-tables are *physically shared* across
+//! every address space, which is the point: EL1 keeps fetching its own
+//! code, its own stack, and `el1_vectors.rs`'s vector table identically no
+//! matter which `TTBR0_EL1` is loaded, which is what makes switching
+//! `TTBR0_EL1` from EL1 survivable at all.
+//!
+//! Revisit trigger: if this kernel ever stops being identity-mapped (a real
+//! physical frame allocator with a separate kernel VA layout, which the
+//! loader slice may well want), move the kernel to `TTBR1_EL1` then --
+//! that's the right moment, and the only one where the split is free.
+//!
+//! # The private region, and why the QEMU/TCG `AP[1]` bug cannot recur here
+//!
+//! Process-private mappings live in their own dedicated 1 GiB VA window,
+//! [`PRIVATE_REGION_BASE`]`..`[`PRIVATE_REGION_END`]
+//! (`0x8000_0000`-`0xBFFF_FFFF`) -- level-1 index 2, which `mmu.rs` leaves
+//! entirely unpopulated. Nothing is identity-mapped there, nothing else in
+//! this crate has any layout expectation of it, and -- the part that
+//! matters -- it is a **different level-1 block from the one containing
+//! `el1_exception_vectors`** (that lives in the Normal region, level-1
+//! index 1).
+//!
+//! Read `mmu.rs`'s `Level3Table` doc comment for the real bug this
+//! structure is defending against: setting `AP[1]=1` anywhere inside the
+//! 1 GiB block that also contained EL1's exception vector table made QEMU
+//! stop being able to *fetch* those vectors -- architecturally impossible
+//! (`AP` gates data access; `UXN`/`PXN` gate fetch), genuinely a TCG bug,
+//! root-caused with `-d int,guest_errors`. The lesson is not "avoid that
+//! one descriptor" -- it is **never let an EL0-accessible mapping share a
+//! translation structure with code EL1 must keep fetching.** Confining
+//! every private page to its own level-1 slot, with its own privately-owned
+//! level-2/level-3 tables, satisfies that by construction: no descriptor
+//! this module writes is ever reachable from the walk that translates
+//! `el1_exception_vectors`, so there is no shared block for the bug class to
+//! act through. [`map_private_page`](AddressSpace::map_private_page)
+//! enforces the window with a real bounds check rather than trusting
+//! callers.
+//!
+//! # ASIDs: deliberately not used
+//!
+//! `TTBR0_EL1[63:48]` can carry an ASID so a context switch doesn't need a
+//! full TLB invalidation. This module does not use one: it writes ASID = 0
+//! in every `TTBR0_EL1` value and does a full `tlbi vmalle1` on every
+//! [`activate`](AddressSpace::activate). Two reasons, in order of weight:
+//!
+//! 1. **ASIDs would not currently work even if set.** ASID tagging only
+//!    applies to translations from descriptors with `nG` (bit 11, not
+//!    Global) set. Neither `mmu.rs`'s descriptors nor this module's set
+//!    `nG`, so every entry is Global and matches regardless of ASID --
+//!    adopting ASIDs means also setting `nG` on every process-private
+//!    descriptor *and* owning an ASID allocation/rollover policy
+//!    (`TCR_EL1.AS` picks 8- or 16-bit), which is scheduler-shaped work.
+//! 2. There is no scheduler here yet, so the cost a full `TLBI` is meant to
+//!    avoid is a cost nothing pays: this crate performs a handful of
+//!    address-space switches total, all from one boot path.
+//!
+//! A full invalidation is *correct*, just slower -- this is a performance
+//! decision deferred, not a correctness detail skipped. Revisit alongside
+//! the scheduler slice.
+//!
+//! # Memory attributes
+//!
+//! Private pages reuse `mmu.rs`'s existing **Normal, Inner/Outer
+//! Non-cacheable** attribute (`AttrIndx = ATTRINDX_NORMAL`, Inner
+//! Shareable) unchanged. Changing cacheability policy is a bigger decision
+//! than this slice should make on its own, and the non-cacheable choice is
+//! what lets this module write a descriptor and let the hardware walker see
+//! it with only a `dsb`, no cache maintenance (see `mmu.rs`'s `TCR_EL1`
+//! comment on non-cacheable table walks).
+
+use crate::mmu::{
+    normal_4kib_page_descriptor, table_descriptor, AP_EL0_RW, DESC_TABLE_OR_PAGE, GRANULE_1GIB,
+    GRANULE_4KIB, PXN, UXN,
+};
+use crate::serial_println;
+use alloc::alloc::{alloc_zeroed, Layout};
+use alloc::collections::BTreeSet;
+use core::fmt;
+
+/// Base of the process-private VA window -- level-1 index 2, which
+/// `mmu.rs` never populates. See this module's doc comment for why private
+/// mappings get their own level-1 slot rather than sharing the kernel's.
+pub const PRIVATE_REGION_BASE: u64 = 2 * GRANULE_1GIB;
+/// One past the end of the private window (exclusive) -- one level-1 slot,
+/// 1 GiB, which is far more private VA space than any plausible first
+/// process needs.
+pub const PRIVATE_REGION_END: u64 = PRIVATE_REGION_BASE + GRANULE_1GIB;
+
+/// Output-address field of a translation descriptor, bits `[47:12]`. Used
+/// both to build a `TTBR0_EL1` value's table address and to read a
+/// next-level table address back out of an existing descriptor.
+const DESC_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+/// 512 `u64` entries, 4 KiB, 4 KiB-aligned -- the shape every level of a
+/// 4 KiB-granule AArch64 translation table has, and the alignment
+/// `TTBR0_EL1` requires of a level-1 table under `mmu.rs`'s `T0SZ = 25`
+/// (39-bit VA, walk starts at level 1).
+const TABLE_ENTRIES: usize = 512;
+const TABLE_BYTES: usize = TABLE_ENTRIES * 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressSpaceError {
+    /// The requested VA is outside [`PRIVATE_REGION_BASE`]..
+    /// [`PRIVATE_REGION_END`]. Rejected rather than mapped: a private,
+    /// EL0-accessible page anywhere in the kernel's own level-1 blocks is
+    /// exactly the shape of the QEMU/TCG `AP[1]` bug this module's doc
+    /// comment describes, and would also alias the kernel's shared
+    /// sub-tables.
+    VaOutsidePrivateRegion,
+    /// The requested VA is not 4 KiB-aligned.
+    VaMisaligned,
+    /// The heap could not supply a 4 KiB-aligned 4 KiB block for a
+    /// translation table or a backing page. Returned, never panicked on --
+    /// this crate is `panic = "abort"`.
+    OutOfMemory,
+}
+
+impl fmt::Display for AddressSpaceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let msg = match self {
+            AddressSpaceError::VaOutsidePrivateRegion => {
+                "virtual address is outside the process-private region"
+            }
+            AddressSpaceError::VaMisaligned => "virtual address is not 4 KiB-aligned",
+            AddressSpaceError::OutOfMemory => "out of memory for a page or translation table",
+        };
+        f.write_str(msg)
+    }
+}
+
+/// Allocates one zeroed, 4 KiB-aligned 4 KiB block and returns its address.
+///
+/// Because `mmu.rs` maps all of RAM identity (VA == PA), this one value is
+/// simultaneously the pointer this code writes through and the physical
+/// address a descriptor must name -- the single biggest simplification ARM
+/// gets here versus x86_64's `physical_memory_offset` arithmetic. If this
+/// kernel ever stops being identity-mapped, every `as u64` in this module
+/// becomes a bug, which is why that is called out as the revisit trigger in
+/// the module doc comment and not left implicit.
+fn alloc_page() -> Result<u64, AddressSpaceError> {
+    // Unwrap-free: the size/align pair is a compile-time-known valid
+    // combination, but `from_size_align` is still fallible, so the error is
+    // folded into `OutOfMemory` rather than `expect`ed on a path this crate
+    // aborts from.
+    let layout = Layout::from_size_align(GRANULE_4KIB as usize, GRANULE_4KIB as usize)
+        .map_err(|_| AddressSpaceError::OutOfMemory)?;
+    let ptr = unsafe { alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return Err(AddressSpaceError::OutOfMemory);
+    }
+    Ok(ptr as u64)
+}
+
+/// An independent set of translation tables rooted at a private level-1
+/// table -- the actual unit of isolation here: everything reachable from a
+/// given `TTBR0_EL1` value is exactly what that context can address.
+///
+/// Known limitation, stated rather than left to be discovered: there is no
+/// `Drop`. Dropping an `AddressSpace` leaks its tables and backing pages,
+/// because freeing them safely requires knowing this space isn't the one
+/// currently in `TTBR0_EL1` — a question only a scheduler can answer, and
+/// there isn't one yet. The boot-path caller ([`prove_isolation`]) builds
+/// exactly two and never releases them, so nothing leaks in practice today;
+/// this becomes real work in the scheduler slice, not before.
+pub struct AddressSpace {
+    /// Physical (== virtual, identity-mapped) address of this space's
+    /// level-1 table, and the value loaded into `TTBR0_EL1` by
+    /// [`activate`](Self::activate).
+    root: u64,
+    /// Every translation table this address space *owns*, by address --
+    /// including [`root`](Self::root).
+    ///
+    /// This is the ARM answer to the real bug x86_64's `process.rs`
+    /// documents (a naive "detach the top-level slot on every map call"
+    /// silently erased an earlier mapping when a second page landed in the
+    /// same slot). Tracking ownership rather than "slots already detached"
+    /// makes the rule directly checkable at every level of the walk:
+    /// descend into a next-level table **only** if this space owns it;
+    /// otherwise the descriptor is either invalid, a block, or -- the
+    /// dangerous case -- a table descriptor copied verbatim from the kernel
+    /// table by [`new`](Self::new) and therefore *physically shared with
+    /// every other address space*, so writing through it would mutate
+    /// everyone's mappings at once. In that case the entry is replaced with
+    /// a freshly allocated, privately owned table.
+    ///
+    /// For today's [`PRIVATE_REGION_BASE`] window the shared-table case
+    /// cannot actually arise (level-1 index 2 is unpopulated in the kernel
+    /// table, so it copies as invalid), but the check is what keeps that a
+    /// *checked* property rather than a coincidence of the current layout.
+    owned_tables: BTreeSet<u64>,
+}
+
+impl AddressSpace {
+    /// Builds a new, independent address space seeded from whichever table
+    /// `TTBR0_EL1` currently points at (in practice `mmu.rs`'s
+    /// `LEVEL1_TABLE`). All 512 level-1 entries are copied **by value**, so
+    /// kernel-space mappings stay reachable identically -- mandatory, since
+    /// EL1 continues executing its own code, on its own stack, and must be
+    /// able to take an exception into `el1_vectors.rs`, from the instruction
+    /// right after a `TTBR0_EL1` switch.
+    ///
+    /// Copying by value shares the kernel's level-2/level-3 tables by
+    /// *pointer*, not content -- deliberate (kernel mappings are meant to be
+    /// identical everywhere, and deep-copying to 4 KiB leaves would be
+    /// enormous for no benefit) and the reason `owned_tables` exists.
+    pub fn new() -> Result<Self, AddressSpaceError> {
+        let root = alloc_page()?;
+        let active = active_root();
+        unsafe {
+            core::ptr::copy_nonoverlapping(active as *const u8, root as *mut u8, TABLE_BYTES);
+        }
+        let mut owned_tables = BTreeSet::new();
+        owned_tables.insert(root);
+        Ok(AddressSpace { root, owned_tables })
+    }
+
+    /// Maps a fresh, zeroed, private 4 KiB page at `va` -- within this
+    /// address space only -- and returns a mutable view of its contents.
+    ///
+    /// The returned reference is usable **immediately, without
+    /// [`activate`](Self::activate)ing this space**, because the page is
+    /// reached through the kernel's own identity mapping of the heap it came
+    /// from; the EL0-facing permissions written into the descriptor don't
+    /// constrain the kernel's access to the same physical memory. That is
+    /// what will let a later loader slice copy a segment's bytes in before
+    /// anything runs.
+    ///
+    /// Descriptor bits: Normal non-cacheable (`ATTRINDX_NORMAL`), Inner
+    /// Shareable, `AF` set, `AP[2:1] = 0b01` (read/write from both EL1 and
+    /// EL0), and `UXN | PXN` -- a data page, never executable from either
+    /// exception level. The loader slice is where per-segment `PF_X` turns
+    /// into clearing `UXN`; doing it here, for a page nothing executes,
+    /// would be a gap for no reason (`mmu.rs` applies the same W^X
+    /// reasoning to `EL0_STACK`).
+    pub fn map_private_page(
+        &mut self,
+        va: u64,
+    ) -> Result<&'static mut [u8; 4096], AddressSpaceError> {
+        if va % GRANULE_4KIB != 0 {
+            return Err(AddressSpaceError::VaMisaligned);
+        }
+        if !(PRIVATE_REGION_BASE..PRIVATE_REGION_END).contains(&va) {
+            return Err(AddressSpaceError::VaOutsidePrivateRegion);
+        }
+
+        let l1_index = ((va >> 30) & 0x1ff) as usize;
+        let l2_index = ((va >> 21) & 0x1ff) as usize;
+        let l3_index = ((va >> 12) & 0x1ff) as usize;
+
+        let l2 = self.descend(self.root, l1_index)?;
+        let l3 = self.descend(l2, l2_index)?;
+
+        let frame = alloc_page()?;
+        unsafe {
+            entry_ptr(l3, l3_index)
+                .write_volatile(normal_4kib_page_descriptor(frame, AP_EL0_RW | UXN | PXN));
+        }
+        // The hardware table walker must observe every descriptor written
+        // above before any translation uses them. `dsb ishst` is sufficient
+        // (and no cache maintenance is needed) only because `TCR_EL1`
+        // configures non-cacheable table walks over non-cacheable memory --
+        // see this module's "Memory attributes" note.
+        unsafe {
+            core::arch::asm!("dsb ishst");
+        }
+
+        Ok(unsafe { &mut *(frame as *mut [u8; 4096]) })
+    }
+
+    /// Returns the address of the next-level table reached through
+    /// `table[index]`, allocating and installing a privately owned one
+    /// unless this address space already owns whatever is there. See
+    /// [`owned_tables`](Self::owned_tables) for why ownership -- not merely
+    /// "is it a valid table descriptor" -- is the condition.
+    fn descend(&mut self, table: u64, index: usize) -> Result<u64, AddressSpaceError> {
+        let descriptor = unsafe { entry_ptr(table, index).read_volatile() };
+        let next = descriptor & DESC_ADDR_MASK;
+        let is_table = descriptor & 0b11 == DESC_TABLE_OR_PAGE;
+        if is_table && self.owned_tables.contains(&next) {
+            return Ok(next);
+        }
+        let fresh = alloc_page()?;
+        self.owned_tables.insert(fresh);
+        unsafe {
+            entry_ptr(table, index).write_volatile(table_descriptor(fresh));
+        }
+        Ok(fresh)
+    }
+
+    /// This space's level-1 table address, i.e. the `TTBR0_EL1` value
+    /// [`activate`](Self::activate) writes. Exposed for a future scheduler
+    /// to compare against the currently loaded value and skip a switch (and
+    /// its TLB invalidation) when it would be a no-op -- the same reason
+    /// x86_64's `AddressSpace::p4_frame` exists.
+    pub fn root(&self) -> u64 {
+        self.root
+    }
+
+    /// Loads this address space into `TTBR0_EL1` for real, returning the
+    /// previous raw register value for [`restore`] to put back.
+    ///
+    /// ASID is written as 0 and the whole EL1&0 TLB is invalidated -- see
+    /// this module's ASID note for why that is a deliberate,
+    /// correctness-preserving choice rather than an omission.
+    ///
+    /// # Safety
+    /// The code currently executing, its stack, and anything an exception
+    /// handler would need must stay correctly mapped in the *new* table.
+    /// True for every space built by [`new`](Self::new), which copies the
+    /// active table's kernel-space entries -- but unverifiable from here, so
+    /// the caller is trusted, exactly as with `Cr3::write` on x86_64.
+    pub unsafe fn activate(&self) -> u64 {
+        let previous = active_ttbr0();
+        unsafe { write_ttbr0(self.root & DESC_ADDR_MASK) };
+        previous
+    }
+}
+
+/// Restores a raw `TTBR0_EL1` value saved from an earlier
+/// [`AddressSpace::activate`] -- usually the kernel's own boot-time table,
+/// which is why this is a free function rather than a method (the value
+/// being restored needn't belong to any `AddressSpace`).
+///
+/// # Safety
+/// Same contract as [`AddressSpace::activate`].
+pub unsafe fn restore(previous: u64) {
+    unsafe { write_ttbr0(previous) };
+}
+
+fn active_ttbr0() -> u64 {
+    let ttbr0: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0, options(nomem, nostack));
+    }
+    ttbr0
+}
+
+/// Address of the level-1 table `TTBR0_EL1` currently points at, with any
+/// ASID/CnP bits masked off.
+fn active_root() -> u64 {
+    active_ttbr0() & DESC_ADDR_MASK
+}
+
+/// # Safety
+/// `value` must name a correctly aligned level-1 table that maps everything
+/// the current execution context needs -- see [`AddressSpace::activate`].
+unsafe fn write_ttbr0(value: u64) {
+    unsafe {
+        core::arch::asm!(
+            // Any descriptor writes must be visible to the walker before
+            // the new table is in use.
+            "dsb ishst",
+            "msr TTBR0_EL1, {ttbr}",
+            // The register write must take effect before the invalidation
+            // that follows, and before any subsequent translation.
+            "isb",
+            // Full EL1&0 invalidation: no ASIDs (see the module doc
+            // comment), and the previous table's entries for this VA range
+            // must not survive the switch.
+            "tlbi vmalle1",
+            "dsb nsh",
+            "isb",
+            ttbr = in(reg) value,
+        );
+    }
+}
+
+/// # Safety
+/// `table` must be a live 4 KiB-aligned translation table and `index` < 512.
+/// Both hold for every caller here (`index` is masked to 9 bits; `table`
+/// comes from [`alloc_page`] or an owned descriptor).
+unsafe fn entry_ptr(table: u64, index: usize) -> *mut u64 {
+    unsafe { (table as *mut u64).add(index) }
+}
+
+/// Arbitrary, fixed VA inside the private window that *both* address spaces
+/// in [`prove_isolation`] map privately -- the whole point being that this
+/// one address means something different depending on which `TTBR0_EL1` is
+/// loaded.
+const PROOF_VA: u64 = PRIVATE_REGION_BASE + 0x0012_3000;
+
+/// The actual proof that this module provides isolation, not bookkeeping:
+/// two address spaces, the same VA mapped privately in each with different
+/// content, a real `TTBR0_EL1` switch into each, and a volatile read back
+/// through that fixed VA. The AArch64 counterpart of
+/// `kernel/tests/process_isolation.rs`, and structured as a boot-sequence
+/// routine with a grepped pass/fail print because this crate has no
+/// QEMU-native `cargo test` harness (see `docs/BETA_MOBILE_PROGRESS.md`
+/// item 1.7's note on that deferred decision).
+///
+/// Also prints `AT S1E1R` translations of the shared VA under each space --
+/// asking the MMU hardware itself what that VA resolves to, the same
+/// independent check `nonsecure.rs` applies to the boot-time identity map.
+/// Two different physical addresses there, from the same VA, is the
+/// hardware's own account of the isolation, not this code's.
+///
+/// Requires the MMU to be on and the heap initialized. Returns to the
+/// kernel's own `TTBR0_EL1` before returning, on every path.
+pub fn prove_isolation() {
+    let mut space_a = match AddressSpace::new() {
+        Ok(space) => space,
+        Err(err) => {
+            serial_println!(
+                "Runix ARM kernel: address-space isolation FAILED -- space A: {}",
+                err
+            );
+            return;
+        }
+    };
+    let mut space_b = match AddressSpace::new() {
+        Ok(space) => space,
+        Err(err) => {
+            serial_println!(
+                "Runix ARM kernel: address-space isolation FAILED -- space B: {}",
+                err
+            );
+            return;
+        }
+    };
+
+    let page_a = match space_a.map_private_page(PROOF_VA) {
+        Ok(page) => page,
+        Err(err) => {
+            serial_println!(
+                "Runix ARM kernel: address-space isolation FAILED -- map A: {}",
+                err
+            );
+            return;
+        }
+    };
+    page_a[0] = 0xAA;
+    let frame_a = page_a.as_ptr() as u64;
+
+    let page_b = match space_b.map_private_page(PROOF_VA) {
+        Ok(page) => page,
+        Err(err) => {
+            serial_println!(
+                "Runix ARM kernel: address-space isolation FAILED -- map B: {}",
+                err
+            );
+            return;
+        }
+    };
+    page_b[0] = 0xBB;
+    let frame_b = page_b.as_ptr() as u64;
+
+    serial_println!(
+        "Runix ARM kernel: address-space roots A={:#x} B={:#x}, private frames A={:#x} B={:#x} \
+         (kernel TTBR0_EL1={:#x})",
+        space_a.root(),
+        space_b.root(),
+        frame_a,
+        frame_b,
+        active_root()
+    );
+
+    // Space A's own page must still hold what was written into it before
+    // any switch -- if the two spaces had accidentally been handed the same
+    // backing page, this alone would catch it, with no TTBR0 switch
+    // involved (x86_64's test makes the same early check for the same
+    // reason).
+    if page_a[0] != 0xAA {
+        serial_println!(
+            "Runix ARM kernel: address-space isolation FAILED -- space A's page was clobbered \
+             before any TTBR0_EL1 switch (the two spaces share backing memory)"
+        );
+        return;
+    }
+
+    let previous = unsafe { space_a.activate() };
+    let observed_a = unsafe { core::ptr::read_volatile(PROOF_VA as *const u8) };
+    let translated_a = translate_read(PROOF_VA);
+    unsafe { restore(previous) };
+
+    let previous = unsafe { space_b.activate() };
+    let observed_b = unsafe { core::ptr::read_volatile(PROOF_VA as *const u8) };
+    let translated_b = translate_read(PROOF_VA);
+    unsafe { restore(previous) };
+
+    serial_println!(
+        "Runix ARM kernel: address-space isolation VA {:#x} A={:#x} B={:#x} (AT S1E1R PA \
+         A={:#x} B={:#x})",
+        PROOF_VA,
+        observed_a,
+        observed_b,
+        translated_a,
+        translated_b
+    );
+
+    if observed_a == 0xAA && observed_b == 0xBB && translated_a != translated_b {
+        serial_println!(
+            "Runix ARM kernel: address-space isolation PASS -- the same VA resolved to different \
+             physical memory depending on which TTBR0_EL1 was active"
+        );
+    } else {
+        serial_println!(
+            "Runix ARM kernel: address-space isolation FAILED -- the two address spaces are not \
+             isolated from each other"
+        );
+    }
+}
+
+/// Asks the MMU to translate `va` for an EL1 read and returns the physical
+/// address, or 0 if the translation faulted. Same `AT S1E1R`/`PAR_EL1`
+/// mechanism `nonsecure.rs` uses on the boot-time map.
+fn translate_read(va: u64) -> u64 {
+    let par_el1: u64;
+    unsafe {
+        core::arch::asm!(
+            "at S1E1R, {va}",
+            "isb",
+            "mrs {par}, PAR_EL1",
+            va = in(reg) va,
+            par = out(reg) par_el1,
+        );
+    }
+    if par_el1 & 1 != 0 {
+        0
+    } else {
+        (par_el1 & DESC_ADDR_MASK) | (va & (GRANULE_4KIB - 1))
+    }
+}

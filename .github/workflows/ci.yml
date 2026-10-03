@@ -534,6 +534,18 @@ jobs:
           # capability-manager token check distinguishing an authorized
           # channel from an unauthorized one — not just that EL0 code ran.
           grep -q "Runix ARM kernel: heap initialized" /tmp/arm-boot.log
+          # Per-process address-space separation (kernel-arm/src/process.rs,
+          # Stage 5 slice 2 of docs/BETA_MOBILE_PROGRESS.md item 2.4): two
+          # independent TTBR0_EL1-rooted table sets map the SAME VA
+          # (0x80123000) to different private pages. A=0xaa/B=0xbb is read
+          # back through that one VA after a real TTBR0_EL1 write, and the
+          # bracketed AT S1E1R pair is the MMU hardware's own report of two
+          # different physical addresses for it — if the two spaces had
+          # accidentally shared translation tables, the second map would
+          # have overwritten the first and both reads would say 0xbb.
+          grep -q "Runix ARM kernel: address-space isolation VA 0x80123000 A=0xaa B=0xbb" \
+            /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: address-space isolation PASS" /tmp/arm-boot.log
           grep -q "Runix ARM kernel: RIL capability issued" /tmp/arm-boot.log
           # "U" (SYS_WRITE gate proof) immediately followed by "B" (0x42,
           # a real EL0 stack strb/ldrb round-trip) on the same line, since
@@ -615,6 +627,13 @@ jobs:
           grep -q "MAC 52:54:00:12:34:56" /tmp/arm-boot-nosecure.log
           grep -q "Runix ARM kernel: virtio-net ARP reply from 10.0.2.2, sender MAC 52:55:0a:00:02:02" \
             /tmp/arm-boot-nosecure.log
+          # Same per-process address-space proof as the secure boot above
+          # (see its comments) -- `process.rs`'s TTBR0_EL1 switch is EL1-side
+          # and security-state-independent, so it must hold on both entry
+          # paths.
+          grep -q "Runix ARM kernel: address-space isolation VA 0x80123000 A=0xaa B=0xbb" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: address-space isolation PASS" /tmp/arm-boot-nosecure.log
           grep -q "^UB$" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_RIL_ACCESS channel 0 authorized" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_RIL_RECV channel 0 authorized, byte 0x41" \

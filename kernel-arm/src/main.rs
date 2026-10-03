@@ -162,6 +162,7 @@ mod gic;
 mod heap;
 mod mmu;
 mod nonsecure;
+mod process;
 mod ril_channel;
 mod serial;
 mod sim;

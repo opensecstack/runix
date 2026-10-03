@@ -278,6 +278,17 @@ fn el1_setup() -> ! {
     }
     serial_println!("Runix ARM kernel: heap initialized");
 
+    // Per-process address-space separation (`process.rs`, Stage 5 slice 2 of
+    // docs/BETA_MOBILE_PROGRESS.md item 2.4): build two independent
+    // `TTBR0_EL1`-rooted table sets, map the same VA privately in each, and
+    // prove a real register switch makes that one VA resolve to different
+    // physical memory. Runs here because it needs the MMU on (above) and the
+    // heap (above) and nothing else -- in particular not EL0, a scheduler,
+    // or the ELF loader, none of which exist yet. There is no real caller
+    // for the primitive itself at this stage; this is its proof, the same
+    // role `kernel/tests/process_isolation.rs` plays on x86_64.
+    crate::process::prove_isolation();
+
     // Issue demo capabilities authorizing RIL channel 0 and SIM slot 0
     // (plus, below, slot 0's profile 0 and its separate delete scope) --
     // stands in for a real issuer (CITADEL MARSHAL) the same way every
