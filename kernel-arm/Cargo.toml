@@ -45,6 +45,21 @@ spin = "0.9"
 # the scratch usage that forces real codegen, not just dependency resolution.
 smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "alloc"] }
 
+# Two targets, same reason net-driver-host has two (see its Cargo.toml):
+# the binary is freestanding `#![no_std] #![no_main]` on
+# `aarch64-unknown-none` and therefore untestable, so pure logic with no
+# hardware dependency (today: `elf.rs`) lives in a library target that can
+# also compile for the host under `cfg(test)` -- run with
+# `cargo test --lib` (no `--target`). Declared explicitly rather than
+# auto-discovered so the pairing is visible here.
+[lib]
+name = "runix_kernel_arm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "runix-kernel-arm"
+path = "src/main.rs"
+
 [profile.dev]
 panic = "abort"
 
