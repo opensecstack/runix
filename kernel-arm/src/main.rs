@@ -156,6 +156,10 @@ extern crate alloc;
 
 mod capabilities;
 mod el0;
+// The first real EL0 *process* (the "combining slices 3-5" step of item
+// 2.4): a scheduled thread owning a `process::AddressSpace`, resumed with
+// its own TTBR0_EL1, eret'ing into a loader.rs-loaded image.
+mod el0_proof;
 mod el1_vectors;
 mod esim_marshal;
 mod gic;

@@ -586,6 +586,48 @@ jobs:
           grep -q "Runix ARM kernel: scheduler interleaving A0,B0,C0,A1,B1,C1,A2,B2,C2" \
             /tmp/arm-boot.log
           grep -q "Runix ARM kernel: scheduler PASS" /tmp/arm-boot.log
+          # The first real EL0 process (kernel-arm/src/el0_proof.rs — the
+          # "combining slices 3-5" step of item 2.4): a scheduled thread that
+          # owns a process::AddressSpace, is resumed with its own TTBR0_EL1,
+          # and eret's into an image loader.rs actually loaded. Every line
+          # below is hardware state, not this code's bookkeeping, which is
+          # what makes it a proof rather than a log:
+          #   - SPSR_EL1=0x3c0 with M=0x0 is the CPU's own record that the
+          #     SVC came from EL0t. An "eret" that never left EL1 would
+          #     report M=0x5 (EL1h) and fail here.
+          #   - ELR_EL1 inside 0x80400000..0x80401000 puts the interrupted
+          #     instruction in *process-private* memory that only this
+          #     address space maps — not in the kernel image.
+          #   - the three TTBR0_EL1 values agreeing on the space's root, plus
+          #     "AT S1E0R data=ok", are the MMU's answer for a VA that is
+          #     unmapped in the kernel's identity table: a TTBR0_EL1 the
+          #     scheduler failed to switch instruction-aborts at EL0 instead
+          #     (verified by deliberately disabling the switch: EC=0x20 at
+          #     0x80400000, reported as FAILED rather than hanging).
+          #   - magic=0x7e is the byte loader.rs copied in, witness=0x5a one
+          #     the payload *wrote and read back* through its own AP=0b01
+          #     page, stack=0x42 one pushed/popped on its own EL0 stack —
+          #     real loads and stores, not just instruction fetch.
+          grep -q "Runix ARM kernel: EL0 process observed SPSR_EL1=0x3c0 (M=0x0, EL0t=true)" \
+            /tmp/arm-boot.log
+          grep -q "inside loaded text 0x80400000..0x80401000: true" /tmp/arm-boot.log
+          grep -q "AT S1E0R data=ok" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: EL0 process payload magic=0x7e witness=0x5a stack=0x42" \
+            /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: EL0 process PASS" /tmp/arm-boot.log
+          # ...and the other half of "TTBR0_EL1 follows the schedule": the
+          # boot thread, which owns no address space, is resumed with the
+          # *kernel's* table reinstalled rather than inheriting the
+          # process's. `elided=` being much larger than `writes=` is the
+          # skip-if-already-loaded optimization demonstrated rather than
+          # asserted — prove_scheduling's kernel-to-kernel switches all
+          # elide. `writes=2` (into the space, then back to the kernel) is
+          # the stable count; the kernel table's own address is deliberately
+          # NOT asserted, since it depends on where the linker put
+          # mmu.rs's LEVEL1_TABLE and would break on an unrelated codegen
+          # change.
+          grep -q "Runix ARM kernel: EL0 process boot thread resumed, TTBR0_EL1=0x.* (kernel table), TTBR0_EL1 writes=2 elided=" \
+            /tmp/arm-boot.log
           grep -q "Runix ARM kernel: RIL capability issued" /tmp/arm-boot.log
           # "U" (SYS_WRITE gate proof) immediately followed by "B" (0x42,
           # a real EL0 stack strb/ldrb round-trip) on the same line, since
@@ -705,6 +747,20 @@ jobs:
           grep -q "Runix ARM kernel: scheduler interleaving A0,B0,C0,A1,B1,C1,A2,B2,C2" \
             /tmp/arm-boot-nosecure.log
           grep -q "Runix ARM kernel: scheduler PASS" /tmp/arm-boot-nosecure.log
+          # Same first-real-EL0-process proof as the secure boot above (see
+          # its comments for what each line actually proves) -- el0_proof.rs
+          # is EL1/EL0-side and security-state-independent, so it must hold
+          # on both entry paths. Independently reproduced: both boots print
+          # the identical roots, ELR_EL1, and payload bytes.
+          grep -q "Runix ARM kernel: EL0 process observed SPSR_EL1=0x3c0 (M=0x0, EL0t=true)" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "inside loaded text 0x80400000..0x80401000: true" /tmp/arm-boot-nosecure.log
+          grep -q "AT S1E0R data=ok" /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: EL0 process payload magic=0x7e witness=0x5a stack=0x42" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: EL0 process PASS" /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: EL0 process boot thread resumed, TTBR0_EL1=0x.* (kernel table), TTBR0_EL1 writes=2 elided=" \
+            /tmp/arm-boot-nosecure.log
           grep -q "^UB$" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_RIL_ACCESS channel 0 authorized" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_RIL_RECV channel 0 authorized, byte 0x41" \

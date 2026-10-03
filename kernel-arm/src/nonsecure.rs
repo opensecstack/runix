@@ -315,6 +315,19 @@ fn el1_setup() -> ! {
     // slice, by design).
     crate::scheduler::prove_scheduling();
 
+    // The first real EL0 process (`el0_proof.rs`, the "combining slices
+    // 3-5" step of docs/BETA_MOBILE_PROGRESS.md item 2.4): build an
+    // address space, load a hand-assembled image into it with loader.rs,
+    // spawn a *scheduled* thread that owns that space, and have the
+    // scheduler install its TTBR0_EL1 as it resumes it -- then `eret` into
+    // the loaded entry point, read and write through the process's own
+    // private mappings at EL0, and come back to EL1 through one
+    // purpose-built syscall. Must come after prove_scheduling (it needs the
+    // run queue that `init`s there) and after the heap and MMU like every
+    // proof above; the verdict is checked against hardware state (SPSR_EL1,
+    // ELR_EL1, TTBR0_EL1, AT S1E0R), not this code's bookkeeping.
+    crate::el0_proof::prove_el0_process();
+
     // Issue demo capabilities authorizing RIL channel 0 and SIM slot 0
     // (plus, below, slot 0's profile 0 and its separate delete scope) --
     // stands in for a real issuer (CITADEL MARSHAL) the same way every

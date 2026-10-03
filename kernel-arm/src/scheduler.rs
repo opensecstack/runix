@@ -16,10 +16,18 @@
 //!   with a full trap frame, because an interrupt can land at *any*
 //!   instruction with arbitrary live caller-saved registers. That
 //!   rewrite-shaped change is exactly why it is not smuggled in here.
-//! - **EL1-only kernel threads.** No EL0, no `process::AddressSpace`
-//!   attached to a thread, no `loader.rs` integration, no `eret` into a
-//!   loaded image. Combining this slice with the loader to actually run a
-//!   loaded EL0 image is the next step, not this one.
+//! - **Threads may now own an address space, but get no kernel-entry stack
+//!   of their own.** A [`Thread`] can carry a `process::AddressSpace`
+//!   ([`spawn_with_address_space`]), and [`yield_now`] installs the incoming
+//!   thread's `TTBR0_EL1` -- or the kernel's own identity-mapped table for a
+//!   thread without one -- right before resuming it. What is *not* here is
+//!   the x86_64 side's second scheduling slice: a separate EL1-entry stack
+//!   per EL0 thread, and a general `SYS_YIELD`. `el0_proof.rs` explains why
+//!   its one EL0 thread does not need either (`SP_EL1` survives the `eret`
+//!   unchanged, so the thread's own kernel stack *is* its exception landing
+//!   site) and exactly what that costs: at most one EL0 thread may be
+//!   mid-`eret` at a time, which is a property of that proof, not a
+//!   general-purpose process model.
 //! - **Heap-allocated stacks, no guard pages.** A thread's stack is a
 //!   plain 16-byte-aligned heap block (see [`Thread::new`]), the same
 //!   "simplest first version" the x86_64 scheduler started from. Guard
@@ -65,9 +73,15 @@
 //!   `d8`-`d15` is the complete FP half, not an approximation.
 //!
 //! Nothing else belongs here for a cooperative switch: `SPSR`/`ELR` are
-//! exception-return state (no exception is taken), `TTBR0_EL1` is
-//! unchanged because no thread owns an address space yet, and `DAIF` is
-//! identical for every thread (see below).
+//! exception-return state (no exception is taken by the switch itself), and
+//! `DAIF` is identical for every thread (see below). `TTBR0_EL1` is
+//! deliberately *not* in [`Context`] either, even though it is now
+//! per-thread: a saved-register block is restored by the *incoming* thread's
+//! own `ldp`s running on its own stack, and the whole point of switching
+//! `TTBR0_EL1` is to do it while the *outgoing* thread's mappings are still
+//! the ones in force. It is written by [`yield_now`] just before
+//! [`switch_to`] instead (see that function), which is also where x86_64's
+//! `Cr3` write lives for the identical reason.
 //!
 //! # Interrupt state across a switch
 //!
@@ -85,13 +99,14 @@
 //! changes: the switch mechanism itself gets replaced (see the scope note
 //! above), and whatever replaces it must mask explicitly.
 
+use crate::process::{self, AddressSpace};
 use crate::serial_println;
 use alloc::alloc::{alloc_zeroed, Layout};
 use alloc::collections::VecDeque;
 use core::arch::naked_asm;
 use core::fmt;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
 /// 8 KiB per thread. Small on purpose: these come out of `heap.rs`'s
@@ -148,7 +163,11 @@ struct Context {
 /// definitions from drifting: 20 registers x 8 bytes = 160, itself a
 /// multiple of 16, so subtracting it from a 16-aligned `sp` leaves `sp`
 /// 16-aligned.
-const CONTEXT_SIZE: usize = 160;
+/// `pub(crate)` so `el0_proof.rs`, whose `enter_el0`/`resume_el1` save and
+/// restore the *same* block in the same layout, can assert its own
+/// duplicated literal against this one instead of two files quietly
+/// disagreeing about 160.
+pub(crate) const CONTEXT_SIZE: usize = 160;
 const _: () = assert!(size_of::<Context>() == CONTEXT_SIZE);
 const _: () = assert!(CONTEXT_SIZE % STACK_ALIGN == 0);
 
@@ -161,6 +180,13 @@ pub enum SpawnError {
     NotInitialized,
     /// `heap.rs`'s heap had no room for another thread stack.
     OutOfMemory,
+    /// The `AddressSpace` handed to [`spawn_with_address_space`] was not
+    /// seeded from the kernel's own level-1 table -- i.e. it was built while
+    /// some *other* address space was active, so its copied level-1 entries
+    /// may include that space's private sub-tables. See
+    /// `process::AddressSpace::seeded_root`'s documentation for why that is
+    /// an isolation break and not merely untidy.
+    AddressSpaceNotSeededFromKernel { seeded_root: u64, kernel_root: u64 },
 }
 
 impl fmt::Display for SpawnError {
@@ -168,6 +194,14 @@ impl fmt::Display for SpawnError {
         match self {
             SpawnError::NotInitialized => f.write_str("scheduler::init() has not run"),
             SpawnError::OutOfMemory => f.write_str("out of heap for a new thread stack"),
+            SpawnError::AddressSpaceNotSeededFromKernel {
+                seeded_root,
+                kernel_root,
+            } => write!(
+                f,
+                "address space was seeded from {:#x}, not the kernel table {:#x}",
+                seeded_root, kernel_root
+            ),
         }
     }
 }
@@ -186,6 +220,26 @@ struct Thread {
     /// as a plain `usize` because both sides of a switch treat it as a raw
     /// address (`switch_to` writes it through `x0`, reads it from `x1`).
     stack_pointer: usize,
+    /// This thread's own translation tables, if it has any.
+    ///
+    /// `None` -- the case for every thread this module spawned before this
+    /// slice, and for the boot context -- means "run under the kernel's own
+    /// identity-mapped table," which [`yield_now`] installs explicitly
+    /// rather than leaving whatever the previous thread happened to have
+    /// loaded. Leaving it alone would mean a plain EL1 kernel thread
+    /// inherited a *process's* `TTBR0_EL1`, which happens to work here only
+    /// because `AddressSpace::new` copies the kernel's mappings -- i.e. it
+    /// would work by accident, and would stop working the moment an address
+    /// space stops being a superset of the kernel's.
+    ///
+    /// Owned, not borrowed or reduced to a bare root address: the tables
+    /// must outlive every resume of this thread, and nothing in this crate
+    /// frees an `AddressSpace` (`process.rs` has no `Drop` -- see its note,
+    /// which wanted exactly this scheduler to exist before freeing could be
+    /// made safe). Threads are never removed from the run queue in this
+    /// slice, so "owned by the `Thread`" and "leaked" coincide today; when
+    /// reclamation lands, this is the field that makes it expressible.
+    address_space: Option<AddressSpace>,
 }
 
 impl Thread {
@@ -283,6 +337,7 @@ impl Thread {
         Ok(Thread {
             stack_base: stack_base as usize,
             stack_pointer: context_ptr as usize,
+            address_space: None,
         })
     }
 
@@ -295,6 +350,7 @@ impl Thread {
         Thread {
             stack_base: 0,
             stack_pointer: 0,
+            address_space: None,
         }
     }
 }
@@ -306,15 +362,55 @@ struct Scheduler {
 
 static SCHEDULER: Mutex<Option<Scheduler>> = Mutex::new(None);
 
+/// The kernel's own identity-mapped level-1 table (`mmu.rs`'s
+/// `LEVEL1_TABLE`), captured once by [`init`] from the live `TTBR0_EL1`
+/// rather than hardcoded or re-exported from `mmu.rs`.
+///
+/// Captured, because it is what [`yield_now`] must install when resuming a
+/// thread with no address space of its own, and read from the live register
+/// because that makes it the table that *actually* booted this kernel, not
+/// the one a second source of truth claims did. 0 means [`init`] has not
+/// run, which is also the state in which `yield_now` is a no-op anyway.
+static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
+
+/// How many times [`yield_now`] has actually written `TTBR0_EL1` (and so
+/// paid for a `tlbi vmalle1`), versus [`TTBR0_SKIPS`], the resumes where
+/// the incoming thread's table was already loaded and the write was elided.
+///
+/// Counted so the skip is a *demonstrated* property rather than an asserted
+/// one: `el0_proof::prove_el0_process` prints both, and nine of
+/// [`prove_scheduling`]'s ten switches are kernel-thread-to-kernel-thread,
+/// which must show up as skips.
+static TTBR0_SWITCHES: AtomicUsize = AtomicUsize::new(0);
+static TTBR0_SKIPS: AtomicUsize = AtomicUsize::new(0);
+
 /// Creates the run queue, with the calling (boot) context installed as the
 /// current thread so the very first [`yield_now`] has somewhere to save
-/// it. Must run after `heap::init` -- `VecDeque` and the thread stacks are
-/// both heap-allocated.
+/// it, and records the kernel's own `TTBR0_EL1` (see [`KERNEL_ROOT`]).
+/// Must run after `heap::init` -- `VecDeque` and the thread stacks are
+/// both heap-allocated -- and after `mmu::install`, so there is a real
+/// kernel table to record.
 pub fn init() {
+    KERNEL_ROOT.store(process::active_root(), Ordering::Relaxed);
     *SCHEDULER.lock() = Some(Scheduler {
         run_queue: VecDeque::new(),
         current: Some(Thread::placeholder()),
     });
+}
+
+/// The kernel's own level-1 table address as [`init`] recorded it, or 0 if
+/// `init` has not run.
+pub fn kernel_root() -> u64 {
+    KERNEL_ROOT.load(Ordering::Relaxed)
+}
+
+/// `(TTBR0_EL1 writes performed, writes elided as already-loaded)` since
+/// boot -- see [`TTBR0_SWITCHES`].
+pub fn ttbr0_switch_counts() -> (usize, usize) {
+    (
+        TTBR0_SWITCHES.load(Ordering::Relaxed),
+        TTBR0_SKIPS.load(Ordering::Relaxed),
+    )
 }
 
 /// Queues a new EL1 kernel thread. `entry` never returns -- there is no
@@ -322,6 +418,43 @@ pub fn init() {
 /// finished thread must loop, typically on [`yield_now`].
 pub fn spawn(entry: extern "C" fn() -> !) -> Result<(), SpawnError> {
     let thread = Thread::new(entry)?;
+    enqueue(thread)
+}
+
+/// Queues a kernel thread that owns `space`, so that every resume of it
+/// installs `space`'s `TTBR0_EL1` (see [`Thread::address_space`]).
+///
+/// `entry` still starts at **EL1**, on this thread's own kernel stack: this
+/// function gives a thread an address space, not an exception level. Getting
+/// to EL0 is `entry`'s own job (`el0_proof.rs` does it with a real `eret`),
+/// which keeps the one genuinely delicate step -- the EL1 -> EL0 transition
+/// and the way back -- out of the scheduler, where it would have to be
+/// general.
+///
+/// Refuses a space that was not seeded from the kernel's own table. That is
+/// the one check this boundary can make cheaply that catches a real
+/// isolation break rather than a typo: see
+/// `process::AddressSpace::seeded_root`.
+pub fn spawn_with_address_space(
+    entry: extern "C" fn() -> !,
+    space: AddressSpace,
+) -> Result<(), SpawnError> {
+    let kernel_root = KERNEL_ROOT.load(Ordering::Relaxed);
+    if kernel_root == 0 {
+        return Err(SpawnError::NotInitialized);
+    }
+    if space.seeded_root() != kernel_root {
+        return Err(SpawnError::AddressSpaceNotSeededFromKernel {
+            seeded_root: space.seeded_root(),
+            kernel_root,
+        });
+    }
+    let mut thread = Thread::new(entry)?;
+    thread.address_space = Some(space);
+    enqueue(thread)
+}
+
+fn enqueue(thread: Thread) -> Result<(), SpawnError> {
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().ok_or(SpawnError::NotInitialized)?;
     sched.run_queue.push_back(thread);
@@ -336,7 +469,7 @@ pub fn spawn(entry: extern "C" fn() -> !) -> Result<(), SpawnError> {
 /// context yields before anything is spawned, in principle), not a caller
 /// bug worth aborting the kernel over.
 pub fn yield_now() {
-    let (current_sp_ptr, next_sp) = {
+    let (current_sp_ptr, next_sp, next_root) = {
         let mut guard = SCHEDULER.lock();
         let Some(sched) = guard.as_mut() else {
             return;
@@ -345,6 +478,15 @@ pub fn yield_now() {
             return;
         };
         let next_sp = next.stack_pointer;
+        // Read out before `next` is moved into `sched.current` below, for
+        // the same reason `current_sp_ptr` is taken *after* its own move:
+        // the value has to be captured on the side of the move where the
+        // `Thread` is still reachable.
+        let next_root = next
+            .address_space
+            .as_ref()
+            .map(|space| space.root())
+            .unwrap_or(KERNEL_ROOT.load(Ordering::Relaxed));
 
         let Some(current) = sched.current.take() else {
             // Can't happen: `current` is only ever `None` inside this
@@ -364,12 +506,49 @@ pub fn yield_now() {
         };
         let current_sp_ptr: *mut usize = &mut back.stack_pointer;
 
-        (current_sp_ptr, next_sp)
+        (current_sp_ptr, next_sp, next_root)
         // `guard` drops here -- before `switch_to`, because the thread
         // being switched to will itself lock `SCHEDULER` in its own
         // `yield_now`, which would spin forever against a lock this
         // (now suspended) stack frame still held.
     };
+
+    // Install the incoming thread's `TTBR0_EL1` -- its own address space's
+    // table, or the kernel's own identity map for a thread that has none.
+    //
+    // **Why here and not inside `switch_to`, and why before rather than
+    // after:** this is the last point at which the *outgoing* thread's
+    // mappings are still what the CPU is translating with. After
+    // `switch_to`, every instruction belongs to the incoming thread, so
+    // "switch the table on the way in" would have to be assembly in the
+    // middle of a register restore; before it, this is ordinary Rust whose
+    // own code, stack and vectors are mapped identically in both tables (the
+    // invariant `process::AddressSpace::new`'s kernel-entry copy exists to
+    // guarantee, and the reason a `TTBR0_EL1` write from EL1 is survivable
+    // at all). `kernel/src/scheduler.rs` puts its `Cr3` write in exactly the
+    // same place for exactly this reason.
+    //
+    // **The skip.** Compared against the *live register*, not a cached
+    // "what we last wrote", so the elision can never disagree with the
+    // hardware. It matters: an unconditional write costs a `tlbi vmalle1`
+    // plus two `isb`s, this crate uses no ASIDs (see `process.rs`), and the
+    // overwhelmingly common case here is kernel-thread-to-kernel-thread,
+    // where both sides want the same table. `next_root == 0` means `init`
+    // never ran, in which case `SCHEDULER` was `None` and we returned above
+    // -- it is re-checked rather than assumed because writing 0 into
+    // `TTBR0_EL1` would unmap the kernel from under this instruction.
+    if next_root != 0 && process::active_root() != next_root {
+        // SAFETY: `next_root` is either `KERNEL_ROOT` (the table this
+        // kernel booted and is still running on) or the root of an
+        // `AddressSpace` that `spawn_with_address_space` verified was
+        // seeded from that same kernel table -- so EL1's code, stack, and
+        // `el1_vectors.rs` vectors are mapped identically either way, which
+        // is `AddressSpace::activate`'s stated contract.
+        unsafe { process::load_root(next_root) };
+        TTBR0_SWITCHES.fetch_add(1, Ordering::Relaxed);
+    } else {
+        TTBR0_SKIPS.fetch_add(1, Ordering::Relaxed);
+    }
 
     // SAFETY: `current_sp_ptr` points into the `Thread` that was just
     // pushed onto the run queue, which lives as long as the scheduler

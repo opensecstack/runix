@@ -251,6 +251,35 @@ pub struct AddressSpace {
     /// table, so it copies as invalid), but the check is what keeps that a
     /// *checked* property rather than a coincidence of the current layout.
     owned_tables: BTreeSet<u64>,
+    /// The `TTBR0_EL1` table address this space's level-1 entries were
+    /// *copied from* by [`new`](Self::new) -- in practice `mmu.rs`'s
+    /// boot-time `LEVEL1_TABLE`.
+    ///
+    /// Recorded, not assumed, because [`new`](Self::new) seeds from whatever
+    /// is **active at the moment of construction**, and that is the ARM
+    /// analogue of a real bug x86_64's `process.rs` documents. Two distinct
+    /// hazards live here, and they are not the same:
+    ///
+    /// 1. *"A level-1 slot that was empty at copy time gets populated in the
+    ///    live kernel table afterwards."* Structurally impossible in this
+    ///    crate: `mmu::install` builds the entire kernel level-1 table once,
+    ///    before the heap exists, and nothing ever writes a kernel level-1
+    ///    entry again. (Changes at level 2 or 3 inside an *existing* kernel
+    ///    slot would propagate to every space automatically, since those
+    ///    sub-tables are shared by pointer -- see [`new`](Self::new). Only a
+    ///    brand-new level-1 slot could be missed, and the only level-1 slot
+    ///    written after `install` is index 2, which is per-space private by
+    ///    design.)
+    /// 2. *"The space was seeded while some **other** `AddressSpace` was
+    ///    active."* Genuinely possible the moment a scheduler exists, and
+    ///    strictly worse: the copy would pick up that space's private
+    ///    level-1 index 2 table descriptor, so the two spaces' private
+    ///    windows would share translation structures -- the exact aliasing
+    ///    `owned_tables` exists to prevent, arriving through the one door it
+    ///    cannot see. [`seeded_root`](Self::seeded_root) is what lets
+    ///    `scheduler::spawn_with_address_space` refuse such a space instead
+    ///    of discovering it as a mysterious isolation failure.
+    seeded_root: u64,
 }
 
 impl AddressSpace {
@@ -274,7 +303,11 @@ impl AddressSpace {
         }
         let mut owned_tables = BTreeSet::new();
         owned_tables.insert(root);
-        Ok(AddressSpace { root, owned_tables })
+        Ok(AddressSpace {
+            root,
+            owned_tables,
+            seeded_root: active,
+        })
     }
 
     /// Maps a fresh, zeroed, private 4 KiB page at `va` -- within this
@@ -379,6 +412,15 @@ impl AddressSpace {
         self.root
     }
 
+    /// The table this space's kernel-space entries were copied from -- see
+    /// [`seeded_root`](Self::seeded_root)'s field documentation for the two
+    /// hazards this exists to make checkable, and
+    /// `scheduler::spawn_with_address_space` for the one caller that checks
+    /// it.
+    pub fn seeded_root(&self) -> u64 {
+        self.seeded_root
+    }
+
     /// The raw level-3 page descriptor this space maps `va` with, or `None`
     /// if `va` is not mapped by a privately owned level-3 entry.
     ///
@@ -447,7 +489,29 @@ impl AddressSpace {
 /// # Safety
 /// Same contract as [`AddressSpace::activate`].
 pub unsafe fn restore(previous: u64) {
+    // Written back *raw*, unlike [`load_root`]: `previous` came out of
+    // `TTBR0_EL1` verbatim, so putting back exactly those bits (any ASID or
+    // `CnP` included, even though this crate sets neither) is what "restore"
+    // has to mean.
     unsafe { write_ttbr0(previous) };
+}
+
+/// Loads a raw level-1 table address into `TTBR0_EL1` -- the same single
+/// operation [`restore`] performs, named for the other direction.
+///
+/// [`restore`] reads as "put back what was there," which is what the
+/// save/restore proofs ([`prove_isolation`], `load_proof::prove_load`) do;
+/// `scheduler.rs` instead *installs* the incoming thread's table (or the
+/// kernel's own) on every resume, where "restore" would actively misdescribe
+/// what is happening. One implementation, two honest names, so neither
+/// caller has to read against the grain of the other's idiom.
+///
+/// # Safety
+/// Same contract as [`AddressSpace::activate`]: `root` must name a correctly
+/// aligned level-1 table that maps the currently executing code, its stack,
+/// and anything an exception handler would need.
+pub unsafe fn load_root(root: u64) {
+    unsafe { write_ttbr0(root & DESC_ADDR_MASK) };
 }
 
 fn active_ttbr0() -> u64 {
@@ -460,7 +524,12 @@ fn active_ttbr0() -> u64 {
 
 /// Address of the level-1 table `TTBR0_EL1` currently points at, with any
 /// ASID/CnP bits masked off.
-fn active_root() -> u64 {
+///
+/// Public because `scheduler.rs` compares it against the incoming thread's
+/// target table to skip a redundant `msr`/`tlbi` pair: the comparison is
+/// made against **the live register**, not a cached "what we last wrote"
+/// value, so the optimization cannot silently desync from the hardware.
+pub fn active_root() -> u64 {
     active_ttbr0() & DESC_ADDR_MASK
 }
 

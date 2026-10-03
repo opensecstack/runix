@@ -178,7 +178,9 @@ const ESR_EC_SVC64: u64 = 0x15;
 /// vector 8 for a non-`SVC` synchronous exception, e.g. a real EL0 data
 /// abort once anything can trigger one) reports and halts, same as
 /// before -- this handler doesn't yet know what a safe resume means for
-/// anything else.
+/// anything else, with one narrow exception documented inline below (an EL0
+/// fault taken during `el0_proof.rs`'s one-shot EL0 excursion, which is the
+/// one other case with a real EL1 continuation to resume *to*).
 #[unsafe(no_mangle)]
 extern "C" fn el1_exception_handler(
     vector: u64,
@@ -212,6 +214,27 @@ extern "C" fn el1_exception_handler(
         ec,
         far_el1
     );
+
+    // One narrow escape from "print and halt forever", for exactly one
+    // situation: a synchronous exception from a lower EL (vector 8) that is
+    // not an `SVC`, taken while `el0_proof.rs` has an EL1 continuation in
+    // flight -- i.e. its EL0 process faulted instead of finishing. The
+    // diagnostic above has already been printed, so nothing is lost; what
+    // this buys is that the *only* thread able to report the proof's result
+    // (the one suspended inside `el0_proof::enter_el0`) gets resumed to
+    // print a `FAILED` line, instead of the whole boot hanging here with no
+    // verdict. Deliberately not generalized to other vectors or to the
+    // no-continuation case: with no continuation live this condition is
+    // false and the behaviour below is unchanged, which is what keeps
+    // `el0.rs`'s `el0_demo` -- which runs later, with no continuation --
+    // exactly as it was.
+    if vector == 8 && crate::el0_proof::continuation_live() {
+        // SAFETY: `continuation_live()` is true, which is this function's
+        // stated precondition; see `abort_from_fault`'s own doc comment for
+        // the stack reasoning.
+        unsafe { crate::el0_proof::abort_from_fault(vector, esr_el1, far_el1, elr_el1) };
+    }
+
     loop {
         unsafe {
             core::arch::asm!("wfe");

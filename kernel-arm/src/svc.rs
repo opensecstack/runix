@@ -100,6 +100,22 @@ pub const SYS_SIM_DELETE: u64 = 9;
 pub const SYS_SIM_STATUS: u64 = 10;
 pub const SYS_IPC_SEND: u64 = 11;
 pub const SYS_IPC_RECV: u64 = 12;
+/// "This EL0 excursion is finished; resume my EL1 continuation" -- the one
+/// syscall `el0_proof.rs`'s EL0 process needs in order to hand control back
+/// to EL1 at all, and the only one added for it.
+///
+/// Deliberately **not** a general `SYS_YIELD` (the shape
+/// `kernel/src/syscall.rs` has on the x86_64 side): it does not reschedule,
+/// does not return to EL0, carries no capability check, and names no
+/// resource. Its entire authority is "end the caller's own EL0 run and
+/// resume the EL1 frame that started it", so there is nothing for a
+/// capability to gate and no privileged action to route through MARSHAL.
+/// With no excursion in flight it is an unknown syscall and returns
+/// `u64::MAX` like any other -- `el0_proof::finish` enforces that, not this
+/// dispatch table. A real `SYS_YIELD` is the next scheduling slice's work;
+/// see `el0_proof.rs`'s doc comment for why keeping the two separate is the
+/// honest split rather than a stopgap.
+pub const SYS_EL0_PROOF_DONE: u64 = 13;
 
 /// `SYS_RIL_RECV`'s return-value convention: `0..=255` is a received byte,
 /// `256`/`257` are out-of-band sentinels distinct from any real byte value
@@ -665,6 +681,12 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                 }
             }
         }
+        // The one arm that may not return to EL0 (see this constant's doc
+        // comment and `el0_proof::finish`): on the proof path it resumes an
+        // EL1 continuation and never comes back here; with no excursion in
+        // flight it falls through to the same `u64::MAX` an unknown syscall
+        // gets.
+        SYS_EL0_PROOF_DONE => crate::el0_proof::finish(arg1, arg2, arg3),
         _ => u64::MAX,
     }
 }
