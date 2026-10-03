@@ -68,7 +68,10 @@ mod tests {
 
     #[test]
     fn accepts_a_well_formed_completion() {
-        assert_eq!(validate_rx_completion(0, RX_BUFFER_SIZE, 4), Some((0, RX_BUFFER_SIZE)));
+        assert_eq!(
+            validate_rx_completion(0, RX_BUFFER_SIZE, 4),
+            Some((0, RX_BUFFER_SIZE))
+        );
     }
 
     #[test]

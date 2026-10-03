@@ -97,7 +97,10 @@ impl core::fmt::Display for ProbeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ProbeError::BadMagic(magic) => {
-                write!(f, "MagicValue read {magic:#x}, expected {MAGIC:#x} (\"virt\")")
+                write!(
+                    f,
+                    "MagicValue read {magic:#x}, expected {MAGIC:#x} (\"virt\")"
+                )
             }
             ProbeError::NoDevice => f.write_str("DeviceID read 0 -- no device in this slot"),
             ProbeError::WrongDeviceId(id) => {

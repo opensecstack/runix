@@ -122,11 +122,11 @@ use crate::mmu::{
     normal_4kib_page_descriptor, table_descriptor, AP_EL0_RW, DESC_TABLE_OR_PAGE, GRANULE_4KIB,
     PXN, UXN,
 };
-use runix_kernel_arm::vm::AP_EL0_RO;
 use crate::serial_println;
 use alloc::alloc::{alloc_zeroed, Layout};
 use alloc::collections::BTreeSet;
 use core::fmt;
+use runix_kernel_arm::vm::AP_EL0_RO;
 
 /// The process-private VA window (`0x8000_0000`..`0xC000_0000`) -- level-1
 /// index 2, which `mmu.rs` never populates. See this module's doc comment

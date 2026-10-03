@@ -154,7 +154,11 @@ pub enum VirtioNetError {
     /// `QueueNumMax` for this queue is smaller than the queue size this
     /// driver asked to use, or larger than [`MAX_SUPPORTED_QUEUE_SIZE`]
     /// (would not fit this driver's fixed one-page descriptor table).
-    QueueSizeUnsupported { queue: u32, requested: u16, max: u32 },
+    QueueSizeUnsupported {
+        queue: u32,
+        requested: u16,
+        max: u32,
+    },
     /// `QueueReady` was written but read back clear.
     QueueNotReady(u32),
 }
@@ -174,7 +178,11 @@ impl core::fmt::Display for VirtioNetError {
             VirtioNetError::FeaturesRejected(s) => {
                 write!(f, "device rejected FEATURES_OK, Status={s:#x}")
             }
-            VirtioNetError::QueueSizeUnsupported { queue, requested, max } => write!(
+            VirtioNetError::QueueSizeUnsupported {
+                queue,
+                requested,
+                max,
+            } => write!(
                 f,
                 "queue {queue} QueueNumMax={max}, need between 1 and \
                  min(requested {requested}, {MAX_SUPPORTED_QUEUE_SIZE})"
@@ -259,7 +267,9 @@ impl VirtioNet {
         requested: u16,
     ) -> Result<u16, VirtioNetError> {
         let max = self.queue_num_max(queue_index);
-        let usable = max.min(u32::from(requested)).min(u32::from(MAX_SUPPORTED_QUEUE_SIZE));
+        let usable = max
+            .min(u32::from(requested))
+            .min(u32::from(MAX_SUPPORTED_QUEUE_SIZE));
         if usable == 0 {
             return Err(VirtioNetError::QueueSizeUnsupported {
                 queue: queue_index,
