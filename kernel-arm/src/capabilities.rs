@@ -55,6 +55,19 @@ pub fn ril_resource(channel: usize) -> String {
     alloc::format!("ril:{channel}")
 }
 
+/// The resource string a capability must match to authorize
+/// `SYS_IPC_SEND`/`SYS_IPC_RECV` on a general-purpose IPC channel -- the
+/// ARM analogue of `kernel/src/capabilities.rs::port_resource`, naming
+/// `ipc_channel.rs`'s own channel space. Deliberately a *different* prefix
+/// from [`ril_resource`]'s even though both name a small integer channel
+/// id: `ipc_channel.rs` is a separate channel array with separate contents
+/// (see its doc comment on why it isn't a reuse of `ril_channel.rs`), so a
+/// shared resource string would let one token reach both, silently
+/// collapsing two distinct resource kinds into one grant.
+pub fn ipc_resource(channel: usize) -> String {
+    alloc::format!("ipc:{channel}")
+}
+
 /// The resource string a capability must match to authorize slot-level
 /// SIM operations -- today just `SYS_SIM_CREATE`, which allocates a new
 /// profile container in `slot`. Deliberately still slot-level rather than

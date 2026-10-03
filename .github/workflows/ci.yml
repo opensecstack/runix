@@ -570,6 +570,22 @@ jobs:
           grep -q "Runix ARM kernel: ELF load EL0 access (AT S1E0R/S1E0W) text read=ok write=fault, data read=ok write=ok" \
             /tmp/arm-boot.log
           grep -q "Runix ARM kernel: ELF loader PASS" /tmp/arm-boot.log
+          # The cooperative scheduler (kernel-arm/src/scheduler.rs, Stage 5
+          # slice 5 of item 2.4): three EL1 kernel threads each print three
+          # tagged rounds with a yield_now() between them. The interleaving
+          # line is the real assertion -- a scheduler that spawned three
+          # threads but never actually switched registers/stacks would print
+          # A0,A1,A2,B0,... (each thread run to completion) and fail here,
+          # while still "booting fine". DAIF=0x3c0 is the masked
+          # Debug/SError/IRQ/FIQ state the switch relies on (see that
+          # module's doc comment): asserted, not assumed, since it is read
+          # out of the live register at proof time.
+          grep -q "Runix ARM kernel: scheduler init (cooperative, DAIF=0x3c0" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: scheduler thread A0 running" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: scheduler thread C2 running" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: scheduler interleaving A0,B0,C0,A1,B1,C1,A2,B2,C2" \
+            /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: scheduler PASS" /tmp/arm-boot.log
           grep -q "Runix ARM kernel: RIL capability issued" /tmp/arm-boot.log
           # "U" (SYS_WRITE gate proof) immediately followed by "B" (0x42,
           # a real EL0 stack strb/ldrb round-trip) on the same line, since
@@ -623,6 +639,19 @@ jobs:
           grep -q "SVC: SYS_SIM_STATUS slot 0 profile 0 authorized, state Deleted" /tmp/arm-boot.log
           grep -q "SVC: SYS_SIM_CREATE slot 99 DENIED" /tmp/arm-boot.log
           grep -q "SVC: SYS_SIM_STATUS slot 99 profile 0 DENIED" /tmp/arm-boot.log
+          # General-purpose IPC channels (kernel-arm/src/ipc_channel.rs), the
+          # ARM analogue of kernel/src/ipc.rs's fixed-count byte channels --
+          # a separately-addressed channel space with its own `ipc:{channel}`
+          # capability strings, so the RIL grant above does not reach it. A
+          # byte sent on the authorized channel round-trips back out (0x49,
+          # echoed as 'I'); the same pair on an unauthorized channel number
+          # is denied before ipc_channel::send/recv ever runs.
+          grep -q "Runix ARM kernel: IPC capability issued (channel 0" /tmp/arm-boot.log
+          grep -q "SVC: SYS_IPC_SEND channel 0 byte 0x49 authorized" /tmp/arm-boot.log
+          grep -q "SVC: SYS_IPC_RECV channel 0 authorized, byte 0x49" /tmp/arm-boot.log
+          grep -q "^I$" /tmp/arm-boot.log
+          grep -q "SVC: SYS_IPC_SEND channel 99 DENIED" /tmp/arm-boot.log
+          grep -q "SVC: SYS_IPC_RECV channel 99 DENIED" /tmp/arm-boot.log
       - name: boot in QEMU without secure=on and check the no-EL3 path
         # Regression check for a real, previously-shipped bug: this used to
         # produce zero UART output (rust_start ran the EL3-only phase
@@ -668,6 +697,14 @@ jobs:
           grep -q "Runix ARM kernel: ELF load EL0 access (AT S1E0R/S1E0W) text read=ok write=fault, data read=ok write=ok" \
             /tmp/arm-boot-nosecure.log
           grep -q "Runix ARM kernel: ELF loader PASS" /tmp/arm-boot-nosecure.log
+          # Same scheduler interleaving proof as the secure boot above (see
+          # its comments) -- scheduler.rs is EL1-side and
+          # security-state-independent, so it must hold on both entry paths.
+          grep -q "Runix ARM kernel: scheduler init (cooperative, DAIF=0x3c0" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: scheduler interleaving A0,B0,C0,A1,B1,C1,A2,B2,C2" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: scheduler PASS" /tmp/arm-boot-nosecure.log
           grep -q "^UB$" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_RIL_ACCESS channel 0 authorized" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_RIL_RECV channel 0 authorized, byte 0x41" \
@@ -678,6 +715,15 @@ jobs:
           grep -q "SVC: SYS_SIM_STATUS slot 0 profile 0 authorized, state Deleted" \
             /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_SIM_CREATE slot 99 DENIED" /tmp/arm-boot-nosecure.log
+          # Same general-purpose IPC round trip + denial as the secure boot
+          # above (see its comments) -- ipc_channel.rs and its capability
+          # check are security-state-independent, so they must hold on both
+          # entry paths.
+          grep -q "SVC: SYS_IPC_SEND channel 0 byte 0x49 authorized" /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_IPC_RECV channel 0 authorized, byte 0x49" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "^I$" /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_IPC_RECV channel 99 DENIED" /tmp/arm-boot-nosecure.log
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke

@@ -297,9 +297,23 @@ fn el1_setup() -> ! {
     // the MMU itself (AT S1E0R/S1E0W) what EL0 may do with each page.
     // Directly after the isolation proof because it needs exactly the same
     // prerequisites -- the MMU and the heap -- and nothing is executed:
-    // there is still no scheduler and no EL0 drop of a loaded image, which
-    // is the next slice.
+    // there is no EL0 drop of a loaded image yet (combining the loader with
+    // the scheduler below is the next step after this slice).
     crate::load_proof::prove_load();
+
+    // The cooperative scheduler (`scheduler.rs`, Stage 5 slice 5 of
+    // docs/BETA_MOBILE_PROGRESS.md item 2.4): spawn three EL1 kernel
+    // threads that each print and record three tagged rounds, yielding
+    // between them, and assert the *observed* order actually interleaved
+    // (A0,B0,C0,A1,...) rather than running each thread to completion --
+    // the property that proves register/stack context switching, not just
+    // that spawning several things didn't crash. Same placement reasoning
+    // as the two proofs above: it needs the heap (thread stacks) and
+    // nothing else -- no EL0, no address space, no syscalls. Returns
+    // normally with the proof threads parked in the run queue; nothing
+    // below here yields, so they never run again (no thread exit in this
+    // slice, by design).
+    crate::scheduler::prove_scheduling();
 
     // Issue demo capabilities authorizing RIL channel 0 and SIM slot 0
     // (plus, below, slot 0's profile 0 and its separate delete scope) --
@@ -336,6 +350,12 @@ fn el1_setup() -> ! {
     serial_println!(
         "Runix ARM kernel: eSIM delete capability issued (slot 0 profile 0, demo trust root)"
     );
+    // The general-purpose IPC channel space (`ipc_channel.rs`) is addressed
+    // separately from RIL's, so it needs its own grant -- an `ril:0` token
+    // deliberately does not reach `ipc:0`. Same channel 0 / channel 99
+    // authorized-vs-not split el0_demo uses for every other resource kind.
+    crate::capabilities::issue_and_hold(crate::capabilities::ipc_resource(0), now);
+    serial_println!("Runix ARM kernel: IPC capability issued (channel 0, demo trust root)");
 
     // The RIL isolation boundary and basic SIM provisioning: drop to EL0,
     // capability-gated through the SVC syscall gate (svc.rs) exactly like

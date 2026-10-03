@@ -20,7 +20,24 @@
 //! walking an authorized slot's first profile through its real state
 //! machine (`sim.rs`) and getting denied on an unauthorized slot --
 //! proving the *same* capability check gates a second,
-//! differently-shaped resource kind, not something special-cased for RIL.
+//! differently-shaped resource kind, not something special-cased for RIL;
+//! and finally `SYS_IPC_SEND`/`SYS_IPC_RECV` round-tripping a byte through
+//! a general-purpose IPC channel (`ipc_channel.rs`) and getting denied on
+//! an unauthorized channel number.
+//!
+//! # Why the IPC walk is sequential send-then-recv from one context
+//!
+//! The IPC pair is exercised exactly the way the RIL pair already is: this
+//! one EL0 context issues `SEND` on channel 0, then later issues `RECV` on
+//! the *same* channel and echoes the byte back out through `SYS_WRITE`.
+//! There is no second thread, because there is no scheduler in this crate
+//! yet (see `capabilities.rs`'s own doc comment) -- and none is needed to
+//! prove what this slice claims: that a general byte channel exists, that
+//! the `SVC` gate carries a real payload byte into and back out of it, and
+//! that the capability check is consulted on *every* operation rather than
+//! cached. Genuine two-thread IPC becomes exercisable once the scheduler
+//! slice of `docs/BETA_MOBILE_PROGRESS.md`'s Item 2.4 lands; it is not what
+//! the channel mechanism itself needs in order to be real.
 //!
 //! # What the eSIM part of the walk is actually proving
 //!
@@ -157,6 +174,8 @@ const SYS_SIM_ENABLE: u64 = 7;
 const SYS_SIM_DISABLE: u64 = 8;
 const SYS_SIM_DELETE: u64 = 9;
 const SYS_SIM_STATUS: u64 = 10;
+const SYS_IPC_SEND: u64 = 11;
+const SYS_IPC_RECV: u64 = 12;
 
 /// The EL0 demo itself. `.balign 4096` for the same reason
 /// `userspace::user_hello` does: this crate's EL0 permissions *are*
@@ -317,6 +336,35 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x1, #99",
         "mov x2, #0",
         "svc #0",
+        // SYS_IPC_SEND(0, 'I') -- a general-purpose IPC channel this context
+        // holds a capability for (`ipc:0`, issued in nonsecure.rs alongside
+        // the RIL/SIM ones). A separate channel space from RIL's, so the
+        // `ril:0` token above does not authorize this.
+        "mov x0, {sys_ipc_send}",
+        "mov x1, #0",
+        "mov x2, #73", // 'I'
+        "svc #0",
+        // SYS_IPC_RECV(0) -- reads that byte back; x0 on return is the byte
+        // itself (see svc.rs's IPC_RECV_EMPTY/IPC_RECV_DENIED for the
+        // sentinels that aren't bytes). Echoed via SYS_WRITE so the round
+        // trip is visible in the serial log, same convention as the RIL
+        // round trip above.
+        "mov x0, {sys_ipc_recv}",
+        "mov x1, #0",
+        "svc #0",
+        "mov x1, x0",
+        "mov x0, {sys_write}",
+        "svc #0",
+        // SYS_IPC_SEND(99, 'Z') -- unauthorized channel: denied before
+        // ipc_channel::send ever runs.
+        "mov x0, {sys_ipc_send}",
+        "mov x1, #99",
+        "mov x2, #90", // 'Z'
+        "svc #0",
+        // SYS_IPC_RECV(99) -- likewise denied.
+        "mov x0, {sys_ipc_recv}",
+        "mov x1, #99",
+        "svc #0",
         "1:",
         "wfe",
         "b 1b",
@@ -343,5 +391,7 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         sys_sim_disable = const SYS_SIM_DISABLE,
         sys_sim_delete = const SYS_SIM_DELETE,
         sys_sim_status = const SYS_SIM_STATUS,
+        sys_ipc_send = const SYS_IPC_SEND,
+        sys_ipc_recv = const SYS_IPC_RECV,
     );
 }

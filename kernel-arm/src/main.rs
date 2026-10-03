@@ -160,6 +160,7 @@ mod el1_vectors;
 mod esim_marshal;
 mod gic;
 mod heap;
+mod ipc_channel;
 // The hardware half of the ELF loader (slice 3 of item 2.4): the
 // `PrivatePageMapper` impl binding `runix_kernel_arm::loader`'s pure logic
 // to `process::AddressSpace`, plus its boot-time proof.
@@ -168,6 +169,9 @@ mod mmu;
 mod nonsecure;
 mod process;
 mod ril_channel;
+// Cooperative round-robin scheduling for EL1 kernel threads (slice 5 of
+// item 2.4), plus its boot-time interleaving proof.
+mod scheduler;
 mod serial;
 mod sim;
 // Spike-only (see docs/BETA_MOBILE_PROGRESS.md Item 2 / 2.3): never called

@@ -3,7 +3,7 @@
 //! `el1_vectors.rs`'s vector-8 `SVC` handling; see that module's doc
 //! comment for how the syscall number/arg actually get here.
 //!
-//! Ten syscalls, matching `el0.rs`'s demo exactly (kept in sync by hand,
+//! Twelve syscalls, matching `el0.rs`'s demo exactly (kept in sync by hand,
 //! not shared constants -- see `el0.rs`'s own doc comment on why):
 //! - `SYS_WRITE`: unconditional -- proves the `SVC` gate itself works,
 //!   the same role `kernel/src/syscall.rs`'s `SYS_WRITE` plays for `int
@@ -28,6 +28,17 @@
 //!   mobile's "eSIM lifecycle" roadmap item, succeeding Alpha's
 //!   three-syscall `PROVISION`/`ACTIVATE`/`STATUS` slot-level set (see
 //!   `docs/BETA_MOBILE_PROGRESS.md`'s Item 1).
+//! - `SYS_IPC_SEND`/`SYS_IPC_RECV`: the same capability check again, now
+//!   over a *general-purpose* byte channel (`ipc_channel.rs`) rather than a
+//!   resource kind with a specific meaning -- the ARM analogue of
+//!   `kernel/src/syscall.rs`'s `SYS_IPC_SEND`/`SYS_IPC_RECV`. Structurally
+//!   identical to the RIL pair above (per-call check, denial distinguishable
+//!   from success), over its own separately-addressed channel space and its
+//!   own `ipc:{channel}` resource strings, so an `ipc:` grant never reaches
+//!   RIL traffic or vice versa. No session/response-capability machinery
+//!   (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`): that design solves
+//!   concurrent-client reply mixups, and this crate has one EL0 context --
+//!   see `ipc_channel.rs`'s doc comment.
 //!
 //! # Three things worth knowing about the SIM set specifically
 //!
@@ -87,6 +98,8 @@ pub const SYS_SIM_ENABLE: u64 = 7;
 pub const SYS_SIM_DISABLE: u64 = 8;
 pub const SYS_SIM_DELETE: u64 = 9;
 pub const SYS_SIM_STATUS: u64 = 10;
+pub const SYS_IPC_SEND: u64 = 11;
+pub const SYS_IPC_RECV: u64 = 12;
 
 /// `SYS_RIL_RECV`'s return-value convention: `0..=255` is a received byte,
 /// `256`/`257` are out-of-band sentinels distinct from any real byte value
@@ -95,6 +108,17 @@ pub const SYS_SIM_STATUS: u64 = 10;
 /// yet" as a third, distinct outcome).
 const RIL_RECV_EMPTY: u64 = 256;
 const RIL_RECV_DENIED: u64 = 257;
+
+/// `SYS_IPC_RECV`'s return-value convention -- the same three-outcome shape
+/// (`0..=255` a real byte, then two out-of-band sentinels) as
+/// `RIL_RECV_EMPTY`/`RIL_RECV_DENIED`, and deliberately the same *values*:
+/// the two syscalls are structurally identical and an EL0 caller reads them
+/// with the same comparison, so giving `IPC_RECV` different sentinel numbers
+/// would be a gratuitous second convention to remember. Kept as separate
+/// named constants rather than reusing the `RIL_*` ones so neither syscall's
+/// convention can be changed by accident while editing the other's.
+const IPC_RECV_EMPTY: u64 = 256;
+const IPC_RECV_DENIED: u64 = 257;
 
 /// `SYS_SIM_STATUS`'s return-value convention: `0..=3` is a real profile
 /// state (see `sim::ProfileState::as_status_code` -- four states now, so
@@ -585,6 +609,59 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                         e
                     );
                     SIM_STATUS_DENIED
+                }
+            }
+        }
+        SYS_IPC_SEND => {
+            let channel = arg1 as usize;
+            let byte = arg2 as u8;
+            match check(&crate::capabilities::ipc_resource(channel)) {
+                Ok(()) => match crate::ipc_channel::send(channel, byte) {
+                    Ok(()) => {
+                        serial_println!(
+                            "\nSVC: SYS_IPC_SEND channel {} byte {:#x} authorized",
+                            channel,
+                            byte
+                        );
+                        0
+                    }
+                    Err(()) => {
+                        serial_println!(
+                            "\nSVC: SYS_IPC_SEND channel {} DENIED (no such channel)",
+                            channel
+                        );
+                        1
+                    }
+                },
+                Err(e) => {
+                    serial_println!("\nSVC: SYS_IPC_SEND channel {} DENIED ({})", channel, e);
+                    1
+                }
+            }
+        }
+        SYS_IPC_RECV => {
+            let channel = arg1 as usize;
+            match check(&crate::capabilities::ipc_resource(channel)) {
+                Ok(()) => match crate::ipc_channel::recv(channel) {
+                    Some(byte) => {
+                        serial_println!(
+                            "\nSVC: SYS_IPC_RECV channel {} authorized, byte {:#x}",
+                            channel,
+                            byte
+                        );
+                        byte as u64
+                    }
+                    None => {
+                        serial_println!(
+                            "\nSVC: SYS_IPC_RECV channel {} authorized, nothing pending",
+                            channel
+                        );
+                        IPC_RECV_EMPTY
+                    }
+                },
+                Err(e) => {
+                    serial_println!("\nSVC: SYS_IPC_RECV channel {} DENIED ({})", channel, e);
+                    IPC_RECV_DENIED
                 }
             }
         }
