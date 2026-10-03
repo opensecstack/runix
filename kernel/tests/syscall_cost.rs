@@ -206,11 +206,22 @@ extern "C" fn benchmark_thread() -> ! {
     let session_id = {
         let open_ret =
             unsafe { syscall::syscall(SYS_IPC_SESSION_OPEN, MEASUREMENT_PORT as u64, 0, 0) };
-        assert_ne!(open_ret, u64::MAX, "SESSION_OPEN denied -- benchmark setup bug");
+        assert_ne!(
+            open_ret,
+            u64::MAX,
+            "SESSION_OPEN denied -- benchmark setup bug"
+        );
         let accept_ret =
             unsafe { syscall::syscall(SYS_IPC_SESSION_ACCEPT, MEASUREMENT_PORT as u64, 0, 0) };
-        assert_ne!(accept_ret, u64::MAX, "SESSION_ACCEPT denied -- benchmark setup bug");
-        assert_eq!(open_ret, accept_ret, "self-paired open/accept should yield the same session");
+        assert_ne!(
+            accept_ret,
+            u64::MAX,
+            "SESSION_ACCEPT denied -- benchmark setup bug"
+        );
+        assert_eq!(
+            open_ret, accept_ret,
+            "self-paired open/accept should yield the same session"
+        );
         open_ret
     };
 

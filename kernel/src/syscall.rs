@@ -349,8 +349,7 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             let Some(caller) = crate::scheduler::current_thread_id() else {
                 return u64::MAX;
             };
-            crate::ipc::session_accept(server_port, caller)
-                .map_or(u64::MAX, ipc::SessionId::as_u64)
+            crate::ipc::session_accept(server_port, caller).map_or(u64::MAX, ipc::SessionId::as_u64)
         }
         SYS_IPC_SESSION_SEND => {
             let session_id = ipc::SessionId::from_u64(arg1);

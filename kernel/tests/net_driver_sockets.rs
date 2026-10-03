@@ -296,7 +296,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
         exit_qemu(QemuExitCode::Failed);
     }
-    serial_println!("net_driver_sockets: unauthorized session open correctly denied (capability gate OK)");
+    serial_println!(
+        "net_driver_sockets: unauthorized session open correctly denied (capability gate OK)"
+    );
 
     // Positive case: a thread holding a capability scoped to exactly
     // `SOCKETS_SERVER_PORT` opens a session and drives a full

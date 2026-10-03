@@ -217,8 +217,9 @@ fn shadow_marshal_evaluate(module_id: &str, instance_id: &str) -> ShadowMarshalO
             let request = MarshalRequest {
                 kerkese_json: kerkese_json.into_bytes(),
             };
-            let max_iters =
-                SHADOW_MARSHAL_MAX_ITERS_OVERRIDE.lock().unwrap_or(SHADOW_MARSHAL_MAX_ITERS);
+            let max_iters = SHADOW_MARSHAL_MAX_ITERS_OVERRIDE
+                .lock()
+                .unwrap_or(SHADOW_MARSHAL_MAX_ITERS);
             match marshal_client::evaluate(
                 config.remote_ip,
                 config.remote_port,

@@ -36,8 +36,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use runix_kernel::qemu_exit::{exit_qemu, QemuExitCode};
 use runix_kernel::serial_println;
 use runix_kernel::syscall::{
-    self, SYS_IPC_SESSION_ACCEPT, SYS_IPC_SESSION_OPEN, SYS_IPC_SESSION_RECV,
-    SYS_IPC_SESSION_SEND, SYS_IPC_SESSION_SEND_LOCK, SYS_IPC_SESSION_SEND_UNLOCK,
+    self, SYS_IPC_SESSION_ACCEPT, SYS_IPC_SESSION_OPEN, SYS_IPC_SESSION_RECV, SYS_IPC_SESSION_SEND,
+    SYS_IPC_SESSION_SEND_LOCK, SYS_IPC_SESSION_SEND_UNLOCK,
 };
 use x86_64::VirtAddr;
 
@@ -246,8 +246,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // thread — `Thread::placeholder` starts it with no capability at all,
     // so this needs no spawn: a bare, ungranted syscall from this exact
     // thread is already the scenario to prove.
-    let denied_open =
-        unsafe { syscall::syscall(SYS_IPC_SESSION_OPEN, DENIAL_PORT as u64, 0, 0) };
+    let denied_open = unsafe { syscall::syscall(SYS_IPC_SESSION_OPEN, DENIAL_PORT as u64, 0, 0) };
     let denied_accept =
         unsafe { syscall::syscall(SYS_IPC_SESSION_ACCEPT, DENIAL_PORT as u64, 0, 0) };
     let denial_ok = denied_open == u64::MAX && denied_accept == u64::MAX;
@@ -311,8 +310,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         before_ok,
         after_ok
     );
-    let teardown_ok =
-        TEARDOWN_SERVER_DONE.load(Ordering::SeqCst) && before_ok && !after_ok;
+    let teardown_ok = TEARDOWN_SERVER_DONE.load(Ordering::SeqCst) && before_ok && !after_ok;
 
     if denial_ok && isolation_ok && teardown_ok {
         serial_println!("ipc_session: PASS — isolation, capability denial, and teardown all hold");

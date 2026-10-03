@@ -303,8 +303,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // writes now share this one server port (see `FS_SERVER_PORT`'s own
     // doc comment), this single check covers what used to be two separate
     // denied-send checks, one per port.
-    let denied =
-        unsafe { syscall::syscall(SYS_IPC_SESSION_OPEN, FS_SERVER_PORT as u64, 0, 0) };
+    let denied = unsafe { syscall::syscall(SYS_IPC_SESSION_OPEN, FS_SERVER_PORT as u64, 0, 0) };
     if denied != u64::MAX {
         serial_println!(
             "blk_fs_ipc: FAIL — an unauthorized session open was not denied \
@@ -580,8 +579,7 @@ extern "C" fn session_request_thread() -> ! {
     }
     for byte in bytes {
         loop {
-            let ret =
-                unsafe { syscall::syscall(SYS_IPC_SESSION_SEND, session_id, byte as u64, 0) };
+            let ret = unsafe { syscall::syscall(SYS_IPC_SESSION_SEND, session_id, byte as u64, 0) };
             if ret != u64::MAX {
                 break;
             }

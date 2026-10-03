@@ -153,7 +153,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let elf = match Elf64::parse(NET_DRIVER_HOST_ELF) {
         Ok(elf) => elf,
         Err(e) => {
-            serial_println!("net_driver_dns: FAIL — parse() rejected the binary: {:?}", e);
+            serial_println!(
+                "net_driver_dns: FAIL — parse() rejected the binary: {:?}",
+                e
+            );
             exit_qemu(QemuExitCode::Failed);
         }
     };
@@ -224,7 +227,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Raw pointers to both result bytes -- reachable via the physical-
     // memory-offset mapping regardless of which `Cr3` is active, same as
     // `info_content` itself (see `map_private_page`'s doc comment).
-    let dns_result_ptr = unsafe { info_content.as_mut_ptr().add(NET_DNS_RESULT_OFFSET as usize) };
+    let dns_result_ptr = unsafe {
+        info_content
+            .as_mut_ptr()
+            .add(NET_DNS_RESULT_OFFSET as usize)
+    };
     let dns_addr_ptr = unsafe { info_content.as_mut_ptr().add(NET_DNS_ADDR_OFFSET as usize) };
     let icmp_result_ptr = unsafe { info_content.as_mut_ptr().add(NET_RESULT_OFFSET as usize) };
 

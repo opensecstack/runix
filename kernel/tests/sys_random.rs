@@ -47,10 +47,12 @@ static AUTHORIZED_SECOND: AtomicU64 = AtomicU64::new(u64::MAX);
 static UNAUTHORIZED_RESULT: AtomicU64 = AtomicU64::new(u64::MAX);
 
 extern "C" fn thread_random_authorized() -> ! {
-    let first = unsafe { runix_kernel::syscall::syscall(runix_kernel::syscall::SYS_RANDOM, 0, 0, 0) };
+    let first =
+        unsafe { runix_kernel::syscall::syscall(runix_kernel::syscall::SYS_RANDOM, 0, 0, 0) };
     AUTHORIZED_FIRST.store(first, Ordering::SeqCst);
     runix_kernel::scheduler::yield_now();
-    let second = unsafe { runix_kernel::syscall::syscall(runix_kernel::syscall::SYS_RANDOM, 0, 0, 0) };
+    let second =
+        unsafe { runix_kernel::syscall::syscall(runix_kernel::syscall::SYS_RANDOM, 0, 0, 0) };
     AUTHORIZED_SECOND.store(second, Ordering::SeqCst);
     loop {
         runix_kernel::scheduler::yield_now();
@@ -58,7 +60,8 @@ extern "C" fn thread_random_authorized() -> ! {
 }
 
 extern "C" fn thread_random_unauthorized() -> ! {
-    let result = unsafe { runix_kernel::syscall::syscall(runix_kernel::syscall::SYS_RANDOM, 0, 0, 0) };
+    let result =
+        unsafe { runix_kernel::syscall::syscall(runix_kernel::syscall::SYS_RANDOM, 0, 0, 0) };
     UNAUTHORIZED_RESULT.store(result, Ordering::SeqCst);
     loop {
         runix_kernel::scheduler::yield_now();

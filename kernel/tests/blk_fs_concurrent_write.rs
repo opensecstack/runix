@@ -527,8 +527,7 @@ static DONE_SEQ: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn send_request_thread_a() -> ! {
     #[allow(static_mut_refs)]
-    let bytes =
-        unsafe { PENDING_SEND_A.take() }.expect("send_request_thread_a: no pending send");
+    let bytes = unsafe { PENDING_SEND_A.take() }.expect("send_request_thread_a: no pending send");
     let response = session_round_trip(bytes);
     #[allow(static_mut_refs)]
     unsafe {
@@ -542,8 +541,7 @@ extern "C" fn send_request_thread_a() -> ! {
 
 extern "C" fn send_request_thread_b() -> ! {
     #[allow(static_mut_refs)]
-    let bytes =
-        unsafe { PENDING_SEND_B.take() }.expect("send_request_thread_b: no pending send");
+    let bytes = unsafe { PENDING_SEND_B.take() }.expect("send_request_thread_b: no pending send");
     let response = session_round_trip(bytes);
     #[allow(static_mut_refs)]
     unsafe {
@@ -578,8 +576,7 @@ extern "C" fn send_request_thread_seq() -> ! {
 /// bound of polls passes with nothing decodable.
 fn session_round_trip(bytes: Vec<u8>) -> Option<FsResponse> {
     let session_id = loop {
-        let ret =
-            unsafe { syscall::syscall(SYS_IPC_SESSION_OPEN, FS_SERVER_PORT as u64, 0, 0) };
+        let ret = unsafe { syscall::syscall(SYS_IPC_SESSION_OPEN, FS_SERVER_PORT as u64, 0, 0) };
         if ret != u64::MAX {
             break ret;
         }
@@ -591,8 +588,7 @@ fn session_round_trip(bytes: Vec<u8>) -> Option<FsResponse> {
     }
     for byte in bytes {
         loop {
-            let ret =
-                unsafe { syscall::syscall(SYS_IPC_SESSION_SEND, session_id, byte as u64, 0) };
+            let ret = unsafe { syscall::syscall(SYS_IPC_SESSION_SEND, session_id, byte as u64, 0) };
             if ret != u64::MAX {
                 break;
             }

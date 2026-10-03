@@ -488,7 +488,11 @@ pub fn reap_sessions_for(thread: ThreadId) {
         let sessions = SESSIONS.lock();
         let mut pending = PENDING_BY_PORT.lock();
         for queue in pending.values_mut() {
-            queue.retain(|id| sessions.get(id).is_some_and(|session| session.owner != thread));
+            queue.retain(|id| {
+                sessions
+                    .get(id)
+                    .is_some_and(|session| session.owner != thread)
+            });
         }
     }
     SESSIONS

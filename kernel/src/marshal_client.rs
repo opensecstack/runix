@@ -171,7 +171,12 @@ fn send_socket_request(session_id: u64, request: &SocketRequest) -> bool {
         }
     }
     unsafe {
-        crate::syscall::syscall(crate::syscall::SYS_IPC_SESSION_SEND_UNLOCK, session_id, 0, 0);
+        crate::syscall::syscall(
+            crate::syscall::SYS_IPC_SESSION_SEND_UNLOCK,
+            session_id,
+            0,
+            0,
+        );
     }
     ok
 }
@@ -345,7 +350,14 @@ pub fn evaluate(
 ) -> Option<MarshalResponse> {
     let session_id = open_session(max_iters)?;
     let handle = open_socket(session_id, max_iters)?;
-    if !connect_socket(session_id, handle, remote_ip, remote_port, local_port, max_iters) {
+    if !connect_socket(
+        session_id,
+        handle,
+        remote_ip,
+        remote_port,
+        local_port,
+        max_iters,
+    ) {
         close_socket(session_id, handle, max_iters);
         return None;
     }
