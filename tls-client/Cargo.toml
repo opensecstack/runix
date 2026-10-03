@@ -23,17 +23,39 @@ embedded-io = { version = "0.7.1", default-features = false }
 # confirmed for real, not assumed from the RFC's own prior research: `ring`
 # pulls in `getrandom`, which hard-fails to build for `x86_64-unknown-none`
 # at all ("target is not supported"), before even reaching the LLVM
-# codegen issues below. `rustpki` + `ed25519`/`p384`/`rsa` is
-# `embedded-tls`'s *other* certificate-verification path
-# (`embedded-tls::pki::CertVerifier`) — real X.509 chain verification
-# against RustCrypto's own signature crates, covering the three signature
-# algorithm families real-world CA roots actually use (Ed25519, ECDSA
-# P-384, RSA), with zero dependency on `ring`/`aws-lc-rs`/`getrandom`.
+# codegen issues below. `rustpki` + `ed25519`/`p384` is `embedded-tls`'s
+# *other* certificate-verification path (`embedded-tls::pki::CertVerifier`)
+# — real X.509 chain verification against RustCrypto's own signature
+# crates, with zero dependency on `ring`/`aws-lc-rs`/`getrandom`.
 # Confirmed to build clean for `x86_64-unknown-none` with this exact
 # feature set — see `.cargo/config.toml` for the LLVM-ICE workarounds that
 # took, and `docs/RFC-TLS-APPROACH.md`'s "Phase 2" note for the full
 # verification account.
-embedded-tls = { version = "0.19.0", default-features = false, features = ["rustpki", "ed25519", "p384", "rsa"] }
+#
+# Deliberately NOT enabling the `rsa` feature (2026-10-03): it pulls in
+# `rsa` 0.9.10, which carries RUSTSEC-2023-0071 (the "Marvin Attack" —
+# private-key operations are non-constant-time, leaking key material over
+# a network-observable timing channel) with no upstream fix available
+# (`patched = []` is intentional in the advisory; still affected as of
+# `rsa` 0.10.0-rc.18, the latest). `embedded-tls`'s own use of this feature
+# is verify-only (`pki.rs` only ever builds an `RsaPublicKey` and calls
+# `Verifier::verify`, never an `RsaPrivateKey`) — a public-key operation
+# the Marvin Attack doesn't touch, since there's no secret to leak timing
+# about on the verifying side. But `cargo-deny`'s advisory check is
+# crate-presence-based, not call-site-aware, so it can't see that
+# distinction, and accepting the advisory via `deny.toml`'s ignore list
+# would misrepresent a real vulnerability as one of the "unmaintained, not
+# exploitable" entries already there. Simpler and more honest to drop RSA
+# certificate-chain verification entirely instead: `tls-client` has zero
+# real callers today (see `docs/ROADMAP.md`), so this costs nothing
+# functionally yet. The real-world cost when a caller does appear: this
+# client cannot verify a TLS server whose certificate chain is RSA-signed
+# (common for older/budget CAs) — only Ed25519- and ECDSA P-384-signed
+# chains verify. Revisit if: (a) a real caller needs to reach an
+# RSA-signed-chain server, (b) the `rsa` crate ships a real fix, or (c) a
+# constant-time RSA verify-only implementation becomes available as a
+# narrower alternative to the full `rsa` crate.
+embedded-tls = { version = "0.19.0", default-features = false, features = ["rustpki", "ed25519", "p384"] }
 # Same exact-version-pinning reasoning as `embedded-io` above — 0.6.4 is
 # what `embedded-tls` itself re-exports (`pub use rand_core::{CryptoRng,
 # CryptoRngCore}`) and what its `CryptoProvider::rng()` bound actually

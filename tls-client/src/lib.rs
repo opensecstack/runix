@@ -33,8 +33,10 @@
 //!   (`embedded_tls::pki::CertVerifier`), not `webpki` (equally
 //!   disqualified — it pulls `ring` the same way `rustls` would). Real
 //!   X.509 chain verification against RustCrypto's own signature crates,
-//!   with `ed25519`/`p384`/`rsa` covering the three signature algorithm
-//!   families real-world CA roots actually use — builds clean for
+//!   with `ed25519`/`p384` covering two of the three signature algorithm
+//!   families real-world CA roots use (the third, RSA, is deliberately not
+//!   enabled — see `Cargo.toml`'s dependency comment on RUSTSEC-2023-0071)
+//!   — builds clean for
 //!   `x86_64-unknown-none` (see `.cargo/config.toml` for the three
 //!   LLVM-codegen-ICE workarounds that took), and — the real proof —
 //!   [`TlsConnection`] genuinely completed a TLS 1.3 handshake against

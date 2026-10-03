@@ -285,6 +285,18 @@ what was found:
   of issue `capability-manager`'s existing `sha2` workaround already
   documents for this target, just hit three more times across different
   crates.
+- **Update (2026-10-03): the `rsa` feature was dropped after this
+  verification pass.** `rsa` 0.9.10 carries RUSTSEC-2023-0071 (the "Marvin
+  Attack," an unpatched RSA private-key timing side-channel), and
+  `embedded-tls`'s own use of it is verify-only — a public-key operation
+  the advisory doesn't actually touch — but `cargo-deny`'s check can't see
+  that distinction, and accepting the advisory via an ignore-list entry
+  would misrepresent a real vulnerability as benign. `tls-client` has no
+  real callers yet, so dropping RSA-signed certificate-chain verification
+  costs nothing today; see `tls-client/Cargo.toml`'s dependency comment
+  for the full reasoning and the revisit conditions. Current feature set
+  is `rustpki,ed25519,p384` — two of the three families this bullet
+  originally verified, not three.
 - TLS 1.3 client only, confirmed (a server-support PR exists upstream but
   its merge status was unconfirmed — treat as not landed).
 - Cipher suites/buffer sizing: not yet independently re-verified past what
