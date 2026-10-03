@@ -1,0 +1,10 @@
+[toolchain]
+# No nightly feature needed — same reasoning as net-driver-host's own
+# rust-toolchain.toml (a direct copy of its shape, swapping the target
+# triple) and kernel-arm's (stable works for AArch64 exception-level code
+# with no x86_64-interrupt-ABI-style nightly requirement). Still needs its
+# OWN toolchain file, not to inherit the root's plain "stable" with no
+# target declared, for the same `E0463: can't find crate for 'core'` reason
+# grid-sandbox-host/rust-toolchain.toml's own doc comment first recorded.
+channel = "stable"
+targets = ["aarch64-unknown-none"]

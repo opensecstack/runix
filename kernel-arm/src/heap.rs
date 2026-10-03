@@ -18,7 +18,22 @@
 use linked_list_allocator::LockedHeap;
 
 const HEAP_START: usize = 0x_4100_0000;
-const HEAP_SIZE: usize = 256 * 1024;
+/// 4 MiB -- grown from the original 256 KiB once `tcp_proof.rs` (Beta
+/// mobile item 2.5) needed real headroom: a `net-driver-host-arm` address
+/// space alone maps its own private 256 KiB heap, 1 `NetBootInfo` page, two
+/// 3-page virtqueue regions, and 12 packet-buffer pages (~332 KiB), *on
+/// top of* its loaded ELF segments/stack and this crate's own translation
+/// tables for that address space -- comfortably more than 256 KiB once
+/// every proof that already ran before it (`process::prove_isolation`,
+/// `load_proof::prove_load`, `scheduler::prove_scheduling`,
+/// `el0_proof::prove_el0_process`) is accounted for too, none of which
+/// ever frees what it allocated (`process.rs` has no `Drop` -- see its own
+/// doc comment). Confirmed by hitting the old size's exact
+/// `AddressSpaceError::OutOfMemory` for real in QEMU, not sized by guesswork.
+/// Still comfortably inside the Normal block's headroom before
+/// `vm::PRIVATE_REGION_BASE` (`0x8000_0000`) and well under `-M virt`'s
+/// default RAM size.
+const HEAP_SIZE: usize = 4 * 1024 * 1024;
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();

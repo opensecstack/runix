@@ -328,6 +328,17 @@ fn el1_setup() -> ! {
     // ELR_EL1, TTBR0_EL1, AT S1E0R), not this code's bookkeeping.
     crate::el0_proof::prove_el0_process();
 
+    // Beta mobile item 2.5 "Stage 3: real outbound TCP at EL0"
+    // (`tcp_proof.rs`): build an address space, wire up every private
+    // region a real compiled `net-driver-host-arm` process needs
+    // (virtio-mmio window, heap, virtqueue regions, packet buffers), load
+    // it, and `eret` into it -- then read back a real TCP round trip's
+    // result through a second `el0_exec` continuation. Placed right after
+    // `el0_proof::prove_el0_process` because it needs exactly the same
+    // prerequisites (the MMU, the heap, the scheduler's run queue) plus
+    // nothing else new.
+    crate::tcp_proof::prove_net_tcp();
+
     // Issue demo capabilities authorizing RIL channel 0 and SIM slot 0
     // (plus, below, slot 0's profile 0 and its separate delete scope) --
     // stands in for a real issuer (CITADEL MARSHAL) the same way every

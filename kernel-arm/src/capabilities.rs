@@ -116,9 +116,9 @@ pub fn sim_delete_resource(slot: usize, profile: u8) -> String {
 /// have mapped into its own `process::AddressSpace`, checked before that
 /// mapping is established -- the same role `ioport_range_resource` plays
 /// for x86_64 port I/O, just scoped to memory addresses instead of port
-/// numbers. No caller exists yet (same as `elf.rs`'s parser had none when
-/// first written) -- this is purely the naming + containment-check
-/// primitive the future loader/syscall path will need.
+/// numbers. First real caller: `tcp_proof.rs`'s net-driver-host-arm loader
+/// integration, via [`virtio_mmio_slot_resource`] -- this is purely the
+/// naming + containment-check primitive that caller needs.
 ///
 /// Encodes `base`/`len` in hex (`{:#x}`), not decimal like
 /// `ril_resource`/`sim_resource`'s channel/slot numbers -- physical
@@ -129,12 +129,6 @@ pub fn sim_delete_resource(slot: usize, profile: u8) -> String {
 /// string as far as `capability-manager` is concerned -- no special
 /// parsing there, same design point as every other `{kind}_resource`
 /// function in this file.
-///
-/// `allow(dead_code)`: no caller yet, same reasoning as `sim.rs`'s
-/// `profiles`/`delete_profile` and `esim_marshal::evaluate`'s
-/// `Unreachable` arm -- this is purely the naming primitive the future
-/// EL0-driver loader/syscall path will need.
-#[allow(dead_code)]
 pub fn mmio_window_resource(base: usize, len: usize) -> String {
     alloc::format!("mmio:{base:#x}:{len:#x}")
 }
@@ -146,10 +140,7 @@ pub fn mmio_window_resource(base: usize, len: usize) -> String {
 /// `kernel/src/capabilities.rs::parse_ioport_range`: only [`check_mmio_window`]
 /// needs the parsed form, everyone else deals in resource strings.
 ///
-/// `allow(dead_code)`: [`check_mmio_window`] is this function's only
-/// caller, and it has no caller of its own yet either -- see that
-/// function's own `allow(dead_code)`.
-#[allow(dead_code)]
+/// [`check_mmio_window`] is this function's only caller.
 fn parse_mmio_window(resource: &str) -> Option<(usize, usize)> {
     let rest = resource.strip_prefix("mmio:")?;
     let (base_str, len_str) = rest.split_once(':')?;
@@ -172,12 +163,7 @@ fn parse_mmio_window(resource: &str) -> Option<(usize, usize)> {
 /// this will silently name the *wrong* slot until someone notices, which
 /// is an acceptable risk for a value with no caller yet -- revisit if/when
 /// a real EL0 driver actually starts issuing these tokens.
-///
-/// `allow(dead_code)`: only [`virtio_mmio_slot_resource`] reads these, and
-/// it has no caller yet either.
-#[allow(dead_code)]
 const VIRTIO_MMIO_BASE: usize = 0x0a00_0000;
-#[allow(dead_code)]
 const VIRTIO_MMIO_SLOT_STRIDE: usize = 0x200;
 
 /// Convenience constructor over [`mmio_window_resource`] scoped to one
@@ -192,10 +178,6 @@ const VIRTIO_MMIO_SLOT_STRIDE: usize = 0x200;
 /// as though the range itself were the authorized thing, when the actual
 /// authorization boundary administrators and auditors reason about is "one
 /// virtio device slot."
-///
-/// `allow(dead_code)`: no caller yet, same reasoning as
-/// [`mmio_window_resource`]'s.
-#[allow(dead_code)]
 pub fn virtio_mmio_slot_resource(slot: usize) -> String {
     mmio_window_resource(
         VIRTIO_MMIO_BASE + slot * VIRTIO_MMIO_SLOT_STRIDE,
@@ -320,6 +302,32 @@ pub fn issue_and_hold(resource: String, now: u64) {
         &demo_signing_key(),
     );
     CURRENT_CAPABILITIES.lock().push(token);
+}
+
+/// Issues a demo token authorizing `resource` and returns it, *without*
+/// adding it to [`CURRENT_CAPABILITIES`] -- unlike [`issue_and_hold`], whose
+/// only callers need a resource added to the current EL0 context's held set
+/// for a later [`check`] lookup by resource string. [`check_mmio_window`]'s
+/// first real caller (`tcp_proof.rs`) needs the token *object* itself, to
+/// hand to `AddressSpace::map_mmio_page`'s verify-then-act caller contract
+/// directly -- `check_mmio_window` already does its own signature
+/// verification against whatever token it's handed, so there is nothing for
+/// a held-set lookup to add here. Same signing key, same expiry-window
+/// reasoning as `issue_and_hold`'s.
+pub fn issue_mmio_token(resource: String, now: u64) -> CapabilityToken {
+    #[cfg(not(test))]
+    let ticks_per_sec = crate::svc::frequency_hz();
+    #[cfg(test)]
+    let ticks_per_sec: u64 = 1;
+    let expires_at = now + 60 * ticks_per_sec;
+    CapabilityToken::issue(
+        "el0:arm-demo",
+        resource,
+        now,
+        expires_at,
+        "demo-key",
+        &demo_signing_key(),
+    )
 }
 
 /// Checks whether the current EL0 context holds *any* token authorizing

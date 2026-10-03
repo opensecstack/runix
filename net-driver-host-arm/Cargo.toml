@@ -1,0 +1,58 @@
+[package]
+name = "net-driver-host-arm"
+description = "Network driver host, ARM: the aarch64-unknown-none analogue of net-driver-host — a freestanding ring 3 / EL0 binary owning a virtio-mmio network device and running smoltcp (TCP client only, Beta mobile item 2.5 'Stage 3: real outbound TCP at EL0'). Ports kernel-arm/src/virtio_mmio.rs + virtio_net.rs's EL1 virtqueue bring-up to a process-private, non-identity-mapped address space. Not yet loaded by anything — see main.rs's module doc comment for the loader-integration contract this binary assumes but does not itself implement."
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/opensecstack/runix"
+publish = false
+
+# NOT a member of the root workspace — same reasoning as net-driver-host's
+# own Cargo.toml (see its comment) and kernel-arm's (see its own): this
+# targets `aarch64-unknown-none`, a target triple the root workspace's host
+# build and net-driver-host's `x86_64-unknown-none` build both differ from,
+# and `cargo build --workspace`/`cargo test --workspace` can't mix target
+# triples into one invocation. Standalone, with its own
+# `.cargo/config.toml` and `rust-toolchain.toml` — matching how
+# net-driver-host itself is configured (also standalone, also `[workspace]`
+# empty below), not kernel-arm's shape (which additionally needs a `[lib]`
+# target for host-testable logic — this crate has one too, for the same
+# reason, see `[lib]` below).
+[workspace]
+
+[dependencies]
+# `socket-tcp`, not `socket-icmp`: this binary's whole job is the TCP proof
+# (Stage 3), unlike kernel-arm's own `smoltcp_spike.rs` (ICMP-only, see that
+# file's doc comment) or net-driver-host's Phase 2a ICMP-then-2b-TCP
+# sequence — there is no ICMP phase here to justify `socket-icmp` too.
+# `default-features = false` + this exact feature list mirrors
+# net-driver-host/Cargo.toml's own (minus the DHCP/DNS/sockets-IPC features
+# that crate's later phases added — out of scope for this slice, see
+# main.rs's module doc comment on scope).
+smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-tcp", "alloc"] }
+# Same heap-allocator crate net-driver-host and kernel-arm's own heap.rs
+# both use for the same reason: a private heap one `LockedHeap::init` call
+# turns on, no allocator design of this crate's own invented.
+linked_list_allocator = "0.10"
+
+[dev-dependencies]
+# Host-only (tests run on the host, never aarch64-unknown-none) — property-
+# tests the pure parsing/validation logic in lib.rs. Same convention
+# net-driver-host/Cargo.toml's own dev-dependency comment documents for the
+# identical reason.
+proptest = "1"
+
+[lib]
+name = "net_driver_host_arm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "net-driver-host-arm"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

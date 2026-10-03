@@ -156,6 +156,11 @@ extern crate alloc;
 
 mod capabilities;
 mod el0;
+// The generic one-shot EL1-to-EL0 continuation (`enter_el0`/`resume_el1` and
+// the claim/resume/abort plumbing around them), extracted from `el0_proof.rs`
+// so a second EL0-excursion caller (Stage 3's TCP proof) can reuse it rather
+// than duplicate the naked-asm stack layout.
+mod el0_exec;
 // The first real EL0 *process* (the "combining slices 3-5" step of item
 // 2.4): a scheduled thread owning a `process::AddressSpace`, resumed with
 // its own TTBR0_EL1, eret'ing into a loader.rs-loaded image.
@@ -182,6 +187,10 @@ mod sim;
 // from this boot sequence, exists only to force real smoltcp codegen.
 mod smoltcp_spike;
 mod svc;
+// Beta mobile item 2.5 "Stage 3: real outbound TCP at EL0" -- loads and
+// runs a real compiled net-driver-host-arm process, reusing el0_exec's
+// one-shot continuation mechanism a second time.
+mod tcp_proof;
 mod vectors;
 mod virtio_mmio;
 mod virtio_net;

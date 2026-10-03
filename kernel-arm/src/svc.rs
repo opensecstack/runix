@@ -117,6 +117,23 @@ pub const SYS_IPC_RECV: u64 = 12;
 /// honest split rather than a stopgap.
 pub const SYS_EL0_PROOF_DONE: u64 = 13;
 
+/// "This EL0 excursion is finished; resume my EL1 continuation" --
+/// `tcp_proof.rs`'s own result-reporting syscall, structurally the twin of
+/// [`SYS_EL0_PROOF_DONE`] (same `el0_exec` one-shot continuation mechanism,
+/// same "claim, record, resume -- never routed through a capability check
+/// or MARSHAL" authority) but kept as a *separate* number rather than
+/// reused, for two reasons that both matter: the result shape differs
+/// ([`SYS_EL0_PROOF_DONE`] reports three observed bytes in `x1`/`x2`/`x3`;
+/// this reports one flat `net-driver-host-arm::ProofResult` code in `x1`
+/// alone), and the continuation each resumes is a different proof's --
+/// `el0_proof::finish` and `tcp_proof::finish` each only know how to
+/// interpret *their own* payload and resume *their own* caller's EL1 frame,
+/// so collapsing them into one syscall number would mean one of the two
+/// handlers guessing at a payload shape that isn't actually its own. Same
+/// "unknown syscall with no excursion in flight" `u64::MAX` fallback as
+/// [`SYS_EL0_PROOF_DONE`] -- see `tcp_proof::finish`'s own doc comment.
+pub const SYS_NET_PROOF_DONE: u64 = 14;
+
 /// `SYS_RIL_RECV`'s return-value convention: `0..=255` is a received byte,
 /// `256`/`257` are out-of-band sentinels distinct from any real byte value
 /// (unlike `SYS_RIL_ACCESS`/`SYS_RIL_SEND`, which only ever report
@@ -687,6 +704,9 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         // flight it falls through to the same `u64::MAX` an unknown syscall
         // gets.
         SYS_EL0_PROOF_DONE => crate::el0_proof::finish(arg1, arg2, arg3),
+        // Same "may not return to EL0" shape as SYS_EL0_PROOF_DONE's arm
+        // above, for `tcp_proof.rs`'s own continuation instead.
+        SYS_NET_PROOF_DONE => crate::tcp_proof::finish(arg1),
         _ => u64::MAX,
     }
 }

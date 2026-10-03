@@ -11,42 +11,17 @@
 //! split into on the x86_64 side ("`Cr3` now follows the schedule"), and
 //! deliberately not the second.
 //!
-//! # The return-to-EL1 mechanism, and why it is honest rather than a
-//! shortcut
+//! # The one-shot EL1 continuation
 //!
-//! The x86_64 side's second scheduling slice gave each ring 3 thread a
-//! *separate kernel-entry stack* and a general `SYS_YIELD`. Neither is here,
-//! and neither is faked. What this module builds instead is a **one-shot
-//! EL1 continuation**:
-//!
-//! [`enter_el0`] saves the EL1 thread's AAPCS64 callee-saved registers onto
-//! that thread's own kernel stack -- the same block `scheduler::switch_to`
-//! saves, in the same layout -- records the resulting `sp` in
-//! [`EL0_CONTINUATION`], and then `eret`s to EL0. The payload runs, issues
-//! one `SVC`, and [`finish`] (reached from `svc.rs`'s single new
-//! [`crate::svc::SYS_EL0_PROOF_DONE`] arm) restores that block and `ret`s --
-//! so `enter_el0` *returns to its caller*, at EL1, on the same stack, with
-//! the same address space still active. The EL0 payload is a coroutine that
-//! yields exactly once, by finishing.
-//!
-//! **Why no separate kernel-entry stack is needed for this, specifically.**
-//! `eret` from EL1h to EL0t does not touch `SP_EL1`; EL0 runs on `SP_EL0`.
-//! So at the moment the `SVC` is taken, `SP_EL1` is bit-for-bit what it was
-//! at the `eret` instruction -- which is this thread's own scheduler-
-//! allocated kernel stack, immediately below the saved continuation block.
-//! The vector stub, `el1_vector_common`'s ten `stp`s and
-//! `el1_exception_handler`'s frames therefore all land *below* the
-//! continuation and cannot touch it, and when [`finish`] sets `sp` back to
-//! the continuation it abandons exactly those frames, which nothing will
-//! ever return to. The EL0 thread's kernel-entry stack is its own kernel
-//! stack, and that is sound here rather than merely convenient.
-//!
-//! **What that costs, stated plainly, because it is exactly what the second
-//! slice would buy:** at most one thread may be mid-`eret` at a time
-//! ([`EL0_CONTINUATION`] is a single slot), and an EL0 thread may not yield
-//! *while at EL0* -- only by finishing. A general process model needs both,
-//! which is why a general `SYS_YIELD` and a per-thread EL1 stack are the
-//! next slice and not smuggled into this one.
+//! The actual `eret`-out/`SVC`-back mechanism -- `enter_el0`/`resume_el1`,
+//! and the reasoning for why it needs no separate kernel-entry stack and
+//! what that costs -- lives in [`crate::el0_exec`], not here: it is generic
+//! to any EL1-to-EL0 excursion that returns through exactly one `SVC`, and
+//! a second caller (a future "Stage 3" TCP proof) is about to need the same
+//! shape with a different payload. This module is that mechanism's *first*
+//! caller: it supplies the payload, the observations that make this
+//! specifically a *proof*, and the `SVC` arm ([`finish`]) that reads the
+//! hardware's own account of the excursion and writes this proof's results.
 //!
 //! **Why this is a proof and not a nicely-shaped assumption.** Every claim
 //! below is read out of hardware, not out of this module's bookkeeping:
@@ -87,11 +62,12 @@
 //! that *is* the Rust constant), so copying it to a different VA is sound
 //! rather than lucky.
 
+use crate::el0_exec;
 use crate::process::{self, AddressSpace};
 use crate::serial_println;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use runix_kernel_arm::elf::{Elf64, PF_R, PF_W, PF_X};
 use runix_kernel_arm::loader::{self, STACK_TOP};
 use runix_kernel_arm::vm::{GRANULE_4KIB, PRIVATE_REGION_BASE};
@@ -218,118 +194,8 @@ fn payload_bytes() -> &'static [u8] {
 }
 
 // ---------------------------------------------------------------------------
-// The one-shot EL1 continuation
+// This proof's own observations and its SVC/fault arms
 // ---------------------------------------------------------------------------
-
-/// `SPSR_EL1` for the `eret` to EL0: `M[3:0] = 0b0000` (EL0t) with
-/// Debug/SError/IRQ/FIQ masked, identical to `el0.rs`'s `SPSR_EL0T_MASKED`
-/// and for the same reasons -- in particular that masking `DAIF` does not
-/// affect `SVC`, which is synchronous and never maskable.
-const SPSR_EL0T_MASKED: u64 = 0b1111 << 6;
-
-/// `M[3:0]` of a `SPSR_EL1` value, i.e. the exception level and stack the
-/// interrupted context was using. `0b0000` is EL0t and nothing else is.
-const SPSR_MODE_MASK: u64 = 0b1111;
-const SPSR_MODE_EL0T: u64 = 0b0000;
-
-/// The saved `sp` of the one in-flight EL1 continuation, or 0 for "no EL0
-/// proof is running." Written by [`enter_el0`]'s assembly through
-/// [`AtomicUsize::as_ptr`] and consumed by [`finish`].
-///
-/// A single slot, not a per-thread field: see this module's doc comment on
-/// what that deliberately does not support.
-static EL0_CONTINUATION: AtomicUsize = AtomicUsize::new(0);
-
-/// [`scheduler::Context`](crate::scheduler)'s size, duplicated here as a
-/// literal for the same reason `scheduler.rs` duplicates it: a naked
-/// function's stack offsets must be assembly-time constants. The two blocks
-/// are the same layout on purpose -- same registers, same order, same size
-/// -- because [`enter_el0`] saves what `switch_to` saves and [`finish`]
-/// restores it the same way; the assertion in `scheduler.rs` pins the
-/// number itself.
-const CONTINUATION_SIZE: usize = 160;
-const _: () = assert!(CONTINUATION_SIZE == crate::scheduler::CONTEXT_SIZE);
-
-/// Saves the calling EL1 thread's callee-saved context on its own kernel
-/// stack, records it in `*slot`, and `eret`s to `entry` at EL0 with
-/// `SP_EL0 = sp_el0`.
-///
-/// Returns -- from [`finish`]'s `ret`, once the EL0 payload has issued its
-/// one `SVC` -- with `sp` and every callee-saved register exactly as they
-/// were. Caller-saved registers are clobbered, which is what the `extern
-/// "C"` boundary already licenses.
-///
-/// # Safety
-/// `entry` must be a mapped, EL0-executable VA in the currently active
-/// address space and `sp_el0` a mapped, EL0-writable, 16-byte-aligned stack
-/// top in it; `slot` must point at a writable `usize` that outlives the EL0
-/// excursion. The code at `entry` must reach EL1 again only through the
-/// `SVC` [`finish`] handles -- anything else either halts in
-/// `el1_vectors.rs` or, for a synchronous fault, is converted to a proof
-/// failure by [`abort_from_fault`].
-#[unsafe(naked)]
-unsafe extern "C" fn enter_el0(entry: u64, sp_el0: u64, slot: *mut usize) {
-    core::arch::naked_asm!(
-        // Byte-for-byte `scheduler::switch_to`'s save half: same registers,
-        // same offsets, same 160-byte block, so `finish`'s restore and
-        // `switch_to`'s restore are interchangeable views of one layout.
-        "sub sp, sp, #160",
-        "stp x19, x20, [sp, #0]",
-        "stp x21, x22, [sp, #16]",
-        "stp x23, x24, [sp, #32]",
-        "stp x25, x26, [sp, #48]",
-        "stp x27, x28, [sp, #64]",
-        "stp x29, x30, [sp, #80]",
-        "stp d8, d9, [sp, #96]",
-        "stp d10, d11, [sp, #112]",
-        "stp d12, d13, [sp, #128]",
-        "stp d14, d15, [sp, #144]",
-        // *slot = sp. x3 onward are caller-saved and dead here.
-        "mov x3, sp",
-        "str x3, [x2]",
-        // Everything the SVC/exception path will use lands *below* this sp,
-        // so the block just saved survives the whole EL0 excursion -- see
-        // this module's doc comment.
-        "movz x3, {spsr}",
-        "msr SPSR_EL1, x3",
-        "msr ELR_EL1, x0",
-        "msr SP_EL0, x1",
-        "eret",
-        spsr = const SPSR_EL0T_MASKED,
-    );
-}
-
-/// Restores a continuation saved by [`enter_el0`] and `ret`s, resuming that
-/// thread where its `enter_el0` call left off.
-///
-/// Abandons every stack frame below `saved_sp` -- the vector stub,
-/// `el1_vector_common`'s saved registers, and `el1_exception_handler`'s own
-/// frame. That is the point: there is nothing at EL0 left to `eret` back to,
-/// so unwinding the exception normally is exactly what must *not* happen.
-///
-/// # Safety
-/// `saved_sp` must be a continuation [`enter_el0`] wrote, on a stack that is
-/// still live, reached with no intervening frame *above* it -- true on the
-/// one path that calls this, since `SP_EL1` has only moved downward since
-/// the `eret`.
-#[unsafe(naked)]
-unsafe extern "C" fn resume_el1(saved_sp: usize) -> ! {
-    core::arch::naked_asm!(
-        "mov sp, x0",
-        "ldp x19, x20, [sp, #0]",
-        "ldp x21, x22, [sp, #16]",
-        "ldp x23, x24, [sp, #32]",
-        "ldp x25, x26, [sp, #48]",
-        "ldp x27, x28, [sp, #64]",
-        "ldp x29, x30, [sp, #80]",
-        "ldp d8, d9, [sp, #96]",
-        "ldp d10, d11, [sp, #112]",
-        "ldp d12, d13, [sp, #128]",
-        "ldp d14, d15, [sp, #144]",
-        "add sp, sp, #160",
-        "ret",
-    );
-}
 
 /// Everything observed about the EL0 excursion, filled in across the two
 /// sides of it (the EL1 thread before the `eret`, then [`finish`] inside the
@@ -390,7 +256,7 @@ static IMAGE_ROOT: AtomicU64 = AtomicU64::new(0);
 /// that nothing changes for `el0_demo`, which runs later with no
 /// continuation live.
 pub fn continuation_live() -> bool {
-    EL0_CONTINUATION.load(Ordering::Relaxed) != 0
+    el0_exec::continuation_live()
 }
 
 /// `svc.rs`'s [`crate::svc::SYS_EL0_PROOF_DONE`] arm: records what EL0
@@ -403,25 +269,36 @@ pub fn continuation_live() -> bool {
 /// name and no privileged action to route through MARSHAL. With no
 /// excursion in flight it is simply an unknown syscall, which is what
 /// `u64::MAX` already means in `svc.rs`'s dispatch.
+///
+/// Delegates the save/resume mechanism to [`el0_exec`]: this function's own
+/// job is just the proof-specific middle -- claim the continuation, record
+/// this proof's three middle statements between the claim and the resume
+/// (two register reads plus this payload's own three reported bytes), then
+/// hand the claimed `sp` back to [`el0_exec::resume_el1`]. `el0_exec`
+/// exposes [`el0_exec::take_continuation`] and the two register-read helpers
+/// as separate pieces rather than one bundled "finish" call precisely so
+/// this middle section stays an ordinary sequence of statements here, not a
+/// closure threaded through the mechanism module -- a future second caller
+/// with a different middle (and no proof-specific registers to read) can
+/// then call exactly the pieces it needs.
 pub fn finish(magic: u64, witness: u64, stack_byte: u64) -> u64 {
-    let saved_sp = EL0_CONTINUATION.swap(0, Ordering::Relaxed);
-    if saved_sp == 0 {
+    let Some(saved_sp) = el0_exec::take_continuation() else {
         return u64::MAX;
-    }
+    };
     {
         let mut observed = OBSERVED.lock();
         observed.magic = magic;
         observed.witness = witness;
         observed.stack_byte = stack_byte;
-        observed.svc_spsr = read_spsr_el1();
-        observed.svc_elr = read_elr_el1();
+        observed.svc_spsr = el0_exec::read_spsr_el1();
+        observed.svc_elr = el0_exec::read_elr_el1();
         observed.svc_root = process::active_root();
     }
-    // SAFETY: `saved_sp` was written by `enter_el0` on this very thread's
-    // kernel stack, which is still live, and `SP_EL1` has only moved
-    // downward since (the `eret`, then this exception) -- see this module's
-    // doc comment.
-    unsafe { resume_el1(saved_sp) }
+    // SAFETY: `saved_sp` was written by `el0_exec::enter_el0` on this very
+    // thread's kernel stack, which is still live, and `SP_EL1` has only
+    // moved downward since (the `eret`, then this exception) -- see
+    // `el0_exec`'s module doc comment.
+    unsafe { el0_exec::resume_el1(saved_sp) }
 }
 
 /// Reached from `el1_vectors.rs` when the EL0 payload takes a *synchronous*
@@ -435,61 +312,21 @@ pub fn finish(magic: u64, witness: u64, stack_byte: u64) -> u64 {
 /// is to print and `wfe` forever. `el1_vectors.rs` still prints its full
 /// diagnostic first, so nothing is lost.
 ///
+/// Delegates the claim/resume-or-halt mechanism to
+/// [`el0_exec::abort_from_fault`], passing it a closure that records the
+/// fault in this proof's own [`OBSERVED`] -- the one piece of this call that
+/// is proof-specific.
+///
 /// # Safety
 /// Only valid from a synchronous lower-EL exception taken during an
 /// in-flight excursion, i.e. with [`continuation_live`] true -- the same
 /// stack reasoning as [`finish`].
 pub unsafe fn abort_from_fault(vector: u64, esr: u64, far: u64, elr: u64) -> ! {
-    let saved_sp = EL0_CONTINUATION.swap(0, Ordering::Relaxed);
-    OBSERVED.lock().fault = Some((vector, esr, far, elr));
-    // SAFETY: the caller's contract is that a continuation is live; if it
-    // somehow is not, halting is the only safe option left (there is no EL1
-    // context to return to and EL0 cannot be resumed meaningfully).
-    if saved_sp == 0 {
-        loop {
-            unsafe { core::arch::asm!("wfe") };
-        }
-    }
-    unsafe { resume_el1(saved_sp) }
-}
-
-fn read_spsr_el1() -> u64 {
-    let value: u64;
-    // SAFETY: a read of an EL1-accessible system register, no side effects.
     unsafe {
-        core::arch::asm!("mrs {}, SPSR_EL1", out(reg) value, options(nomem, nostack));
+        el0_exec::abort_from_fault(|| {
+            OBSERVED.lock().fault = Some((vector, esr, far, elr));
+        })
     }
-    value
-}
-
-fn read_elr_el1() -> u64 {
-    let value: u64;
-    // SAFETY: as above.
-    unsafe {
-        core::arch::asm!("mrs {}, ELR_EL1", out(reg) value, options(nomem, nostack));
-    }
-    value
-}
-
-/// `AT S1E0R`: does the MMU allow an *unprivileged* read of `va` under the
-/// currently loaded tables? The same mechanism `load_proof.rs` uses, and the
-/// one check here that would catch a `TTBR0_EL1` the scheduler never
-/// switched: [`DATA_VADDR`] is unmapped in the kernel's identity table.
-fn el0_can_read(va: u64) -> bool {
-    let par: u64;
-    // SAFETY: `AT` translates without accessing memory and reports through
-    // `PAR_EL1`; a faulting translation sets `PAR_EL1.F` rather than taking
-    // an exception.
-    unsafe {
-        core::arch::asm!(
-            "at S1E0R, {va}",
-            "isb",
-            "mrs {par}, PAR_EL1",
-            va = in(reg) va,
-            par = out(reg) par,
-        );
-    }
-    par & 1 == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -568,7 +405,7 @@ extern "C" fn el0_proof_thread() -> ! {
     {
         let mut observed = OBSERVED.lock();
         observed.thread_root = process::active_root();
-        observed.data_el0_readable = el0_can_read(DATA_VADDR);
+        observed.data_el0_readable = el0_exec::el0_can_read(DATA_VADDR);
     }
 
     let entry = IMAGE_ENTRY.load(Ordering::Relaxed);
@@ -583,12 +420,12 @@ extern "C" fn el0_proof_thread() -> ! {
 
     // SAFETY: `entry`/`stack_top` are `loader::load`'s own verified output
     // for the address space this thread owns and which is active right now
-    // (checked above, from the live register); `EL0_CONTINUATION` is a
-    // writable `static` that outlives this call. The payload reaches EL1
-    // only through the `SVC` `finish` handles -- and any synchronous fault
-    // instead of it is turned into a proof failure by `abort_from_fault`
-    // rather than left to hang.
-    unsafe { enter_el0(entry, stack_top, EL0_CONTINUATION.as_ptr()) };
+    // (checked above, from the live register); `el0_exec`'s continuation
+    // slot is a writable static that outlives this call. The payload
+    // reaches EL1 only through the `SVC` `finish` handles -- and any
+    // synchronous fault instead of it is turned into a proof failure by
+    // `abort_from_fault` rather than left to hang.
+    unsafe { el0_exec::enter_el0(entry, stack_top, el0_exec::continuation_slot()) };
 
     report();
     FINISHED.store(true, Ordering::Relaxed);
@@ -617,7 +454,7 @@ fn report() {
     }
 
     let text_end = TEXT_VADDR + GRANULE_4KIB;
-    let from_el0 = observed.svc_spsr & SPSR_MODE_MASK == SPSR_MODE_EL0T;
+    let from_el0 = observed.svc_spsr & el0_exec::SPSR_MODE_MASK == el0_exec::SPSR_MODE_EL0T;
     let elr_in_text = (TEXT_VADDR..text_end).contains(&observed.svc_elr);
     let root_followed = observed.thread_root == root && observed.svc_root == root;
 
@@ -626,7 +463,7 @@ fn report() {
          ELR_EL1={:#x} (inside loaded text {:#x}..{:#x}: {}), TTBR0_EL1 thread={:#x} \
          svc={:#x} space={:#x}, AT S1E0R data={}",
         observed.svc_spsr,
-        observed.svc_spsr & SPSR_MODE_MASK,
+        observed.svc_spsr & el0_exec::SPSR_MODE_MASK,
         from_el0,
         observed.svc_elr,
         TEXT_VADDR,

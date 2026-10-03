@@ -228,6 +228,23 @@ extern "C" fn el1_exception_handler(
     // false and the behaviour below is unchanged, which is what keeps
     // `el0.rs`'s `el0_demo` -- which runs later, with no continuation --
     // exactly as it was.
+    // `tcp_proof.rs`'s own continuation is checked *first* and is the only
+    // one of the two that can actually tell whether it is live: it ANDs
+    // `el0_exec::continuation_live()` with a flag of its own (see
+    // `tcp_proof::TCP_PROOF_ACTIVE`'s doc comment), whereas
+    // `el0_proof::continuation_live()` below is simply
+    // `el0_exec::continuation_live()` unconditionally -- correct only when
+    // `tcp_proof.rs`'s excursion is not the one in flight. Checking
+    // `tcp_proof` first means a fault during *its* excursion is never
+    // misrouted into `el0_proof`'s own `OBSERVED`, which nothing would ever
+    // read.
+    if vector == 8 && crate::tcp_proof::continuation_live() {
+        // SAFETY: `continuation_live()` is true, which is this function's
+        // stated precondition; see `abort_from_fault`'s own doc comment for
+        // the stack reasoning.
+        unsafe { crate::tcp_proof::abort_from_fault(vector, esr_el1, far_el1, elr_el1) };
+    }
+
     if vector == 8 && crate::el0_proof::continuation_live() {
         // SAFETY: `continuation_live()` is true, which is this function's
         // stated precondition; see `abort_from_fault`'s own doc comment for

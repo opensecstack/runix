@@ -10,12 +10,13 @@ jobs:
   # Dependency supply-chain policy (deny.toml at repo root) — checked
   # against every one of this repo's independent manifest roots, since
   # none of kernel/xtask/grid-sandbox-host/net-driver-host/blk-driver-host/
-  # kernel-arm are members of the root `[workspace]` (see Cargo.toml's own
-  # comment on why) and each resolves its own dependency graph. See
-  # deny.toml's own doc comment for why this exists — not just "keep deps
-  # fresh," but specifically to catch a compromised/malicious dependency
-  # version before it lands, given citadel-integration will eventually
-  # depend on opensecstack/sdk/rust on the boot-time authorization path.
+  # kernel-arm/net-driver-host-arm are members of the root `[workspace]`
+  # (see Cargo.toml's own comment on why) and each resolves its own
+  # dependency graph. See deny.toml's own doc comment for why this exists —
+  # not just "keep deps fresh," but specifically to catch a compromised/
+  # malicious dependency version before it lands, given citadel-integration
+  # will eventually depend on opensecstack/sdk/rust on the boot-time
+  # authorization path.
   cargo-deny:
     runs-on: ubuntu-latest
     strategy:
@@ -29,6 +30,7 @@ jobs:
           - net-driver-host
           - blk-driver-host
           - kernel-arm
+          - net-driver-host-arm
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -466,21 +468,44 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: kernel-arm
+          workspaces: |
+            kernel-arm
+            net-driver-host-arm
       - name: fmt check
         run: cargo fmt --check
       - name: clippy
         run: cargo clippy --target aarch64-unknown-none -- -D warnings
+      # tcp_proof.rs's `include_bytes!` embeds this binary at kernel-arm
+      # compile time (Beta mobile item 2.5, "Stage 3: real outbound TCP at
+      # EL0") — same "build the payload before the thing that embeds it"
+      # requirement/reasoning as net-driver-host's own CI step on the
+      # x86_64 side, just a different standalone crate/target. Built from
+      # the sibling directory, not `kernel-arm` (this job's default
+      # `working-directory`).
+      - name: build net-driver-host-arm (payload for tcp_proof.rs's net TCP proof)
+        working-directory: net-driver-host-arm
+        run: cargo build --target aarch64-unknown-none --release
       - name: build
         run: cargo build --target aarch64-unknown-none --release
       - name: install QEMU (aarch64)
         run: sudo apt-get update && sudo apt-get install -y qemu-system-arm
       - name: boot in QEMU and check EL3 boot, exception resume, GIC, EL3->EL1 drop
+        # The `guestfwd` route + listener are for tcp_proof.rs's net TCP
+        # proof (Beta mobile item 2.5, "Stage 3") below — identical
+        # `tcp_proof_listener.py`/port/guestfwd-target convention
+        # `kernel-tests`' own `net_driver_tcp` step uses on the x86_64 side
+        # (reused verbatim, per docs/BETA_MOBILE_PROGRESS.md item 2.5), safe
+        # to reuse port 9001 unmodified since this is a separate CI job/
+        # runner from that one. `nc`/`python3` are preinstalled on
+        # `ubuntu-latest`, same as that step's own comment notes.
         run: |
-          timeout 10 qemu-system-aarch64 \
+          python3 ../kernel/tests/support/tcp_proof_listener.py &
+          sleep 0.3
+          timeout 20 qemu-system-aarch64 \
             -M virt,secure=on,gic-version=2 -cpu cortex-a53 -nographic \
             -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
-            -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
+            -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001" \
+            -device virtio-net-device,netdev=net0 \
             -global virtio-mmio.force-legacy=false \
             | tee /tmp/arm-boot.log || true
           grep -q "Runix ARM kernel: boot OK" /tmp/arm-boot.log
@@ -694,6 +719,22 @@ jobs:
           grep -q "^I$" /tmp/arm-boot.log
           grep -q "SVC: SYS_IPC_SEND channel 99 DENIED" /tmp/arm-boot.log
           grep -q "SVC: SYS_IPC_RECV channel 99 DENIED" /tmp/arm-boot.log
+          # Beta mobile item 2.5, "Stage 3: real outbound TCP at EL0"
+          # (kernel-arm/src/tcp_proof.rs): a genuine compiled
+          # net-driver-host-arm binary, loaded as its own EL0 process with a
+          # capability-gated virtio-mmio window (check_mmio_window's first
+          # real caller) and physically contiguous virtqueue regions, probes
+          # the net device, negotiates real virtqueues, and completes a real
+          # TCP round trip against tcp_proof_listener.py through the
+          # `guestfwd` bridge above -- the same dual-ended "exact bytes, not
+          # just connected" discipline net_driver_tcp.rs already proves on
+          # x86_64. `result=0 (Pass)` is `net-driver-host-arm`'s own
+          # ProofResult, reported through SYS_NET_PROOF_DONE and read back
+          # here as hardware-observed state (SPSR_EL1/TTBR0_EL1), not this
+          # code's bookkeeping -- see tcp_proof.rs's own doc comment.
+          grep -q "Runix ARM kernel: net TCP proof observed SPSR_EL1=.* result=0 (Pass)" \
+            /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: net TCP proof PASS" /tmp/arm-boot.log
       - name: boot in QEMU without secure=on and check the no-EL3 path
         # Regression check for a real, previously-shipped bug: this used to
         # produce zero UART output (rust_start ran the EL3-only phase
@@ -701,10 +742,13 @@ jobs:
         # installed yet to catch it) -- see main.rs's doc comment and
         # docs/STATUS.md's "Real bugs" section for the full account.
         run: |
-          timeout 8 qemu-system-aarch64 \
+          python3 ../kernel/tests/support/tcp_proof_listener.py &
+          sleep 0.3
+          timeout 20 qemu-system-aarch64 \
             -M virt,gic-version=2 -cpu cortex-a53 -nographic \
             -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
-            -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
+            -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001" \
+            -device virtio-net-device,netdev=net0 \
             -global virtio-mmio.force-legacy=false \
             | tee /tmp/arm-boot-nosecure.log || true
           grep -q "Runix ARM kernel: boot OK" /tmp/arm-boot-nosecure.log
@@ -780,6 +824,13 @@ jobs:
             /tmp/arm-boot-nosecure.log
           grep -q "^I$" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_IPC_RECV channel 99 DENIED" /tmp/arm-boot-nosecure.log
+          # Same net TCP proof as the secure boot above (see its comments)
+          # -- tcp_proof.rs's address-space/loader/scheduler work is EL1/
+          # EL0-side and security-state-independent, so it must hold on both
+          # entry paths.
+          grep -q "Runix ARM kernel: net TCP proof observed SPSR_EL1=.* result=0 (Pass)" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: net TCP proof PASS" /tmp/arm-boot-nosecure.log
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke

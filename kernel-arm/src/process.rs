@@ -122,6 +122,7 @@ use crate::mmu::{
     normal_4kib_page_descriptor, table_descriptor, AP_EL0_RW, DESC_TABLE_OR_PAGE, GRANULE_4KIB,
     PXN, UXN,
 };
+use runix_kernel_arm::vm::AP_EL0_RO;
 use crate::serial_println;
 use alloc::alloc::{alloc_zeroed, Layout};
 use alloc::collections::BTreeSet;
@@ -381,6 +382,96 @@ impl AddressSpace {
         }
 
         Ok(unsafe { &mut *(frame as *mut [u8; 4096]) })
+    }
+
+    /// Maps `pa` -- a caller-supplied **physical** address, not a
+    /// freshly allocated heap frame -- at `va`, within this address space
+    /// only. Everything about the walk (bounds check, level-2/level-3
+    /// descend-and-build, the `dsb ishst` after the write) is identical to
+    /// [`map_private_page_with`](Self::map_private_page_with); the only
+    /// difference is the one line that matters: this never calls
+    /// [`alloc_page`] and never owns the page it maps. That is the whole
+    /// point -- it exists for physical ranges this crate does not and
+    /// cannot allocate, because they are not RAM at all. The motivating
+    /// case is `virtio_mmio.rs`'s `VIRTIO_MMIO_BASE` device window: a
+    /// fixed physical region the virtio device itself owns, which a future
+    /// EL0 driver needs mapped into its own private window to poke
+    /// registers through, not a page this kernel could hand out of its
+    /// heap even if it wanted to.
+    ///
+    /// Descriptor bits: still Normal, Inner/Outer Non-cacheable
+    /// (`ATTRINDX_NORMAL`, Inner Shareable) -- this module's "Memory
+    /// attributes" note explains why that attribute index is not changed
+    /// here even though real hardware MMIO is conventionally Device
+    /// memory: introducing a second `AttrIndx`/`MAIR_EL1` encoding for
+    /// device pages is a bigger decision than this primitive should make
+    /// unilaterally, and is deferred to whichever slice actually maps a
+    /// real device into a process (see `mmu.rs`'s own
+    /// `ATTRINDX_DEVICE`/`ATTRINDX_NORMAL` split for the existing
+    /// precedent this would need to extend). `AF` set, `UXN | PXN` always
+    /// (an MMIO register window is data, never code, under any
+    /// circumstance), and `AP[2:1]` chosen by `writable`: [`AP_EL0_RO`]
+    /// (readable from EL0, read-only everywhere including EL1) when
+    /// `false`, [`AP_EL0_RW`] when `true` -- virtio MMIO registers need
+    /// both read and write, but a future caller mapping something
+    /// read-only shouldn't have to ask for more than it needs.
+    ///
+    /// # Safety
+    /// `pa` must be 4 KiB-aligned (checked, returns
+    /// [`AddressSpaceError::VaMisaligned`] rather than silently truncating
+    /// low bits into the descriptor) and must genuinely be a physical
+    /// address this process is authorized to see and touch for as long as
+    /// this mapping exists. Unlike [`map_private_page_with`], which only
+    /// ever hands out memory this module itself allocated and therefore
+    /// owns outright, this function has no way to verify either of those
+    /// things from inside itself -- it will map whatever `pa` it is given,
+    /// including kernel memory, another process's private frames, or a
+    /// device register window nobody granted this process a capability
+    /// for. That verification is the caller's job: the intended caller is
+    /// a future EL0-driver loader that calls
+    /// `capabilities::check_mmio_window` against the process's own
+    /// capability token *before* calling this, the same
+    /// verify-then-act ordering `kernel/src/capabilities.rs::check_ioport_range`
+    /// already uses on the x86_64 side. Calling this with an unchecked
+    /// `pa` is exactly the "ambient authority" shortcut this crate's
+    /// capability model exists to prevent.
+    /// `allow(dead_code)`: no caller yet, same reasoning as
+    /// `capabilities.rs`'s `check_mmio_window` -- this is the mapping
+    /// primitive a future proof module will call *after* `check_mmio_window`
+    /// authorizes the range, not written yet.
+    #[allow(dead_code)]
+    pub unsafe fn map_mmio_page(
+        &mut self,
+        va: u64,
+        pa: u64,
+        writable: bool,
+    ) -> Result<(), AddressSpaceError> {
+        if va % GRANULE_4KIB != 0 || pa % GRANULE_4KIB != 0 {
+            return Err(AddressSpaceError::VaMisaligned);
+        }
+        if !(PRIVATE_REGION_BASE..PRIVATE_REGION_END).contains(&va) {
+            return Err(AddressSpaceError::VaOutsidePrivateRegion);
+        }
+
+        let l1_index = ((va >> 30) & 0x1ff) as usize;
+        let l2_index = ((va >> 21) & 0x1ff) as usize;
+        let l3_index = ((va >> 12) & 0x1ff) as usize;
+
+        let l2 = self.descend(self.root, l1_index)?;
+        let l3 = self.descend(l2, l2_index)?;
+
+        let ap = if writable { AP_EL0_RW } else { AP_EL0_RO };
+        unsafe {
+            entry_ptr(l3, l3_index).write_volatile(normal_4kib_page_descriptor(pa, ap | UXN | PXN));
+        }
+        // Same reasoning as `map_private_page_with`: `dsb ishst` alone is
+        // sufficient because table walks over this non-cacheable memory
+        // need no cache maintenance.
+        unsafe {
+            core::arch::asm!("dsb ishst");
+        }
+
+        Ok(())
     }
 
     /// Returns the address of the next-level table reached through

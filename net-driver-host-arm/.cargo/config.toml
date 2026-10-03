@@ -1,0 +1,25 @@
+# Deliberately no `[build] target = ...` default here -- same "don't leak
+# an ambient target into a nested host-side invocation" reasoning as
+# net-driver-host/.cargo/config.toml and kernel-arm/.cargo/config.toml.
+# Invoke explicitly: `cargo build --target aarch64-unknown-none`.
+
+[target.aarch64-unknown-none]
+rustflags = [
+    # Places this binary's segments inside kernel-arm's EL0-reachable
+    # private VA window -- see linker.ld's own doc comment for why the
+    # default link address doesn't work with kernel-arm's loader.
+    "-C", "link-arg=-Tlinker.ld",
+    # Pins a static relocation model, same reasoning as
+    # net-driver-host/.cargo/config.toml's identical flag for
+    # x86_64-unknown-none and kernel-arm/.cargo/config.toml's for
+    # aarch64-unknown-none: the eventual loader (kernel-arm's `loader.rs`,
+    # see main.rs's module doc comment) treats a `PT_LOAD` segment's
+    # `p_vaddr` as an absolute address with zero relocation processing, and
+    # a position-independent (ET_DYN) binary's own PC-relative data (vtable
+    # entries behind `format_args!`'s `Display::fmt`, needed even for a
+    # `panic!`/`assert!` message that never fires) would never get
+    # relocated by anything -- net-driver-host's own config comment records
+    # this as a real, confirmed bug on the x86_64 side (a ring 3 fault on a
+    # null function pointer), not a theoretical concern.
+    "-C", "relocation-model=static",
+]
