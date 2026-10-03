@@ -132,6 +132,30 @@ of Alpha's scope (and beyond it) is done, in progress, or not started.
     `RUNIX_MARSHAL_PROXY_ADDR` hook) is done and verified — see
     `docs/STATUS.md`. This is real identity integration against a live
     governance platform, squarely RC-scope work.
+  - **Re-confirmed 2026-10-03, full per-gate trace, not just the HTTP
+    status this time.** A real `POST /api/v1/marshal/evaluate` with an
+    empty body against the same reachable deployment: `{"outcome":
+    "REFUSE", "gates": [{"gate":1,"name":"AuthN","status":"WARN",
+    "reason":"AUTH_FAIL: no actor_token provided for user_id=;
+    AUTH_FAIL: no signing key registered for operator user_id="},
+    {"gate":2,"name":"AuthZ","status":"FAIL","reason":"AUTHZ_FAIL: role
+    \"\" is not permitted to perform \"\""},{"gate":3,"name":"NDS",
+    "status":"HARD_STOP","reason":"NDS_SAME_IDENTITY: operator and
+    verifier are the same user"},{"gate":4,"name":"AUGUR",
+    "status":"PASS"},{"gate":5,"name":"WORM","status":"PASS"}]}`.
+    Confirms the framing above precisely: Gate 1 only `WARN`s
+    (`EnforceIdentity`/`EnforceSignatures` aren't set to strict on this
+    deployment), so the outcome is actually decided by Gate 2 (empty
+    role → `FAIL`, which has no soft mode) and Gate 3 (empty actor/
+    verifier → same-identity `HARD_STOP` by construction, not a
+    deliberate test of the real NDS check). Re-affirmed the "deliberately
+    not provisioned" decision above rather than seeding sinauth accounts
+    now: the actual next gap is that `citadel_proxy` has no code path
+    that constructs `actor_token`/`sig_operator` at all (it only ever
+    attaches `sig_verifier`), so provisioning operator accounts/keys
+    today would produce infrastructure nothing can use until that's
+    designed — the identity-architecture questions two bullets up are
+    the real blocker, not missing accounts.
 - **SDK dependency — supply-chain policy for when #34 unblocks this.** This
   dependency sits on the boot-time authorization path: a compromised or
   maliciously-updated version doesn't just add a bug, it can make MARSHAL
