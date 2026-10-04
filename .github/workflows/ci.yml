@@ -500,10 +500,20 @@ jobs:
         # to reuse port 9001 unmodified since this is a separate CI job/
         # runner from that one. `nc`/`python3` are preinstalled on
         # `ubuntu-latest`, same as that step's own comment notes.
+        #
+        # `timeout` bumped 20 -> 25 for item 2.6: `nonsecure.rs` now
+        # unconditionally configures `marshal_transport`'s MARSHAL proxy at
+        # `10.0.2.100:9100`, and this boot config has no `guestfwd` route for
+        # that port -- so the eSIM demo's `SYS_SIM_ENABLE`/`SYS_SIM_DELETE`
+        # calls each drive one real (bounded) connect-and-time-out attempt
+        # before falling back to `Unreachable`/fail-open. Confirmed in a real
+        # boot (via the project's Fedora WSL dev environment, where `nc`
+        # actually works) that every expected line still appears well inside
+        # the old 20s budget; the extra 5s is margin, not a measured need.
         run: |
           python3 ../kernel/tests/support/tcp_proof_listener.py &
           sleep 0.3
-          timeout 20 qemu-system-aarch64 \
+          timeout 25 qemu-system-aarch64 \
             -M virt,secure=on,gic-version=2 -cpu cortex-a53 -nographic \
             -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
             -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001" \
@@ -695,6 +705,14 @@ jobs:
             /tmp/arm-boot.log
           # Enable succeeding is itself an assertion: esim_marshal.rs's
           # fail-open gate must not block a legitimate authorized operation.
+          # Beta item 2.6: this is no longer a stub returning Unreachable
+          # without trying -- marshal_transport::evaluate now really attempts
+          # a connection to the configured (but, in this boot config,
+          # unmapped) 10.0.2.100:9100 and only *then* falls back to
+          # Unreachable, which is what the first grep line below confirms
+          # actually happened rather than assuming it.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for enable slot=0 profile=0: Unreachable" \
+            /tmp/arm-boot.log
           grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 0 authorized" /tmp/arm-boot.log
           grep -q "SVC: SYS_SIM_STATUS slot 0 profile 0 authorized, state Enabled" /tmp/arm-boot.log
           # Deleting an Enabled profile must be rejected at the syscall
@@ -743,10 +761,12 @@ jobs:
         # unconditionally, which UNDEFINED-traps from EL1 with no VBAR_EL1
         # installed yet to catch it) -- see main.rs's doc comment and
         # docs/STATUS.md's "Real bugs" section for the full account.
+        # `timeout` bumped 20 -> 25 for the same reason the secure boot
+        # above was -- see that step's comment.
         run: |
           python3 ../kernel/tests/support/tcp_proof_listener.py &
           sleep 0.3
-          timeout 20 qemu-system-aarch64 \
+          timeout 25 qemu-system-aarch64 \
             -M virt,gic-version=2 -cpu cortex-a53 -nographic \
             -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
             -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001" \
@@ -833,6 +853,59 @@ jobs:
           grep -q "Runix ARM kernel: net TCP proof observed SPSR_EL1=.* result=0 (Pass)" \
             /tmp/arm-boot-nosecure.log
           grep -q "Runix ARM kernel: net TCP proof PASS" /tmp/arm-boot-nosecure.log
+      # Beta mobile item 2.6, "Stage 4: wire esim_marshal::evaluate to a real
+      # transport" -- the fail-closed case. `nonsecure.rs` always points
+      # marshal_transport's MARSHAL proxy at 10.0.2.100:9100; the two boot
+      # steps above leave that port unmapped (proving fail-open, see their
+      # own comments) -- this step instead bridges it to
+      # grid_sandbox_marshal_shadow_listener.py (reused verbatim from the
+      # x86_64 side: a test-only stand-in that answers the real wire format
+      # with a canned Refuse, same role marshal_proof_listener.py plays for
+      # marshal_tcp_roundtrip.rs -- not itself a MARSHAL proxy). Two
+      # `guestfwd` routes in one `-netdev user,...` string: 9000 for
+      # tcp_proof.rs's own already-running TCP proof (unrelated to this
+      # step, but still exercised every boot), 9100 for this step's actual
+      # subject.
+      - name: boot in QEMU and check MARSHAL REFUSE denies eSIM enable (Beta item 2.6)
+        run: |
+          python3 ../kernel/tests/support/tcp_proof_listener.py &
+          sleep 0.3
+          python3 ../kernel/tests/support/grid_sandbox_marshal_shadow_listener.py &
+          sleep 0.3
+          timeout 20 qemu-system-aarch64 \
+            -M virt,secure=on,gic-version=2 -cpu cortex-a53 -nographic \
+            -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
+            -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001,guestfwd=tcp:10.0.2.100:9100-cmd:nc 127.0.0.1 9004" \
+            -device virtio-net-device,netdev=net0 \
+            -global virtio-mmio.force-legacy=false \
+            | tee /tmp/arm-boot-marshal-refuse.log || true
+          grep -q "Runix ARM kernel: MARSHAL evaluation for enable slot=0 profile=0: Refuse" \
+            /tmp/arm-boot-marshal-refuse.log
+          # The real enforcement outcome: a reachable Refuse now actually
+          # blocks the syscall, replacing this same boot config's own
+          # unconfigured "... authorized" line with a DENIED one -- the
+          # literal point of this item.
+          grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 0 DENIED (MARSHAL Refuse)" \
+            /tmp/arm-boot-marshal-refuse.log
+      # A real-chain "Execute via citadel_proxy" boot config was tried here
+      # and deliberately dropped, not merely skipped: `citadel_proxy`'s own
+      # local policy layer (desktop/src/citadel/proxy.rs, upstream of
+      # CITADEL's server-side rbacMap that item 2.8 already extended) only
+      # recognizes `grid_sandbox.spawn_instance` as a valid action type
+      # today, confirmed by sending it a real, correctly-encoded
+      # `esim.enable` MarshalRequest directly (bypassing QEMU) and getting
+      # back `MarshalResponse::Error(Other("POLICY_REFUSE: action type
+      # \"esim.enable\" is not one this proxy recognizes..."))` --
+      # `policy_refusal_never_forwards_to_citadel`'s own test in that file
+      # proves this is intentional, not a bug. Teaching `citadel_proxy`
+      # about `esim.*` actions is real, separately-scoped work in that
+      # file (what identity/SoD shape an eSIM action needs), tracked as a
+      # follow-up rather than rushed into this item -- see
+      # docs/BETA_MOBILE_PROGRESS.md item 2.6's own notes. The REFUSE and
+      # Unreachable boot configs above already prove `esim_marshal`'s real
+      # transport end to end over the actual wire format; this would have
+      # only added a third proof that the *policy allowlist* also needs an
+      # entry, which is now stated directly instead.
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke

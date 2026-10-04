@@ -24,118 +24,25 @@
 //! `smoltcp` TCP client, not a three-instruction proof payload: it needs a
 //! private heap, a mapped virtio-mmio register window, physically
 //! contiguous virtqueue descriptor/avail/used-ring regions, and a page per
-//! packet buffer -- none of which `el0_proof.rs`'s payload needed. Every
-//! one of those VAs and the physical addresses behind them are fixed,
-//! duplicated constants matching `net-driver-host-arm/src/main.rs`'s own
-//! `NetBootInfo`/`HEAP_START`/`NET_*_VA` definitions exactly -- the same
-//! "private, one-sided, hand-synced contract" precedent
-//! `net-driver-host`/`kernel/tests/net_driver_tcp.rs` already use on the
-//! x86_64 side, restated here rather than shared through a crate because
-//! this boundary is a one-shot boot-time handoff, not the bidirectional
-//! typed traffic `ipc::sockets` exists for.
-//!
-//! # The virtio-mmio window: this crate's first real `check_mmio_window`
-//! caller
-//!
-//! `capabilities::check_mmio_window`/`issue_mmio_token`/
-//! `virtio_mmio_slot_resource` existed with no caller before this module
-//! (see their own doc comments in `capabilities.rs`). [`build_net_boot_info`]
-//! is the real verify-then-act sequence they were written for: issue a
-//! token scoped to exactly the device's own virtio-mmio slot, verify it
-//! covers the physical range about to be mapped, and only then call
-//! [`AddressSpace::map_mmio_page`] -- never skip the check to "simplify"
-//! this boot-time demo, since this is the one place in the crate that
-//! exercises the real ordering a future non-demo caller would also have to
-//! follow.
-//!
-//! # Physical contiguity, and why it needs its own allocation path
-//!
-//! `AddressSpace::map_private_page`/`map_private_page_with` each allocate
-//! one fresh frame per call with no contiguity guarantee across calls --
-//! fine for the heap, the `NetBootInfo` page, and the per-buffer pages
-//! (each independently recorded in `NetBootInfo`), but not for the RX/TX
-//! virtqueue regions, whose descriptor table, avail ring, and used ring
-//! must sit back-to-back in physical memory (see
-//! `net-driver-host-arm::virtio_net::Virtqueue`'s own doc comment).
-//! [`map_contiguous_region`] allocates one single `3 * QUEUE_ALIGN`-byte
-//! block directly (so contiguity is a property of a single allocation, not
-//! an assumption about allocator behavior across several), then maps each
-//! page of it at the matching VA through [`AddressSpace::map_mmio_page`] --
-//! reused here for ordinary, already-owned heap memory rather than a real
-//! device window, which is sound: that function's own doc comment flags
-//! the *capability* check as the caller's responsibility specifically for
-//! physical ranges the caller does not already own, and this allocation is
-//! this module's own, fresh, zeroed memory, not a device register window
-//! anyone needs authorizing to touch.
+//! packet buffer -- none of which `el0_proof.rs`'s payload needed. All of
+//! that address-space/mapping/loading setup now lives in
+//! [`crate::net_process`] (extracted from this module once a second caller
+//! -- a per-syscall MARSHAL-transport path -- was about to need the exact
+//! same setup for a different `net-driver-host-arm` mode); see that
+//! module's own doc comment for the full "private, one-sided, hand-synced
+//! contract" reasoning, the virtio-mmio capability-check sequence, and why
+//! the virtqueue regions need their own contiguous-allocation path. This
+//! module keeps only what's specific to the TCP proof itself: today's fixed
+//! `NetBootInfo` contents (nothing beyond what [`crate::net_process::setup`]
+//! computes on its own), the one-shot EL0 excursion's observations, and the
+//! thread that drives it.
 
-use crate::capabilities;
 use crate::el0_exec;
-use crate::process::{self, AddressSpace};
+use crate::net_process;
+use crate::process;
 use crate::serial_println;
-use alloc::alloc::{alloc_zeroed, Layout};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use runix_kernel_arm::elf::Elf64;
-use runix_kernel_arm::loader;
-use runix_kernel_arm::vm::GRANULE_4KIB;
 use spin::Mutex;
-
-// ---------------------------------------------------------------------------
-// net-driver-host-arm's own fixed contract, duplicated by hand
-// ---------------------------------------------------------------------------
-//
-// Every constant below must match `net-driver-host-arm/src/main.rs`'s own
-// definition exactly -- see this module's doc comment for why that is a
-// deliberate duplication, not an oversight.
-
-/// Matches `net-driver-host-arm::HEAP_START`/`HEAP_SIZE` (256 KiB = 64
-/// pages) exactly.
-const NET_HEAP_START: u64 = 0x_8800_0000;
-const NET_HEAP_PAGES: u64 = 64;
-
-const NET_INFO_VA: u64 = 0x_8810_0000;
-const NET_RXQ_VA: u64 = 0x_8820_0000;
-const NET_TXQ_VA: u64 = 0x_8830_0000;
-const NET_RXBUF_VA: u64 = 0x_8840_0000;
-const NET_TXBUF_VA: u64 = 0x_8850_0000;
-
-/// `net-driver-host-arm::virtio_net::QUEUE_ALIGN` is one page (`GRANULE_4KIB`
-/// here); three rings per queue (descriptor table, avail ring, used ring).
-const QUEUE_REGION_PAGES: u64 = 3;
-
-/// Matches `net-driver-host-arm::smoltcp_device::RX_BUFFER_COUNT`/
-/// `TX_BUFFER_COUNT`.
-const RX_BUFFER_COUNT: usize = 8;
-const TX_BUFFER_COUNT: usize = 4;
-
-/// This module's own choice of VA for the mapped virtio-mmio register
-/// window -- not fixed by `net-driver-host-arm` the way the constants above
-/// are (that binary only ever dereferences whatever `NetBootInfo::mmio_base`
-/// says), so any VA inside the private window that doesn't collide with the
-/// loaded ELF's own low segments or the fixed VAs above is correct. Chosen
-/// well clear of both.
-const NET_MMIO_VA: u64 = 0x_8900_0000;
-
-/// Duplicated from `virtio_mmio.rs`'s own private `SLOT_STRIDE`, same
-/// reasoning `capabilities.rs`'s own `VIRTIO_MMIO_SLOT_STRIDE` duplication
-/// already documents: a capability check needs the real per-slot byte range
-/// to ask `check_mmio_window` about, and that value has no `pub(crate)`
-/// path out of `virtio_mmio.rs` today.
-const NET_MMIO_SLOT_STRIDE: u64 = 0x200;
-
-/// The AArch64/MMIO-v2 boot-info page -- byte-for-byte the same `#[repr(C)]`
-/// layout as `net-driver-host-arm::NetBootInfo`, duplicated rather than
-/// shared (see this module's doc comment). `mmio_base` is a **virtual**
-/// address ([`NET_MMIO_VA`]), not physical -- that binary dereferences it
-/// directly from inside its own address space, exactly as its own doc
-/// comment on the field states.
-#[repr(C)]
-struct NetBootInfo {
-    mmio_base: u64,
-    rx_queue_phys: u64,
-    tx_queue_phys: u64,
-    rx_buffer_phys: [u64; RX_BUFFER_COUNT],
-    tx_buffer_phys: [u64; TX_BUFFER_COUNT],
-}
 
 /// The compiled `net-driver-host-arm` binary. Built separately
 /// (`cd net-driver-host-arm && cargo build --target aarch64-unknown-none
@@ -146,143 +53,6 @@ struct NetBootInfo {
 static NET_DRIVER_HOST_ARM_ELF: &[u8] = include_bytes!(
     "../../net-driver-host-arm/target/aarch64-unknown-none/release/net-driver-host-arm"
 );
-
-// ---------------------------------------------------------------------------
-// Address-space construction
-// ---------------------------------------------------------------------------
-
-/// Allocates one physically contiguous, zeroed `pages * 4 KiB` block and
-/// maps it at `va_base..va_base + pages * 4 KiB`, returning the block's own
-/// (identity-mapped) physical base. See this module's doc comment for why
-/// this -- not repeated [`AddressSpace::map_private_page`] calls -- is what
-/// a virtqueue region needs.
-fn map_contiguous_region(
-    space: &mut AddressSpace,
-    va_base: u64,
-    pages: u64,
-) -> Result<u64, &'static str> {
-    let layout = Layout::from_size_align((pages * GRANULE_4KIB) as usize, GRANULE_4KIB as usize)
-        .map_err(|_| "bad layout for a virtqueue region")?;
-    // SAFETY: `layout` has a non-zero size and a valid alignment; the
-    // null check below handles allocation failure without ever
-    // dereferencing the result.
-    let ptr = unsafe { alloc_zeroed(layout) };
-    if ptr.is_null() {
-        return Err("out of memory for a contiguous virtqueue region");
-    }
-    let pa_base = ptr as u64;
-    for i in 0..pages {
-        let va = va_base + i * GRANULE_4KIB;
-        let pa = pa_base + i * GRANULE_4KIB;
-        // SAFETY: `pa` is this freshly allocated block's own memory --
-        // this module's, not a device's -- so there is no outstanding
-        // capability check to perform before mapping it (see this
-        // module's doc comment on why reusing `map_mmio_page` here is
-        // sound rather than a bypass of its documented contract).
-        unsafe {
-            space.map_mmio_page(va, pa, true).map_err(|e| e.message())?;
-        }
-    }
-    Ok(pa_base)
-}
-
-/// Maps the virtio-mmio device window (capability-gated) plus every private
-/// region `net-driver-host-arm`'s own `NetBootInfo` contract expects, and
-/// writes the filled-in struct into the mapped [`NET_INFO_VA`] page.
-fn build_net_boot_info(
-    space: &mut AddressSpace,
-    dev: &crate::virtio_mmio::NetDevice,
-) -> Result<(), &'static str> {
-    let now = crate::svc::now_ticks();
-
-    // The device window: issue a token scoped to exactly this device's own
-    // virtio-mmio slot, verify it covers the range about to be mapped, and
-    // only then map it -- see this module's doc comment.
-    //
-    // `mmio_phys_base` (the slot's own base, `VIRTIO_MMIO_BASE + slot *
-    // SLOT_STRIDE`) is not itself 4 KiB-aligned for most slots (`SLOT_STRIDE`
-    // is `0x200`, eight slots per page) -- `map_mmio_page` requires page
-    // alignment, so this maps the *containing* page and records the slot's
-    // real sub-page offset in `NetBootInfo::mmio_base` instead, rather than
-    // asking `map_mmio_page` to map an address it was never going to accept.
-    // The capability check still verifies the real, unaligned slot range --
-    // alignment is a mapping-mechanism detail, not part of what the token
-    // authorizes.
-    let mmio_phys_base = dev.base() as u64;
-    let mmio_page_pa = mmio_phys_base & !(GRANULE_4KIB - 1);
-    let mmio_page_offset = mmio_phys_base - mmio_page_pa;
-    let token =
-        capabilities::issue_mmio_token(capabilities::virtio_mmio_slot_resource(dev.slot), now);
-    capabilities::check_mmio_window(
-        &token,
-        mmio_phys_base as usize,
-        NET_MMIO_SLOT_STRIDE as usize,
-        now,
-    )
-    .map_err(|_| "mmio capability check denied the virtio-net device window")?;
-    // SAFETY: just verified by `check_mmio_window` above, against a token
-    // scoped to this exact device slot.
-    unsafe {
-        space
-            .map_mmio_page(NET_MMIO_VA, mmio_page_pa, true)
-            .map_err(|e| e.message())?;
-    }
-
-    // The private heap.
-    for i in 0..NET_HEAP_PAGES {
-        space
-            .map_private_page(NET_HEAP_START + i * GRANULE_4KIB)
-            .map_err(|e| e.message())?;
-    }
-
-    // The NetBootInfo page itself -- filled in last, once every other
-    // address below is known.
-    let info_page = space
-        .map_private_page(NET_INFO_VA)
-        .map_err(|e| e.message())?;
-
-    // The RX/TX virtqueue regions -- physically contiguous, see
-    // `map_contiguous_region`.
-    let rx_queue_phys = map_contiguous_region(space, NET_RXQ_VA, QUEUE_REGION_PAGES)?;
-    let tx_queue_phys = map_contiguous_region(space, NET_TXQ_VA, QUEUE_REGION_PAGES)?;
-
-    // The packet buffers -- individually mapped; each page's own physical
-    // address (== its VA under this kernel's identity map) is recorded
-    // directly, the same technique `el0_proof.rs::prove_el0_process` uses
-    // for its own private frames.
-    let mut rx_buffer_phys = [0u64; RX_BUFFER_COUNT];
-    for (i, slot) in rx_buffer_phys.iter_mut().enumerate() {
-        let page = space
-            .map_private_page(NET_RXBUF_VA + (i as u64) * GRANULE_4KIB)
-            .map_err(|e| e.message())?;
-        *slot = page.as_ptr() as u64;
-    }
-    let mut tx_buffer_phys = [0u64; TX_BUFFER_COUNT];
-    for (i, slot) in tx_buffer_phys.iter_mut().enumerate() {
-        let page = space
-            .map_private_page(NET_TXBUF_VA + (i as u64) * GRANULE_4KIB)
-            .map_err(|e| e.message())?;
-        *slot = page.as_ptr() as u64;
-    }
-
-    let info = NetBootInfo {
-        mmio_base: NET_MMIO_VA + mmio_page_offset,
-        rx_queue_phys,
-        tx_queue_phys,
-        rx_buffer_phys,
-        tx_buffer_phys,
-    };
-    // SAFETY: `info_page` is a freshly mapped, zeroed, 4 KiB page --
-    // large enough for `NetBootInfo` (checked below) and correctly
-    // aligned for it (8-byte fields, 4 KiB page alignment).
-    unsafe {
-        (info_page.as_mut_ptr() as *mut NetBootInfo).write(info);
-    }
-
-    Ok(())
-}
-
-const _: () = assert!(core::mem::size_of::<NetBootInfo>() <= 4096);
 
 // ---------------------------------------------------------------------------
 // The one-shot EL1-to-EL0 continuation, and this proof's own observations
@@ -498,6 +268,15 @@ fn report() {
 /// `net-driver-host-arm` needs, loads it, spawns a thread that owns it, and
 /// schedules it for real.
 ///
+/// The address-space/mapping/loading setup itself is
+/// [`crate::net_process::setup`] -- this function supplies today's
+/// TCP-proof-mode [`net_process::NetBootInfo`] contents (nothing beyond what
+/// that function computes on its own, so an all-zero value) and keeps the
+/// proof-specific tail: handing the loaded image to [`net_tcp_proof_thread`]
+/// through the `IMAGE_*` statics, the actual
+/// `scheduler::spawn_with_address_space` call, and the bounded wait for a
+/// result.
+///
 /// Called from `nonsecure.rs`'s shared EL1 bring-up right after
 /// `el0_proof::prove_el0_process` -- it needs everything that proof needs
 /// (the MMU, the heap, the scheduler's run queue) plus one more
@@ -511,46 +290,31 @@ pub fn prove_net_tcp() {
         return;
     };
 
-    let elf = match Elf64::parse(NET_DRIVER_HOST_ARM_ELF) {
-        Ok(elf) => elf,
-        Err(err) => {
-            serial_println!("Runix ARM kernel: net TCP proof FAILED -- parse: {}", err);
-            return;
-        }
+    // Nothing beyond what `net_process::setup` computes on its own -- see
+    // its own doc comment on why it still takes a `NetBootInfo` by value.
+    // `mode: 0` (TCP-proof mode, the only mode this module ever drives) --
+    // `remote_ip`/`remote_port`/`request_len` are all ignored by
+    // `net-driver-host-arm` in that mode, so left zero.
+    let info = net_process::NetBootInfo {
+        mmio_base: 0,
+        rx_queue_phys: 0,
+        tx_queue_phys: 0,
+        rx_buffer_phys: [0; net_process::RX_BUFFER_COUNT],
+        tx_buffer_phys: [0; net_process::TX_BUFFER_COUNT],
+        mode: 0,
+        remote_ip: [0; 4],
+        remote_port: 0,
+        request_len: 0,
     };
 
-    let mut space = match AddressSpace::new() {
-        Ok(space) => space,
-        Err(err) => {
-            serial_println!(
-                "Runix ARM kernel: net TCP proof FAILED -- address space: {}",
-                err
-            );
-            return;
-        }
-    };
-
-    if let Err(reason) = build_net_boot_info(&mut space, &dev) {
-        serial_println!("Runix ARM kernel: net TCP proof FAILED -- {}", reason);
-        return;
-    }
-
-    let loaded = match loader::load(&elf, &mut space) {
-        Ok(loaded) => loaded,
-        Err(err) => {
-            serial_println!("Runix ARM kernel: net TCP proof FAILED -- load: {}", err);
-            return;
-        }
-    };
-
-    // Same instruction-cache reasoning as `el0_proof::prove_el0_process`:
-    // the loaded bytes reached their frames as data writes, and are about
-    // to be fetched through a different VA.
-    //
-    // SAFETY: cache maintenance on the current PE with no memory operands.
-    unsafe {
-        core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb");
-    }
+    let (space, loaded, _response_phys) =
+        match net_process::setup(NET_DRIVER_HOST_ARM_ELF, &dev, info, None) {
+            Ok(result) => result,
+            Err(reason) => {
+                serial_println!("Runix ARM kernel: net TCP proof FAILED -- {}", reason);
+                return;
+            }
+        };
 
     IMAGE_ENTRY.store(loaded.entry, Ordering::Relaxed);
     IMAGE_STACK_TOP.store(loaded.stack_top, Ordering::Relaxed);

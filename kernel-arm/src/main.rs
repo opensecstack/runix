@@ -174,7 +174,18 @@ mod ipc_channel;
 // `PrivatePageMapper` impl binding `runix_kernel_arm::loader`'s pure logic
 // to `process::AddressSpace`, plus its boot-time proof.
 mod load_proof;
+// Beta mobile item 2.6 "Stage 4: wire esim_marshal::evaluate to a real
+// transport" -- per-syscall MARSHAL evaluation, loading a real compiled
+// net-driver-host-arm process a second way (mode 1, relaying an arbitrary
+// MARSHAL request instead of tcp_proof.rs's fixed PING/PONG demo),
+// reusing el0_exec's one-shot continuation mechanism a third time.
+mod marshal_transport;
 mod mmu;
+// Shared address-space/mapping/loading setup for spawning a
+// `net-driver-host-arm` process (extracted from `tcp_proof.rs` so a second
+// caller, a per-syscall MARSHAL-transport path, can reuse it instead of
+// duplicating it) -- see its own module doc comment.
+mod net_process;
 mod nonsecure;
 mod process;
 mod ril_channel;

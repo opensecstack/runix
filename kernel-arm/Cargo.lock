@@ -307,6 +307,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "runix-ipc"
+version = "0.0.1"
+dependencies = [
+ "runix-capability-manager",
+ "serde",
+]
+
+[[package]]
 name = "runix-kernel-arm"
 version = "0.0.1"
 dependencies = [
@@ -314,6 +322,7 @@ dependencies = [
  "linked_list_allocator",
  "runix-capability-manager",
  "runix-citadel-integration",
+ "runix-ipc",
  "smoltcp",
  "spin",
 ]

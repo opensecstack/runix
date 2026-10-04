@@ -119,6 +119,22 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 ///      `el0_proof.rs::prove_el0_process` already proves end to end for a
 ///      hand-built image — this binary is a real compiled ELF rather than
 ///      a `global_asm!` payload, which is the only thing that differs.
+///
+/// # `mode` and the second use this binary is growing (Beta item 2.6)
+///
+/// This struct, and this binary, originally had exactly one job: the
+/// fixed PING/PONG [`ProofResult`] round trip described above
+/// ([`Mode::TcpProof`], `mode == 0`). `kernel-arm/src/marshal_transport.rs`
+/// (a parallel, independent slice) is wiring `esim_marshal::evaluate` to a
+/// real transport by loading this *same compiled binary* a second way —
+/// into a fresh process, same as `tcp_proof.rs` already does, but asking
+/// it to relay an arbitrary caller-supplied byte buffer to a configurable
+/// remote address instead of running the fixed demo exchange
+/// ([`Mode::MarshalRequest`], `mode == 1`). The fields below `mode` itself
+/// are only meaningful in that second mode; `Mode::TcpProof` ignores them
+/// and behaves exactly as it always has, reading [`TCP_REMOTE_IP`]/
+/// [`TCP_REMOTE_PORT`] the same way it always did — this is an addition,
+/// not a rewrite, of the existing proof.
 #[repr(C)]
 struct NetBootInfo {
     /// VA of this device's virtio-mmio register window, already mapped
@@ -140,6 +156,59 @@ struct NetBootInfo {
     /// Physical addresses of individually-mapped TX packet buffers —
     /// matching virtual base [`NET_TXBUF_VA`].
     tx_buffer_phys: [u64; smoltcp_device::TX_BUFFER_COUNT],
+    /// `0` = [`Mode::TcpProof`] (the original, still-default behavior —
+    /// every field below this one is ignored in this mode), `1` =
+    /// [`Mode::MarshalRequest`] (see this struct's own doc comment
+    /// section above). Any other value is treated the same as `0` — see
+    /// `_start`'s dispatch for why defaulting to the long-proven behavior
+    /// rather than failing closed is the right call for a value this
+    /// binary cannot itself validate against anything.
+    mode: u64,
+    /// `Mode::MarshalRequest`-only: the remote host to connect to, as four
+    /// octets in the same order `Ipv4Address::new`'s own arguments take
+    /// (`[a, b, c, d]` for `a.b.c.d`) — replacing the role [`TCP_REMOTE_IP`]
+    /// plays for `Mode::TcpProof`. `Mode::TcpProof` ignores this field and
+    /// keeps using that constant unchanged.
+    remote_ip: [u8; 4],
+    /// `Mode::MarshalRequest`-only: the remote TCP port, replacing the role
+    /// [`TCP_REMOTE_PORT`] plays for `Mode::TcpProof`.
+    remote_port: u16,
+    /// `Mode::MarshalRequest`-only: how many bytes at [`MARSHAL_REQUEST_VA`]
+    /// are valid — the loader writes the encoded `MarshalRequest` there
+    /// before `eret`ing and records its exact length here, since the
+    /// buffer itself carries no length prefix of its own. Clamped to
+    /// [`MARSHAL_REQUEST_CAPACITY`] before use (see `run_marshal_request`)
+    /// rather than trusted outright — a value larger than the loader
+    /// actually mapped must not turn into an out-of-bounds read just
+    /// because this struct's own producer made a mistake.
+    request_len: u64,
+}
+
+/// See [`NetBootInfo::mode`]'s own doc comment — kept as a small enum here
+/// purely for `_start`'s `match` to read, not part of the wire struct
+/// itself (the wire field is the plain `u64` above, same reasoning
+/// `ProofResult`'s own `#[repr(u64)]` gives for why the wire shape and the
+/// Rust-side match target can be the same representation without needing
+/// two separate types).
+#[repr(u64)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    TcpProof = 0,
+    MarshalRequest = 1,
+}
+
+impl Mode {
+    /// Any value this binary does not recognize defaults to
+    /// [`Mode::TcpProof`] — see [`NetBootInfo::mode`]'s doc comment for why
+    /// defaulting to the long-proven behavior, rather than failing closed,
+    /// is the right call for a field this binary has no independent way to
+    /// validate.
+    fn from_u64(value: u64) -> Mode {
+        match value {
+            1 => Mode::MarshalRequest,
+            _ => Mode::TcpProof,
+        }
+    }
 }
 
 const NET_INFO_VA: usize = 0x_8810_0000;
@@ -147,6 +216,38 @@ const NET_RXQ_VA: usize = 0x_8820_0000;
 const NET_TXQ_VA: usize = 0x_8830_0000;
 const NET_RXBUF_VA: usize = 0x_8840_0000;
 const NET_TXBUF_VA: usize = 0x_8850_0000;
+/// `Mode::MarshalRequest`-only: VA of the encoded `MarshalRequest` bytes
+/// the loader writes before `eret`ing — see [`NetBootInfo::request_len`]
+/// for the matching length field. Chosen clear of every VA above and of
+/// [`MARSHAL_RESPONSE_VA`] below.
+const MARSHAL_REQUEST_VA: usize = 0x_8860_0000;
+/// `Mode::MarshalRequest`-only: how many bytes the loader is expected to
+/// have mapped at [`MARSHAL_REQUEST_VA`] — [`NetBootInfo::request_len`] is
+/// clamped to this before any read, so a bogus/oversized `request_len`
+/// turns into a truncated send rather than a read past what is actually
+/// mapped. 8 KiB, matching [`MARSHAL_RESPONSE_CAPACITY`]'s own reasoning
+/// below (comfortably larger than a `MarshalRequest`'s encoded JSON is
+/// ever expected to be).
+const MARSHAL_REQUEST_CAPACITY: usize = 8192;
+/// `Mode::MarshalRequest`-only: VA of a fixed-capacity buffer this binary
+/// writes reply bytes into as they arrive — EL1 reads `request_len`-many
+/// bytes back out starting here after this process reports completion
+/// (see `SYS_MARSHAL_PROOF_DONE`'s own doc comment at its call site for
+/// how the actual byte count is reported — not through this struct, since
+/// `NetBootInfo` is otherwise a one-direction, EL1-writes/EL0-reads-only
+/// contract, and adding a write-back field to it would be the one
+/// exception).
+const MARSHAL_RESPONSE_VA: usize = 0x_8870_0000;
+/// `Mode::MarshalRequest`-only: fixed capacity of the buffer at
+/// [`MARSHAL_RESPONSE_VA`]. 8 KiB: comfortably larger than twice
+/// `runix_ipc::marshal`'s `MAX_JSON_LEN` would need for a full
+/// decodable `MarshalResponse` with headroom, picked as a generous round
+/// number rather than by pulling in the `runix-ipc` crate as a dependency
+/// of this `no_std`/`aarch64-unknown-none` binary just to read one
+/// constant — the response is truncated (never overrun) if a reply
+/// somehow exceeds this, which `run_marshal_request` reports honestly via
+/// the byte count it hands back rather than silently.
+const MARSHAL_RESPONSE_CAPACITY: usize = 8192;
 
 /// Requested queue size for both RX and TX — the device's own
 /// `QueueNumMax` may cap this lower; see
@@ -204,42 +305,85 @@ pub extern "C" fn _start() -> ! {
     }
 
     let info = unsafe { &*(NET_INFO_VA as *const NetBootInfo) };
-    let result = run(info);
 
-    write_all(b"net-driver-host-arm: result=");
-    write_decimal(result as u64);
-    write_byte(b'\n');
+    match Mode::from_u64(info.mode) {
+        Mode::TcpProof => {
+            let result = run_tcp_proof_mode(info);
 
-    // "This EL0 excursion is finished; resume my EL1 continuation" --
-    // `kernel-arm/src/svc.rs`'s `SYS_NET_PROOF_DONE`, following
-    // `el0_proof.rs::finish`'s own payload convention exactly: `x0` =
-    // syscall number, `x1` = this `result as u64`, `svc #0`. Only one
-    // register of payload (unlike `SYS_EL0_PROOF_DONE`'s three), since this
-    // proof's whole verdict is the single flat `ProofResult` code, not
-    // several separately observed bytes. `SYS_NET_PROOF_DONE` is duplicated
-    // here by hand rather than shared from a crate, matching
-    // `SYS_WRITE`'s own duplication above (see `syscall.rs`'s module doc
-    // comment on why this binary and `kernel-arm` stay two independently
-    // compiled programs that agree on syscall numbers by convention, not by
-    // a shared dependency) -- it must match `kernel-arm/src/svc.rs`'s
-    // `SYS_NET_PROOF_DONE` exactly.
-    const SYS_NET_PROOF_DONE: u64 = 14;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x0") SYS_NET_PROOF_DONE,
-            in("x1") result as u64,
-            options(nostack),
-        );
+            write_all(b"net-driver-host-arm: result=");
+            write_decimal(result as u64);
+            write_byte(b'\n');
+
+            // "This EL0 excursion is finished; resume my EL1 continuation" --
+            // `kernel-arm/src/svc.rs`'s `SYS_NET_PROOF_DONE`, following
+            // `el0_proof.rs::finish`'s own payload convention exactly: `x0` =
+            // syscall number, `x1` = this `result as u64`, `svc #0`. Only one
+            // register of payload (unlike `SYS_EL0_PROOF_DONE`'s three), since
+            // this proof's whole verdict is the single flat `ProofResult`
+            // code, not several separately observed bytes. `SYS_NET_PROOF_DONE`
+            // is duplicated here by hand rather than shared from a crate,
+            // matching `SYS_WRITE`'s own duplication above (see `syscall.rs`'s
+            // module doc comment on why this binary and `kernel-arm` stay two
+            // independently compiled programs that agree on syscall numbers
+            // by convention, not by a shared dependency) -- it must match
+            // `kernel-arm/src/svc.rs`'s `SYS_NET_PROOF_DONE` exactly.
+            const SYS_NET_PROOF_DONE: u64 = 14;
+            unsafe {
+                core::arch::asm!(
+                    "svc #0",
+                    in("x0") SYS_NET_PROOF_DONE,
+                    in("x1") result as u64,
+                    options(nostack),
+                );
+            }
+        }
+        Mode::MarshalRequest => {
+            let (status, response_len) = run_marshal_request_mode(info);
+
+            write_all(b"net-driver-host-arm: marshal-request status=");
+            write_decimal(status as u64);
+            write_all(b" response_len=");
+            write_decimal(response_len);
+            write_byte(b'\n');
+
+            // "This EL0 excursion is finished; resume my EL1 continuation" --
+            // the `Mode::MarshalRequest` counterpart of `SYS_NET_PROOF_DONE`
+            // above, newly allocated for this mode rather than reusing `14`
+            // because the payload shape is different: `x1` = status (`0` =
+            // at least one reply byte was received and copied into
+            // [`MARSHAL_RESPONSE_VA`]; `1` = the connect attempt failed or
+            // timed out with nothing ever received, and `response_len` is
+            // `0`), `x2` = the number of bytes actually written at
+            // [`MARSHAL_RESPONSE_VA`] (always `<= MARSHAL_RESPONSE_CAPACITY`,
+            // never a silent truncation the caller can't detect — EL1 reads
+            // exactly this many bytes back, no more). Not wired into
+            // `kernel-arm/src/svc.rs::dispatch` by this slice — that is
+            // `marshal_transport.rs`'s own follow-up job, same as this
+            // file's existing `TODO(loader integration)` convention left
+            // `SYS_NET_PROOF_DONE`'s dispatch arm for a later slice. Must
+            // match whatever `kernel-arm/src/svc.rs` defines for
+            // `SYS_MARSHAL_PROOF_DONE` once that side lands.
+            const SYS_MARSHAL_PROOF_DONE: u64 = 15;
+            unsafe {
+                core::arch::asm!(
+                    "svc #0",
+                    in("x0") SYS_MARSHAL_PROOF_DONE,
+                    in("x1") status as u64,
+                    in("x2") response_len,
+                    options(nostack),
+                );
+            }
+        }
     }
 
     // `finish` on the EL1 side never resumes this process once it has
     // claimed the continuation -- reaching here would mean either no
     // continuation was live (this binary wasn't actually launched through
-    // `tcp_proof.rs`'s mechanism) or the syscall number above doesn't match
-    // `svc.rs`'s dispatch table. Either way there is nothing left to do but
-    // spin, same as `el0_proof.rs`'s payload's own trailing `wfe` loop for
-    // the identical "should never actually be reached" reason.
+    // `tcp_proof.rs`'s/`marshal_transport.rs`'s mechanism) or the syscall
+    // number above doesn't match `svc.rs`'s dispatch table. Either way
+    // there is nothing left to do but spin, same as `el0_proof.rs`'s
+    // payload's own trailing `wfe` loop for the identical "should never
+    // actually be reached" reason.
     loop {
         unsafe {
             core::arch::asm!("wfe", options(nostack, preserves_flags));
@@ -247,21 +391,52 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
-/// The whole proof: probe the device, bring up virtqueues, build the
-/// `smoltcp` interface with the static SLIRP address, and run the TCP
-/// round trip. Returns a [`ProofResult`] rather than panicking on any
-/// failure — this process is `panic = "abort"`, and every failure mode
-/// below is an ordinary, expected-to-sometimes-happen outcome (a
-/// misconfigured QEMU command line, an unreachable listener), not a bug in
-/// this code reaching an invariant violation.
-fn run(info: &NetBootInfo) -> ProofResult {
+/// `Mode::TcpProof` entry point: shares every bring-up step with
+/// `Mode::MarshalRequest` via [`bring_up_interface`], branching only at
+/// "what do we do with the open interface" by calling [`run_tcp_proof`] —
+/// this function, and [`ProofResult`]'s possible values, are unchanged
+/// from before `Mode::MarshalRequest` existed.
+fn run_tcp_proof_mode(info: &NetBootInfo) -> ProofResult {
+    match bring_up_interface(info) {
+        Ok((mut iface, mut device)) => run_tcp_proof(&mut iface, &mut device),
+        Err(result) => result,
+    }
+}
+
+/// `Mode::MarshalRequest` entry point: identical bring-up to
+/// [`run_tcp_proof_mode`] via [`bring_up_interface`], then
+/// [`run_marshal_request`] in place of [`run_tcp_proof`]. Returns `(status,
+/// response_len)` exactly as `_start` reports them via
+/// `SYS_MARSHAL_PROOF_DONE` — see that call site's own doc comment for the
+/// convention. Bring-up failure (device probe/feature negotiation/queue
+/// setup) is reported the same way a connect failure is: status `1`,
+/// `response_len` `0` — from `marshal_transport.rs`'s point of view both
+/// are simply "no reply came back", and `ProofResult`'s finer-grained
+/// distinction is already written to the serial console by
+/// [`bring_up_interface`]'s own failure branches for human diagnosis.
+fn run_marshal_request_mode(info: &NetBootInfo) -> (u8, u64) {
+    match bring_up_interface(info) {
+        Ok((mut iface, mut device)) => run_marshal_request(&mut iface, &mut device, info),
+        Err(_) => (1, 0),
+    }
+}
+
+/// Every step both modes share: probe the device, negotiate features,
+/// stand up the virtqueues, and build the `smoltcp` interface with the
+/// static SLIRP address. Returns the live `(Interface, RunixNetDevice)`
+/// pair on success, or the specific [`ProofResult`] naming what failed —
+/// callers that don't need that granularity (`run_marshal_request_mode`)
+/// are free to collapse it. This is a straight extraction of what used to
+/// be the first half of the old, single-mode `run` function; no bring-up
+/// behavior changed.
+fn bring_up_interface(info: &NetBootInfo) -> Result<(Interface, RunixNetDevice), ProofResult> {
     let dev = match virtio_mmio::probe(info.mmio_base as usize) {
         Ok(dev) => dev,
         Err(err) => {
             write_all(b"net-driver-host-arm: virtio-mmio probe failed: ");
             write_all(err_to_bytes(&err));
             write_byte(b'\n');
-            return ProofResult::DeviceProbeFailed;
+            return Err(ProofResult::DeviceProbeFailed);
         }
     };
     write_all(b"net-driver-host-arm: virtio-net probed, version=");
@@ -281,29 +456,29 @@ fn run(info: &NetBootInfo) -> ProofResult {
         Ok(net) => net,
         Err(_) => {
             write_all(b"net-driver-host-arm: feature negotiation failed\n");
-            return ProofResult::FeatureNegotiationFailed;
+            return Err(ProofResult::FeatureNegotiationFailed);
         }
     };
 
     let rx_size = match net.negotiate_queue_size(virtio_net::QUEUE_RX, REQUESTED_QUEUE_SIZE) {
         Ok(size) => size,
-        Err(_) => return ProofResult::QueueSetupFailed,
+        Err(_) => return Err(ProofResult::QueueSetupFailed),
     };
     let tx_size = match net.negotiate_queue_size(virtio_net::QUEUE_TX, REQUESTED_QUEUE_SIZE) {
         Ok(size) => size,
-        Err(_) => return ProofResult::QueueSetupFailed,
+        Err(_) => return Err(ProofResult::QueueSetupFailed),
     };
     if net
         .setup_queue(virtio_net::QUEUE_RX, rx_size, info.rx_queue_phys)
         .is_err()
     {
-        return ProofResult::QueueSetupFailed;
+        return Err(ProofResult::QueueSetupFailed);
     }
     if net
         .setup_queue(virtio_net::QUEUE_TX, tx_size, info.tx_queue_phys)
         .is_err()
     {
-        return ProofResult::QueueSetupFailed;
+        return Err(ProofResult::QueueSetupFailed);
     }
 
     let mut device = unsafe {
@@ -329,7 +504,7 @@ fn run(info: &NetBootInfo) -> ProofResult {
     });
     let _ = iface.routes_mut().add_default_ipv4_route(GATEWAY_IP);
 
-    run_tcp_proof(&mut iface, &mut device)
+    Ok((iface, device))
 }
 
 /// One real TCP round trip against `tcp_proof_listener.py`, through the
@@ -416,6 +591,124 @@ fn run_tcp_proof(iface: &mut Interface, device: &mut RunixNetDevice) -> ProofRes
     }
 
     ProofResult::TcpConnectTimedOut
+}
+
+/// The `Mode::MarshalRequest` counterpart of [`run_tcp_proof`]: same
+/// connect-then-poll shape (same iteration bound, same Nagle-disabled
+/// socket setup, same "the listener closing is also a legitimate reason
+/// to stop polling" exit condition), but relaying an arbitrary
+/// caller-supplied buffer instead of the fixed [`TCP_PING`]/[`TCP_PONG`]
+/// demo exchange: connect to `info.remote_ip`/`info.remote_port`, send
+/// `info.request_len` bytes read from [`MARSHAL_REQUEST_VA`] (clamped to
+/// [`MARSHAL_REQUEST_CAPACITY`]), and accumulate whatever reply bytes
+/// arrive into [`MARSHAL_RESPONSE_VA`] (clamped to
+/// [`MARSHAL_RESPONSE_CAPACITY`] — never written past it) until the
+/// connection closes, the response buffer fills, or the iteration bound
+/// is hit. Returns `(status, response_len)` exactly as `_start` reports
+/// them via `SYS_MARSHAL_PROOF_DONE`: status `0` with `response_len > 0`
+/// means at least one reply byte was received and copied back; status `1`
+/// with `response_len == 0` covers both "never connected" and "connected
+/// but nothing came back before the bound" — `marshal_transport.rs`'s own
+/// caller (`esim_marshal::evaluate`) treats both the same way (no decodable
+/// `MarshalResponse`), so collapsing them here rather than inventing a
+/// third status is the point.
+fn run_marshal_request(
+    iface: &mut Interface,
+    device: &mut RunixNetDevice,
+    info: &NetBootInfo,
+) -> (u8, u64) {
+    let remote_ip = Ipv4Address::new(
+        info.remote_ip[0],
+        info.remote_ip[1],
+        info.remote_ip[2],
+        info.remote_ip[3],
+    );
+
+    let tcp_rx_buffer = tcp::SocketBuffer::new(vec![0; MARSHAL_RESPONSE_CAPACITY]);
+    let tcp_tx_buffer = tcp::SocketBuffer::new(vec![0; MARSHAL_REQUEST_CAPACITY]);
+    let mut tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
+    tcp_socket.set_nagle_enabled(false);
+
+    let mut sockets = SocketSet::new(vec![]);
+    let handle = sockets.add(tcp_socket);
+    if sockets
+        .get_mut::<tcp::Socket>(handle)
+        .connect(
+            iface.context(),
+            (IpAddress::Ipv4(remote_ip), info.remote_port),
+            TCP_LOCAL_PORT,
+        )
+        .is_err()
+    {
+        return (1, 0);
+    }
+
+    // Clamped, not trusted outright -- see [`MARSHAL_REQUEST_CAPACITY`]'s
+    // own doc comment for why a bogus/oversized `request_len` must turn
+    // into a truncated send rather than a read past what the loader
+    // actually mapped.
+    let request_len = (info.request_len as usize).min(MARSHAL_REQUEST_CAPACITY);
+    // SAFETY: the loader contract (see `NetBootInfo`'s own doc comment)
+    // is that it maps at least `MARSHAL_REQUEST_CAPACITY` bytes at
+    // `MARSHAL_REQUEST_VA` before `eret`ing into this process, and
+    // `request_len` is clamped to that same capacity immediately above --
+    // this read never reaches past what is guaranteed mapped.
+    let request: &[u8] =
+        unsafe { core::slice::from_raw_parts(MARSHAL_REQUEST_VA as *const u8, request_len) };
+
+    let response_ptr = MARSHAL_RESPONSE_VA as *mut u8;
+    let mut sent = 0usize;
+    let mut received_len = 0usize;
+
+    // Same bound (2,000,000 iterations, 1ms apart) as
+    // [`run_tcp_proof`]'s identical loop, and the same reasoning: a real
+    // reply from a reachable listener arrives promptly in practice, so
+    // the bound exists purely to turn a genuinely broken/unreachable path
+    // into a reported failure instead of an unbounded hang.
+    for offset in 0..2_000_000u32 {
+        let timestamp = Instant::from_millis(offset as i64);
+        iface.poll(timestamp, device, &mut sockets);
+        let socket = sockets.get_mut::<tcp::Socket>(handle);
+
+        if socket.can_send() && sent < request.len() {
+            if let Ok(n) = socket.send_slice(&request[sent..]) {
+                sent += n;
+            }
+        }
+
+        if socket.can_recv() && received_len < MARSHAL_RESPONSE_CAPACITY {
+            // SAFETY: `response_ptr` points at a `MARSHAL_RESPONSE_CAPACITY`-
+            // byte buffer the loader mapped (same contract as the request
+            // buffer above); `received_len` only ever grows up to that same
+            // capacity across iterations, so this slice never extends past
+            // it -- no silent truncation past the buffer's own bounds, only
+            // the documented, honestly-reported truncation at capacity.
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut(
+                    response_ptr.add(received_len),
+                    MARSHAL_RESPONSE_CAPACITY - received_len,
+                )
+            };
+            if let Ok(n) = socket.recv_slice(dst) {
+                received_len += n;
+            }
+        }
+
+        let response_buffer_full = received_len >= MARSHAL_RESPONSE_CAPACITY;
+        // The listener closing its end once the request has been fully
+        // sent is also a legitimate reason to stop polling -- same
+        // discipline [`run_tcp_proof`] applies to `TCP_PONG`.
+        let remote_closed = sent >= request.len() && !socket.is_open();
+        if response_buffer_full || remote_closed {
+            break;
+        }
+    }
+
+    if received_len == 0 {
+        (1, 0)
+    } else {
+        (0, received_len as u64)
+    }
 }
 
 /// Renders a [`virtio_mmio::ProbeError`] without pulling in `core::fmt`'s

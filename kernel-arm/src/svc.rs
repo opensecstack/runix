@@ -134,6 +134,21 @@ pub const SYS_EL0_PROOF_DONE: u64 = 13;
 /// [`SYS_EL0_PROOF_DONE`] -- see `tcp_proof::finish`'s own doc comment.
 pub const SYS_NET_PROOF_DONE: u64 = 14;
 
+/// "This EL0 excursion is finished; resume my EL1 continuation" --
+/// `marshal_transport.rs`'s own result-reporting syscall, structurally the
+/// third twin of [`SYS_EL0_PROOF_DONE`]/[`SYS_NET_PROOF_DONE`] (same
+/// `el0_exec` one-shot continuation mechanism, same "claim, record,
+/// resume -- never routed through a capability check or MARSHAL"
+/// authority), kept as its own number for the same reason
+/// [`SYS_NET_PROOF_DONE`] is kept separate from [`SYS_EL0_PROOF_DONE`]: a
+/// different result shape (`x1` = status, `x2` = `response_len`, where
+/// [`SYS_NET_PROOF_DONE`] reports one flat code in `x1` alone) resumed by a
+/// different caller's continuation (`marshal_transport::finish`, which
+/// knows nothing about `tcp_proof.rs`'s or `el0_proof.rs`'s own payload
+/// shapes, and vice versa). Same "unknown syscall with no excursion in
+/// flight" `u64::MAX` fallback as the other two.
+pub const SYS_MARSHAL_PROOF_DONE: u64 = 15;
+
 /// `SYS_RIL_RECV`'s return-value convention: `0..=255` is a received byte,
 /// `256`/`257` are out-of-band sentinels distinct from any real byte value
 /// (unlike `SYS_RIL_ACCESS`/`SYS_RIL_SEND`, which only ever report
@@ -707,6 +722,11 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         // Same "may not return to EL0" shape as SYS_EL0_PROOF_DONE's arm
         // above, for `tcp_proof.rs`'s own continuation instead.
         SYS_NET_PROOF_DONE => crate::tcp_proof::finish(arg1),
+        // Same "may not return to EL0" shape as the two arms above, for
+        // `marshal_transport.rs`'s own continuation instead -- see
+        // `SYS_MARSHAL_PROOF_DONE`'s own doc comment for the two-value
+        // payload.
+        SYS_MARSHAL_PROOF_DONE => crate::marshal_transport::finish(arg1, arg2),
         _ => u64::MAX,
     }
 }

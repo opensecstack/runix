@@ -1,127 +1,61 @@
-//! Structural placeholder for a MARSHAL-shaped gate in front of
-//! `kernel-arm`'s destructive eSIM lifecycle operations (enable, delete —
-//! the two operations with real, hard-to-undo consequences for a live SIM
-//! profile), mirroring the shape (not yet the substance) of
+//! MARSHAL-shaped gate in front of `kernel-arm`'s destructive eSIM
+//! lifecycle operations (enable, delete — the two operations with real,
+//! hard-to-undo consequences for a live SIM profile), mirroring
 //! `kernel/src/grid_sandbox.rs`'s `shadow_marshal_evaluate` /
 //! `enforce_marshal_decision` pair on the x86_64 kernel.
 //!
-//! # Why this exists now, with no transport behind it
+//! # Real transport, via `marshal_transport.rs`
 //!
-//! `kernel-arm` has no network stack and no MARSHAL transport of any kind
-//! today — there is nothing real to call yet, unlike the x86_64 kernel's
-//! `grid_sandbox` module, which has a working `marshal_client` and a
-//! configurable proxy address. This module exists anyway so that:
+//! [`evaluate`] now delegates to [`crate::marshal_transport::evaluate`] --
+//! `kernel-arm`'s real MARSHAL transport (Beta mobile item 2.6), loading a
+//! real `net-driver-host-arm` process per call and sending a real Kerkese-
+//! shaped request over a real TCP connection when a proxy address is
+//! configured (`marshal_transport::set_marshal_proxy`), or short-circuiting
+//! to [`ShadowMarshalOutcome::Unreachable`] with no process spawned at all
+//! when none is -- the same fail-open default this module always returned
+//! back when there was no transport of any kind to attempt. See
+//! `marshal_transport.rs`'s own doc comment for the full mechanism.
 //!
-//! - every destructive eSIM operation can already be routed through one
-//!   gate today, with that gate proven to fail open correctly (see
-//!   [`evaluate`]/[`enforce`]'s own tests, once wired up by a caller), and
-//! - swapping in a real transport later is a drop-in replacement of
-//!   [`evaluate`]'s body only — everything that calls [`evaluate`] and
-//!   [`enforce`] today keeps working unchanged once that body starts
-//!   actually talking to a MARSHAL proxy, the same way
-//!   `shadow_marshal_evaluate` does on the x86_64 side.
+//! This module **is** wired into `svc.rs`'s dispatch: `SYS_SIM_ENABLE` and
+//! `SYS_SIM_DELETE` both call [`evaluate`] then [`enforce`] between their
+//! capability check and the real `sim::*` call. It is deliberately *not*
+//! wired into `sim.rs`'s `transition` function — governance decisions
+//! belong at the syscall boundary where the requesting context is known,
+//! not inside the data model, which `sim.rs`'s own doc comment already says
+//! is "only the data model and the transition logic."
 //!
-//! This module **is** wired into `svc.rs`'s dispatch, as of the eSIM
-//! lifecycle integration: `SYS_SIM_ENABLE` and `SYS_SIM_DELETE` both call
-//! [`evaluate`] then [`enforce`] between their capability check and the
-//! real `sim::*` call. It is deliberately *not* wired into `sim.rs`'s
-//! `transition` function — governance decisions belong at the syscall
-//! boundary where the requesting context is known, not inside the data
-//! model, which `sim.rs`'s own doc comment already says is "only the data
-//! model and the transition logic."
+//! # Real `ShadowMarshalOutcome`, not a local duplicate
 //!
-//! # Local `ShadowMarshalOutcome`, not `citadel-integration`'s
-//!
-//! `citadel-integration` defines its own `pub` `ShadowMarshalOutcome` (see
-//! `kernel/src/grid_sandbox.rs`'s `use runix_citadel_integration::{..,
-//! ShadowMarshalOutcome, ..}`), but this module defines a local copy
-//! anyway. The original reason — that depending on `citadel-integration`
-//! at all would drag `citadel-kerkese-core`, `serde`, `hex`, and `sha2`
-//! into a crate that had none of them — no longer holds: `kernel-arm` now
-//! *does* depend on `citadel-integration`, for `WormLog` (see `svc.rs`'s
-//! `ESIM_WORM_LOG`), and it builds for `aarch64-unknown-none` fine. What
-//! remains is a weaker but still real reason to keep the copy for now:
-//! `citadel-integration`'s enum is shaped around that crate's own
-//! request/response types, and switching to it is only worth doing as part
-//! of the same change that gives this module a real transport (which will
-//! want those types anyway). Until then the copy costs one four-variant
-//! enum and avoids a conversion layer in between.
-//!
-//! # What changes when `kernel-arm` gets real networking
-//!
-//! [`evaluate`] unconditionally returns [`ShadowMarshalOutcome::Unreachable`]
-//! — the documented fail-open default per
-//! `docs/MARSHAL-ENFORCEMENT-POLICY.md`'s Option B ("fail-open when there's
-//! nothing to honor"), which is simply *always* true today since there is no
-//! transport to attempt contact with. Once `kernel-arm` has real networking,
-//! mirror `kernel/src/grid_sandbox.rs`'s `shadow_marshal_evaluate`: look up a
-//! configured MARSHAL proxy address, attempt a real call if one is
-//! configured, and map a reachable response's outcome onto this module's
-//! [`ShadowMarshalOutcome`] — collapsing "not configured" and "configured
-//! but unreachable" into [`ShadowMarshalOutcome::Unreachable`] exactly as
-//! `shadow_marshal_evaluate` does. [`enforce`] itself should not need to
-//! change at all.
+//! This module used to define its own local four-variant
+//! `ShadowMarshalOutcome` copy -- see this crate's git history for why that
+//! was the right call while `kernel-arm` had no real transport to shape a
+//! request/response conversion layer around. Now that [`evaluate`] has one
+//! (`marshal_transport.rs`, which itself needs
+//! `runix_ipc::marshal::{MarshalRequest, MarshalResponse}`), importing
+//! `citadel-integration`'s own [`ShadowMarshalOutcome`] directly is the
+//! same "no parallel type for the same four-outcome shape" discipline
+//! `kernel/src/grid_sandbox.rs` already applies on the x86_64 side.
 
-/// Mirrors `citadel-integration`'s own `ShadowMarshalOutcome` (see this
-/// module's doc comment for why this is a local copy rather than a
-/// dependency on that crate).
-///
-/// `allow(dead_code)`: [`evaluate`] can only construct `Unreachable`
-/// today, so the other three variants have no constructor anywhere in the
-/// crate. They are written out now rather than added later because
-/// [`enforce`]'s policy match — the whole fail-open/fail-closed decision —
-/// is only auditable if it covers every outcome a real transport will
-/// eventually return. Narrowly scoped to this enum, and expected to be
-/// removable (not just inherited) the moment [`evaluate`] gains a real
-/// transport body.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShadowMarshalOutcome {
-    /// No MARSHAL transport configured, or a configured one that couldn't
-    /// be reached. Today this is the *only* outcome [`evaluate`] can ever
-    /// produce, since `kernel-arm` has no transport at all yet.
-    Unreachable,
-    /// A reachable MARSHAL deployment approved the operation.
-    Execute,
-    /// A reachable MARSHAL deployment refused the operation.
-    Refuse,
-    /// A reachable MARSHAL deployment issued a hard stop.
-    HardStop,
-}
+pub use runix_citadel_integration::ShadowMarshalOutcome;
 
 /// Evaluates whether a destructive eSIM lifecycle operation (`"enable"` or
 /// `"delete"` — see this module's doc comment) should be allowed to
 /// proceed, for the given `slot`/`profile`, as requested by `principal`.
 ///
-/// `operation`, `slot`, and `profile` are accepted now (rather than added
-/// later) so a real transport's body can use them to shape a real request
-/// without changing this function's signature or any caller. `principal`
-/// is accepted for the same reason: a real MARSHAL request has an `actor`
-/// field, and that field needs to name *who* is asking, not just *what* is
-/// being asked. See `svc.rs`'s call sites for what value is actually passed
-/// today and why — `kernel-arm` has only one EL0 context today
-/// (`capabilities.rs`'s own doc comment calls this out: "one flat set of
-/// capabilities for the one EL0 context," not yet a per-thread/per-process
-/// model), so there is at most one meaningful "current principal," not a
-/// dynamic per-call identity to look up here.
-///
-/// **Always returns [`ShadowMarshalOutcome::Unreachable`] today.** There is
-/// no MARSHAL transport of any kind in `kernel-arm` yet — no network stack,
-/// no configured proxy, nothing to attempt contact with — so this is
-/// unconditionally the fail-open case per
-/// `docs/MARSHAL-ENFORCEMENT-POLICY.md`'s Option B, not a placeholder that
-/// happens to always take one branch of a real check. See this module's own
-/// doc comment for exactly what to change here (mirroring
-/// `kernel/src/grid_sandbox.rs`'s `shadow_marshal_evaluate`) once
-/// `kernel-arm` has real networking — at that point `principal` becomes the
-/// real request's `actor` field.
+/// Delegates to [`crate::marshal_transport::evaluate`] — see that
+/// function's own doc comment for exactly what it does with these
+/// arguments (building a Kerkese-shaped request, which only happens at all
+/// once a MARSHAL proxy is configured) and for why
+/// [`ShadowMarshalOutcome::Unreachable`] is still the correct answer with
+/// none configured, exactly as it always was when this module had no
+/// transport of any kind.
 pub fn evaluate(
-    _operation: &str,
-    _slot: usize,
-    _profile: u8,
-    _principal: &str,
+    operation: &str,
+    slot: usize,
+    profile: u8,
+    principal: &str,
 ) -> ShadowMarshalOutcome {
-    ShadowMarshalOutcome::Unreachable
+    crate::marshal_transport::evaluate(operation, slot, profile, principal)
 }
 
 /// What [`enforce`] hands back when a reachable MARSHAL deployment refused
@@ -148,11 +82,6 @@ pub enum MarshalEnforcementError {
 /// stays in one small, trivially auditable match, exactly as
 /// `kernel/src/grid_sandbox.rs`'s `enforce_marshal_decision` is kept
 /// separate from `shadow_marshal_evaluate`.
-///
-/// Since [`evaluate`] can only ever return [`ShadowMarshalOutcome::Unreachable`]
-/// today, this always returns `Ok(())` for now — but the full match is
-/// written out now so nothing here needs to change once [`evaluate`] starts
-/// returning real outcomes.
 pub fn enforce(outcome: ShadowMarshalOutcome) -> Result<(), MarshalEnforcementError> {
     match outcome {
         ShadowMarshalOutcome::Unreachable => Ok(()),

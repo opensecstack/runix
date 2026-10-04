@@ -245,6 +245,23 @@ extern "C" fn el1_exception_handler(
         unsafe { crate::tcp_proof::abort_from_fault(vector, esr_el1, far_el1, elr_el1) };
     }
 
+    // `marshal_transport.rs`'s own continuation, checked next for the same
+    // reason `tcp_proof`'s is checked before `el0_proof`'s below: three
+    // modules now share `el0_exec`'s single continuation slot, and each
+    // one's own `*_ACTIVE`-gated `continuation_live()` is the only way to
+    // tell *whose* excursion is actually live (see
+    // `marshal_transport::MARSHAL_ACTIVE`'s doc comment). A fault during
+    // this module's excursion must never be misrouted into `tcp_proof`'s or
+    // `el0_proof`'s own `OBSERVED`, which would otherwise record a fault
+    // that wasn't theirs and leave this module's own bounded wait to time
+    // out with no diagnostic.
+    if vector == 8 && crate::marshal_transport::continuation_live() {
+        // SAFETY: `continuation_live()` is true, which is this function's
+        // stated precondition; see `abort_from_fault`'s own doc comment for
+        // the stack reasoning.
+        unsafe { crate::marshal_transport::abort_from_fault(vector, esr_el1, far_el1, elr_el1) };
+    }
+
     if vector == 8 && crate::el0_proof::continuation_live() {
         // SAFETY: `continuation_live()` is true, which is this function's
         // stated precondition; see `abort_from_fault`'s own doc comment for

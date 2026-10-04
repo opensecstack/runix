@@ -246,6 +246,61 @@ pub(crate) fn read_elr_el1() -> u64 {
     value
 }
 
+/// `msr SPSR_EL1`/`msr ELR_EL1`/`msr SP_EL0` and their matching `mrs SP_EL0`
+/// reader -- the save/restore half [`read_spsr_el1`]/[`read_elr_el1`] didn't
+/// need until a caller could nest *another* `enter_el0`/`resume_el1` round
+/// trip inside an SVC that was itself reached from EL0.
+///
+/// # Why a caller needs these at all
+///
+/// `SPSR_EL1`/`ELR_EL1`/`SP_EL0` are real hardware registers, not part of
+/// any software-saved context -- every one of this module's `eret`s and
+/// every `SVC` exception entry overwrites them as a side effect, and
+/// `el1_vectors.rs`'s own epilogue `eret`s a *resumed* SVC caller using
+/// whatever currently sits in them, not whatever they held when that SVC
+/// was first entered. That is exactly right for the mechanism's original
+/// callers (`el0_proof.rs`/`tcp_proof.rs`), which only ever call
+/// [`enter_el0`] directly from EL1 boot-sequence code, with no SVC of
+/// another EL0 caller still "in flight" around them. A caller that instead
+/// runs this mechanism *nested* inside an SVC reached from a different,
+/// already-active EL0 context (`marshal_transport.rs`, nested inside
+/// `el0_demo`'s own `SYS_SIM_ENABLE`/`SYS_SIM_DELETE`) must save these three
+/// registers before driving its own excursion and restore them afterward --
+/// otherwise the outer SVC's eventual `eret` resumes at the *inner*
+/// excursion's leftover `ELR_EL1`/`SPSR_EL1`/`SP_EL0` instead of the outer
+/// caller's own interrupted state.
+pub(crate) fn write_spsr_el1(value: u64) {
+    // SAFETY: a write of an EL1-accessible system register with no memory
+    // side effects of its own; the actual `eret` that reads it back happens
+    // later, at a call site responsible for that being correct.
+    unsafe {
+        core::arch::asm!("msr SPSR_EL1, {}", in(reg) value, options(nomem, nostack));
+    }
+}
+
+pub(crate) fn write_elr_el1(value: u64) {
+    // SAFETY: as above.
+    unsafe {
+        core::arch::asm!("msr ELR_EL1, {}", in(reg) value, options(nomem, nostack));
+    }
+}
+
+pub(crate) fn read_sp_el0() -> u64 {
+    let value: u64;
+    // SAFETY: a read of an EL1-accessible system register, no side effects.
+    unsafe {
+        core::arch::asm!("mrs {}, SP_EL0", out(reg) value, options(nomem, nostack));
+    }
+    value
+}
+
+pub(crate) fn write_sp_el0(value: u64) {
+    // SAFETY: as above.
+    unsafe {
+        core::arch::asm!("msr SP_EL0, {}", in(reg) value, options(nomem, nostack));
+    }
+}
+
 /// `AT S1E0R`: does the MMU allow an *unprivileged* read of `va` under the
 /// currently loaded tables? The one check that would catch a `TTBR0_EL1` the
 /// scheduler never switched, for whichever VA a caller's payload touches.

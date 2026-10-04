@@ -33,6 +33,13 @@ runix-capability-manager = { path = "../capability-manager" }
 # kind of freestanding caller), and verified to build for
 # `aarch64-unknown-none` and not just `x86_64-unknown-none`.
 runix-citadel-integration = { path = "../citadel-integration" }
+# Same path/`default-features = false` shape as `kernel/Cargo.toml`'s own
+# line (skips the `std` feature, which this `no_std`/`aarch64-unknown-none`
+# crate can't use) -- pulled in for `marshal_transport.rs`'s
+# `runix_ipc::marshal::{MarshalRequest, MarshalResponse}` wire types, the
+# same request/response shape the x86_64 kernel's own MARSHAL transport
+# (`kernel/src/marshal_client.rs`) already builds on.
+runix-ipc = { path = "../ipc", default-features = false }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
 # The same heap-allocator crate grid-sandbox-host uses for its own ring 3
 # (x86_64) private heap -- capability-manager needs `alloc` (String/Vec),

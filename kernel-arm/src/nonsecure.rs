@@ -339,6 +339,29 @@ fn el1_setup() -> ! {
     // nothing else new.
     crate::tcp_proof::prove_net_tcp();
 
+    // Beta mobile item 2.6 "Stage 4: wire esim_marshal::evaluate to a real
+    // transport": configure `marshal_transport.rs`'s MARSHAL proxy address
+    // before the eSIM demo walk below exercises SYS_SIM_ENABLE/SYS_SIM_DELETE,
+    // so `esim_marshal::evaluate` actually attempts a real connection instead
+    // of short-circuiting to `Unreachable` with nothing configured. Left in
+    // place deliberately (not reverted to unconfigured) once this proved out
+    // in QEMU -- the next step (CI wiring, done separately) needs this call
+    // site to exist so CI can make it configurable per-boot-config.
+    //
+    // `10.0.2.100:9100` -- same guest-visible SLIRP subnet `tcp_proof.rs`'s
+    // own `TCP_REMOTE_IP` uses, but a **different port** (9100, not 9000):
+    // `tcp_proof::prove_net_tcp` already connects to `10.0.2.100:9000`
+    // earlier in this same boot sequence, and a `guestfwd` route only ever
+    // points one guest `ip:port` at one host listener for its one-shot
+    // Python test scripts to answer -- sharing port 9000 here would mean
+    // this evaluation's connection either races `tcp_proof`'s own PING/PONG
+    // exchange against the same listener or reaches that listener after it
+    // has already exited following its one accepted connection. A distinct
+    // port keeps the two proofs' traffic on separate `guestfwd` routes within
+    // one boot. A real deployment would set this to an actual MARSHAL
+    // proxy's address instead.
+    crate::marshal_transport::set_marshal_proxy([10, 0, 2, 100], 9100);
+
     // Issue demo capabilities authorizing RIL channel 0 and SIM slot 0
     // (plus, below, slot 0's profile 0 and its separate delete scope) --
     // stands in for a real issuer (CITADEL MARSHAL) the same way every
