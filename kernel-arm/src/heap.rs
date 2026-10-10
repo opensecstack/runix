@@ -47,3 +47,22 @@ pub unsafe fn init() {
         ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
     }
 }
+
+/// Heap range `[start, end)` as addresses -- what `reclaim::plan_frees`
+/// validates every frame against before anything is freed, so an MMIO or
+/// stray address can never reach the allocator's `dealloc`.
+pub fn range() -> (u64, u64) {
+    (HEAP_START as u64, (HEAP_START + HEAP_SIZE) as u64)
+}
+
+/// Bytes currently free in the heap (all free holes, including fragmented
+/// ones). The reclamation proof's watermark: it must not drain across
+/// repeated evaluations.
+pub fn free_bytes() -> usize {
+    ALLOCATOR.lock().free()
+}
+
+/// Bytes currently allocated from the heap.
+pub fn used_bytes() -> usize {
+    ALLOCATOR.lock().used()
+}

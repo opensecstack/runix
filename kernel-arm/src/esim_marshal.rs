@@ -20,10 +20,24 @@
 //! real `net-driver-host-arm` process per call and sending a real Kerkese-
 //! shaped request over a real TCP connection when a proxy address is
 //! configured (`marshal_transport::set_marshal_proxy`), or short-circuiting
-//! to [`ShadowMarshalOutcome::Unreachable`] with no process spawned at all
-//! when none is -- the same fail-open default this module always returned
-//! back when there was no transport of any kind to attempt. See
-//! `marshal_transport.rs`'s own doc comment for the full mechanism.
+//! to `Remote(Unreachable)` with no process spawned at all when none is --
+//! the same fail-open default this module always returned back when there
+//! was no transport of any kind to attempt. See `marshal_transport.rs`'s own
+//! doc comment for the full mechanism.
+//!
+//! # Fail-open vs. fail-closed (precise split)
+//!
+//! - **Remote could not be reached / did not answer** (no proxy configured,
+//!   no virtio-net device, connect failure or timeout, the process not
+//!   reporting back within its bounded budget, an undecodable reply):
+//!   `Remote(Unreachable)` -> **fail-open** (Option B,
+//!   `docs/MARSHAL-ENFORCEMENT-POLICY.md`).
+//! - **The kernel failed to run the evaluation** (process setup failing,
+//!   including out of memory; thread spawn failing; the EL0 excursion
+//!   faulting): `LocalFailure(..)` -> **fail-closed**. A buggy or hostile
+//!   EL0 caller can drive these by looping on governed syscalls, so they
+//!   must not be an ungoverned bypass.
+//! - A reachable MARSHAL's `Refuse`/`HardStop` always blocks.
 //!
 //! This module **is** wired into `svc.rs`'s dispatch: `SYS_SIM_ENABLE` and
 //! `SYS_SIM_DELETE` both call [`evaluate`] then [`enforce`] between their
@@ -45,26 +59,17 @@
 //! same "no parallel type for the same four-outcome shape" discipline
 //! `kernel/src/grid_sandbox.rs` already applies on the x86_64 side.
 
-pub use runix_citadel_integration::ShadowMarshalOutcome;
-use runix_kernel_arm::marshal_action::MarshalAction;
+use runix_kernel_arm::marshal_action::{Blocked, GateOutcome, MarshalAction};
 
 /// Evaluates whether a destructive eSIM lifecycle operation (`"enable"` or
 /// `"delete"` — see this module's doc comment) should be allowed to
 /// proceed, for the given `slot`/`profile`, as requested by `principal`.
 ///
 /// Delegates to [`crate::marshal_transport::evaluate`] — see that
-/// function's own doc comment for exactly what it does with these
-/// arguments (building a Kerkese-shaped request, which only happens at all
-/// once a MARSHAL proxy is configured) and for why
-/// [`ShadowMarshalOutcome::Unreachable`] is still the correct answer with
-/// none configured, exactly as it always was when this module had no
-/// transport of any kind.
-pub fn evaluate(
-    operation: &str,
-    slot: usize,
-    profile: u8,
-    principal: &str,
-) -> ShadowMarshalOutcome {
+/// function's own doc comment for the exact classification of what
+/// becomes `Remote(Unreachable)` (fail-open) versus `LocalFailure(..)`
+/// (fail-closed).
+pub fn evaluate(operation: &str, slot: usize, profile: u8, principal: &str) -> GateOutcome {
     crate::marshal_transport::evaluate(
         &MarshalAction::Esim {
             op: operation,
@@ -75,36 +80,20 @@ pub fn evaluate(
     )
 }
 
-/// What [`enforce`] hands back when a reachable MARSHAL deployment refused
-/// (or hard-stopped) the operation. Kept as its own enum, distinct from any
-/// boot-time module-authorization error type this crate may grow, for the
-/// same reason `kernel/src/grid_sandbox.rs`'s `MarshalEnforcementError` is
-/// kept separate from `CitadelError` there: boot-time authorization ("is
-/// this allowed to exist at all") and runtime governance ("CITADEL says
-/// don't run this right now") are different failure categories that callers
-/// legitimately want to handle differently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MarshalEnforcementError {
-    /// A reachable MARSHAL deployment returned `Refuse` or `HardStop` for
-    /// this operation. Carries the exact outcome so a caller/log message
-    /// can tell the two apart without re-deriving it.
-    Blocked(ShadowMarshalOutcome),
-}
+/// What [`enforce`] hands back when an operation is blocked: either a
+/// reachable MARSHAL refused/hard-stopped it (`Remote`), or the kernel failed
+/// to run the evaluation at all (`Local`, fail closed). Kept as its own type,
+/// distinct from any boot-time module-authorization error type this crate may
+/// grow, for the same reason `kernel/src/grid_sandbox.rs`'s
+/// `MarshalEnforcementError` is kept separate from `CitadelError` there.
+pub type MarshalEnforcementError = Blocked;
 
 /// The enforcement gate itself — Option B from
-/// `docs/MARSHAL-ENFORCEMENT-POLICY.md`: fail-open when there is nothing to
-/// honor ([`ShadowMarshalOutcome::Unreachable`]), fail-closed only when a
-/// reachable MARSHAL actually said no. Deliberately separated from
-/// [`evaluate`] so this policy — the entire fail-open/fail-closed decision —
-/// stays in one small, trivially auditable match, exactly as
-/// `kernel/src/grid_sandbox.rs`'s `enforce_marshal_decision` is kept
-/// separate from `shadow_marshal_evaluate`.
-pub fn enforce(outcome: ShadowMarshalOutcome) -> Result<(), MarshalEnforcementError> {
-    match outcome {
-        ShadowMarshalOutcome::Unreachable => Ok(()),
-        ShadowMarshalOutcome::Execute => Ok(()),
-        ShadowMarshalOutcome::Refuse | ShadowMarshalOutcome::HardStop => {
-            Err(MarshalEnforcementError::Blocked(outcome))
-        }
-    }
+/// `docs/MARSHAL-ENFORCEMENT-POLICY.md` for the remote verdict (fail-open when
+/// the remote is unreachable, fail-closed when it said no), plus fail-closed
+/// for every local evaluation failure. The decision is the pure
+/// [`runix_kernel_arm::marshal_action::enforce`] (host-tested); this is its
+/// stable name for callers.
+pub fn enforce(outcome: GateOutcome) -> Result<(), MarshalEnforcementError> {
+    runix_kernel_arm::marshal_action::enforce(outcome)
 }

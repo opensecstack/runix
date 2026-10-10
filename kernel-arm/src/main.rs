@@ -192,6 +192,8 @@ mod mvno_proof;
 mod net_process;
 mod nonsecure;
 mod process;
+// Boot-time proof that repeated MARSHAL evaluations do not drain the heap.
+mod reclaim_proof;
 mod ril_channel;
 // Cooperative round-robin scheduling for EL1 kernel threads (slice 5 of
 // item 2.4), plus its boot-time interleaving proof.

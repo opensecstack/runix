@@ -40,7 +40,7 @@
 
 use crate::capabilities;
 use crate::process::AddressSpace;
-use alloc::alloc::{alloc_zeroed, Layout};
+use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use runix_kernel_arm::elf::{Elf64, ElfError};
 use runix_kernel_arm::loader::{self, LoadedImage, LoaderError};
 use runix_kernel_arm::vm::GRANULE_4KIB;
@@ -219,6 +219,14 @@ fn map_contiguous_region(
         return Err("out of memory for a contiguous virtqueue region");
     }
     let pa_base = ptr as u64;
+    // The space owns this block from here on: `AddressSpace::destroy` frees
+    // it. `map_mmio_page` below never owns what it maps, so without this
+    // adoption the block would leak for good.
+    if space.adopt_block(pa_base, pages).is_err() {
+        // SAFETY: just allocated above with this exact layout.
+        unsafe { dealloc(ptr, layout) };
+        return Err("out of memory recording a contiguous virtqueue region");
+    }
     for i in 0..pages {
         let va = va_base + i * GRANULE_4KIB;
         let pa = pa_base + i * GRANULE_4KIB;
@@ -391,6 +399,9 @@ fn build_net_boot_info(
 /// `Option<u64>` is the response region's own physical base in that case
 /// (`None` when `request_bytes` is `None`), for the caller to read back
 /// from directly once the EL0 excursion reports a response length.
+///
+/// On any failure after the address space exists, the partially built space is
+/// destroyed here (frames freed, device quiesced) rather than leaked.
 pub fn setup(
     elf: &[u8],
     dev: &crate::virtio_mmio::NetDevice,
@@ -400,10 +411,20 @@ pub fn setup(
     let elf = Elf64::parse(elf).map_err(elf_error_message)?;
 
     let mut space = AddressSpace::new().map_err(|e| e.message())?;
+    // The virtio device will hold DMA pointers into this space's virtqueue
+    // and buffer frames (the driver leaves it at DRIVER_OK on exit); reset it
+    // before those frames can be freed and reused. See `reset_virtio_device`.
+    space.set_pre_free_hook(reset_virtio_device, dev.base());
 
-    let response_phys = build_net_boot_info(&mut space, dev, info, request_bytes)?;
-
-    let loaded = loader::load(&elf, &mut space).map_err(loader_error_message)?;
+    let (response_phys, loaded) = match build_and_load(&mut space, &elf, dev, info, request_bytes) {
+        Ok(built) => built,
+        Err(reason) => {
+            // Never live (not yet installed anywhere), so destroy cannot refuse
+            // for that reason; a ledger refusal would only leak.
+            let _ = space.destroy();
+            return Err(reason);
+        }
+    };
 
     // Same instruction-cache reasoning as `el0_proof::prove_el0_process`:
     // the loaded bytes reached their frames as data writes, and are about
@@ -415,4 +436,44 @@ pub fn setup(
     }
 
     Ok((space, loaded, response_phys))
+}
+
+fn build_and_load(
+    space: &mut AddressSpace,
+    elf: &Elf64<'_>,
+    dev: &crate::virtio_mmio::NetDevice,
+    info: NetBootInfo,
+    request_bytes: Option<&[u8]>,
+) -> Result<(Option<u64>, LoadedImage), &'static str> {
+    let response_phys = build_net_boot_info(space, dev, info, request_bytes)?;
+    let loaded = loader::load(elf, space).map_err(loader_error_message)?;
+    Ok((response_phys, loaded))
+}
+
+/// virtio-mmio `Status` register offset (spec 4.2.2); writing 0 resets the
+/// device, which stops all virtqueue processing and DMA.
+const VIRTIO_REG_STATUS: usize = 0x070;
+
+/// [`AddressSpace::set_pre_free_hook`] target: resets the virtio device at
+/// `base` (its slot's register window, reached through the kernel's own
+/// Device mapping) before the space's frames are freed.
+///
+/// Why this is mandatory, not tidiness: `net-driver-host-arm` exits leaving
+/// the device at `DRIVER_OK` with RX buffers posted, i.e. the device still
+/// holds DMA pointers into frames that `destroy` returns to the heap. A
+/// packet arriving later would be written into whatever the allocator has
+/// since put there. Reset makes the device drop every queue before the free.
+fn reset_virtio_device(base: usize) {
+    let status = (base + VIRTIO_REG_STATUS) as *mut u32;
+    // SAFETY: `base` is `NetDevice::base()` for a slot `virtio_mmio::probe`
+    // found; the window is inside the kernel's Device mapping.
+    unsafe { status.write_volatile(0) };
+    // The spec requires the driver to read back 0 to confirm the reset;
+    // bounded so a wedged device cannot hang a reap.
+    for _ in 0..1000 {
+        // SAFETY: as above.
+        if unsafe { status.read_volatile() } == 0 {
+            return;
+        }
+    }
 }

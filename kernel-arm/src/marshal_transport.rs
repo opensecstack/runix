@@ -26,7 +26,9 @@
 //! well-formed envelope), and the same outcome mapping
 //! (`MarshalResponse::Decision{outcome,..}` passes through;
 //! `MarshalResponse::Error(_)`, an undecodable reply, or no reply at all
-//! are all `ShadowMarshalOutcome::Unreachable`). The transport underneath
+//! are all `Remote(Unreachable)`), with one deliberate divergence: local
+//! failures of the kernel's own evaluation machinery are a separate
+//! `GateOutcome::LocalFailure` that fails closed -- see [`evaluate`]. The transport underneath
 //! differs -- that function reaches a user-space MARSHAL proxy via
 //! `marshal_client::evaluate` over `kernel/`'s own general IPC surface;
 //! this module has no user-space IPC story at all yet, so it reaches the
@@ -46,7 +48,9 @@ use crate::serial_println;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use runix_citadel_integration::ShadowMarshalOutcome;
 use runix_ipc::marshal::{MarshalOutcome, MarshalRequest, MarshalResponse};
-use runix_kernel_arm::marshal_action::{marshal_local_port, MarshalAction};
+use runix_kernel_arm::marshal_action::{
+    marshal_local_port, GateOutcome, LocalFailure, MarshalAction,
+};
 use spin::Mutex;
 
 /// The compiled `net-driver-host-arm` binary -- the same ELF `tcp_proof.rs`
@@ -70,6 +74,14 @@ static NET_DRIVER_HOST_ARM_ELF: &[u8] = include_bytes!(
 /// make on its own (see `docs/MARSHAL-ENFORCEMENT-POLICY.md`).
 static MARSHAL_PROXY: Mutex<Option<([u8; 4], u16)>> = Mutex::new(None);
 
+/// DEBUG PROOF HOOK, `None` in every shipped build. Flipping this to
+/// `Some((op, failure))` makes [`evaluate_configured`] report that
+/// [`LocalFailure`] for eSIM operation `op` (e.g. `"delete"`) once a proxy is
+/// configured, exercising the fail-closed path on real hardware/QEMU without
+/// having to exhaust the heap. It is a compile-time `const`, deliberately not
+/// a runtime switch or feature: nothing at runtime can turn it on.
+const DEBUG_FORCE_LOCAL_FAILURE: Option<(&str, LocalFailure)> = None;
+
 /// Configures the remote MARSHAL proxy address [`evaluate`] connects to.
 /// For a boot-sequence demo or a future test harness -- not called from
 /// anywhere in this crate's own normal (unconfigured) boot path by default.
@@ -77,7 +89,7 @@ pub fn set_marshal_proxy(ip: [u8; 4], port: u16) {
     *MARSHAL_PROXY.lock() = Some((ip, port));
 }
 
-/// Reverts to the unconfigured (fail-open) state -- see [`MARSHAL_PROXY`]'s
+/// Reverts to the unconfigured (`Remote(Unreachable)`, fail-open) state -- see [`MARSHAL_PROXY`]'s
 /// own doc comment. `allow(dead_code)`: no caller in this crate's own boot
 /// sequence needs this today (`nonsecure.rs` only ever calls
 /// [`set_marshal_proxy`], never this), but a future test harness that wants
@@ -208,22 +220,13 @@ extern "C" fn marshal_transport_thread() -> ! {
     unsafe { el0_exec::enter_el0(entry, stack_top, el0_exec::continuation_slot()) };
 
     FINISHED.store(true, Ordering::Relaxed);
-    // Never dropped, same reasoning as `tcp_proof::net_tcp_proof_thread`'s
-    // trailing loop: this thread's `AddressSpace` -- and in particular the
-    // response region [`RESPONSE_PHYS`] points at -- must stay mapped and
-    // allocated until [`evaluate`] has finished reading it back, which
-    // happens on a different thread (the one that called [`evaluate`])
-    // after this one reports `FINISHED`. Looping forever instead of
-    // returning (there is nowhere to return *to* -- this is a scheduled
-    // thread, not a call) keeps that memory alive indefinitely; this
-    // thread, and the address space/process it owns, are simply never
-    // reclaimed. Acceptable for this slice's proof-of-transport scope, the
-    // same scope `tcp_proof.rs` and `el0_proof.rs` already accept for their
-    // own one-shot threads -- a real process-lifecycle/reap mechanism is a
-    // later slice's job, not this one's.
-    loop {
-        crate::scheduler::yield_now();
-    }
+    // Exit rather than park: the scheduler moves this thread to its zombie
+    // list on its next switch-away (so it is never scheduled again), and
+    // [`evaluate`] -- on the caller's thread, after reading the response
+    // region [`RESPONSE_PHYS`] points at -- reaps it, freeing this thread's
+    // stack and its whole `AddressSpace`. Nothing frees them from here: this
+    // thread is still running on that stack and under that address space.
+    crate::scheduler::exit_current()
 }
 
 // ---------------------------------------------------------------------------
@@ -240,9 +243,28 @@ extern "C" fn marshal_transport_thread() -> ! {
 /// path can run a nested EL0 excursion, which re-enters the kernel through
 /// `SVC` and reschedules.
 ///
-/// `None` configured (the default): returns
-/// [`ShadowMarshalOutcome::Unreachable`] with no process spawned at all --
-/// see [`MARSHAL_PROXY`]'s own doc comment.
+/// # Classification: fail-open vs. fail-closed
+///
+/// Returns a [`GateOutcome`]. The split is the whole point:
+///
+/// **`Remote(Unreachable)` (fail-open, by design for a network that is down)**
+/// - no proxy configured (no process spawned at all -- see [`MARSHAL_PROXY`]);
+/// - no virtio-net device found;
+/// - the remote connect failed or timed out (`status != 0` / empty reply);
+/// - the EL0 process did not report back within the bounded 64-yield budget
+///   (ambiguous with a slow network, so not blamed on the kernel);
+/// - the reply did not decode, or decoded as `MarshalResponse::Error`.
+///
+/// **`LocalFailure(..)` (fail-closed: the kernel failed to run the evaluation)**
+/// - `net_process::setup` failing, including out of memory for a page or
+///   translation table, or returning no response region
+///   ([`LocalFailure::SetupFailed`]);
+/// - the evaluation thread spawn failing ([`LocalFailure::SpawnFailed`]);
+/// - the EL0 excursion faulting ([`LocalFailure::ExcursionFaulted`]).
+///
+/// The local class can be driven by a buggy or hostile EL0 caller looping on
+/// governed syscalls, so treating it as `Unreachable` would let it bypass
+/// MARSHAL.
 ///
 /// Configured: builds a minimal, genuinely well-formed Kerkese-shaped
 /// request (`dry_run: true`), encodes it as a [`MarshalRequest`], loads a
@@ -250,17 +272,10 @@ extern "C" fn marshal_transport_thread() -> ! {
 /// ([`net_process::setup`]) pointed at the configured remote address,
 /// spawns and runs it to completion (bounded, same 64-yield budget
 /// `tcp_proof.rs`'s own boot-thread wait uses), and decodes whatever
-/// [`MarshalResponse`] bytes came back. Any failure along the way --
-/// no virtio-net device, `net_process::setup` failing, the spawn itself
-/// failing, the excursion faulting, never reporting back, reporting a
-/// connect failure, or reporting bytes that don't decode as a
-/// `MarshalResponse::Decision` -- collapses to
-/// [`ShadowMarshalOutcome::Unreachable`], the same "no usable Decision"
-/// bucket `grid_sandbox::shadow_marshal_evaluate` uses for every one of its
-/// own non-`Decision` outcomes.
-pub fn evaluate(action: &MarshalAction<'_>, principal: &str) -> ShadowMarshalOutcome {
+/// [`MarshalResponse`] bytes came back.
+pub fn evaluate(action: &MarshalAction<'_>, principal: &str) -> GateOutcome {
     let Some((remote_ip, remote_port)) = *MARSHAL_PROXY.lock() else {
-        return ShadowMarshalOutcome::Unreachable;
+        return GateOutcome::Remote(ShadowMarshalOutcome::Unreachable);
     };
 
     // `svc.rs`'s `SYS_SIM_ENABLE`/`SYS_SIM_DELETE` reach this function from
@@ -283,25 +298,50 @@ pub fn evaluate(action: &MarshalAction<'_>, principal: &str) -> ShadowMarshalOut
 
     let outcome = evaluate_configured(action, principal, remote_ip, remote_port);
 
+    // The response (if any) has been decoded into `outcome`; free the exited
+    // evaluation thread's stack and address space.
+    crate::scheduler::reap_exited();
+
     el0_exec::write_elr_el1(saved_elr);
     el0_exec::write_spsr_el1(saved_spsr);
     el0_exec::write_sp_el0(saved_sp_el0);
 
-    serial_println!(
-        "Runix ARM kernel: MARSHAL evaluation for {}: {:?}",
-        action.label(),
-        outcome
-    );
+    // Remote outcomes print exactly as before (`Execute`/`Refuse`/...,
+    // grepped by CI); a local failure prints `LocalFailure(<reason>)`.
+    match outcome {
+        GateOutcome::Remote(o) => serial_println!(
+            "Runix ARM kernel: MARSHAL evaluation for {}: {:?}",
+            action.label(),
+            o
+        ),
+        GateOutcome::LocalFailure(l) => serial_println!(
+            "Runix ARM kernel: MARSHAL evaluation for {}: LocalFailure({})",
+            action.label(),
+            l.as_str()
+        ),
+    }
 
     outcome
 }
 
-fn evaluate_configured(
+pub(crate) fn evaluate_configured(
     action: &MarshalAction<'_>,
     principal: &str,
     remote_ip: [u8; 4],
     remote_port: u16,
-) -> ShadowMarshalOutcome {
+) -> GateOutcome {
+    use GateOutcome::{LocalFailure as Local, Remote};
+    if let (Some((op, failure)), MarshalAction::Esim { op: this_op, .. }) =
+        (DEBUG_FORCE_LOCAL_FAILURE, action)
+    {
+        if op == *this_op {
+            serial_println!(
+                "Runix ARM kernel: MARSHAL evaluation for {}: DEBUG forced local failure",
+                action.label()
+            );
+            return Local(failure);
+        }
+    }
     let scan = crate::virtio_mmio::probe();
     let Some(dev) = scan.net else {
         serial_println!(
@@ -309,7 +349,8 @@ fn evaluate_configured(
              device found",
             action.label()
         );
-        return ShadowMarshalOutcome::Unreachable;
+        // Remote class: nothing to reach the remote with, same as down.
+        return Remote(ShadowMarshalOutcome::Unreachable);
     };
 
     // Same "dry_run: true, minimal but genuinely well-formed envelope"
@@ -351,7 +392,9 @@ fn evaluate_configured(
                     action.label(),
                     reason
                 );
-                return ShadowMarshalOutcome::Unreachable;
+                // Local class (fail closed): out of memory etc. is the
+                // kernel's failure to evaluate, not a down network.
+                return Local(LocalFailure::SetupFailed);
             }
         };
     // `setup` always returns `Some` when given `Some(request_bytes)` (see
@@ -363,7 +406,8 @@ fn evaluate_configured(
              return a response region",
             action.label()
         );
-        return ShadowMarshalOutcome::Unreachable;
+        // Local class: an internal inconsistency in our own machinery.
+        return Local(LocalFailure::SetupFailed);
     };
 
     IMAGE_ENTRY.store(loaded.entry, Ordering::Relaxed);
@@ -383,7 +427,8 @@ fn evaluate_configured(
             action.label(),
             err
         );
-        return ShadowMarshalOutcome::Unreachable;
+        // Local class (fail closed).
+        return Local(LocalFailure::SpawnFailed);
     }
 
     // Bounded for the same reason `tcp_proof.rs`'s own boot-thread wait is:
@@ -403,7 +448,8 @@ fn evaluate_configured(
             action.label(),
             yields
         );
-        return ShadowMarshalOutcome::Unreachable;
+        // Remote class: ambiguous with a slow network, so stays fail-open.
+        return Remote(ShadowMarshalOutcome::Unreachable);
     }
 
     let (status, response_len, faulted) = {
@@ -421,28 +467,31 @@ fn evaluate_configured(
              faulted instead of finishing",
             action.label()
         );
-        return ShadowMarshalOutcome::Unreachable;
+        // Local class (fail closed): our EL0 process crashed.
+        return Local(LocalFailure::ExcursionFaulted);
     }
 
+    // Remote class: connect failure / timeout / empty reply.
     if status != 0 || response_len == 0 {
-        return ShadowMarshalOutcome::Unreachable;
+        return Remote(ShadowMarshalOutcome::Unreachable);
     }
 
     let len = (response_len as usize).min(net_process::MARSHAL_BUFFER_CAPACITY);
     // SAFETY: `response_phys` is a kernel-identity-mapped physical address
     // `net_process::setup` mapped for this excursion's own address space;
-    // that space is never dropped (`marshal_transport_thread` loops forever
-    // after reporting `FINISHED` -- see that function's own doc comment),
-    // so the frame is still live. `len` is clamped to
+    // that space is only destroyed by `reap_exited`, which `evaluate` calls
+    // after this function (and so this read) returns, so the frame is
+    // still live. `len` is clamped to
     // `MARSHAL_BUFFER_CAPACITY`, the exact size `setup` mapped.
     let bytes = unsafe { core::slice::from_raw_parts(response_phys as *const u8, len) };
 
     match MarshalResponse::decode(bytes) {
-        Some((MarshalResponse::Decision { outcome, .. }, _)) => match outcome {
+        Some((MarshalResponse::Decision { outcome, .. }, _)) => Remote(match outcome {
             MarshalOutcome::Execute => ShadowMarshalOutcome::Execute,
             MarshalOutcome::Refuse => ShadowMarshalOutcome::Refuse,
             MarshalOutcome::HardStop => ShadowMarshalOutcome::HardStop,
-        },
-        Some((MarshalResponse::Error(_), _)) | None => ShadowMarshalOutcome::Unreachable,
+        }),
+        // Remote class: an undecodable or error reply is "no usable Decision".
+        Some((MarshalResponse::Error(_), _)) | None => Remote(ShadowMarshalOutcome::Unreachable),
     }
 }

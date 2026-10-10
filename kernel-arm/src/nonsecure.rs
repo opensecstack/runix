@@ -339,6 +339,12 @@ fn el1_setup() -> ! {
     // nothing else new.
     crate::tcp_proof::prove_net_tcp();
 
+    // Reclamation proof: 24 real evaluations through the production
+    // spawn/teardown path (remote port 0, so no network and no connect wait),
+    // asserting the heap does not drain. Before the proxy below is
+    // configured, and independent of it.
+    crate::reclaim_proof::prove_reclamation();
+
     // Beta mobile item 2.6 "Stage 4: wire esim_marshal::evaluate to a real
     // transport": configure `marshal_transport.rs`'s MARSHAL proxy address
     // before the eSIM demo walk below exercises SYS_SIM_ENABLE/SYS_SIM_DELETE,

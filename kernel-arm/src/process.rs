@@ -123,9 +123,11 @@ use crate::mmu::{
     PXN, UXN,
 };
 use crate::serial_println;
-use alloc::alloc::{alloc_zeroed, Layout};
+use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use alloc::collections::BTreeSet;
+use alloc::vec::Vec;
 use core::fmt;
+use runix_kernel_arm::reclaim::{plan_frees, PlanError};
 use runix_kernel_arm::vm::AP_EL0_RO;
 
 /// The process-private VA window (`0x8000_0000`..`0xC000_0000`) -- level-1
@@ -219,13 +221,21 @@ fn alloc_page() -> Result<u64, AddressSpaceError> {
 /// table -- the actual unit of isolation here: everything reachable from a
 /// given `TTBR0_EL1` value is exactly what that context can address.
 ///
-/// Known limitation, stated rather than left to be discovered: there is no
-/// `Drop`. Dropping an `AddressSpace` leaks its tables and backing pages,
-/// because freeing them safely requires knowing this space isn't the one
-/// currently in `TTBR0_EL1` — a question only a scheduler can answer, and
-/// there isn't one yet. The boot-path caller ([`prove_isolation`]) builds
-/// exactly two and never releases them, so nothing leaks in practice today;
-/// this becomes real work in the scheduler slice, not before.
+/// # Reclamation: an explicit [`destroy`](Self::destroy), deliberately not `Drop`
+///
+/// Plain `drop` still leaks (and always will): freeing is only safe when
+/// this space is not the one in `TTBR0_EL1`, nothing can still DMA into its
+/// frames, and the TLB is flushed first -- conditions only the caller (the
+/// scheduler's reaper) can establish, and a `Drop` firing at an arbitrary
+/// scope end (including mid-unwind-free `panic = "abort"` paths, or while the
+/// space is live) would make "when" implicit. [`destroy`](Self::destroy)
+/// consumes the space, refuses a live one, and frees only what this space
+/// *allocated*: its own tables ([`owned_tables`](Self::owned_tables)), its
+/// private data pages, and contiguous blocks explicitly adopted via
+/// [`adopt_block`](Self::adopt_block). Pages mapped with
+/// [`map_mmio_page`](Self::map_mmio_page) are never recorded as owned (they
+/// are device windows, or memory somebody else owns), and kernel tables
+/// shared by pointer are never in `owned_tables`, so neither can be freed.
 pub struct AddressSpace {
     /// Physical (== virtual, identity-mapped) address of this space's
     /// level-1 table, and the value loaded into `TTBR0_EL1` by
@@ -281,6 +291,36 @@ pub struct AddressSpace {
     ///    `scheduler::spawn_with_address_space` refuse such a space instead
     ///    of discovering it as a mysterious isolation failure.
     seeded_root: u64,
+    /// Every private data page [`map_private_page_with`](Self::map_private_page_with)
+    /// allocated (heap frames, freed by [`destroy`](Self::destroy)). Never
+    /// holds a [`map_mmio_page`](Self::map_mmio_page) address.
+    owned_pages: Vec<u64>,
+    /// Physically contiguous heap blocks `(base, pages)` the caller allocated
+    /// with `Layout(pages * 4096, 4096)` and handed over via
+    /// [`adopt_block`](Self::adopt_block), freed by [`destroy`](Self::destroy).
+    owned_blocks: Vec<(u64, u64)>,
+    /// Run once at the start of [`destroy`](Self::destroy), before any frame is
+    /// released: `(hook, argument)`. For quiescing a DMA-capable device that
+    /// may still hold this space's frames (e.g. a virtio reset), so a freed
+    /// and re-allocated frame can never be written by hardware.
+    pre_free_hook: Option<(fn(usize), usize)>,
+}
+
+/// What [`AddressSpace::destroy`] released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reclaimed {
+    pub extents: usize,
+    pub bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestroyError {
+    /// This space's root is the live `TTBR0_EL1`. Never torn down; the
+    /// caller must switch away first (the scheduler's reaper just waits).
+    Live,
+    /// The ownership ledger failed validation; nothing was freed (leaking is
+    /// the safe failure).
+    BadLedger(PlanError),
 }
 
 impl AddressSpace {
@@ -308,6 +348,9 @@ impl AddressSpace {
             root,
             owned_tables,
             seeded_root: active,
+            owned_pages: Vec::new(),
+            owned_blocks: Vec::new(),
+            pre_free_hook: None,
         })
     }
 
@@ -368,7 +411,14 @@ impl AddressSpace {
         let l2 = self.descend(self.root, l1_index)?;
         let l3 = self.descend(l2, l2_index)?;
 
+        // Reserve the ledger slot first: `Vec::push` growth failure would
+        // abort the kernel, so growth is made fallible here and the push
+        // below is then infallible.
+        self.owned_pages
+            .try_reserve(1)
+            .map_err(|_| AddressSpaceError::OutOfMemory)?;
         let frame = alloc_page()?;
+        self.owned_pages.push(frame);
         unsafe {
             entry_ptr(l3, l3_index).write_volatile(normal_4kib_page_descriptor(frame, permissions));
         }
@@ -472,6 +522,92 @@ impl AddressSpace {
         }
 
         Ok(())
+    }
+
+    /// Records a contiguous heap block this space's mappings reference as
+    /// owned by it, so [`destroy`](Self::destroy) frees it. `pa` must have
+    /// been allocated with `Layout(pages * 4096, 4096)`; it is *only*
+    /// recorded here, mapping it is still `map_mmio_page`'s job (which never
+    /// owns anything). The ledger is validated against the heap range at
+    /// destroy time, so a bogus `pa` leaks everything rather than corrupting
+    /// the heap.
+    pub fn adopt_block(&mut self, pa: u64, pages: u64) -> Result<(), AddressSpaceError> {
+        self.owned_blocks
+            .try_reserve(1)
+            .map_err(|_| AddressSpaceError::OutOfMemory)?;
+        self.owned_blocks.push((pa, pages));
+        Ok(())
+    }
+
+    /// Registers the [`pre_free_hook`](Self::pre_free_hook).
+    pub fn set_pre_free_hook(&mut self, hook: fn(usize), arg: usize) {
+        self.pre_free_hook = Some((hook, arg));
+    }
+
+    /// True if this space's root is the table `TTBR0_EL1` currently names.
+    pub fn is_live(&self) -> bool {
+        self.root == active_root()
+    }
+
+    /// Frees every frame this space owns. Consumes the space.
+    ///
+    /// Rules enforced (see the type's doc comment):
+    /// 1. **Never a live space**: refuses with [`DestroyError::Live`] if
+    ///    `self.root == active_root()` (compared with the live register). The
+    ///    caller must have switched `TTBR0_EL1` away; this function does not
+    ///    switch for it, because it cannot know which table is safe to load.
+    ///    On refusal the space is dropped without freeing (a leak, never a
+    ///    corruption) -- callers check [`is_live`](Self::is_live) first.
+    /// 2. **Only owned memory**: tables from `owned_tables`, `owned_pages`,
+    ///    `owned_blocks`. Kernel-shared tables and `map_mmio_page` targets
+    ///    are never recorded, and `plan_frees` additionally refuses any
+    ///    extent outside the heap range, misaligned, or overlapping another.
+    /// 3. **Device quiesced first** (`pre_free_hook`), so no DMA targets a
+    ///    frame once it is back in the allocator.
+    /// 4. **TLB flushed before any free** (`tlbi vmalle1`; no ASIDs are used,
+    ///    so this drops every cached translation, including walk caches that
+    ///    could name the freed tables), so no stale entry can alias a frame
+    ///    the allocator is about to hand out again.
+    pub fn destroy(self) -> Result<Reclaimed, DestroyError> {
+        if self.is_live() {
+            return Err(DestroyError::Live);
+        }
+        if let Some((hook, arg)) = self.pre_free_hook {
+            hook(arg);
+        }
+        let (heap_start, heap_end) = crate::heap::range();
+        let plan = plan_frees(
+            self.owned_tables.iter().copied(),
+            &self.owned_pages,
+            &self.owned_blocks,
+            heap_start,
+            heap_end,
+        )
+        .map_err(DestroyError::BadLedger)?;
+
+        // SAFETY: cache/TLB maintenance only, no memory operands.
+        unsafe {
+            core::arch::asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb");
+        }
+
+        let mut bytes = 0usize;
+        for extent in &plan {
+            // Cannot fail: `plan_frees` validated alignment (4096) and a
+            // non-zero length that fits the heap; folded rather than unwrapped.
+            let Ok(layout) = Layout::from_size_align(extent.bytes as usize, GRANULE_4KIB as usize)
+            else {
+                continue;
+            };
+            // SAFETY: each extent was allocated by this space (or adopted
+            // with the same layout) from the global allocator and appears
+            // exactly once in the validated, non-overlapping plan.
+            unsafe { dealloc(extent.addr as *mut u8, layout) };
+            bytes += extent.bytes as usize;
+        }
+        Ok(Reclaimed {
+            extents: plan.len(),
+            bytes,
+        })
     }
 
     /// Returns the address of the next-level table reached through

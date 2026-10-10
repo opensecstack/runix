@@ -820,6 +820,14 @@ jobs:
           grep -q "Runix ARM kernel: net TCP proof observed SPSR_EL1=.* result=0 (Pass)" \
             /tmp/arm-boot.log
           grep -q "Runix ARM kernel: net TCP proof PASS" /tmp/arm-boot.log
+          # Evaluation reclamation (Beta item 3.4 follow-up): every MARSHAL evaluation
+          # builds and runs a fresh EL0 process; before this, nothing freed its address
+          # space or thread stack and the 4 MiB heap was exhausted after ~8 evaluations
+          # per boot, which made MARSHAL silently stop being consulted. The proof runs
+          # 24 evaluations with no network and asserts the free-heap watermark does not
+          # drain (a leak makes it print FAIL, or the later real evaluations hit
+          # "setup failed (out of memory ...)").
+          grep -q "Runix ARM kernel: evaluation reclamation PASS (24 runs" /tmp/arm-boot.log
       - name: boot in QEMU without secure=on and check the no-EL3 path
         # Regression check for a real, previously-shipped bug: this used to
         # produce zero UART output (rust_start ran the EL3-only phase
@@ -964,6 +972,14 @@ jobs:
           grep -q "Runix ARM kernel: net TCP proof observed SPSR_EL1=.* result=0 (Pass)" \
             /tmp/arm-boot-nosecure.log
           grep -q "Runix ARM kernel: net TCP proof PASS" /tmp/arm-boot-nosecure.log
+          # Evaluation reclamation (Beta item 3.4 follow-up): every MARSHAL evaluation
+          # builds and runs a fresh EL0 process; before this, nothing freed its address
+          # space or thread stack and the 4 MiB heap was exhausted after ~8 evaluations
+          # per boot, which made MARSHAL silently stop being consulted. The proof runs
+          # 24 evaluations with no network and asserts the free-heap watermark does not
+          # drain (a leak makes it print FAIL, or the later real evaluations hit
+          # "setup failed (out of memory ...)").
+          grep -q "Runix ARM kernel: evaluation reclamation PASS (24 runs" /tmp/arm-boot-nosecure.log
       # Beta mobile item 2.6, "Stage 4: wire esim_marshal::evaluate to a real
       # transport" -- the fail-closed case. `nonsecure.rs` always points
       # marshal_transport's MARSHAL proxy at 10.0.2.100:9100; the two boot

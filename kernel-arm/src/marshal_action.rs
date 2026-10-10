@@ -14,6 +14,7 @@
 
 use alloc::format;
 use alloc::string::String;
+use runix_citadel_integration::ShadowMarshalOutcome;
 
 /// One governed action. `Esim::op` is `"enable"` or `"delete"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +112,88 @@ impl MarshalAction<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The enforcement decision: remote verdict vs. local failure
+// ---------------------------------------------------------------------------
+
+/// Why the kernel could not even *run* a MARSHAL evaluation -- a failure of
+/// this kernel's own evaluation machinery, as opposed to the remote MARSHAL
+/// being unreachable. Every one of these **fails closed**: the consequential
+/// operation is denied.
+///
+/// Why this is a different category from `Unreachable`: an unreachable remote
+/// is something an outsider can cause only by taking the network down (the
+/// documented Option B fail-open in `docs/MARSHAL-ENFORCEMENT-POLICY.md`).
+/// A local resource failure (heap exhaustion from repeated evaluations, a
+/// failed thread spawn, a faulting excursion) can be driven by a buggy or
+/// hostile EL0 caller just by repeating governed syscalls; treating it as
+/// fail-open would let that caller bypass MARSHAL entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalFailure {
+    /// `net_process::setup` failed (out of memory for a page/translation
+    /// table, ELF load failure, ...) or returned an inconsistent result.
+    SetupFailed,
+    /// The evaluation thread could not be spawned.
+    SpawnFailed,
+    /// The EL0 evaluation process faulted instead of finishing.
+    ExcursionFaulted,
+}
+
+impl LocalFailure {
+    /// Stable, greppable name used in the DENIED line and the WORM reason.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LocalFailure::SetupFailed => "SetupFailed",
+            LocalFailure::SpawnFailed => "SpawnFailed",
+            LocalFailure::ExcursionFaulted => "ExcursionFaulted",
+        }
+    }
+}
+
+/// The result of one MARSHAL evaluation attempt, as seen by enforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateOutcome {
+    /// The evaluation machinery ran; this is the remote verdict (or
+    /// `Unreachable` when the remote could not be reached / answered).
+    Remote(ShadowMarshalOutcome),
+    /// The kernel failed to run the evaluation at all.
+    LocalFailure(LocalFailure),
+}
+
+/// Why [`enforce`] blocked an operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Blocked {
+    /// A reachable MARSHAL returned `Refuse` or `HardStop`.
+    Remote(ShadowMarshalOutcome),
+    /// The kernel failed to run the evaluation (fail closed).
+    Local(LocalFailure),
+}
+
+impl core::fmt::Display for Blocked {
+    /// `Remote` prints exactly `MARSHAL <Outcome>` (the pre-existing DENIED
+    /// text CI greps); `Local` prints `MARSHAL local failure: <reason>`.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Blocked::Remote(o) => write!(f, "MARSHAL {o:?}"),
+            Blocked::Local(l) => write!(f, "MARSHAL local failure: {}", l.as_str()),
+        }
+    }
+}
+
+/// The whole fail-open / fail-closed decision, pure. Remote:
+/// `Execute`/`Unreachable` allow (Option B: nothing to honor when the remote
+/// is down or unconfigured), `Refuse`/`HardStop` block. Every local failure
+/// blocks.
+pub fn enforce(outcome: GateOutcome) -> Result<(), Blocked> {
+    match outcome {
+        GateOutcome::Remote(ShadowMarshalOutcome::Execute)
+        | GateOutcome::Remote(ShadowMarshalOutcome::Unreachable) => Ok(()),
+        GateOutcome::Remote(o @ ShadowMarshalOutcome::Refuse)
+        | GateOutcome::Remote(o @ ShadowMarshalOutcome::HardStop) => Err(Blocked::Remote(o)),
+        GateOutcome::LocalFailure(l) => Err(Blocked::Local(l)),
+    }
+}
+
 /// First source port handed to a MARSHAL evaluation. `49152` itself is left
 /// to the TCP proof (`tcp_proof.rs` / the driver's `TCP_LOCAL_PORT`).
 pub const MARSHAL_LOCAL_PORT_BASE: u16 = 49153;
@@ -150,6 +233,59 @@ mod tests {
         assert_eq!(marshal_local_port(MARSHAL_LOCAL_PORT_SPAN as u64), first);
         // No overflow even at the extreme.
         let _ = marshal_local_port(u64::MAX);
+    }
+
+    #[test]
+    fn enforce_matrix_remote_outcomes_unchanged() {
+        use ShadowMarshalOutcome::*;
+        assert_eq!(enforce(GateOutcome::Remote(Execute)), Ok(()));
+        assert_eq!(enforce(GateOutcome::Remote(Unreachable)), Ok(()));
+        assert_eq!(
+            enforce(GateOutcome::Remote(Refuse)),
+            Err(Blocked::Remote(Refuse))
+        );
+        assert_eq!(
+            enforce(GateOutcome::Remote(HardStop)),
+            Err(Blocked::Remote(HardStop))
+        );
+    }
+
+    #[test]
+    fn enforce_blocks_every_local_failure() {
+        for l in [
+            LocalFailure::SetupFailed,
+            LocalFailure::SpawnFailed,
+            LocalFailure::ExcursionFaulted,
+        ] {
+            assert_eq!(
+                enforce(GateOutcome::LocalFailure(l)),
+                Err(Blocked::Local(l))
+            );
+        }
+    }
+
+    #[test]
+    fn denial_text_is_stable() {
+        assert_eq!(
+            format!("{}", Blocked::Remote(ShadowMarshalOutcome::Refuse)),
+            "MARSHAL Refuse"
+        );
+        assert_eq!(
+            format!("{}", Blocked::Remote(ShadowMarshalOutcome::HardStop)),
+            "MARSHAL HardStop"
+        );
+        assert_eq!(
+            format!("{}", Blocked::Local(LocalFailure::SetupFailed)),
+            "MARSHAL local failure: SetupFailed"
+        );
+        assert_eq!(
+            format!("{}", Blocked::Local(LocalFailure::SpawnFailed)),
+            "MARSHAL local failure: SpawnFailed"
+        );
+        assert_eq!(
+            format!("{}", Blocked::Local(LocalFailure::ExcursionFaulted)),
+            "MARSHAL local failure: ExcursionFaulted"
+        );
     }
 
     const P: &str = "el0:arm-demo";

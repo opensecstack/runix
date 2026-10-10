@@ -33,10 +33,15 @@
 //!   "simplest first version" the x86_64 scheduler started from. Guard
 //!   pages need per-stack page-table entries, which in turn wants a real
 //!   kernel VA layout -- deferred for the same staged reason.
-//! - **No exit/reclamation.** A finished thread loops forever calling
-//!   [`yield_now`]; nothing frees a thread's stack or removes it from the
-//!   run queue. Stacks are leaked on purpose (and only ever allocated at
-//!   boot today).
+//! - **Minimal exit/reclamation, for the evaluation path.** A thread that
+//!   calls [`exit_current`] is moved by its own final [`yield_now`] from the
+//!   run queue to a zombie list and is never scheduled again; a *different*
+//!   thread then calls [`reap_exited`], which frees the zombie's stack and
+//!   destroys its `AddressSpace`. A thread's stack is never freed while it
+//!   (or anything) still executes on it, and a space is never destroyed
+//!   while live in `TTBR0_EL1` -- both checked, not assumed. Threads that
+//!   never call `exit_current` (the boot proofs) still park forever and are
+//!   still leaked.
 //! - **No syscalls.** Nothing here touches `svc.rs`. The proof
 //!   ([`prove_scheduling`]) is entirely EL1-side.
 //!
@@ -101,8 +106,9 @@
 
 use crate::process::{self, AddressSpace};
 use crate::serial_println;
-use alloc::alloc::{alloc_zeroed, Layout};
+use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 use core::arch::naked_asm;
 use core::fmt;
 use core::mem::size_of;
@@ -213,7 +219,6 @@ struct Thread {
     /// A `usize`, not a `*mut u8`: a raw pointer here would make `Thread`
     /// (and so the `static` `SCHEDULER` holding it) `!Send`/`!Sync` for no
     /// real reason, since nothing ever dereferences this field.
-    #[allow(dead_code)]
     stack_base: usize,
     /// This thread's `sp` while it is *not* running: points at its saved
     /// [`Context`] block, which lives at the top of its own stack. Stored
@@ -240,6 +245,9 @@ struct Thread {
     /// slice, so "owned by the `Thread`" and "leaked" coincide today; when
     /// reclamation lands, this is the field that makes it expressible.
     address_space: Option<AddressSpace>,
+    /// Set by [`exit_current`]: the next [`yield_now`] by this thread parks it
+    /// on the zombie list instead of the run queue.
+    exiting: bool,
 }
 
 impl Thread {
@@ -338,6 +346,7 @@ impl Thread {
             stack_base: stack_base as usize,
             stack_pointer: context_ptr as usize,
             address_space: None,
+            exiting: false,
         })
     }
 
@@ -351,6 +360,7 @@ impl Thread {
             stack_base: 0,
             stack_pointer: 0,
             address_space: None,
+            exiting: false,
         }
     }
 }
@@ -358,6 +368,9 @@ impl Thread {
 struct Scheduler {
     run_queue: VecDeque<Thread>,
     current: Option<Thread>,
+    /// Threads that called [`exit_current`] and have switched away for the
+    /// last time; awaiting [`reap_exited`]. Never scheduled.
+    zombies: Vec<Thread>,
 }
 
 static SCHEDULER: Mutex<Option<Scheduler>> = Mutex::new(None);
@@ -395,6 +408,7 @@ pub fn init() {
     *SCHEDULER.lock() = Some(Scheduler {
         run_queue: VecDeque::new(),
         current: Some(Thread::placeholder()),
+        zombies: Vec::new(),
     });
 }
 
@@ -440,18 +454,40 @@ pub fn spawn_with_address_space(
     space: AddressSpace,
 ) -> Result<(), SpawnError> {
     let kernel_root = KERNEL_ROOT.load(Ordering::Relaxed);
+    // On every refusal the space is destroyed rather than leaked: the caller
+    // handed over ownership, so a failed spawn must not strand its frames.
     if kernel_root == 0 {
+        discard_space(space);
         return Err(SpawnError::NotInitialized);
     }
     if space.seeded_root() != kernel_root {
-        return Err(SpawnError::AddressSpaceNotSeededFromKernel {
+        let err = SpawnError::AddressSpaceNotSeededFromKernel {
             seeded_root: space.seeded_root(),
             kernel_root,
-        });
+        };
+        discard_space(space);
+        return Err(err);
     }
-    let mut thread = Thread::new(entry)?;
+    let mut thread = match Thread::new(entry) {
+        Ok(thread) => thread,
+        Err(err) => {
+            discard_space(space);
+            return Err(err);
+        }
+    };
     thread.address_space = Some(space);
     enqueue(thread)
+}
+
+/// Destroys a space that never became a thread's. Reports (does not hide) a
+/// refusal; the space is leaked in that case, never freed unsafely.
+fn discard_space(space: AddressSpace) {
+    if let Err(err) = space.destroy() {
+        serial_println!(
+            "Runix ARM kernel: scheduler: discarded address space leaked ({:?})",
+            err
+        );
+    }
 }
 
 fn enqueue(thread: Thread) -> Result<(), SpawnError> {
@@ -494,17 +530,30 @@ pub fn yield_now() {
             sched.run_queue.push_front(next);
             return;
         };
-        sched.run_queue.push_back(current);
-        sched.current = Some(next);
-
-        // Taken *after* the push, for the reason
-        // `kernel/src/scheduler.rs`'s first version documents: a pointer
-        // into the `Thread` before it is moved into the `VecDeque` dangles
-        // the instant the move happens.
-        let Some(back) = sched.run_queue.back_mut() else {
-            return;
+        // An exiting thread leaves the run queue for good. The zombie list's
+        // growth is made fallible first (`push` growth failure would abort);
+        // if it cannot grow, the thread simply stays schedulable and keeps
+        // parking, exactly as before this existed.
+        let to_zombies = current.exiting && sched.zombies.try_reserve(1).is_ok();
+        let current_sp_ptr: *mut usize = if to_zombies {
+            sched.zombies.push(current);
+            sched.current = Some(next);
+            match sched.zombies.last_mut() {
+                Some(zombie) => &mut zombie.stack_pointer,
+                None => return,
+            }
+        } else {
+            sched.run_queue.push_back(current);
+            sched.current = Some(next);
+            // Taken *after* the push, for the reason
+            // `kernel/src/scheduler.rs`'s first version documents: a pointer
+            // into the `Thread` before it is moved into the `VecDeque`
+            // dangles the instant the move happens.
+            match sched.run_queue.back_mut() {
+                Some(back) => &mut back.stack_pointer,
+                None => return,
+            }
         };
-        let current_sp_ptr: *mut usize = &mut back.stack_pointer;
 
         (current_sp_ptr, next_sp, next_root)
         // `guard` drops here -- before `switch_to`, because the thread
@@ -557,6 +606,121 @@ pub fn yield_now() {
     unsafe {
         switch_to(current_sp_ptr, next_sp);
     }
+}
+
+/// Total threads reaped and bytes reclaimed (stack + address-space frames)
+/// since boot; `reclaim_proof.rs` asserts on these.
+static REAPED_THREADS: AtomicUsize = AtomicUsize::new(0);
+static RECLAIMED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+pub fn reap_totals() -> (usize, usize) {
+    (
+        REAPED_THREADS.load(Ordering::Relaxed),
+        RECLAIMED_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+/// Ends the calling thread: it is moved to the zombie list by its own next
+/// switch-away and never scheduled again. Its stack and address space are
+/// freed later by [`reap_exited`], from another thread -- never from here,
+/// since this thread is still executing on that stack and (usually) under
+/// that `TTBR0_EL1`.
+///
+/// The boot context (no stack of its own) cannot exit; calling this from it
+/// just yields forever like the old parked-thread idiom.
+pub fn exit_current() -> ! {
+    {
+        let mut guard = SCHEDULER.lock();
+        if let Some(sched) = guard.as_mut() {
+            if let Some(current) = sched.current.as_mut() {
+                if current.stack_base != 0 {
+                    current.exiting = true;
+                }
+            }
+        }
+    }
+    loop {
+        yield_now();
+    }
+}
+
+fn current_sp() -> usize {
+    let sp: usize;
+    // SAFETY: reads `sp`; no memory access, no side effects.
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    sp
+}
+
+impl Thread {
+    /// Frees this exited thread's address space and stack, or hands the
+    /// thread back untouched if either is still in use. Rules: the space
+    /// must not be the live `TTBR0_EL1` (also re-checked inside
+    /// `AddressSpace::destroy`), and the executing `sp` must not lie inside
+    /// the stack being freed.
+    #[allow(clippy::result_large_err)] // Err hands the whole thread back, by design
+    fn reclaim(mut self) -> Result<usize, Thread> {
+        let sp = current_sp();
+        let stack_lo = self.stack_base;
+        let stack_hi = stack_lo.saturating_add(STACK_SIZE);
+        if self.stack_base == 0 || (sp >= stack_lo && sp < stack_hi) {
+            return Err(self);
+        }
+        if self.address_space.as_ref().is_some_and(|s| s.is_live()) {
+            return Err(self);
+        }
+        let mut bytes = STACK_SIZE;
+        if let Some(space) = self.address_space.take() {
+            match space.destroy() {
+                Ok(reclaimed) => bytes += reclaimed.bytes,
+                Err(err) => serial_println!(
+                    "Runix ARM kernel: scheduler: exited thread's address space leaked ({:?})",
+                    err
+                ),
+            }
+        }
+        if let Ok(layout) = Layout::from_size_align(STACK_SIZE, STACK_ALIGN) {
+            // SAFETY: allocated in `Thread::new` with this exact layout, the
+            // thread is off every queue and will never run again, and the
+            // current `sp` was just checked to be outside it.
+            unsafe { dealloc(self.stack_base as *mut u8, layout) };
+        }
+        Ok(bytes)
+    }
+}
+
+/// Reclaims every exited thread that is safe to reclaim right now; returns
+/// the number reaped. Must be called from a thread other than the ones being
+/// reaped (a thread cannot be both zombie and caller). Threads that cannot
+/// be reaped yet stay on the zombie list for a later call.
+pub fn reap_exited() -> usize {
+    let taken: Vec<Thread> = {
+        let mut guard = SCHEDULER.lock();
+        match guard.as_mut() {
+            Some(sched) => core::mem::take(&mut sched.zombies),
+            None => return 0,
+        }
+    };
+    let mut reaped = 0;
+    let mut kept: Vec<Thread> = Vec::new();
+    for thread in taken {
+        match thread.reclaim() {
+            Ok(bytes) => {
+                reaped += 1;
+                REAPED_THREADS.fetch_add(1, Ordering::Relaxed);
+                RECLAIMED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+            }
+            Err(thread) => kept.push(thread),
+        }
+    }
+    if !kept.is_empty() {
+        let mut guard = SCHEDULER.lock();
+        if let Some(sched) = guard.as_mut() {
+            sched.zombies.append(&mut kept);
+        }
+    }
+    reaped
 }
 
 /// The context switch itself: save the *caller's* callee-saved registers
