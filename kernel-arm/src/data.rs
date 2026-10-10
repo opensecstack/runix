@@ -9,7 +9,11 @@
 //! snapshot builder) is in the lib target (`data_state.rs`, `data_codes.rs`)
 //! where `cargo test --lib` covers it.
 //!
-//! # Why none of this is MARSHAL-gated (Beta item 4.3 design)
+//! # Why four of the five data syscalls are not MARSHAL-gated (Beta item 4.3)
+//!
+//! (The fifth, `SYS_DATA_RESET`, IS gated -- see the paragraph beginning "The
+//! usage-period RESET" below. `docs/adrs/0001-data-syscalls-not-marshal-gated.md`
+//! records the decision and names the reset as its revisit trigger.)
 //!
 //! The policy engine (`runix_mobile::policy`) is pure and stateless and only
 //! REQUESTS; the reconciler (`runix_mobile::reconcile`) only OBSERVES. The
@@ -31,10 +35,17 @@
 //! None of them is a governance-consequential state change, so none gets a new
 //! MARSHAL action type or gate; the consequential action a request can lead to
 //! -- suspending the account -- is the existing MARSHAL-gated
-//! `SYS_MVNO_SUSPEND`. That also means a data syscall that needed a MARSHAL
-//! round trip would be a design error: the reclamation work (`reclaim.rs`)
-//! and the walk's evaluation budget are built around the gated set staying
-//! exactly as it is.
+//! `SYS_MVNO_SUSPEND`.
+//!
+//! The usage-period RESET is the exception, and exactly the one the decision
+//! record said would be: `SYS_DATA_RESET(account)` zeroes the counter, which
+//! LIFTS a cap and restores service the plan had withheld, so whoever holds it
+//! can undo enforcement. That makes it consequential and governable, so it has
+//! its own capability scope (`data:reset:{account}`) AND a MARSHAL action
+//! (`data.reset_usage`), checked in that order before [`reset_usage`] is
+//! reached. It clears the reconciler's `last_used` memory in the same critical
+//! section so the reset reads as a new period, not as tampering. It still
+//! closes no session and changes no standing or profile.
 //!
 //! The usage FEED is nonetheless privileged. Counting bytes into an account
 //! can push it over its cap -- that denies it service -- and over the
@@ -42,7 +53,8 @@
 //! `SYS_DATA_ACCOUNT` is capability-scoped on its own resource
 //! (`data:usage:{account}`), separate from session access
 //! (`data:session:{account}`): holding the right to open or close sessions
-//! does not imply the right to meter the account.
+//! does not imply the right to meter the account (and neither implies the
+//! reset's `data:reset:{account}`).
 //!
 //! Every policy decision, every engine request and every reconciler incident
 //! is still WORM-audited (on the same chain as the eSIM/MVNO transitions, via
@@ -88,6 +100,14 @@ const MAX_SLOT_SCAN: usize = 16;
 /// Add `bytes` to `account`'s counter; `(before, after)`.
 pub fn feed_usage(account: u64, bytes: u64) -> Result<(DataUsage, DataUsage), TableFull> {
     DATA.lock().feed_usage(account, bytes)
+}
+
+/// Start a new usage period for `account` (the governed `SYS_DATA_RESET`, called
+/// only AFTER its capability check and MARSHAL gate passed): usage back to
+/// `reset_usage()`, reconciler `last_used` cleared, one critical section.
+/// Returns `(before, after)`. Sessions, standing and profiles are not touched.
+pub fn reset_usage(account: u64) -> (DataUsage, DataUsage) {
+    DATA.lock().reset_usage(account)
 }
 
 /// Decide a session and, iff allowed, record it -- one critical section. The

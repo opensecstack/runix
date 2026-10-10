@@ -4,7 +4,10 @@ This is the detailed, narrative engineering log of what's actually built,
 verified, and (importantly) what broke along the way — as opposed to
 [ROADMAP.md](ROADMAP.md)'s target dates/scope, or [BUILDING.md](BUILDING.md)'s
 build-stage checklist. Read this before assuming something is or isn't
-implemented; the roadmap describes targets, not current state.
+implemented; the roadmap describes targets, not current state. Decisions
+that cross crate or trust boundaries are recorded separately, with their
+alternatives and revisit triggers, in the
+[architecture decision records](adrs/README.md).
 
 We are currently in **Alpha**. The kernel's own bring-up — all 9 "Kernel
 build stages" (see [BUILDING.md](BUILDING.md)) — is **complete**: boot, serial
@@ -2423,9 +2426,10 @@ Simplifications, all deliberate at this stage:
 
 ### MARSHAL gate for mobile (`marshal_action.rs`, `marshal_transport.rs`, `esim_marshal.rs`)
 
-One gate covers five action types: `esim.enable`, `esim.delete`,
-`mvno.bind_profile`, `mvno.suspend_account` and `mvno.reactivate_account`.
-The data syscalls are outside it by design (see the data policy engine
+One gate covers six action types: `esim.enable`, `esim.delete`,
+`mvno.bind_profile`, `mvno.suspend_account`, `mvno.reactivate_account` and
+`data.reset_usage`. Of the data syscalls, only the governed usage-period reset
+is inside it. The other four are outside by design (see the data policy engine
 section, which also explains why).
 `marshal_action.rs`'s `MarshalAction` builds each Kerkese envelope. The eSIM
 envelope is byte-identical to the format it had before the gate was
@@ -2467,13 +2471,22 @@ proxy must be deployed together: a proxy built before this change still sends
 fails to parse at all is still `BadResponse` and so still fail-open.
 
 The desktop side (`desktop/src/citadel/{policy,proxy}.rs`) recognizes
-`esim.enable`, `esim.delete` and the three `mvno.*` actions. Each action family
-has its own field rules: eSIM actions require `slot` and `profile`, MVNO
-actions require `account`, and each family rejects the others' fields. The
-proxy attaches its own Verifier identity (`sig_verifier`) and records its own
-WORM verification entry, attributed to module `esim` or `mvno`. CITADEL's
-server-side `rbacMap` carries entries for these actions (`esim.*` merged from
-`opensecstack` `b575903`; `mvno.*` via opensecstack PR #83).
+`esim.enable`, `esim.delete`, the three `mvno.*` actions and `data.reset_usage`.
+Each action family has its own field rules: eSIM actions require `slot` and
+`profile`, MVNO actions require `account`, `data.reset_usage` requires `account`
+alone, and each family rejects the others' fields (for the reset, `slot`,
+`profile`, `module_id` and `instance_id` are refused). The proxy attaches its
+own Verifier identity (`sig_verifier`) and records its own WORM verification
+entry, attributed to module `esim`, `mvno` or `data` (the reset's instance is
+`account-N`). CITADEL's server-side `rbacMap` carries entries for the eSIM and
+MVNO actions (`esim.*` merged from `opensecstack` `b575903`; `mvno.*` via
+opensecstack PR #83). As of 2026-10-11 the `data.reset_usage` entry is a local,
+unpushed change in an opensecstack checkout and is not merged upstream. This
+repository cannot show that checkout's state, so the claim is as reported. Until
+the entry is merged, a live CITADEL is expected to hard-REFUSE the action at
+Gate 2, and the kernel would print `DENIED (MARSHAL Refuse)` and leave the
+counter alone. CI's mock CITADEL answers EXECUTE for any request, so CI cannot
+show this.
 
 Not closed:
 
@@ -2506,9 +2519,11 @@ Not built, and nothing above implies it:
   measures bytes, and no code path consults a data session before network I/O.
 - **Billing or rating.**
 - **Persistence.** Counters and sessions are in memory and are lost on reboot.
-- **A billing-period clock.** The engine has no notion of time. `reset_usage()`
-  exists, but no kernel code calls it and no syscall exposes it. Once an
-  account's counter reaches its cap it stays there until reboot.
+- **A billing-period clock.** The engine has no notion of time, and nothing
+  starts a period on a schedule. `SYS_DATA_RESET` starts one, but only when a
+  caller issues it, so a billing-period boundary needs a caller. Whether a
+  period has really ended is the caller's claim, not something the kernel
+  checks.
 
 **The engine only requests, and nothing in this block acts on its own.** This
 is the governing invariant. The rest follows from it.
@@ -2519,6 +2534,9 @@ is the governing invariant. The rest follows from it.
   state in response to a request. `SYS_DATA_ACCOUNT` changes a usage counter.
   `SYS_DATA_SESSION_OPEN` and `SYS_DATA_SESSION_CLOSE` change the session table.
   `SYS_DATA_RECONCILE` writes only the usage table's `last_used` bookkeeping.
+  `SYS_DATA_RESET` zeroes a usage counter and clears `last_used`. It runs only
+  when a caller issues it, behind its own capability and the MARSHAL gate, and
+  never as a response to an `ActionRequest`.
 - The demo's suspension is carried out by the caller. The boot walk issues
   `SYS_MVNO_SUSPEND(0)`, which needs `mvno:suspend:0` and passes the MARSHAL gate
   (`mvno.suspend_account`) before the registry changes. The walk issues it
@@ -2598,9 +2616,11 @@ Special plans:
   is sorted by kind, subject and facts, so it does not depend on the order the
   caller listed records in.
 - **`usage-regression` cannot fire through any syscall today.** The counter only
-  goes up, and `last_used` records only what the reconciler saw. It is a tripwire
-  for tampering. A future period reset must clear `last_used` in the same critical
-  section, or it will report the reset as tampering (see `data_state.rs`).
+  goes up, except that `SYS_DATA_RESET` sets it to zero, and the reset clears
+  `last_used` in the same critical section, so a legitimate period reset is not
+  reported as tampering (see `data_state.rs`). `last_used` records only what the
+  reconciler saw. The check remains a tripwire for any other path that lowers the
+  counter.
 - **The checks**, by group. Snapshot: `snapshot-too-large`. Binding and profile:
   `duplicate-account`, `duplicate-profile`, `enabled-profile-under-inactive-account`,
   `enabled-profile-unbound`, `profile-owner-unknown`, `multiple-enabled-in-slot`.
@@ -2618,7 +2638,7 @@ handlers copy what they need before they audit. `data_codes.rs` holds the return
 codes, the argument packing, the enum adapters, the demo plan table and the WORM
 description strings, all host-tested.
 
-**Syscalls.** `svc.rs`'s dispatch arms 19–22 (`SYS_DATA_*`), with `el0.rs` keeping
+**Syscalls.** `svc.rs`'s dispatch arms 19–23 (`SYS_DATA_*`), with `el0.rs` keeping
 its own copies of the numbers, as the other mobile syscalls do.
 
 | No. | Syscall | Arguments (x1, x2, x3) | Capability | Returns |
@@ -2627,13 +2647,17 @@ its own copies of the numbers, as the other mobile syscalls do.
 | 20 | `SYS_DATA_SESSION_OPEN` | account, slot, profile \| roaming<<8 | `data:session:{account}` | `0` allow, `1` allow throttled; `2`–`6` engine denial; `7`–`13` refused |
 | 21 | `SYS_DATA_SESSION_CLOSE` | account, slot, profile | `data:session:{account}` | `0` closed, `1` denied, `2` not open, `3` bad argument |
 | 22 | `SYS_DATA_RECONCILE` | none | `data:reconcile` | incident count; `u64::MAX` if denied |
+| 23 | `SYS_DATA_RESET` | account | `data:reset:{account}` + MARSHAL (`data.reset_usage`) | `0` counter reset; `1` no capability; `2` MARSHAL `Refuse`/`HardStop`; `3` MARSHAL local failure; `4` no entitlement; `5` no such account |
 
 The refusal codes are named. For `SYS_DATA_ACCOUNT`: `4` no capability, `5` no
 entitlement for the account, `6` no such account, `7` usage table full (bytes not
 counted). For `SYS_DATA_SESSION_OPEN`: `7` no capability, `8` no entitlement, `9`
 no such account, `10` profile not bound to this account, `11` unknown profile, `12`
 malformed argument, `13` allowed by policy but the session table is full, so
-nothing was recorded.
+nothing was recorded. The reset's codes are `RESET_OK`, `RESET_DENIED_CAPABILITY`,
+`RESET_DENIED_MARSHAL`, `RESET_DENIED_LOCAL_FAILURE`, `RESET_NO_ENTITLEMENT` and
+`RESET_NO_SUCH_ACCOUNT` in `data_codes.rs`. Its one argument is in x1, and x2 and
+x3 are ignored.
 
 **The packed third argument.** `SYS_DATA_SESSION_OPEN` takes the profile id in bits
 0–7 and the roaming flag in bit 8. Bits 9–63 must be zero, or the call returns
@@ -2657,6 +2681,11 @@ which call it is making.
 - *Close:* capability; plain profile argument; the open row is removed if present.
 - *Reconcile:* capability; snapshot from copies; `reconcile`; WORM entries for each
   incident; `mark_observed`; incident count.
+- *Reset:* capability (`data:reset:{account}`); entitlement; account exists;
+  MARSHAL evaluate and enforce (`data.reset_usage`), with no lock held; only then
+  the counter reset and the `last_used` clear, in one critical section; WORM entry
+  with the before and after counter. The entitlement and account checks run before
+  the gate, so a reset that cannot happen costs no network round trip.
 
 **Separate capability scopes.** `data:usage:{id}` is separate from
 `data:session:{id}` because the feed is privileged. Counting bytes into an account
@@ -2664,18 +2693,66 @@ can push it over its cap, which denies it service, and over the escalation
 threshold, which makes the engine request suspension. Holding the right to open
 and close sessions does not imply the right to meter. `data:reconcile` is not
 account-scoped, because the reconciler reads every account in one pass and writes
-only evidence and its own bookkeeping.
+only evidence and its own bookkeeping. `data:reset:{id}` is a third account-scoped
+resource, separate from both. The reset lifts a cap, so neither the right to meter
+nor the right to open sessions implies it.
 
-**Not MARSHAL-gated, and why.** None of the four changes governance-consequential
-state. The feed moves a counter, open and close change the session table, and the
-reconciler reads. The consequential act a request can lead to, suspension, stays on
-`SYS_MVNO_SUSPEND`, which is gated. The code comments also record why a gate here
+**Not MARSHAL-gated, and why (four of the five).** None of the feed, open, close
+or reconcile changes governance-consequential state. The feed moves a counter,
+open and close change the session table, and the reconciler reads. The
+consequential act a request can lead to, suspension, stays on `SYS_MVNO_SUSPEND`,
+which is gated. The fifth, the usage reset, does lift a cap, so it is gated; see
+the next subsection. The code comments also record why a gate on the other four
 would be wrong: the reclamation work and the walk's evaluation budget are built
-around the gated set staying as it is. The CI boot assertions, in both boots,
-fail if any log line contains `MARSHAL evaluation for data`. That is a tripwire on
-the log. The structural guarantee is that `MarshalAction` has no data variant, so
-adding a data action would mean changing the enum. The walk still performs seven
-evaluations per boot.
+around the gated set. The CI boot assertions, in both boots, fail if a log line
+contains `MARSHAL evaluation for data` unless that line names `data.reset_usage`,
+and they require exactly one such line. That is a tripwire on the log. The
+structural guarantee is that `MarshalAction` has one data variant, `DataResetUsage`,
+so adding another data action would mean changing the enum. The walk performs
+eight evaluations per boot: seven from the eSIM and MVNO calls and one from the
+reset.
+
+**The governed usage-period reset (`SYS_DATA_RESET`, syscall 23).** It starts a new
+usage period for one account by zeroing its counter. It is the one data syscall
+the MARSHAL gate covers. It is gated because it lifts a cap: whoever can run it can
+restore service the plan had withheld, the same kind of act as
+`SYS_MVNO_REACTIVATE`. The decision is recorded in
+[adrs/0002-usage-reset-is-marshal-gated.md](adrs/0002-usage-reset-is-marshal-gated.md),
+which follows [adrs/0001-data-syscalls-not-marshal-gated.md](adrs/0001-data-syscalls-not-marshal-gated.md)
+and names a reset as the revisit trigger for leaving the four ungated.
+
+What it does, in order (`svc.rs`'s `data_reset`):
+
+1. Capability `data:reset:{account}`, re-checked on every call. A denial prints to
+   the serial log only.
+2. Entitlement, then account existence (a lookup in the registry that fails only for
+   an unknown account). Both run before the gate, so a reset that cannot happen costs
+   no network round trip. Each refusal is WORM-audited with `authorized=false`.
+3. MARSHAL evaluation of `data.reset_usage`, with the Kerkese action
+   `{"type":"data.reset_usage","account":A}`. `Execute` and `Unreachable` proceed,
+   which is the fail-open policy every gated action shares. `Refuse` and `HardStop`
+   deny, and nothing is audited for them, as for the other gated syscalls. A local
+   evaluation failure denies and is WORM-audited.
+4. Only then the data lock. The counter goes to the pure `reset_usage()` (zero),
+   and the reconciler's `last_used` for the account is cleared in the same critical
+   section. The reconciler therefore reads the reset as a new period and does not
+   report a `usage-regression`. No lock is held across step 3.
+5. A WORM entry with the before and after counter, then the serial line.
+
+It does not close sessions, change standing, or touch profiles. It does not check
+whether the account is Suspended or Closed. A reset on a suspended account lifts the
+cap, but session open still reports `Suspended` first, so service is not restored
+until `SYS_MVNO_REACTIVATE`. A reset of an account that has no usage row succeeds and
+creates no row; its WORM entry reads `used 0 -> used 0`. The reset does not check the
+counter before zeroing it, so it zeroes an account under its cap as readily as one
+over it. Its WORM entry does record the counter's value before the reset.
+
+Its return codes are in the table above. In the boot walk the reset is evaluated
+as `data.reset_usage` with the no-proxy verdict `Unreachable`. The
+desktop `citadel_proxy` recognizes the action, so a proxy-backed boot reads
+`Execute` and a boot whose proxy refuses it reads `Refuse`. The reset is therefore
+asserted in all five QEMU boot steps, and each step also checks the outcome its
+configuration produces.
 
 **Audit trail.** Data entries go to the same chain as the eSIM and MVNO transitions
 (`ESIM_WORM_LOG`). Calls past the capability check normally append at least one
@@ -2703,12 +2780,24 @@ entry. The exceptions are listed at the end of this subsection.
   denial.** A reader tells the two apart by the `data:reconcile:` subject prefix and
   that reason.
 
-Not audited, serial line only: capability denials on all four syscalls, a malformed
-argument to `SYS_DATA_SESSION_CLOSE`, and a reconcile pass with zero incidents.
+- `data:reset:{id}`, applied: `used B -> used A`, `authorized=true`, with the reason
+  `usage period reset (new period); reconciler memory cleared; no session, standing
+  or profile changed`. The entry does not record the MARSHAL verdict. `Execute` and
+  `Unreachable` produce the same entry.
+- `data:reset:{id}`, refused for no entitlement or no such account:
+  `usage period in force -> usage period in force`, `authorized=false`.
+- `data:reset:{id}`, MARSHAL local failure: `usage period in force -> new usage
+  period (counter reset)`, `authorized=false`, with the local-failure reason.
+
+Not audited, serial line only: capability denials on all five data syscalls, a
+malformed argument to `SYS_DATA_SESSION_CLOSE`, a reconcile pass with zero
+incidents, and a reset that MARSHAL `Refuse`s or `HardStop`s, as for the other
+gated syscalls.
 
 **What the boot walk proves.** The walk in `el0.rs` runs between the first `ENABLE`
 (profile 0 is bound to account 0 and `Enabled`) and the existing `SUSPEND(0)`. That
-is the only point where a session can be allowed in the walk. In order:
+is the first point where a session can be allowed in the walk. The second is after
+the reset, at steps 12 to 16. In order:
 
 1. `SESSION_OPEN(0, 0, 0)`: allowed (`0`), usage 0.
 2. `SESSION_OPEN(0, 0, roaming)`: denied `RoamingDataNotAllowed` (`5`). The home
@@ -2730,35 +2819,63 @@ is the only point where a session can be allowed in the walk. In order:
 10. `SESSION_CLOSE(0, 0, 0)`: closed by the caller (`0`, audited).
 11. `RECONCILE`: zero incidents.
 
+The second phase runs after the walk's second `ENABLE`, which re-enables profile 0.
+Account 0 is Active again, usage is still 1600 of 1000 bytes, and no session is open.
+
+12. `SESSION_OPEN(0, 0, 0)`: denied `CapExceeded` (`6`). The cap is still in force.
+13. `SYS_DATA_RESET(0)`: capability `data:reset:0`, then MARSHAL `data.reset_usage`
+    (the eighth evaluation of the boot, `Unreachable` here), then usage 1600 -> 0 with
+    the reconciler's memory cleared. This is the only reset in the walk. It closes no
+    session.
+14. `SESSION_OPEN(0, 0, 0)`: allowed (`0`), `used=0`. Service is restored.
+15. `RECONCILE`: zero incidents. The reset cleared `last_used`, so 1600 -> 0 is not
+    reported as a regression.
+16. `SESSION_CLOSE(0, 0, 0)`: closed by the caller (`0`, audited).
+
 Denial proofs: `SESSION_OPEN(0, 0, 1)` on profile 1, which is installed but never
-bound, is refused with `10`. `SESSION_OPEN(99, ...)` and `ACCOUNT(99, ...)` are
-refused by the capability check.
+bound, is refused with `10`. `SESSION_OPEN(99, ...)`, `ACCOUNT(99, ...)` and
+`SYS_DATA_RESET(99)` are refused by the capability check, before any state is read
+or MARSHAL is consulted.
 
 Documented choices:
 
-- **Reconcile passes run while the account is suspended.** After `REACTIVATE` the
-  account is Active again, its usage is still 1600, and there is no period reset.
-  At 160% of cap, `anomalous-usage-no-escalation` fires for an Active account
-  whether or not a session is open. The reconciler would correctly raise it again,
-  so a clean pass is possible only while the account is suspended.
+- **A clean pass needs either a suspended account or a reset.** After `REACTIVATE`
+  the account is Active again at 160% of cap. `anomalous-usage-no-escalation` fires
+  for an Active account whether or not a session is open, and the reconciler would
+  correctly raise it again. The first clean pass is therefore the one at step 11,
+  while the account is suspended. The one at step 15 is clean because the reset
+  zeroed the usage.
 - **Real demo numbers.** Account 0 is the only entry in the kernel's plan table:
   cap 1000 bytes, throttle at 80% (800), escalation at 150% (1500), roaming not
   allowed. The walk feeds 900 and then 700. Nothing else in the boot exercises a
   second account's plan.
 
-**Tests.** 65 host tests cover the data layer: 19 in `policy.rs` and 21 in
-`reconcile.rs` (`mobile/`), 11 in `data_state.rs` and 14 in `data_codes.rs` (the
+**Tests.** 71 host tests cover the data layer: 19 in `policy.rs` and 21 in
+`reconcile.rs` (`mobile/`), 15 in `data_state.rs` and 16 in `data_codes.rs` (the
 `kernel-arm` lib target). They cover the band boundaries at `u64::MAX`, the
 replay property, the deny-reason precedence, the table bounds, idempotent opens,
-and the encodings of every return code. The kernel-side refusal codes (`7`–`13`)
-are pinned as values and checked for distinctness. The boot walk exercises only
-some of them.
+and the encodings of every return code. The reset's gate decision is among them:
+`Refuse`, `HardStop` and local failures block, and `Execute` and `Unreachable` pass.
+The reset's counter change and `last_used` clear are tested in `data_state.rs`. The
+kernel-side refusal codes (`7`–`13`) are pinned as values and checked for
+distinctness. The boot walk exercises only some of them. The reset's capability
+scope is tested in `capabilities.rs`, and `data.reset_usage`'s JSON and label in
+`marshal_action.rs`.
 
-**Gaps, specific to this section.**
+**Gaps, specific to this section.** The over-cap-until-reboot limitation is closed by
+the governed reset above. What the reset adds, and what remains, is listed here and
+in THREAT_MODEL.md's mobile gaps (25 to 27).
 
 - Usage is caller-asserted. Nothing measures it, so whoever holds `data:usage`
-  decides the numbers.
-- There is no governed reset. An over-cap account is denied until reboot.
+  decides the numbers. The reset does not read the counter, so the numbers do not
+  decide whether a reset happens.
+- The reset is a privileged lever. A holder of `data:reset:{id}` who gets an
+  `Execute` or `Unreachable` verdict can restore service. `Unreachable` passes, so a
+  proxy that is down or cut off lets a reset through with no verdict. The reset's
+  WORM entry does not record which verdict it got.
+- There is no period clock. Nothing schedules a reset, and nothing limits how often
+  one can be issued. A reset on a suspended account lifts the cap without restoring
+  service.
 - Policy only requests. A caller that ignores a suspension request leaves the
   account Active, and an already-open session stays open.
 - Sessions are a kernel table that no traffic path reads. A denial is a

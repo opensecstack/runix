@@ -11,10 +11,11 @@
 //!   which is the reconciler's `last_used_bytes` input for its regression
 //!   check. The counter only ever goes up (`apply_usage` saturates), so a
 //!   regression incident can only mean the state was tampered with; it is a
-//!   tripwire, not an expected event. There is no billing-period reset path in
-//!   this slice; when one is added it must clear `last_used` in the same
-//!   critical section, or the reconciler will report the legitimate reset as
-//!   tampering (see `reconcile::ObservedAccount::last_used_bytes`).
+//!   tripwire, not an expected event. The one legitimate way it goes back down
+//!   is [`DataState::reset_usage`] (the governed `SYS_DATA_RESET`), which clears
+//!   `last_used` in the same critical section so the reconciler reads the reset
+//!   as a new period, not as tampering (see
+//!   `reconcile::ObservedAccount::last_used_bytes`).
 //! - The open-session table the reconciler snapshots. A session is recorded
 //!   only when the policy engine allowed it.
 //! - NOT here: entitlements (`data_codes::demo_entitlement`), account
@@ -34,8 +35,8 @@
 use alloc::vec::Vec;
 
 use runix_mobile::policy::{
-    apply_usage, evaluate_usage, AccountStandingForData, DataEntitlement, DataUsage, NetworkClass,
-    PolicyDecisionRecord, ProfileLifecycleForData, SessionDecision, SessionRequest,
+    apply_usage, evaluate_usage, reset_usage, AccountStandingForData, DataEntitlement, DataUsage,
+    NetworkClass, PolicyDecisionRecord, ProfileLifecycleForData, SessionDecision, SessionRequest,
 };
 
 /// Most accounts the usage table tracks. Equals the account registry's own
@@ -138,6 +139,28 @@ impl DataState {
             last_used: None,
         });
         Ok((before, after))
+    }
+
+    /// Start a new usage period for `account`: set its counter to the engine's
+    /// `reset_usage()` and clear `last_used` (the reconciler's memory), in this
+    /// one critical section. Clearing `last_used` is what tells the reconciler a
+    /// legitimate period reset happened; without it its `UsageRegression` check
+    /// would report the reset as counter tampering. Returns `(before, after)`.
+    ///
+    /// Touches nothing else: no session is closed, no standing or profile
+    /// changes (the caller lifts the cap, it does not also tear down or
+    /// restore anything). An account that was never fed has no row and nothing
+    /// to reset (`(0, 0)`); no row is created for it.
+    pub fn reset_usage(&mut self, account: u64) -> (DataUsage, DataUsage) {
+        match self.usage.iter_mut().find(|e| e.account == account) {
+            Some(e) => {
+                let before = e.usage;
+                e.usage = reset_usage();
+                e.last_used = None;
+                (before, e.usage)
+            }
+            None => (DataUsage { used_bytes: 0 }, reset_usage()),
+        }
     }
 
     /// Evaluate a session request against the CURRENT usage and, only if the
@@ -394,6 +417,76 @@ mod tests {
         assert_eq!(s0, s1);
         assert_eq!(u1[0].usage, u0[0].usage);
         assert_eq!(u1[0].account, u0[0].account);
+    }
+
+    #[test]
+    fn reset_zeroes_usage_clears_last_used_and_touches_nothing_else() {
+        let mut s = DataState::new();
+        s.feed_usage(0, 1600).unwrap();
+        s.feed_usage(1, 40).unwrap();
+        open(&mut s, 1, false);
+        let (snap, _) = s.snapshot();
+        s.mark_observed(&snap);
+        let sessions_before = s.snapshot().1;
+        let (b, a) = s.reset_usage(0);
+        assert_eq!((b.used_bytes, a.used_bytes), (1600, 0));
+        let (rows, sessions) = s.snapshot();
+        let r0 = rows.iter().find(|e| e.account == 0).unwrap();
+        assert_eq!(r0.usage.used_bytes, 0);
+        assert_eq!(
+            r0.last_used, None,
+            "reset must be signalled to the reconciler"
+        );
+        // Another account's row (and its last_used) is untouched.
+        let r1 = rows.iter().find(|e| e.account == 1).unwrap();
+        assert_eq!((r1.usage.used_bytes, r1.last_used), (40, Some(40)));
+        // No session is closed or changed.
+        assert_eq!(sessions, sessions_before);
+    }
+
+    #[test]
+    fn reset_restores_service_for_an_over_cap_account() {
+        let mut s = DataState::new();
+        s.feed_usage(0, 1600).unwrap();
+        assert_eq!(
+            open(&mut s, 0, false).record.decision,
+            SessionDecision::Deny(DenyReason::CapExceeded)
+        );
+        s.reset_usage(0);
+        assert_eq!(
+            open(&mut s, 0, false).record.decision,
+            SessionDecision::Allow
+        );
+    }
+
+    #[test]
+    fn reset_of_an_unfed_account_creates_no_row() {
+        let mut s = DataState::new();
+        let (b, a) = s.reset_usage(7);
+        assert_eq!((b.used_bytes, a.used_bytes), (0, 0));
+        assert!(s.snapshot().0.is_empty());
+    }
+
+    #[test]
+    fn reset_then_reconcile_snapshot_reports_no_regression() {
+        use crate::data_codes::{build_observed, demo_entitlement};
+        use runix_mobile::account::AccountStatus;
+        use runix_mobile::reconcile::reconcile;
+        let mut s = DataState::new();
+        s.feed_usage(0, 1600).unwrap();
+        let (snap, _) = s.snapshot();
+        s.mark_observed(&snap); // the reconciler saw 1600
+        let accts = [(0u64, AccountStatus::Active)];
+        // Without the clear, a drop to 0 would be reported as a regression...
+        let mut tampered = s.snapshot().0;
+        tampered[0].usage.used_bytes = 0;
+        let o = build_observed(&accts, &[], &tampered, &[], demo_entitlement);
+        assert!(!reconcile(&o).is_empty());
+        // ...a governed reset is not.
+        s.reset_usage(0);
+        let (rows, sessions) = s.snapshot();
+        let o = build_observed(&accts, &[], &rows, &sessions, demo_entitlement);
+        assert!(reconcile(&o).is_empty());
     }
 
     #[test]

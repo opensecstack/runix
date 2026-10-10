@@ -36,6 +36,7 @@ use runix_mobile::reconcile::{
 };
 
 use crate::data_state::{DataSession, UsageEntry};
+use crate::marshal_action::{enforce, Blocked, GateOutcome};
 use crate::sim::ProfileState;
 
 // --- SYS_DATA_ACCOUNT return codes ----------------------------------------
@@ -140,6 +141,47 @@ pub const CLOSE_BAD_ARGUMENT: u64 = 3;
 /// capability denial. `u64::MAX` can never be a count (the snapshot is
 /// bounded far below it), so the two cannot be confused.
 pub const RECONCILE_DENIED: u64 = u64::MAX;
+
+// --- SYS_DATA_RESET return codes --------------------------------------------
+// The governed usage-period reset: capability, then MARSHAL, then the mutation.
+// `0` is the only success; each refusal is its own code, in the order the
+// checks run.
+
+/// The counter was reset to zero (a new usage period began).
+pub const RESET_OK: u64 = 0;
+/// The caller lacks `data:reset:{account}`.
+pub const RESET_DENIED_CAPABILITY: u64 = 1;
+/// A reachable MARSHAL answered `Refuse` or `HardStop`. Nothing changed.
+pub const RESET_DENIED_MARSHAL: u64 = 2;
+/// The kernel failed to run the MARSHAL evaluation at all (fail closed).
+/// Nothing changed.
+pub const RESET_DENIED_LOCAL_FAILURE: u64 = 3;
+/// No entitlement is configured for the account (fail closed).
+pub const RESET_NO_ENTITLEMENT: u64 = 4;
+/// No such account in the registry.
+pub const RESET_NO_SUCH_ACCOUNT: u64 = 5;
+
+/// The `SYS_DATA_RESET` return code for a MARSHAL block: a remote
+/// `Refuse`/`HardStop` and a local evaluation failure are distinguishable to
+/// the caller (the same split the DENIED line makes). Exhaustive.
+pub const fn reset_blocked_code(blocked: &Blocked) -> u64 {
+    match blocked {
+        Blocked::Remote(_) => RESET_DENIED_MARSHAL,
+        Blocked::Local(_) => RESET_DENIED_LOCAL_FAILURE,
+    }
+}
+
+/// The whole MARSHAL half of the reset's decision, pure: `RESET_OK` means the
+/// gate lets the mutation proceed (`Execute`, or `Unreachable` -- Option B
+/// fail-open); anything else is the code the syscall returns with state
+/// untouched. `svc.rs` runs the real evaluation and the local-failure WORM
+/// audit; this is the decision they feed, pinned by `cargo test --lib`.
+pub fn reset_gate_code(outcome: GateOutcome) -> u64 {
+    match enforce(outcome) {
+        Ok(()) => RESET_OK,
+        Err(b) => reset_blocked_code(&b),
+    }
+}
 
 // --- Argument packing -------------------------------------------------------
 
@@ -436,6 +478,50 @@ mod tests {
             assert_eq!(
                 session_decision_code(SessionDecision::Deny(DenyReason::ProfileNotEnabled(lc))),
                 SESSION_DENY_PROFILE_NOT_ENABLED
+            );
+        }
+    }
+
+    #[test]
+    fn reset_codes_are_pinned_distinct_and_only_zero_is_success() {
+        let all = [
+            RESET_OK,
+            RESET_DENIED_CAPABILITY,
+            RESET_DENIED_MARSHAL,
+            RESET_DENIED_LOCAL_FAILURE,
+            RESET_NO_ENTITLEMENT,
+            RESET_NO_SUCH_ACCOUNT,
+        ];
+        for (i, c) in all.iter().enumerate() {
+            assert_eq!(*c, i as u64, "codes are the dense list 0..=5");
+        }
+    }
+
+    #[test]
+    fn reset_gate_decision_blocks_exactly_what_marshal_blocks() {
+        use crate::marshal_action::LocalFailure;
+        use runix_citadel_integration::ShadowMarshalOutcome::*;
+        // Execute and Unreachable (Option B fail-open) let the reset proceed.
+        assert_eq!(reset_gate_code(GateOutcome::Remote(Execute)), RESET_OK);
+        assert_eq!(reset_gate_code(GateOutcome::Remote(Unreachable)), RESET_OK);
+        // Refuse and HardStop block it, state untouched.
+        assert_eq!(
+            reset_gate_code(GateOutcome::Remote(Refuse)),
+            RESET_DENIED_MARSHAL
+        );
+        assert_eq!(
+            reset_gate_code(GateOutcome::Remote(HardStop)),
+            RESET_DENIED_MARSHAL
+        );
+        // Every local failure fails CLOSED, with its own code.
+        for l in [
+            LocalFailure::SetupFailed,
+            LocalFailure::SpawnFailed,
+            LocalFailure::ExcursionFaulted,
+        ] {
+            assert_eq!(
+                reset_gate_code(GateOutcome::LocalFailure(l)),
+                RESET_DENIED_LOCAL_FAILURE
             );
         }
     }

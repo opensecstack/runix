@@ -3,7 +3,9 @@
 This describes the layer split, workspace layout, and why certain crates
 are (or aren't) members of the root Cargo workspace. For current
 implementation status, see [STATUS.md](STATUS.md); for phase targets, see
-[ROADMAP.md](ROADMAP.md).
+[ROADMAP.md](ROADMAP.md); for why specific cross-crate or trust-boundary
+decisions were made (and what would reopen them), see the
+[architecture decision records](adrs/README.md).
 
 This repo is a single Cargo workspace shared by both the desktop and mobile
 editions — they share the same kernel, capability manager, WASM runtime, and

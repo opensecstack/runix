@@ -220,7 +220,12 @@ fn build_enriched_envelope(envelope: &KernelMinimalEnvelope, signing_key: &Signi
     let ts_utc = identity::format_rfc3339_utc(identity::now_unix_secs());
 
     let mut extra = std::collections::BTreeMap::new();
-    let description = if policy::is_mvno_action(&envelope.action.action_type) {
+    let description = if policy::is_data_action(&envelope.action.action_type) {
+        // `policy::check` guarantees `account` for `data.reset_usage`.
+        let account = envelope.action.account.unwrap_or_default();
+        extra.insert("account".to_string(), account.to_string());
+        format!("{} account={account}", envelope.action.action_type)
+    } else if policy::is_mvno_action(&envelope.action.action_type) {
         // `policy::check` guarantees `account` (and, for bind, slot/profile).
         let account = envelope.action.account.unwrap_or_default();
         extra.insert("account".to_string(), account.to_string());
@@ -975,6 +980,31 @@ mod tests {
                 forwarded.sod.verifier_user_id
             );
         }
+    }
+
+    #[test]
+    fn forwards_data_reset_usage_as_an_enriched_envelope() {
+        let (response, ids, forwarded) = mvno_round_trip(
+            r#"{"kerkese_version":"1.0","dry_run":true,"action":{"type":"data.reset_usage","account":6},"actor":{"user_id":"el0:arm-demo","role":"operator"},"execution_id":"data-reset-6"}"#,
+        );
+        assert_execute(&response);
+        assert_eq!(ids, ("data".to_string(), "account-6".to_string()));
+        assert_eq!(forwarded.action.action_type, "data.reset_usage");
+        assert_eq!(forwarded.action.description, "data.reset_usage account=6");
+        let extra = &forwarded.evidence.extra;
+        assert_eq!(extra.get("account"), Some(&"6".to_string()));
+        assert!(!extra.contains_key("slot"));
+        assert!(!extra.contains_key("profile"));
+        assert!(!extra.contains_key("module_id"));
+        assert_eq!(
+            extra.get("kernel_execution_id"),
+            Some(&"data-reset-6".to_string())
+        );
+        assert_eq!(forwarded.sod.operator_user_id, "el0:arm-demo");
+        assert_ne!(
+            forwarded.sod.operator_user_id,
+            forwarded.sod.verifier_user_id
+        );
     }
 
     /// Proves the policy check actually gates forwarding: a request this

@@ -1,6 +1,9 @@
 # 0001: Data policy syscalls are not MARSHAL-gated; the engine only requests
 
 **Status**: Accepted, 2026-10-10 (Beta item 4, the mobile data policy engine).
+Amended by [0002](0002-usage-reset-is-marshal-gated.md): the usage-period reset,
+which this record named as a revisit trigger, is the one data syscall that is
+MARSHAL-gated. Everything below still holds for every other data syscall.
 
 ## Context
 

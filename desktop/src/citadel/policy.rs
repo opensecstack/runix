@@ -33,8 +33,11 @@
 //!    it explicitly recognizes ([`RECOGNIZED_ACTION_TYPES`]) — matching
 //!    CITADEL's own `rbacMap` entries for `grid_sandbox.spawn_instance`
 //!    `esim.enable`/`esim.delete`, and `mvno.bind_profile`/
-//!    `mvno.suspend_account`/`mvno.reactivate_account`
-//!    (`citadel/internal/marshal/types.go`; eSIM actions are identified by
+//!    `mvno.suspend_account`/`mvno.reactivate_account`, and `data.reset_usage`
+//!    (`citadel/internal/marshal/types.go`; `data.reset_usage` is identified
+//!    by `account` alone and is the ONE data action that is MARSHAL-gated --
+//!    the other data syscalls never reach this proxy, see
+//!    `docs/adrs/0001-data-syscalls-not-marshal-gated.md`; eSIM actions are identified by
 //!    `slot`/`profile`, MVNO actions by `account` (plus `slot`/`profile`
 //!    for `mvno.bind_profile` only), instead of `module_id`/`instance_id`,
 //!    and [`check`] enforces those per-family splits), so this rejects a request for
@@ -73,8 +76,8 @@ use serde::Deserialize;
 /// Action types this proxy is willing to vouch for as Verifier — kept in
 /// sync with `citadel/internal/marshal/types.go`'s `rbacMap`'s
 /// `grid_sandbox.spawn_instance`, `esim.enable`/`esim.delete` and
-/// `mvno.bind_profile`/`mvno.suspend_account`/`mvno.reactivate_account`
-/// entries (both the `"admin"` and `"operator"` role lists carry them today). A request for anything else is
+/// `mvno.bind_profile`/`mvno.suspend_account`/`mvno.reactivate_account` and
+/// `data.reset_usage` entries (both the `"admin"` and `"operator"` role lists carry them today). A request for anything else is
 /// refused before an envelope is even built, regardless of how well-formed
 /// it otherwise is.
 pub const RECOGNIZED_ACTION_TYPES: &[&str] = &[
@@ -84,6 +87,7 @@ pub const RECOGNIZED_ACTION_TYPES: &[&str] = &[
     MVNO_BIND_PROFILE_ACTION,
     MVNO_SUSPEND_ACCOUNT_ACTION,
     MVNO_REACTIVATE_ACCOUNT_ACTION,
+    DATA_RESET_USAGE_ACTION,
 ];
 
 /// `kernel-arm/src/marshal_transport.rs` sends these two (`esim.{action}`)
@@ -97,6 +101,17 @@ pub const ESIM_DELETE_ACTION: &str = "esim.delete";
 pub const MVNO_BIND_PROFILE_ACTION: &str = "mvno.bind_profile";
 pub const MVNO_SUSPEND_ACCOUNT_ACTION: &str = "mvno.suspend_account";
 pub const MVNO_REACTIVATE_ACCOUNT_ACTION: &str = "mvno.reactivate_account";
+
+/// `kernel-arm` sends this for the data usage-counter reset -- the one data
+/// action that is MARSHAL-gated (see
+/// `docs/adrs/0001-data-syscalls-not-marshal-gated.md`, "Revisit when");
+/// identified by `account` alone.
+pub const DATA_RESET_USAGE_ACTION: &str = "data.reset_usage";
+
+/// Whether `action_type` is the (MARSHAL-gated) data usage reset.
+pub fn is_data_action(action_type: &str) -> bool {
+    action_type == DATA_RESET_USAGE_ACTION
+}
 
 /// Whether `action_type` is one of the MVNO actions, identified by
 /// `account` (and, for `mvno.bind_profile` only, `slot`/`profile`).
@@ -167,7 +182,7 @@ pub struct KernelMinimalAction {
     /// eSIM actions only: the profile id within `slot`.
     #[serde(default)]
     pub profile: Option<u64>,
-    /// MVNO actions only (`mvno.*`): the account id.
+    /// MVNO actions (`mvno.*`) and `data.reset_usage`: the account id.
     #[serde(default)]
     pub account: Option<u64>,
 }
@@ -182,10 +197,16 @@ impl KernelMinimalAction {
     /// `account-{account}-slot-{slot}-profile-{profile}` for
     /// `mvno.bind_profile`) (empty parts if a field is missing --
     /// [`check`] refuses that case, but the refusal itself still gets
-    /// recorded, so this must not panic).
+    /// recorded, so this must not panic). `data.reset_usage` is the fixed
+    /// module `"data"` and an instance of `account-{account}`.
     pub fn audit_ids(&self) -> (String, String) {
         let part = |v: Option<u64>| v.map_or_else(String::new, |n| n.to_string());
-        if is_mvno_action(&self.action_type) {
+        if is_data_action(&self.action_type) {
+            (
+                "data".to_string(),
+                format!("account-{}", part(self.account)),
+            )
+        } else if is_mvno_action(&self.action_type) {
             let instance = if self.action_type == MVNO_BIND_PROFILE_ACTION {
                 format!(
                     "account-{}-slot-{}-profile-{}",
@@ -276,7 +297,24 @@ pub fn check(envelope: &KernelMinimalEnvelope) -> Result<(), PolicyError> {
         ));
     }
 
-    if is_mvno_action(&envelope.action.action_type) {
+    if is_data_action(&envelope.action.action_type) {
+        // `data.reset_usage` is identified by `account` alone.
+        if envelope.action.account.is_none() {
+            return Err(PolicyError::MissingField("account"));
+        }
+        if envelope.action.slot.is_some() {
+            return Err(PolicyError::UnexpectedField("slot"));
+        }
+        if envelope.action.profile.is_some() {
+            return Err(PolicyError::UnexpectedField("profile"));
+        }
+        if !envelope.action.module_id.is_empty() {
+            return Err(PolicyError::UnexpectedField("module_id"));
+        }
+        if !envelope.action.instance_id.is_empty() {
+            return Err(PolicyError::UnexpectedField("instance_id"));
+        }
+    } else if is_mvno_action(&envelope.action.action_type) {
         // MVNO actions are identified by `account` (plus slot/profile for
         // bind); module/instance ids have no meaning here.
         let is_bind = envelope.action.action_type == MVNO_BIND_PROFILE_ACTION;
@@ -655,6 +693,95 @@ mod tests {
             e.action.audit_ids(),
             ("mvno".to_string(), "account-".to_string())
         );
+    }
+
+    fn data_envelope() -> KernelMinimalEnvelope {
+        let mut e = valid_envelope();
+        e.action = KernelMinimalAction {
+            action_type: DATA_RESET_USAGE_ACTION.into(),
+            module_id: String::new(),
+            instance_id: String::new(),
+            slot: None,
+            profile: None,
+            account: Some(4),
+        };
+        e.actor.user_id = "el0:arm-demo".into();
+        e
+    }
+
+    #[test]
+    fn accepts_well_formed_data_reset_usage_request() {
+        assert!(check(&data_envelope()).is_ok());
+        assert!(RECOGNIZED_ACTION_TYPES.contains(&DATA_RESET_USAGE_ACTION));
+        assert!(is_data_action(DATA_RESET_USAGE_ACTION));
+        assert!(!is_data_action(MVNO_SUSPEND_ACCOUNT_ACTION));
+        assert!(!is_mvno_action(DATA_RESET_USAGE_ACTION));
+        assert!(!is_esim_action(DATA_RESET_USAGE_ACTION));
+    }
+
+    #[test]
+    fn rejects_data_reset_usage_missing_account() {
+        let mut e = data_envelope();
+        e.action.account = None;
+        assert_eq!(check(&e), Err(PolicyError::MissingField("account")));
+    }
+
+    #[test]
+    fn rejects_data_reset_usage_with_stray_fields() {
+        let mut e = data_envelope();
+        e.action.slot = Some(0);
+        assert_eq!(check(&e), Err(PolicyError::UnexpectedField("slot")));
+        let mut e = data_envelope();
+        e.action.profile = Some(0);
+        assert_eq!(check(&e), Err(PolicyError::UnexpectedField("profile")));
+        let mut e = data_envelope();
+        e.action.module_id = "grid-sandbox-host".into();
+        assert_eq!(check(&e), Err(PolicyError::UnexpectedField("module_id")));
+        let mut e = data_envelope();
+        e.action.instance_id = "x".into();
+        assert_eq!(check(&e), Err(PolicyError::UnexpectedField("instance_id")));
+    }
+
+    #[test]
+    fn other_families_unaffected_by_data_reset_usage() {
+        let mut e = esim_envelope(ESIM_ENABLE_ACTION);
+        e.action.account = Some(1);
+        assert_eq!(check(&e), Err(PolicyError::UnexpectedField("account")));
+        let mut e = valid_envelope();
+        e.action.account = Some(1);
+        assert_eq!(check(&e), Err(PolicyError::UnexpectedField("account")));
+        for t in MVNO_ALL {
+            assert!(check(&mvno_envelope(t)).is_ok(), "{t}");
+        }
+        // The same account-only body under an mvno suspend type follows mvno rules.
+        let mut e = data_envelope();
+        e.action.action_type = MVNO_SUSPEND_ACCOUNT_ACTION.into();
+        assert!(check(&e).is_ok());
+    }
+
+    #[test]
+    fn data_audit_ids_are_derived_and_never_panic() {
+        assert_eq!(
+            data_envelope().action.audit_ids(),
+            ("data".to_string(), "account-4".to_string())
+        );
+        let mut e = data_envelope();
+        e.action.account = None;
+        assert_eq!(
+            e.action.audit_ids(),
+            ("data".to_string(), "account-".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_the_real_data_reset_usage_envelope_kernel_arm_sends() {
+        let json = r#"{"kerkese_version":"1.0","dry_run":true,"action":{"type":"data.reset_usage","account":3},"actor":{"user_id":"el0:arm-demo","role":"operator"},"execution_id":"data-reset-3"}"#;
+        let envelope: KernelMinimalEnvelope =
+            serde_json::from_str(json).expect("should parse the real kernel-arm shape");
+        assert!(check(&envelope).is_ok());
+        let bad = json.replace(r#""account":3"#, r#""account":3,"slot":0"#);
+        let envelope: KernelMinimalEnvelope = serde_json::from_str(&bad).expect("parses");
+        assert_eq!(check(&envelope), Err(PolicyError::UnexpectedField("slot")));
     }
 
     #[test]

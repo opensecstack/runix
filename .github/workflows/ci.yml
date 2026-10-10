@@ -501,30 +501,18 @@ jobs:
         # runner from that one. `nc`/`python3` are preinstalled on
         # `ubuntu-latest`, same as that step's own comment notes.
         #
-        # `timeout` bumped 20 -> 25 for item 2.6: `nonsecure.rs` now
-        # unconditionally configures `marshal_transport`'s MARSHAL proxy at
-        # `10.0.2.100:9100`, and this boot config has no `guestfwd` route for
-        # that port -- so the eSIM demo's `SYS_SIM_ENABLE`/`SYS_SIM_DELETE`
-        # calls each drive one real (bounded) connect-and-time-out attempt
-        # before falling back to `Unreachable`/fail-open. Confirmed in a real
-        # boot (via the project's Fedora WSL dev environment, where `nc`
-        # actually works) that every expected line still appears well inside
-        # the old 20s budget; the extra 5s is margin, not a measured need.
-        #
-        # `timeout` bumped 25 -> 35 for Beta item 3.4: the three MVNO
-        # syscalls are MARSHAL-gated now, so the EL0 walk performs seven
-        # evaluations per boot instead of four, and in this config every one
-        # is a bounded connect-and-time-out attempt. MEASURED natively (QEMU
-        # TCG on the Windows dev box, no guestfwd, all evaluations
-        # Unreachable): the full serial output is complete by ~6-9s (secure)
-        # / ~6-7s (non-secure) with seven evaluations vs ~4.5s with four
-        # (~1-1.5s per extra attempt). The 35s ceiling is margin for a slower
-        # runner plus the tcp_proof guestfwd round trip, which the Windows box
-        # cannot run -- UNMEASURED on ubuntu-latest.
+        # `timeout` is 25 s, set from MEASUREMENT (9 CI runs, per-line runner
+        # timestamps): this step's last required serial line appears within
+        # ~1-6 s of the first serial line (worst case ~7 s once Beta item 4's
+        # data reset adds an eighth MARSHAL evaluation), so 25 s is ~3.6x the
+        # worst case. The guest idles forever after its demo, so `timeout` always
+        # kills QEMU and a step's wall-clock is ~N regardless of the boot; only
+        # time-to-last-required-line matters. Runner speed varied ~2.4x between
+        # identical runs, so do not tighten further without more data.
         run: |
           python3 ../kernel/tests/support/tcp_proof_listener.py &
           sleep 0.3
-          timeout 35 qemu-system-aarch64 \
+          timeout 25 qemu-system-aarch64 \
             -M virt,secure=on,gic-version=2 -cpu cortex-a53 -nographic \
             -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
             -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001" \
@@ -803,8 +791,8 @@ jobs:
           # data_state.rs/data_codes.rs wrapping runix_mobile::policy and
           # ::reconcile). The engine only REQUESTS and the reconciler only
           # OBSERVES; the requests are carried out by the caller through the
-          # existing governed syscalls, so none of the four data syscalls is
-          # MARSHAL-gated (asserted below: no data action is ever evaluated).
+          # existing governed syscalls, so none of the four of them is MARSHAL-gated
+          # (asserted below: the only data action ever evaluated is the reset).
           # Account 0 is compiled-in DEMO data: cap 1000 bytes, throttle at
           # 80%, no roaming, suspension requested at 150%. The walk runs it
           # between the first ENABLE and the existing SUSPEND(0), which is the
@@ -849,8 +837,34 @@ jobs:
           # No capability for account 99: denied per call, before any state is read.
           grep -q "SVC: SYS_DATA_SESSION_OPEN account 99 slot 0 DENIED" /tmp/arm-boot.log
           grep -q "SVC: SYS_DATA_ACCOUNT account 99 DENIED" /tmp/arm-boot.log
-          # Not MARSHAL-gated: no data action is ever sent for evaluation.
-          if grep -q "MARSHAL evaluation for data" /tmp/arm-boot.log; then exit 1; fi
+          # Not MARSHAL-gated: of the data actions, ONLY the usage-period reset
+          # (data.reset_usage, below) is ever sent for evaluation. Any other
+          # "MARSHAL evaluation for data..." line is a regression, and so is
+          # more than one (the walk performs exactly one reset).
+          if grep "MARSHAL evaluation for data" /tmp/arm-boot.log | grep -qvF "data.reset_usage"; then exit 1; fi
+          test "$(grep -c "MARSHAL evaluation for data" /tmp/arm-boot.log)" -eq 1
+          # Governed usage-period reset (SYS_DATA_RESET): it lifts a cap, so it is
+          # capability-gated (data:reset:0, its own scope) AND MARSHAL-gated. The
+          # walk runs it after the second ENABLE: usage 1600/1000, no session. In
+          # this boot config the gate reads Unreachable (fail-open).
+          grep -q "Runix ARM kernel: data reset capability issued (account 0" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=0: Unreachable" \
+            /tmp/arm-boot.log
+          grep -q "SVC: SYS_DATA_RESET account 0 authorized (usage 1600 -> 0; new period; MARSHAL did not block it (verdict on the evaluation line above); " \
+            /tmp/arm-boot.log
+          # Order matters: the SAME session open is DENIED CapExceeded before the
+          # reset (the cap is still in force) and Allowed after it (service
+          # restored); the reconcile after the reset sees zero incidents (no
+          # UsageRegression, because the reset cleared the reconciler's memory).
+          sed -n '1,/SYS_DATA_RESET account 0 authorized/p' /tmp/arm-boot.log > /tmp/arm-boot-pre-reset.log
+          sed -n '/SYS_DATA_RESET account 0 authorized/,$p' /tmp/arm-boot.log > /tmp/arm-boot-post-reset.log
+          test "$(grep -c "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 DENIED (CapExceeded; " /tmp/arm-boot-pre-reset.log)" -ge 2
+          grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 authorized (Allow; .*used=0 " \
+            /tmp/arm-boot-post-reset.log
+          grep -q "SVC: SYS_DATA_RECONCILE authorized (0 incident(s);" /tmp/arm-boot-post-reset.log
+          if grep -q "incident usage-regression" /tmp/arm-boot.log; then exit 1; fi
+          # No capability for data:reset:99: denied before MARSHAL or any state.
+          grep -q "SVC: SYS_DATA_RESET account 99 DENIED" /tmp/arm-boot.log
           # Network selection driven by a registry account's standing (own local registry;
           # kernel-arm/src/mvno_proof.rs, EL1-only): allowed while Active,
           # refused once suspended.
@@ -891,13 +905,18 @@ jobs:
         # unconditionally, which UNDEFINED-traps from EL1 with no VBAR_EL1
         # installed yet to catch it) -- see main.rs's doc comment and
         # docs/STATUS.md's "Real bugs" section for the full account.
-        # `timeout` bumped 20 -> 25 for the same reason the secure boot
-        # above was, then 25 -> 35 for Beta item 3.4 -- see that step's
-        # comment (measured natively: ~6-7s non-secure).
+        # See the secure boot step above: `timeout` is 25 s, set from MEASUREMENT (9 CI runs, per-line runner
+        # timestamps): this step's last required serial line appears within
+        # ~1-6 s of the first serial line (worst case ~7 s once Beta item 4's
+        # data reset adds an eighth MARSHAL evaluation), so 25 s is ~3.6x the
+        # worst case. The guest idles forever after its demo, so `timeout` always
+        # kills QEMU and a step's wall-clock is ~N regardless of the boot; only
+        # time-to-last-required-line matters. Runner speed varied ~2.4x between
+        # identical runs, so do not tighten further without more data.
         run: |
           python3 ../kernel/tests/support/tcp_proof_listener.py &
           sleep 0.3
-          timeout 35 qemu-system-aarch64 \
+          timeout 25 qemu-system-aarch64 \
             -M virt,gic-version=2 -cpu cortex-a53 -nographic \
             -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
             -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001" \
@@ -1016,8 +1035,8 @@ jobs:
           # data_state.rs/data_codes.rs wrapping runix_mobile::policy and
           # ::reconcile). The engine only REQUESTS and the reconciler only
           # OBSERVES; the requests are carried out by the caller through the
-          # existing governed syscalls, so none of the four data syscalls is
-          # MARSHAL-gated (asserted below: no data action is ever evaluated).
+          # existing governed syscalls, so none of the four of them is MARSHAL-gated
+          # (asserted below: the only data action ever evaluated is the reset).
           # Account 0 is compiled-in DEMO data: cap 1000 bytes, throttle at
           # 80%, no roaming, suspension requested at 150%. The walk runs it
           # between the first ENABLE and the existing SUSPEND(0), which is the
@@ -1059,8 +1078,34 @@ jobs:
           # No capability for account 99: denied per call, before any state is read.
           grep -q "SVC: SYS_DATA_SESSION_OPEN account 99 slot 0 DENIED" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_DATA_ACCOUNT account 99 DENIED" /tmp/arm-boot-nosecure.log
-          # Not MARSHAL-gated: no data action is ever sent for evaluation.
-          if grep -q "MARSHAL evaluation for data" /tmp/arm-boot-nosecure.log; then exit 1; fi
+          # Not MARSHAL-gated: of the data actions, ONLY the usage-period reset
+          # (data.reset_usage, below) is ever sent for evaluation. Any other
+          # "MARSHAL evaluation for data..." line is a regression, and so is
+          # more than one (the walk performs exactly one reset).
+          if grep "MARSHAL evaluation for data" /tmp/arm-boot-nosecure.log | grep -qvF "data.reset_usage"; then exit 1; fi
+          test "$(grep -c "MARSHAL evaluation for data" /tmp/arm-boot-nosecure.log)" -eq 1
+          # Governed usage-period reset (SYS_DATA_RESET): it lifts a cap, so it is
+          # capability-gated (data:reset:0, its own scope) AND MARSHAL-gated. The
+          # walk runs it after the second ENABLE: usage 1600/1000, no session. In
+          # this boot config the gate reads Unreachable (fail-open).
+          grep -q "Runix ARM kernel: data reset capability issued (account 0" /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=0: Unreachable" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_DATA_RESET account 0 authorized (usage 1600 -> 0; new period; MARSHAL did not block it (verdict on the evaluation line above); " \
+            /tmp/arm-boot-nosecure.log
+          # Order matters: the SAME session open is DENIED CapExceeded before the
+          # reset (the cap is still in force) and Allowed after it (service
+          # restored); the reconcile after the reset sees zero incidents (no
+          # UsageRegression, because the reset cleared the reconciler's memory).
+          sed -n '1,/SYS_DATA_RESET account 0 authorized/p' /tmp/arm-boot-nosecure.log > /tmp/arm-boot-nosecure-pre-reset.log
+          sed -n '/SYS_DATA_RESET account 0 authorized/,$p' /tmp/arm-boot-nosecure.log > /tmp/arm-boot-nosecure-post-reset.log
+          test "$(grep -c "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 DENIED (CapExceeded; " /tmp/arm-boot-nosecure-pre-reset.log)" -ge 2
+          grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 authorized (Allow; .*used=0 " \
+            /tmp/arm-boot-nosecure-post-reset.log
+          grep -q "SVC: SYS_DATA_RECONCILE authorized (0 incident(s);" /tmp/arm-boot-nosecure-post-reset.log
+          if grep -q "incident usage-regression" /tmp/arm-boot-nosecure.log; then exit 1; fi
+          # No capability for data:reset:99: denied before MARSHAL or any state.
+          grep -q "SVC: SYS_DATA_RESET account 99 DENIED" /tmp/arm-boot-nosecure.log
           # Network selection driven by a registry account's standing (own local registry;
           # kernel-arm/src/mvno_proof.rs, EL1-only): allowed while Active,
           # refused once suspended.
@@ -1113,13 +1158,15 @@ jobs:
           sleep 0.3
           python3 ../kernel/tests/support/arm_marshal_selective_listener.py 9004 --refuse esim. &
           sleep 0.3
-          # `timeout` bumped 20 -> 30: Beta item 3.3's EL0 walk adds one more
-          # authorized ENABLE (one more esim_marshal::evaluate round trip).
-          # Item 3.4 adds three more (MVNO) evaluations, but with a listener
-          # answering they are fast round trips, not timed-out attempts.
-          # UNMEASURED margin (guestfwd can't run on the Windows dev box);
-          # tighten from the first CI run's real timing.
-          timeout 30 qemu-system-aarch64 \
+          # `timeout` is 25 s, set from MEASUREMENT (9 CI runs, per-line runner
+          # timestamps): this step's last required serial line appears within
+          # ~1-6 s of the first serial line (worst case ~7 s once Beta item 4's
+          # data reset adds an eighth MARSHAL evaluation), so 25 s is ~3.6x the
+          # worst case. The guest idles forever after its demo, so `timeout` always
+          # kills QEMU and a step's wall-clock is ~N regardless of the boot; only
+          # time-to-last-required-line matters. Runner speed varied ~2.4x between
+          # identical runs, so do not tighten further without more data.
+          timeout 25 qemu-system-aarch64 \
             -M virt,secure=on,gic-version=2 -cpu cortex-a53 -nographic \
             -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
             -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001,guestfwd=tcp:10.0.2.100:9100-cmd:nc 127.0.0.1 9004" \
@@ -1140,6 +1187,10 @@ jobs:
             /tmp/arm-boot-marshal-refuse.log
           grep -q "SVC: SYS_MVNO_BIND account 0 slot 0 profile 0 authorized" \
             /tmp/arm-boot-marshal-refuse.log
+          # Only esim.* is refused, so the data usage-period reset still Executes.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=0: Execute" \
+            /tmp/arm-boot-marshal-refuse.log
+          grep -q "SVC: SYS_DATA_RESET account 0 authorized" /tmp/arm-boot-marshal-refuse.log
 
       # Beta item 3.4: the MVNO MARSHAL gate itself. Same bridge as above, but
       # the selective listener Refuses only `mvno.suspend_account`: the walk's
@@ -1151,11 +1202,17 @@ jobs:
           trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
           python3 ../kernel/tests/support/tcp_proof_listener.py &
           sleep 0.3
-          python3 ../kernel/tests/support/arm_marshal_selective_listener.py 9004 --refuse mvno.suspend_account &
+          python3 ../kernel/tests/support/arm_marshal_selective_listener.py 9004 --refuse mvno.suspend_account --refuse data.reset_usage &
           sleep 0.3
-          # UNMEASURED margin, same as the step above (guestfwd can't run on
-          # the Windows dev box).
-          timeout 30 qemu-system-aarch64 \
+          # See the step above: `timeout` is 25 s, set from MEASUREMENT (9 CI runs, per-line runner
+          # timestamps): this step's last required serial line appears within
+          # ~1-6 s of the first serial line (worst case ~7 s once Beta item 4's
+          # data reset adds an eighth MARSHAL evaluation), so 25 s is ~3.6x the
+          # worst case. The guest idles forever after its demo, so `timeout` always
+          # kills QEMU and a step's wall-clock is ~N regardless of the boot; only
+          # time-to-last-required-line matters. Runner speed varied ~2.4x between
+          # identical runs, so do not tighten further without more data.
+          timeout 25 qemu-system-aarch64 \
             -M virt,secure=on,gic-version=2 -cpu cortex-a53 -nographic \
             -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
             -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001,guestfwd=tcp:10.0.2.100:9100-cmd:nc 127.0.0.1 9004" \
@@ -1175,6 +1232,18 @@ jobs:
             /tmp/arm-boot-marshal-refuse-mvno.log
           grep -q "SVC: SYS_MVNO_BIND account 0 slot 0 profile 0 authorized" \
             /tmp/arm-boot-marshal-refuse-mvno.log
+          # The data usage-period reset is Refused too (second --refuse above): the
+          # governed lift of the cap is DENIED at the syscall boundary and the
+          # counter is untouched, so service is still withheld afterwards.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=0: Refuse" \
+            /tmp/arm-boot-marshal-refuse-mvno.log
+          grep -q "SVC: SYS_DATA_RESET account 0 DENIED (MARSHAL Refuse)" \
+            /tmp/arm-boot-marshal-refuse-mvno.log
+          if grep -q "SVC: SYS_DATA_RESET account 0 authorized" /tmp/arm-boot-marshal-refuse-mvno.log; then exit 1; fi
+          sed -n '/SYS_DATA_RESET account 0 DENIED (MARSHAL Refuse)/,$p' /tmp/arm-boot-marshal-refuse-mvno.log > /tmp/arm-boot-marshal-refuse-mvno-post-reset.log
+          grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 DENIED (CapExceeded; .*used=1600 " \
+            /tmp/arm-boot-marshal-refuse-mvno-post-reset.log
+          if grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 authorized" /tmp/arm-boot-marshal-refuse-mvno-post-reset.log; then exit 1; fi
       # Full real chain, the third case the REFUSE/Unreachable configs above
       # can't distinguish on their own (a Refuse from a canned stand-in
       # listener proves the transport, not that the real proxy's policy
@@ -1188,7 +1257,8 @@ jobs:
       # 10.0.2.100:9100. The mock is mock_citadel_server_multi.py, not
       # mock_citadel_server.py: since Beta item 3.4 the walk performs seven
       # evaluations per boot (eSIM enable/delete and the three MVNO
-      # syscalls), each a fresh proxy request, and the one-shot original
+      # syscalls), and the governed data reset adds an eighth
+      # (data.reset_usage), each a fresh proxy request, and the one-shot original
       # serves exactly one and exits. The proxy must also recognize
       # mvno.bind_profile / mvno.suspend_account / mvno.reactivate_account
       # (desktop/src/citadel/policy.rs) or those lines read Unreachable/Refuse. Before the proxy learned `esim.*` this exact chain
@@ -1211,11 +1281,15 @@ jobs:
             RUNIX_CITADEL_URL=http://127.0.0.1:9105/marshal/kerkese \
             ../target/release/citadel_proxy &
           sleep 0.3
-          # `timeout` bumped 25 -> 35: Beta item 3.3's EL0 walk adds one more
-          # authorized ENABLE (one more esim_marshal::evaluate round trip).
-          # UNMEASURED margin (guestfwd can't run on the Windows dev box);
-          # tighten from the first CI run's real timing.
-          timeout 35 qemu-system-aarch64 \
+          # `timeout` is 25 s, set from MEASUREMENT (9 CI runs, per-line runner
+          # timestamps): this step's last required serial line appears within
+          # ~1-6 s of the first serial line (worst case ~7 s once Beta item 4's
+          # data reset adds an eighth MARSHAL evaluation), so 25 s is ~3.6x the
+          # worst case. The guest idles forever after its demo, so `timeout` always
+          # kills QEMU and a step's wall-clock is ~N regardless of the boot; only
+          # time-to-last-required-line matters. Runner speed varied ~2.4x between
+          # identical runs, so do not tighten further without more data.
+          timeout 25 qemu-system-aarch64 \
             -M virt,secure=on,gic-version=2 -cpu cortex-a53 -nographic \
             -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
             -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001,guestfwd=tcp:10.0.2.100:9100-cmd:nc 127.0.0.1 9104" \
@@ -1236,6 +1310,12 @@ jobs:
             /tmp/arm-boot-marshal-execute.log
           grep -q "SVC: SYS_MVNO_SUSPEND account 0 authorized" \
             /tmp/arm-boot-marshal-execute.log
+          # The governed data reset: the real proxy must recognize data.reset_usage
+          # (desktop/src/citadel/policy.rs) or this reads Refuse and the reset is
+          # DENIED.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=0: Execute" \
+            /tmp/arm-boot-marshal-execute.log
+          grep -q "SVC: SYS_DATA_RESET account 0 authorized" /tmp/arm-boot-marshal-execute.log
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke

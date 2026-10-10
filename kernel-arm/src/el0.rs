@@ -34,8 +34,9 @@
 //!
 //! Beta item 4.3 adds the data policy walk (`SYS_DATA_ACCOUNT` /
 //! `SESSION_OPEN` / `SESSION_CLOSE` / `RECONCILE`, see "The data policy
-//! additions" below). None of those is MARSHAL-gated, so the walk still
-//! performs exactly seven evaluations.
+//! additions" below). None of those four is MARSHAL-gated; the follow-up
+//! `SYS_DATA_RESET` (the governed usage-period reset, which lifts a cap) IS,
+//! so the walk performs exactly eight evaluations.
 //!
 //! # Why the IPC walk is sequential send-then-recv from one context
 //!
@@ -92,8 +93,9 @@
 //! denied because the account capability is held but the profile capability
 //! (`sim:0:2`) is not -- `BIND` needs both. The three MVNO syscalls
 //! are MARSHAL-gated too (Beta item 3.4; transparent here: Unreachable and
-//! Execute both pass), so the walk performs seven evaluations per boot
-//! (bind, enable, suspend, reactivate, enable, delete x2).
+//! Execute both pass), so the MVNO/eSIM part of the walk performs seven
+//! evaluations per boot (bind, enable, suspend, reactivate, enable, delete x2);
+//! the data reset below adds an eighth (`data.reset_usage`).
 //!
 //! # The data policy additions
 //!
@@ -114,6 +116,17 @@
 //! billing-period reset, which the reconciler would rightly flag again.
 //! Denial proofs: `SESSION_OPEN(0, 0, 1)` on the installed-but-unbound
 //! profile, and `SESSION_OPEN(99, ..)` / `ACCOUNT(99, ..)` with no capability.
+//!
+//! The governed reset sits after the second `ENABLE`/`STATUS (Enabled)` (the
+//! account is Active again, profile 0 Enabled and bound, usage still 1600 of a
+//! 1000-byte cap, no session open) and before the `INSTALL`/`DELETE`-must-fail
+//! steps, which only need the profile Enabled: `SESSION_OPEN` (DENIED
+//! CapExceeded -- the cap is still in force), `RESET(0)` (authorized, usage
+//! 1600 -> 0, MARSHAL-gated), `SESSION_OPEN` (allowed -- service restored),
+//! `RECONCILE` (zero incidents: an open session on an Enabled profile under
+//! the cap, and no `UsageRegression` because the reset cleared the
+//! reconciler's memory), `SESSION_CLOSE`. `RESET(99)` is the denial proof
+//! (no `data:reset:99` capability).
 //!
 //! The denial half intentionally uses `CREATE(99)`/`STATUS(99, 0)` rather
 //! than repeating every operation on slot 99: the point is that the
@@ -239,6 +252,8 @@ const SYS_DATA_ACCOUNT: u64 = 19;
 const SYS_DATA_SESSION_OPEN: u64 = 20;
 const SYS_DATA_SESSION_CLOSE: u64 = 21;
 const SYS_DATA_RECONCILE: u64 = 22;
+// 23 is the governed usage-period reset (MARSHAL-gated).
+const SYS_DATA_RESET: u64 = 23;
 
 /// The EL0 demo itself. `.balign 4096` for the same reason
 /// `userspace::user_hello` does: this crate's EL0 permissions *are*
@@ -372,8 +387,8 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         // profile 0 is bound to account 0 and Enabled right now, which is the
         // only moment a data session can be allowed, and it precedes the
         // MARSHAL-gated SYS_MVNO_SUSPEND below, which is the CALLER carrying
-        // out the engine's suspension request. None of the data syscalls is
-        // MARSHAL-gated, so this adds no evaluation to the walk (still seven).
+        // out the engine's suspension request. None of these four data
+        // syscalls is MARSHAL-gated (only SYS_DATA_RESET, further down, is).
         // The plan is the kernel's DEMO entitlement for account 0: cap 1000
         // bytes, throttle at 80%, no roaming, suspension requested at 150%.
         // SYS_DATA_SESSION_OPEN(0, 0, 0) -- usage 0: allowed. x3 packs the
@@ -485,6 +500,44 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x0, {sys_sim_status}",
         "mov x1, #0",
         "mov x2, #0",
+        "svc #0",
+        // --- Governed usage-period reset. State here: account 0 Active,
+        // profile 0 Enabled and bound, usage 1600/1000, no session open (the
+        // session was closed before the reactivation).
+        // SYS_DATA_SESSION_OPEN(0, 0, 0) -- DENIED CapExceeded: the cap is
+        // still in force, so service has not been restored.
+        "mov x0, {sys_data_session_open}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "mov x3, #0",
+        "svc #0",
+        // SYS_DATA_RESET(0) -- capability data:reset:0, then MARSHAL
+        // (data.reset_usage, the walk's eighth evaluation), then usage
+        // 1600 -> 0 with the reconciler's memory cleared. Closes no session.
+        "mov x0, {sys_data_reset}",
+        "mov x1, #0",
+        "svc #0",
+        // SYS_DATA_SESSION_OPEN(0, 0, 0) -- now Allow: service restored.
+        "mov x0, {sys_data_session_open}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "mov x3, #0",
+        "svc #0",
+        // SYS_DATA_RECONCILE -- 0 incidents: the account is under its cap and
+        // Active with an open session on an Enabled profile, and the reset
+        // cleared last_used so 1600 -> 0 is not reported as a UsageRegression.
+        "mov x0, {sys_data_reconcile}",
+        "svc #0",
+        // SYS_DATA_SESSION_CLOSE(0, 0, 0) -- the caller finishing the session.
+        "mov x0, {sys_data_session_close}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "mov x3, #0",
+        "svc #0",
+        // SYS_DATA_RESET(99) -- no data:reset:99 capability: DENIED before any
+        // state is read, MARSHAL consulted or counter touched.
+        "mov x0, {sys_data_reset}",
+        "mov x1, #99",
         "svc #0",
         // SYS_SIM_INSTALL(0, 0, 0x6666) -- expected to FAIL: re-installing
         // over the live Enabled profile would swap its identity (and, with
@@ -666,5 +719,6 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         sys_data_session_open = const SYS_DATA_SESSION_OPEN,
         sys_data_session_close = const SYS_DATA_SESSION_CLOSE,
         sys_data_reconcile = const SYS_DATA_RECONCILE,
+        sys_data_reset = const SYS_DATA_RESET,
     );
 }

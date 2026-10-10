@@ -446,7 +446,7 @@ fn el1_setup() -> ! {
     // service) and trip the engine's suspension request -- so holding session
     // access must not imply it (see svc.rs's doc comment and capabilities.rs).
     // Account 99 gets none: el0_demo's SYS_DATA_SESSION_OPEN/SYS_DATA_ACCOUNT
-    // on 99 are the denial proofs. None of these is MARSHAL-gated; the
+    // on 99 are the denial proofs. None of these three is MARSHAL-gated; the
     // consequential action a usage request can lead to, suspension, stays the
     // existing MARSHAL-gated SYS_MVNO_SUSPEND.
     crate::capabilities::issue_and_hold(crate::capabilities::data_session_resource(0), now);
@@ -457,6 +457,11 @@ fn el1_setup() -> ! {
     serial_println!("Runix ARM kernel: data usage capability issued (account 0, demo trust root)");
     crate::capabilities::issue_and_hold(crate::capabilities::data_reconcile_resource(), now);
     serial_println!("Runix ARM kernel: data reconcile capability issued (demo trust root)");
+    // The usage-period RESET is its own scope (it lifts a cap) and, unlike the
+    // four above, IS MARSHAL-gated (`data.reset_usage`). Account 0 only;
+    // el0_demo's SYS_DATA_RESET(99) is the denial proof.
+    crate::capabilities::issue_and_hold(crate::capabilities::data_reset_resource(0), now);
+    serial_println!("Runix ARM kernel: data reset capability issued (account 0, demo trust root)");
     // Network-selection proof (`mvno_proof.rs`) on its own local registry;
     // EL1-only, no syscall, does not touch the global registry above.
     crate::mvno_proof::prove_selection();

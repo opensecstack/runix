@@ -156,6 +156,19 @@ pub fn data_usage_resource(account: u64) -> String {
 }
 
 /// The resource string a capability must match to authorize
+/// `SYS_DATA_RESET` on `account` -- the governed usage-PERIOD reset. A third,
+/// wholly separate scope from [`data_usage_resource`] (the feed) and
+/// [`data_session_resource`]: the reset zeroes the account's counter, which
+/// LIFTS a cap and restores service the plan had withheld, so whoever holds it
+/// can undo the enforcement the feed produced. Neither the right to meter the
+/// account nor the right to open its sessions may imply it. It is additionally
+/// MARSHAL-gated (`data.reset_usage`); this capability is only the first of
+/// the two checks.
+pub fn data_reset_resource(account: u64) -> String {
+    alloc::format!("data:reset:{account}")
+}
+
+/// The resource string a capability must match to authorize
 /// `SYS_DATA_RECONCILE`. Not account-scoped: the reconciler reads every
 /// account's state in one pass (and writes only incident evidence to the
 /// WORM log plus its own `last_used` bookkeeping), so there is no per-account
@@ -484,6 +497,46 @@ mod tests {
         assert_eq!(data_session_resource(99), "data:session:99");
         assert_eq!(data_usage_resource(99), "data:usage:99");
         assert_eq!(data_reconcile_resource(), "data:reconcile");
+        assert_eq!(data_reset_resource(0), "data:reset:0");
+        assert_eq!(data_reset_resource(99), "data:reset:99");
+    }
+
+    #[test]
+    fn data_reset_is_a_separate_scope_from_usage_and_session() {
+        // Whoever can lift a cap must hold a token minted for exactly that:
+        // usage/session tokens do not verify for reset, reset does not verify
+        // for them, and neither crosses accounts.
+        let now = 0u64;
+        let issue = |resource: String| {
+            CapabilityToken::issue(
+                "el0:arm-demo",
+                resource,
+                now,
+                now + 100,
+                "demo-key",
+                &demo_signing_key(),
+            )
+        };
+        let vk = demo_verifying_key();
+        let reset = issue(data_reset_resource(0));
+        assert!(reset.verify(&vk, &data_reset_resource(0), now).is_ok());
+        assert!(reset.verify(&vk, &data_reset_resource(99), now).is_err());
+        assert!(reset.verify(&vk, &data_usage_resource(0), now).is_err());
+        assert!(reset.verify(&vk, &data_session_resource(0), now).is_err());
+        assert!(reset.verify(&vk, &data_reconcile_resource(), now).is_err());
+        for other in [
+            issue(data_usage_resource(0)),
+            issue(data_session_resource(0)),
+            issue(data_reconcile_resource()),
+            issue(mvno_account_resource(0)),
+            issue(mvno_suspend_resource(0)),
+        ] {
+            assert!(other.verify(&vk, &data_reset_resource(0), now).is_err());
+        }
+        for a in [0u64, 1, 99, u64::MAX] {
+            assert_ne!(data_reset_resource(a), data_usage_resource(a));
+            assert_ne!(data_reset_resource(a), data_session_resource(a));
+        }
     }
 
     #[test]

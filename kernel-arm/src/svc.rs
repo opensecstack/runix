@@ -3,7 +3,7 @@
 //! `el1_vectors.rs`'s vector-8 `SVC` handling; see that module's doc
 //! comment for how the syscall number/arg actually get here.
 //!
-//! Nineteen syscalls for EL0 callers (twelve base, three MVNO, four data;
+//! Twenty syscalls for EL0 callers (twelve base, three MVNO, five data;
 //! plus three EL1-continuation ones, see `SYS_EL0_PROOF_DONE` and friends),
 //! matching `el0.rs`'s demo exactly (kept
 //! in sync by hand, not shared constants -- see `el0.rs`'s own doc comment on
@@ -73,12 +73,16 @@
 //!   must never happen under a spin lock. Status reads are not gated.
 //!
 //! - `SYS_DATA_ACCOUNT` (19) / `SYS_DATA_SESSION_OPEN` (20) /
-//!   `SYS_DATA_SESSION_CLOSE` (21) / `SYS_DATA_RECONCILE` (22): the data policy
+//!   `SYS_DATA_SESSION_CLOSE` (21) / `SYS_DATA_RECONCILE` (22) /
+//!   `SYS_DATA_RESET` (23): the data policy
 //!   layer (Beta item 4.3, `data.rs` + the lib-side `data_state.rs`/
-//!   `data_codes.rs`, wrapping `runix_mobile::policy` and `::reconcile`).
-//!   Same per-call capability check, over three separately scoped resources:
+//!   `data_codes.rs`, wrapping `runix_mobile::policy` and `::reconcile`; the
+//!   governed reset is the follow-up that
+//!   `docs/adrs/0001-data-syscalls-not-marshal-gated.md` named).
+//!   Same per-call capability check, over four separately scoped resources:
 //!   `data:usage:{account}` (the usage FEED), `data:session:{account}`
-//!   (open/close) and `data:reconcile`. The feed is scoped apart from session
+//!   (open/close), `data:reconcile` and `data:reset:{account}` (the period
+//!   reset). The feed is scoped apart from session
 //!   access because it is privileged: it can push an account over its cap
 //!   (denying service) and over the escalation threshold (the engine then
 //!   asks for suspension), so the right to open or close sessions must not
@@ -90,6 +94,7 @@
 //!   20   SYS_DATA_SESSION_OPEN        account, slot, profile|roam<<8   data:session:{account}
 //!   21   SYS_DATA_SESSION_CLOSE       account, slot, profile           data:session:{account}
 //!   22   SYS_DATA_RECONCILE           (none)                           data:reconcile
+//!   23   SYS_DATA_RESET               account                          data:reset:{account} + MARSHAL
 //!   ```
 //!
 //!   Returns (encodings pinned and tested in `data_codes.rs`): `ACCOUNT` ->
@@ -100,25 +105,50 @@
 //!   refusals (no capability, no entitlement, no such account, profile not
 //!   bound to this account, unknown profile, malformed argument, table full);
 //!   `SESSION_CLOSE` -> `0` closed / `1` denied / `2` not open / `3` bad
-//!   argument; `RECONCILE` -> the incident count (`u64::MAX` = denied). The
+//!   argument; `RECONCILE` -> the incident count (`u64::MAX` = denied);
+//!   `RESET` -> `0` reset / `1` no capability / `2` MARSHAL Refuse or HardStop
+//!   / `3` MARSHAL local failure (fail closed) / `4` no entitlement / `5` no
+//!   such account. The
 //!   third `SESSION_OPEN` argument packs `profile` in bits 0..=7 and the
 //!   roaming flag in bit 8 (the ABI has three argument registers and the call
 //!   needs four values; the profile id is a `u8`; reserved bits are rejected).
 //!
-//!   **Not MARSHAL-gated, by design.** The policy engine only REQUESTS and the
-//!   reconciler only OBSERVES; a request is carried out by the CALLER through
+//!   **`SYS_DATA_RESET` is MARSHAL-gated; the other four are not.** The reset
+//!   zeroes an account's usage counter, which LIFTS its cap and restores
+//!   service the plan had withheld -- whoever holds it can undo the
+//!   enforcement the feed produced -- so it is a consequential, governable
+//!   action (the revisit trigger named in
+//!   `docs/adrs/0001-data-syscalls-not-marshal-gated.md`). Order: capability
+//!   (`data:reset:{account}`, a scope separate from the feed's and from
+//!   session access, re-checked every call), the cheap local entitlement/
+//!   account checks, then MARSHAL evaluate + enforce through [`marshal_gate`]
+//!   (`data.reset_usage`; the same fail-open `Unreachable` / fail-closed
+//!   local-failure split as the MVNO syscalls, with the same WORM audit of a
+//!   local-failure denial) and only then the data lock and the mutation. No
+//!   lock is held across the evaluation. A block leaves usage and the
+//!   reconciler's memory untouched. The mutation sets the counter to
+//!   `runix_mobile::policy::reset_usage()` and clears the reconciler's
+//!   `last_used` in the same critical section, so the reset reads as a new
+//!   period and not as a `UsageRegression`. It closes no session and changes
+//!   no standing or profile; the applied reset is WORM-audited with the
+//!   before/after counter.
+//!
+//!   **The other four are not MARSHAL-gated, by design.** The policy engine
+//!   only REQUESTS and the reconciler only OBSERVES; a request is carried out by the CALLER through
 //!   an existing governed syscall under its OWN capability (for a
 //!   `SuspendAccount` request that is `SYS_MVNO_SUSPEND`: capability, MARSHAL,
 //!   WORM). The data syscalls never suspend, disable, close or mutate
 //!   account/profile state in response to a request -- they update a usage
 //!   counter or the session table and read policy, which are not
-//!   governance-consequential state changes. So no new MARSHAL action type
-//!   exists and the walk's evaluation count is unchanged. They ARE audited,
+//!   governance-consequential state changes. So these four have no MARSHAL
+//!   action type of their own (the walk's one data evaluation is the reset's
+//!   `data.reset_usage`, not any of them). They ARE audited,
 //!   but not exhaustively: every policy decision, every request the engine
 //!   makes (worded as a REQUEST, not an action) and every reconciler incident
 //!   goes to the same WORM chain. Capability denials, a malformed
 //!   `SESSION_CLOSE` argument, a close of a session that is not open, and a
-//!   reconcile pass with zero incidents are serial-only. See `data.rs` for the
+//!   reconcile pass with zero incidents are serial-only (as is a reset
+//!   capability denial). See `data.rs` for the
 //!   fuller argument and the lock order (registry -> sim -> data; data is a
 //!   leaf).
 //!
@@ -294,6 +324,13 @@ pub const SYS_DATA_SESSION_CLOSE: u64 = 21;
 /// policy; incidents are printed and WORM-recorded, nothing is corrected.
 /// Capability: `data_reconcile_resource()`.
 pub const SYS_DATA_RECONCILE: u64 = 22;
+/// `SYS_DATA_RESET(account)`: start a new usage period -- zero the account's
+/// counter (lifting any cap it had hit) and clear the reconciler's memory of it.
+/// Capability `data_reset_resource(account)`, then the MARSHAL gate
+/// (`data.reset_usage`), then the mutation, then a WORM entry. The ONE
+/// MARSHAL-gated data syscall (see this module's doc comment). Closes no
+/// session and changes no standing or profile.
+pub const SYS_DATA_RESET: u64 = 23;
 
 /// `SYS_RIL_RECV`'s return-value convention: `0..=255` is a received byte,
 /// `256`/`257` are out-of-band sentinels distinct from any real byte value
@@ -1130,6 +1167,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         SYS_DATA_SESSION_OPEN => data_session_open(arg1, arg2 as usize, arg3),
         SYS_DATA_SESSION_CLOSE => data_session_close(arg1, arg2 as usize, arg3),
         SYS_DATA_RECONCILE => data_reconcile(),
+        SYS_DATA_RESET => data_reset(arg1),
         // The one arm that may not return to EL0 (see this constant's doc
         // comment and `el0_proof::finish`): on the proof path it resumes an
         // EL1 continuation and never comes back here; with no excursion in
@@ -1674,6 +1712,101 @@ fn data_reconcile() -> u64 {
         chain_ok
     );
     incidents.len() as u64
+}
+
+/// `SYS_DATA_RESET(account)`: the governed usage-period reset.
+///
+/// Order, each step before the next and none skippable:
+/// 1. capability `data:reset:{account}` (re-run every call);
+/// 2. the cheap local checks -- an entitlement exists and the account exists
+///    (no point spending a MARSHAL round trip on a reset that cannot happen,
+///    the same reasoning as `mvno::gate_enable` ahead of `SYS_SIM_ENABLE`'s
+///    gate);
+/// 3. MARSHAL evaluate + enforce ([`marshal_gate`], `data.reset_usage`). NO
+///    lock is held here: the evaluation can drive a nested EL0 excursion, which
+///    must never run under a spin lock. A block returns with state untouched;
+/// 4. only now the data lock, via `data::reset_usage`: counter to
+///    `reset_usage()`, reconciler `last_used` cleared, one critical section;
+/// 5. the WORM entry (before/after counter) and the serial line.
+///
+/// This lifts a cap, so it is the consequential data action. It does NOT close
+/// sessions, change standing or touch profiles: the caller lifted the cap, and
+/// opening a session afterwards is a separate decision by the policy engine.
+fn data_reset(account: u64) -> u64 {
+    use runix_kernel_arm::data_codes::{
+        demo_entitlement, reset_blocked_code, RESET_DENIED_CAPABILITY, RESET_NO_ENTITLEMENT,
+        RESET_NO_SUCH_ACCOUNT, RESET_OK,
+    };
+    let resource = crate::capabilities::data_reset_resource(account);
+    if let Err(e) = check(&resource) {
+        serial_println!("\nSVC: SYS_DATA_RESET account {} DENIED ({})", account, e);
+        return RESET_DENIED_CAPABILITY;
+    }
+    if demo_entitlement(account).is_none() {
+        audit_event(
+            &resource,
+            "usage period in force",
+            "usage period in force",
+            false,
+            Some(String::from(
+                "refused: no data entitlement for this account",
+            )),
+        );
+        serial_println!(
+            "\nSVC: SYS_DATA_RESET account {} FAILED (no data entitlement for this account)",
+            account
+        );
+        return RESET_NO_ENTITLEMENT;
+    }
+    if crate::mvno::standing(account).is_none() {
+        audit_event(
+            &resource,
+            "usage period in force",
+            "usage period in force",
+            false,
+            Some(String::from("refused: no such account in the registry")),
+        );
+        serial_println!(
+            "\nSVC: SYS_DATA_RESET account {} FAILED (no such account)",
+            account
+        );
+        return RESET_NO_SUCH_ACCOUNT;
+    }
+    // No lock held across this call. A block leaves usage and `last_used` alone.
+    if let Err(blocked) = marshal_gate(
+        &MarshalAction::DataResetUsage { account },
+        &resource,
+        "usage period in force",
+        "new usage period (counter reset)",
+    ) {
+        serial_println!(
+            "\nSVC: SYS_DATA_RESET account {} DENIED ({})",
+            account,
+            blocked
+        );
+        return reset_blocked_code(&blocked);
+    }
+    // Capability and MARSHAL both passed: only now the data lock.
+    let (before, after) = crate::data::reset_usage(account);
+    audit_event(
+        &resource,
+        &format!("used {}", before.used_bytes),
+        &format!("used {}", after.used_bytes),
+        true,
+        Some(String::from(
+            "usage period reset (new period); reconciler memory cleared; no session, standing or profile changed",
+        )),
+    );
+    let (entries, chain_ok) = audit_chain_summary();
+    serial_println!(
+        "\nSVC: SYS_DATA_RESET account {} authorized (usage {} -> {}; new period; MARSHAL did not block it (verdict on the evaluation line above); WORM entries {}, chain verified {})",
+        account,
+        before.used_bytes,
+        after.used_bytes,
+        entries,
+        chain_ok
+    );
+    RESET_OK
 }
 
 fn check(resource: &str) -> Result<(), runix_capability_manager::CapabilityError> {

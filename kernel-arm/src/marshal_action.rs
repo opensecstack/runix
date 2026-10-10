@@ -36,6 +36,12 @@ pub enum MarshalAction<'a> {
     MvnoReactivate {
         account: u64,
     },
+    /// Beta follow-up: the governed data usage-period reset. Consequential
+    /// because it lifts a cap (restores service), so it is the one data
+    /// action that is MARSHAL-gated; see `svc.rs`'s `data_reset`.
+    DataResetUsage {
+        account: u64,
+    },
 }
 
 impl MarshalAction<'_> {
@@ -46,6 +52,7 @@ impl MarshalAction<'_> {
             MarshalAction::MvnoBind { .. } => String::from("mvno.bind_profile"),
             MarshalAction::MvnoSuspend { .. } => String::from("mvno.suspend_account"),
             MarshalAction::MvnoReactivate { .. } => String::from("mvno.reactivate_account"),
+            MarshalAction::DataResetUsage { .. } => String::from("data.reset_usage"),
         }
     }
 
@@ -63,7 +70,9 @@ impl MarshalAction<'_> {
             } => format!(
                 r#"{{"type":"{ty}","account":{account},"slot":{slot},"profile":{profile}}}"#
             ),
-            MarshalAction::MvnoSuspend { account } | MarshalAction::MvnoReactivate { account } => {
+            MarshalAction::MvnoSuspend { account }
+            | MarshalAction::MvnoReactivate { account }
+            | MarshalAction::DataResetUsage { account } => {
                 format!(r#"{{"type":"{ty}","account":{account}}}"#)
             }
         }
@@ -80,6 +89,7 @@ impl MarshalAction<'_> {
             } => format!("mvno-bind-{account}-{slot}-{profile}"),
             MarshalAction::MvnoSuspend { account } => format!("mvno-suspend-{account}"),
             MarshalAction::MvnoReactivate { account } => format!("mvno-reactivate-{account}"),
+            MarshalAction::DataResetUsage { account } => format!("data-reset-{account}"),
         }
     }
 
@@ -99,6 +109,9 @@ impl MarshalAction<'_> {
             }
             MarshalAction::MvnoReactivate { account } => {
                 format!("mvno.reactivate_account account={account}")
+            }
+            MarshalAction::DataResetUsage { account } => {
+                format!("data.reset_usage account={account}")
             }
         }
     }
@@ -429,6 +442,24 @@ mod tests {
             r#"{"kerkese_version":"1.0","dry_run":true,"action":{"type":"mvno.reactivate_account","account":3},"actor":{"user_id":"el0:arm-demo","role":"operator"},"execution_id":"mvno-reactivate-3"}"#
         );
         assert_eq!(r.label(), "mvno.reactivate_account account=3");
+    }
+
+    #[test]
+    fn data_reset_usage_json_and_label() {
+        let a = MarshalAction::DataResetUsage { account: 0 };
+        assert_eq!(a.action_type(), "data.reset_usage");
+        assert_eq!(
+            a.action_json(),
+            r#"{"type":"data.reset_usage","account":0}"#
+        );
+        assert_eq!(a.execution_id(), "data-reset-0");
+        assert_eq!(a.label(), "data.reset_usage account=0");
+        assert_eq!(
+            a.kerkese_json(P),
+            r#"{"kerkese_version":"1.0","dry_run":true,"action":{"type":"data.reset_usage","account":0},"actor":{"user_id":"el0:arm-demo","role":"operator"},"execution_id":"data-reset-0"}"#
+        );
+        let big = MarshalAction::DataResetUsage { account: u64::MAX };
+        assert_eq!(big.execution_id(), "data-reset-18446744073709551615");
     }
 
     #[test]
