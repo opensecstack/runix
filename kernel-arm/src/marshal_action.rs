@@ -116,6 +116,42 @@ impl MarshalAction<'_> {
         }
     }
 
+    /// What the kernel does when MARSHAL could not give a verdict for THIS
+    /// action (`Remote(Unreachable)`): allow it ([`UnreachablePolicy::FailOpen`])
+    /// or block it ([`UnreachablePolicy::FailClosed`]).
+    ///
+    /// One exhaustive `match`, no wildcard: a new action variant cannot compile
+    /// without choosing, and flipping an action later is a one-line change in
+    /// exactly one reviewable place. (Refuse/HardStop and local evaluation
+    /// failures block regardless of this policy.)
+    pub fn unreachable_policy(&self) -> UnreachablePolicy {
+        match self {
+            // FailOpen: eSIM enable/delete act on a single local profile and the
+            // MVNO gate has already checked the account owns it; an outsider who
+            // can only take the network down gains no new service from it
+            // (Option B in docs/MARSHAL-ENFORCEMENT-POLICY.md; behaviour kept
+            // exactly as before this policy existed).
+            MarshalAction::Esim { .. } => UnreachablePolicy::FailOpen,
+            // FailOpen: binding a profile to an account is capacity bookkeeping
+            // the registry itself bounds; unchanged Option B behaviour.
+            MarshalAction::MvnoBind { .. } => UnreachablePolicy::FailOpen,
+            // FailOpen: suspension is the restrictive direction; refusing to
+            // cut service because MARSHAL is down would help an abuser, so the
+            // pre-existing Option B behaviour is kept.
+            MarshalAction::MvnoSuspend { .. } => UnreachablePolicy::FailOpen,
+            // FailOpen: reactivation restores a suspended account, but the
+            // pre-existing behaviour is deliberately kept unchanged here; flip
+            // this line if the restoring direction should also fail closed.
+            MarshalAction::MvnoReactivate { .. } => UnreachablePolicy::FailOpen,
+            // FailClosed: a usage reset RESTORES data service to an account
+            // whose policy cut it off. An unreachable MARSHAL (which anyone
+            // able to drop the network can cause) must not wave through the
+            // lifting of a cap; the reset is denied and WORM-audited instead
+            // (docs/adrs/0002: the strongest reset-specific weakness).
+            MarshalAction::DataResetUsage { .. } => UnreachablePolicy::FailClosed,
+        }
+    }
+
     /// The full minimal-but-well-formed Kerkese envelope (`dry_run: true`).
     pub fn kerkese_json(&self, principal: &str) -> String {
         let action = self.action_json();
@@ -174,6 +210,18 @@ pub enum GateOutcome {
     LocalFailure(LocalFailure),
 }
 
+/// What to do with an action when MARSHAL gave no usable verdict
+/// (`Remote(Unreachable)`). Chosen per action by
+/// [`MarshalAction::unreachable_policy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnreachablePolicy {
+    /// Allow it (Option B, `docs/MARSHAL-ENFORCEMENT-POLICY.md`). The success
+    /// is recorded as NOT governed (see [`verdict_text`]).
+    FailOpen,
+    /// Block it with [`Blocked::Unreachable`] and WORM-audit the denial.
+    FailClosed,
+}
+
 /// Why [`enforce`] blocked an operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Blocked {
@@ -181,30 +229,67 @@ pub enum Blocked {
     Remote(ShadowMarshalOutcome),
     /// The kernel failed to run the evaluation (fail closed).
     Local(LocalFailure),
+    /// MARSHAL was unreachable and this action's policy is
+    /// [`UnreachablePolicy::FailClosed`]. The kernel's own policy decision,
+    /// not a remote governance verdict.
+    Unreachable,
 }
 
 impl core::fmt::Display for Blocked {
     /// `Remote` prints exactly `MARSHAL <Outcome>` (the pre-existing DENIED
-    /// text CI greps); `Local` prints `MARSHAL local failure: <reason>`.
+    /// text CI greps); `Local` prints `MARSHAL local failure: <reason>`;
+    /// `Unreachable` prints `MARSHAL unreachable: fail-closed for this action`.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Blocked::Remote(o) => write!(f, "MARSHAL {o:?}"),
             Blocked::Local(l) => write!(f, "MARSHAL local failure: {}", l.as_str()),
+            Blocked::Unreachable => write!(f, "MARSHAL unreachable: fail-closed for this action"),
         }
     }
 }
 
-/// The whole fail-open / fail-closed decision, pure. Remote:
-/// `Execute`/`Unreachable` allow (Option B: nothing to honor when the remote
-/// is down or unconfigured), `Refuse`/`HardStop` block. Every local failure
-/// blocks.
-pub fn enforce(outcome: GateOutcome) -> Result<(), Blocked> {
+/// The whole fail-open / fail-closed decision, pure. Remote: `Execute`
+/// allows; `Unreachable` allows under [`UnreachablePolicy::FailOpen`] (Option
+/// B: nothing to honor when the remote is down or unconfigured) and blocks
+/// under `FailClosed`; `Refuse`/`HardStop` block. Every local failure blocks.
+pub fn enforce(policy: UnreachablePolicy, outcome: GateOutcome) -> Result<(), Blocked> {
     match outcome {
-        GateOutcome::Remote(ShadowMarshalOutcome::Execute)
-        | GateOutcome::Remote(ShadowMarshalOutcome::Unreachable) => Ok(()),
+        GateOutcome::Remote(ShadowMarshalOutcome::Execute) => Ok(()),
+        GateOutcome::Remote(ShadowMarshalOutcome::Unreachable) => match policy {
+            UnreachablePolicy::FailOpen => Ok(()),
+            UnreachablePolicy::FailClosed => Err(Blocked::Unreachable),
+        },
         GateOutcome::Remote(o @ ShadowMarshalOutcome::Refuse)
         | GateOutcome::Remote(o @ ShadowMarshalOutcome::HardStop) => Err(Blocked::Remote(o)),
         GateOutcome::LocalFailure(l) => Err(Blocked::Local(l)),
+    }
+}
+
+/// The text recorded (WORM reason and serial success line) for the verdict
+/// that let an action through, so an auditor can tell a governed action from
+/// an ungoverned one. Total over every outcome (the blocked arms exist only so
+/// the function cannot panic or lie if a caller misuses it).
+pub fn verdict_text(outcome: GateOutcome) -> String {
+    match outcome {
+        GateOutcome::Remote(ShadowMarshalOutcome::Execute) => {
+            String::from("MARSHAL verdict: Execute")
+        }
+        GateOutcome::Remote(ShadowMarshalOutcome::Unreachable) => {
+            String::from("MARSHAL verdict: Unreachable (fail-open: not governed)")
+        }
+        GateOutcome::Remote(o) => format!("MARSHAL verdict: {o:?} (blocked)"),
+        GateOutcome::LocalFailure(l) => {
+            format!("MARSHAL verdict: local failure {} (blocked)", l.as_str())
+        }
+    }
+}
+
+/// A WORM reason carrying the verdict: the existing reason (if any), then the
+/// verdict text, `; `-separated.
+pub fn reason_with_verdict(base: Option<String>, verdict: &str) -> String {
+    match base {
+        Some(b) => format!("{b}; {verdict}"),
+        None => String::from(verdict),
     }
 }
 
@@ -278,32 +363,117 @@ mod tests {
     }
 
     #[test]
-    fn enforce_matrix_remote_outcomes_unchanged() {
+    fn enforce_matrix_policy_x_outcome() {
         use ShadowMarshalOutcome::*;
-        assert_eq!(enforce(GateOutcome::Remote(Execute)), Ok(()));
-        assert_eq!(enforce(GateOutcome::Remote(Unreachable)), Ok(()));
+        use UnreachablePolicy::*;
+        for policy in [FailOpen, FailClosed] {
+            // Execute always allows; Refuse/HardStop always block.
+            assert_eq!(enforce(policy, GateOutcome::Remote(Execute)), Ok(()));
+            assert_eq!(
+                enforce(policy, GateOutcome::Remote(Refuse)),
+                Err(Blocked::Remote(Refuse))
+            );
+            assert_eq!(
+                enforce(policy, GateOutcome::Remote(HardStop)),
+                Err(Blocked::Remote(HardStop))
+            );
+            // Every local failure blocks under both policies.
+            for l in [
+                LocalFailure::SetupFailed,
+                LocalFailure::SpawnFailed,
+                LocalFailure::ExcursionFaulted,
+            ] {
+                assert_eq!(
+                    enforce(policy, GateOutcome::LocalFailure(l)),
+                    Err(Blocked::Local(l))
+                );
+            }
+        }
+        // The only cell the policy decides.
+        assert_eq!(enforce(FailOpen, GateOutcome::Remote(Unreachable)), Ok(()));
         assert_eq!(
-            enforce(GateOutcome::Remote(Refuse)),
-            Err(Blocked::Remote(Refuse))
-        );
-        assert_eq!(
-            enforce(GateOutcome::Remote(HardStop)),
-            Err(Blocked::Remote(HardStop))
+            enforce(FailClosed, GateOutcome::Remote(Unreachable)),
+            Err(Blocked::Unreachable)
         );
     }
 
     #[test]
-    fn enforce_blocks_every_local_failure() {
-        for l in [
-            LocalFailure::SetupFailed,
-            LocalFailure::SpawnFailed,
-            LocalFailure::ExcursionFaulted,
-        ] {
-            assert_eq!(
-                enforce(GateOutcome::LocalFailure(l)),
-                Err(Blocked::Local(l))
-            );
+    fn unreachable_policy_table_is_pinned() {
+        use UnreachablePolicy::*;
+        let table = [
+            (
+                MarshalAction::Esim {
+                    op: "enable",
+                    slot: 0,
+                    profile: 0,
+                },
+                FailOpen,
+            ),
+            (
+                MarshalAction::Esim {
+                    op: "delete",
+                    slot: 0,
+                    profile: 0,
+                },
+                FailOpen,
+            ),
+            (
+                MarshalAction::MvnoBind {
+                    account: 0,
+                    slot: 0,
+                    profile: 0,
+                },
+                FailOpen,
+            ),
+            (MarshalAction::MvnoSuspend { account: 0 }, FailOpen),
+            (MarshalAction::MvnoReactivate { account: 0 }, FailOpen),
+            (MarshalAction::DataResetUsage { account: 0 }, FailClosed),
+        ];
+        for (action, expected) in table {
+            assert_eq!(action.unreachable_policy(), expected, "{}", action.label());
         }
+    }
+
+    #[test]
+    fn verdict_text_is_pinned_and_marks_ungoverned_success() {
+        use ShadowMarshalOutcome::*;
+        assert_eq!(
+            verdict_text(GateOutcome::Remote(Execute)),
+            "MARSHAL verdict: Execute"
+        );
+        assert_eq!(
+            verdict_text(GateOutcome::Remote(Unreachable)),
+            "MARSHAL verdict: Unreachable (fail-open: not governed)"
+        );
+        assert_eq!(
+            verdict_text(GateOutcome::Remote(Refuse)),
+            "MARSHAL verdict: Refuse (blocked)"
+        );
+        assert_eq!(
+            verdict_text(GateOutcome::Remote(HardStop)),
+            "MARSHAL verdict: HardStop (blocked)"
+        );
+        assert_eq!(
+            verdict_text(GateOutcome::LocalFailure(LocalFailure::SpawnFailed)),
+            "MARSHAL verdict: local failure SpawnFailed (blocked)"
+        );
+        // The two ways to be allowed are never confusable.
+        assert_ne!(
+            verdict_text(GateOutcome::Remote(Execute)),
+            verdict_text(GateOutcome::Remote(Unreachable))
+        );
+    }
+
+    #[test]
+    fn reason_with_verdict_appends_or_stands_alone() {
+        assert_eq!(
+            reason_with_verdict(None, "MARSHAL verdict: Execute"),
+            "MARSHAL verdict: Execute"
+        );
+        assert_eq!(
+            reason_with_verdict(Some(String::from("x")), "MARSHAL verdict: Execute"),
+            "x; MARSHAL verdict: Execute"
+        );
     }
 
     #[test]
@@ -327,6 +497,10 @@ mod tests {
         assert_eq!(
             format!("{}", Blocked::Local(LocalFailure::ExcursionFaulted)),
             "MARSHAL local failure: ExcursionFaulted"
+        );
+        assert_eq!(
+            format!("{}", Blocked::Unreachable),
+            "MARSHAL unreachable: fail-closed for this action"
         );
     }
 
@@ -374,9 +548,12 @@ mod tests {
         );
         assert_eq!(classify_response(None), Unreachable);
         // And a policy refusal is blocked end to end.
-        assert!(enforce(GateOutcome::Remote(classify_response(Some(&err(
-            MarshalError::PolicyRefused(s())
-        )))))
+        assert!(enforce(
+            UnreachablePolicy::FailOpen,
+            GateOutcome::Remote(classify_response(Some(&err(MarshalError::PolicyRefused(
+                s()
+            )))))
+        )
         .is_err());
     }
 

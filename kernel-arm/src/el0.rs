@@ -36,7 +36,8 @@
 //! `SESSION_OPEN` / `SESSION_CLOSE` / `RECONCILE`, see "The data policy
 //! additions" below). None of those four is MARSHAL-gated; the follow-up
 //! `SYS_DATA_RESET` (the governed usage-period reset, which lifts a cap) IS,
-//! so the walk performs exactly eight evaluations.
+//! so the walk performs exactly eight evaluations. `SYS_DATA_PERIOD` (the
+//! read-only billing-period advice) is not gated and adds none.
 //!
 //! # Why the IPC walk is sequential send-then-recv from one context
 //!
@@ -126,7 +127,23 @@
 //! `RECONCILE` (zero incidents: an open session on an Enabled profile under
 //! the cap, and no `UsageRegression` because the reset cleared the
 //! reconciler's memory), `SESSION_CLOSE`. `RESET(99)` is the denial proof
-//! (no `data:reset:99` capability).
+//! (no `data:reset:99` capability). That is the sequence when the reset is
+//! AUTHORIZED (a reachable MARSHAL that answers Execute). In the plain boot
+//! configurations there is no MARSHAL proxy, the evaluation is `Unreachable`,
+//! and the reset is FAIL-CLOSED (ADR 0003): `RESET(0)` is DENIED, usage stays
+//! 1600, the next `SESSION_OPEN` is still DENIED CapExceeded, `RECONCILE`
+//! reports one incident (`anomalous-usage-no-escalation`: the over-cap
+//! account was never restricted) and `SESSION_CLOSE` is refused (no session is
+//! open). CI asserts the plain-boot sequence.
+//!
+//! The billing-period advice (`SYS_DATA_PERIOD`, read-only, not MARSHAL-gated,
+//! no new MARSHAL evaluation) is called twice with account 0 and once with 99.
+//! `PERIOD(0)` right after the `ACCOUNT(0, 700)` feed returns 1: the 500 ms demo
+//! period, which started at tick 0, is long over, so a reset is REQUESTED
+//! (nothing is reset). `PERIOD(0)` again right after the post-reset
+//! `SESSION_OPEN` returns 0 if the reset was authorized (it started the next
+//! period) and 1 if it was denied (a denied reset starts no period; the request
+//! is still outstanding). `PERIOD(99)` is the capability-denial proof.
 //!
 //! The denial half intentionally uses `CREATE(99)`/`STATUS(99, 0)` rather
 //! than repeating every operation on slot 99: the point is that the
@@ -254,6 +271,8 @@ const SYS_DATA_SESSION_CLOSE: u64 = 21;
 const SYS_DATA_RECONCILE: u64 = 22;
 // 23 is the governed usage-period reset (MARSHAL-gated).
 const SYS_DATA_RESET: u64 = 23;
+// 24 is the read-only billing-period advice (capability-checked, not gated).
+const SYS_DATA_PERIOD: u64 = 24;
 
 /// The EL0 demo itself. `.balign 4096` for the same reason
 /// `userspace::user_hello` does: this crate's EL0 permissions *are*
@@ -387,8 +406,9 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         // profile 0 is bound to account 0 and Enabled right now, which is the
         // only moment a data session can be allowed, and it precedes the
         // MARSHAL-gated SYS_MVNO_SUSPEND below, which is the CALLER carrying
-        // out the engine's suspension request. None of these four data
-        // syscalls is MARSHAL-gated (only SYS_DATA_RESET, further down, is).
+        // out the engine's suspension request. None of these data syscalls
+        // (nor SYS_DATA_PERIOD) is MARSHAL-gated (only SYS_DATA_RESET, further
+        // down, is).
         // The plan is the kernel's DEMO entitlement for account 0: cap 1000
         // bytes, throttle at 80%, no roaming, suspension requested at 150%.
         // SYS_DATA_SESSION_OPEN(0, 0, 0) -- usage 0: allowed. x3 packs the
@@ -427,6 +447,18 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x0, {sys_data_account}",
         "mov x1, #0",
         "mov x2, #700",
+        "svc #0",
+        // SYS_DATA_PERIOD(0) -- returns code 1: the billing period has ELAPSED,
+        // so a reset is REQUESTED (advice only: nothing is reset, and nothing
+        // resets on a schedule). Account 0's DEMO period starts at tick 0 and
+        // lasts 500 ms, and the counter is already seconds old here (24
+        // reclamation evaluations, the TCP proof and two MARSHAL evaluations
+        // precede this point), so "elapsed" has a wide margin on any host.
+        // Placed BEFORE the next RECONCILE on purpose: this call records the
+        // tick the request was first issued, which is what starts the
+        // reconciler's (long, DEMO) grace for an unactioned request.
+        "mov x0, {sys_data_period}",
+        "mov x1, #0",
         "svc #0",
         // SYS_DATA_SESSION_OPEN(0, 0, 0) -- DENIED CapExceeded: usage is past
         // the cap. The existing session is still open (not closed for us).
@@ -523,6 +555,16 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x2, #0",
         "mov x3, #0",
         "svc #0",
+        // SYS_DATA_PERIOD(0) -- where the reset was AUTHORIZED, the governed
+        // reset also started the next billing period (start = the tick it took
+        // effect), so this reads ACTIVE (code 0). Where the reset was DENIED
+        // (fail-closed with no MARSHAL proxy, or Refuse) nothing started a
+        // period: it still reads ELAPSED (code 1) and the request is still
+        // outstanding -- which is itself the proof that a denied reset starts
+        // no new period.
+        "mov x0, {sys_data_period}",
+        "mov x1, #0",
+        "svc #0",
         // SYS_DATA_RECONCILE -- 0 incidents: the account is under its cap and
         // Active with an open session on an Enabled profile, and the reset
         // cleared last_used so 1600 -> 0 is not reported as a UsageRegression.
@@ -537,6 +579,11 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         // SYS_DATA_RESET(99) -- no data:reset:99 capability: DENIED before any
         // state is read, MARSHAL consulted or counter touched.
         "mov x0, {sys_data_reset}",
+        "mov x1, #99",
+        "svc #0",
+        // SYS_DATA_PERIOD(99) -- no data:session:99 capability: DENIED before
+        // any period is read or any marker written.
+        "mov x0, {sys_data_period}",
         "mov x1, #99",
         "svc #0",
         // SYS_SIM_INSTALL(0, 0, 0x6666) -- expected to FAIL: re-installing
@@ -720,5 +767,6 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         sys_data_session_close = const SYS_DATA_SESSION_CLOSE,
         sys_data_reconcile = const SYS_DATA_RECONCILE,
         sys_data_reset = const SYS_DATA_RESET,
+        sys_data_period = const SYS_DATA_PERIOD,
     );
 }

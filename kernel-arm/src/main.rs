@@ -195,6 +195,10 @@ mod mvno_proof;
 // duplicating it) -- see its own module doc comment.
 mod net_process;
 mod nonsecure;
+// Boot-time proof of runix_mobile::period's pure billing-period model on
+// synthetic ticks (EL1-only, no live state), including the incidents the live
+// EL0 walk cannot reach.
+mod period_proof;
 mod process;
 // Boot-time proof that repeated MARSHAL evaluations do not drain the heap.
 mod reclaim_proof;

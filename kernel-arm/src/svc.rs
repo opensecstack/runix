@@ -3,7 +3,7 @@
 //! `el1_vectors.rs`'s vector-8 `SVC` handling; see that module's doc
 //! comment for how the syscall number/arg actually get here.
 //!
-//! Twenty syscalls for EL0 callers (twelve base, three MVNO, five data;
+//! Twenty-one syscalls for EL0 callers (twelve base, three MVNO, six data;
 //! plus three EL1-continuation ones, see `SYS_EL0_PROOF_DONE` and friends),
 //! matching `el0.rs`'s demo exactly (kept
 //! in sync by hand, not shared constants -- see `el0.rs`'s own doc comment on
@@ -74,14 +74,15 @@
 //!
 //! - `SYS_DATA_ACCOUNT` (19) / `SYS_DATA_SESSION_OPEN` (20) /
 //!   `SYS_DATA_SESSION_CLOSE` (21) / `SYS_DATA_RECONCILE` (22) /
-//!   `SYS_DATA_RESET` (23): the data policy
+//!   `SYS_DATA_RESET` (23) / `SYS_DATA_PERIOD` (24): the data policy
 //!   layer (Beta item 4.3, `data.rs` + the lib-side `data_state.rs`/
-//!   `data_codes.rs`, wrapping `runix_mobile::policy` and `::reconcile`; the
-//!   governed reset is the follow-up that
+//!   `data_codes.rs`, wrapping `runix_mobile::policy`, `::reconcile` and
+//!   `::period`; the governed reset is the follow-up that
 //!   `docs/adrs/0001-data-syscalls-not-marshal-gated.md` named).
 //!   Same per-call capability check, over four separately scoped resources:
 //!   `data:usage:{account}` (the usage FEED), `data:session:{account}`
-//!   (open/close), `data:reconcile` and `data:reset:{account}` (the period
+//!   (open/close, and the read-only period advice), `data:reconcile` and
+//!   `data:reset:{account}` (the period
 //!   reset). The feed is scoped apart from session
 //!   access because it is privileged: it can push an account over its cap
 //!   (denying service) and over the escalation threshold (the engine then
@@ -95,6 +96,7 @@
 //!   21   SYS_DATA_SESSION_CLOSE       account, slot, profile           data:session:{account}
 //!   22   SYS_DATA_RECONCILE           (none)                           data:reconcile
 //!   23   SYS_DATA_RESET               account                          data:reset:{account} + MARSHAL
+//!   24   SYS_DATA_PERIOD              account                          data:session:{account}
 //!   ```
 //!
 //!   Returns (encodings pinned and tested in `data_codes.rs`): `ACCOUNT` ->
@@ -108,7 +110,9 @@
 //!   argument; `RECONCILE` -> the incident count (`u64::MAX` = denied);
 //!   `RESET` -> `0` reset / `1` no capability / `2` MARSHAL Refuse or HardStop
 //!   / `3` MARSHAL local failure (fail closed) / `4` no entitlement / `5` no
-//!   such account. The
+//!   such account / `6` MARSHAL unreachable (fail closed); `PERIOD` -> `0`
+//!   active / `1` elapsed: reset REQUESTED / `2` clock before the period start /
+//!   `3` no billing period / `4` denied. The
 //!   third `SESSION_OPEN` argument packs `profile` in bits 0..=7 and the
 //!   roaming flag in bit 8 (the ABI has three argument registers and the call
 //!   needs four values; the profile id is a `u8`; reserved bits are rejected).
@@ -122,9 +126,10 @@
 //!   (`data:reset:{account}`, a scope separate from the feed's and from
 //!   session access, re-checked every call), the cheap local entitlement/
 //!   account checks, then MARSHAL evaluate + enforce through [`marshal_gate`]
-//!   (`data.reset_usage`; the same fail-open `Unreachable` / fail-closed
-//!   local-failure split as the MVNO syscalls, with the same WORM audit of a
-//!   local-failure denial) and only then the data lock and the mutation. No
+//!   (`data.reset_usage`; FAIL-CLOSED on both `Unreachable` and a local
+//!   failure -- ADR 0003 -- unlike the MVNO syscalls, which fail open on
+//!   `Unreachable`; each such denial is WORM-audited) and only then the data
+//!   lock and the mutation. No
 //!   lock is held across the evaluation. A block leaves usage and the
 //!   reconciler's memory untouched. The mutation sets the counter to
 //!   `runix_mobile::policy::reset_usage()` and clears the reconciler's
@@ -133,7 +138,30 @@
 //!   no standing or profile; the applied reset is WORM-audited with the
 //!   before/after counter.
 //!
-//!   **The other four are not MARSHAL-gated, by design.** The policy engine
+//!   **The reset also starts the next billing period.** On its success path
+//!   only (after the capability and the MARSHAL gate, where the counter is
+//!   zeroed) it installs `period::next_period(old, now)` -- start = the
+//!   generic-timer tick read after the gate, same length -- and clears the
+//!   account's reset-request marker, in the same critical section as the
+//!   counter. A denied, blocked or failed reset changes NEITHER the period NOR
+//!   the marker, so a request stays outstanding until a governed reset
+//!   actually happens. An account with no period resets exactly as before.
+//!
+//!   **`SYS_DATA_PERIOD` is read-only advice, and nothing resets on a
+//!   schedule.** A billing period is DATA (`runix_mobile::period`: a start tick
+//!   and a length); whether it has elapsed is computed from an explicit `now`
+//!   the kernel reads from the ARM generic timer at the moment a CALLER asks.
+//!   There is no timer interrupt, thread or deferred job that resets anything:
+//!   that would be an ungoverned writer on a schedule, the parallel
+//!   authorization path this project forbids (ADR 0002). The syscall's
+//!   capability is `data:session:{account}`, re-checked every call; see
+//!   [`data_period`] for why that scope and no new one. It returns a code (the
+//!   engine's REQUEST, like `SYS_DATA_ACCOUNT`), records
+//!   `reset_requested_since` the first time a request is issued, WORM-audits
+//!   that first request worded as an advisory REQUEST, and mutates nothing else:
+//!   it never resets or restricts anything.
+//!
+//!   **The other five are not MARSHAL-gated, by design.** The policy engine
 //!   only REQUESTS and the reconciler only OBSERVES; a request is carried out by the CALLER through
 //!   an existing governed syscall under its OWN capability (for a
 //!   `SuspendAccount` request that is `SYS_MVNO_SUSPEND`: capability, MARSHAL,
@@ -158,7 +186,11 @@
 //!   explicit "not a denial" reason: the observed state is not the expected,
 //!   authorized one), and its only write is the usage table's `last_used`
 //!   bookkeeping, done after the snapshot is built. It calls no `mvno::`/
-//!   `sim::` mutator and no `data::` mutator other than `mark_observed`.
+//!   `sim::` mutator and no `data::` mutator other than `mark_observed`. It
+//!   also checks the billing periods (`period::check_periods`, at the tick it
+//!   reads now, with the DEMO grace `data_codes::DEMO_GRACE_MILLIS`) and records
+//!   any period incident exactly like the others -- evidence, nothing
+//!   corrected; those are counted in the same incident total.
 //!
 //! # The MVNO gate on `SYS_SIM_ENABLE`
 //!
@@ -204,7 +236,12 @@
 //! policy is split precisely: the remote MARSHAL being *unreachable* (no
 //! proxy configured, no device, connect failure/timeout, no report within the
 //! bounded budget, undecodable reply) is `Remote(Unreachable)` and fail-open
-//! (Option B, `docs/MARSHAL-ENFORCEMENT-POLICY.md`); the kernel *failing to
+//! (Option B, `docs/MARSHAL-ENFORCEMENT-POLICY.md`) -- except for an action
+//! whose `MarshalAction::unreachable_policy()` is `FailClosed` (the data
+//! usage-period reset), which is denied with `Blocked::Unreachable` and
+//! WORM-audited like a local failure. Every success records the verdict that
+//! allowed it (`verdict_text`) in its WORM reason and serial line, so an
+//! `Unreachable` fail-open success reads "not governed"; the kernel *failing to
 //! run the evaluation at all* (process setup failing incl. out of memory,
 //! thread spawn failing, the EL0 excursion faulting) is a `LocalFailure` and
 //! fails **closed** for every gated syscall here (both eSIM ops and the three
@@ -230,6 +267,7 @@ use crate::serial_println;
 use crate::sim::{ProfileState, SimError};
 use runix_kernel_arm::marshal_action::GateOutcome;
 use runix_kernel_arm::marshal_action::MarshalAction;
+use runix_kernel_arm::marshal_action::{reason_with_verdict, verdict_text, UnreachablePolicy};
 
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_RIL_ACCESS: u64 = 2;
@@ -331,6 +369,13 @@ pub const SYS_DATA_RECONCILE: u64 = 22;
 /// MARSHAL-gated data syscall (see this module's doc comment). Closes no
 /// session and changes no standing or profile.
 pub const SYS_DATA_RESET: u64 = 23;
+/// `SYS_DATA_PERIOD(account)`: READ-ONLY ADVICE about the account's billing
+/// period. Reads the generic timer, assesses the period and returns a code
+/// (`data_codes::PERIOD_*`): active, or elapsed -> a reset is REQUESTED.
+/// Capability `data_session_resource(account)`, re-checked every call. Records
+/// the tick of the first request; resets and restricts NOTHING (the caller
+/// carries a request out through `SYS_DATA_RESET`). Not MARSHAL-gated.
+pub const SYS_DATA_PERIOD: u64 = 24;
 
 /// `SYS_RIL_RECV`'s return-value convention: `0..=255` is a received byte,
 /// `256`/`257` are out-of-band sentinels distinct from any real byte value
@@ -420,11 +465,18 @@ fn audit_transition(
     from: ProfileState,
     to: ProfileState,
     result: &Result<(), SimError>,
+    verdict: Option<&str>,
 ) {
     let subject = crate::capabilities::sim_profile_resource(slot, profile_id);
     let (authorized, reason) = match result {
         Ok(()) => (true, None),
         Err(e) => (false, Some(format!("{e}"))),
+    };
+    // A MARSHAL-gated transition records which verdict let it through; the
+    // ungated ones (install, disable) pass `None` and are unchanged.
+    let reason = match verdict {
+        Some(v) => Some(reason_with_verdict(reason, v)),
+        None => reason,
     };
     audit_event(
         &subject,
@@ -665,6 +717,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                         ProfileState::Created,
                         ProfileState::Disabled,
                         &result,
+                        None,
                     );
                     match result {
                         Ok(()) => {
@@ -728,20 +781,29 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                     // for a capability denial.
                     let outcome =
                         esim_marshal::evaluate("enable", slot, profile_id, MARSHAL_PRINCIPAL);
-                    if let Err(blocked) = enforce_gate(
+                    let verdict = match enforce_gate(
+                        MarshalAction::Esim {
+                            op: "enable",
+                            slot,
+                            profile: profile_id,
+                        }
+                        .unreachable_policy(),
                         outcome,
                         &crate::capabilities::sim_profile_resource(slot, profile_id),
                         &format!("{:?}", ProfileState::Disabled),
                         &format!("{:?}", ProfileState::Enabled),
                     ) {
-                        serial_println!(
-                            "\nSVC: SYS_SIM_ENABLE slot {} profile {} DENIED ({})",
-                            slot,
-                            profile_id,
-                            blocked
-                        );
-                        return 1;
-                    }
+                        Ok(allowed) => verdict_text(allowed),
+                        Err(blocked) => {
+                            serial_println!(
+                                "\nSVC: SYS_SIM_ENABLE slot {} profile {} DENIED ({})",
+                                slot,
+                                profile_id,
+                                blocked
+                            );
+                            return 1;
+                        }
+                    };
                     let result = crate::sim::enable(slot, profile_id);
                     audit_transition(
                         slot,
@@ -749,13 +811,15 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                         ProfileState::Disabled,
                         ProfileState::Enabled,
                         &result,
+                        Some(&verdict),
                     );
                     match result {
                         Ok(()) => {
                             serial_println!(
-                                "\nSVC: SYS_SIM_ENABLE slot {} profile {} authorized",
+                                "\nSVC: SYS_SIM_ENABLE slot {} profile {} authorized [{}]",
                                 slot,
-                                profile_id
+                                profile_id,
+                                verdict
                             );
                             0
                         }
@@ -798,6 +862,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                         ProfileState::Enabled,
                         ProfileState::Disabled,
                         &result,
+                        None,
                     );
                     match result {
                         Ok(()) => {
@@ -843,20 +908,29 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                     // consequential pair -- deletion is irreversible.
                     let outcome =
                         esim_marshal::evaluate("delete", slot, profile_id, MARSHAL_PRINCIPAL);
-                    if let Err(blocked) = enforce_gate(
+                    let verdict = match enforce_gate(
+                        MarshalAction::Esim {
+                            op: "delete",
+                            slot,
+                            profile: profile_id,
+                        }
+                        .unreachable_policy(),
                         outcome,
                         &crate::capabilities::sim_profile_resource(slot, profile_id),
                         &format!("{:?}", ProfileState::Disabled),
                         &format!("{:?}", ProfileState::Deleted),
                     ) {
-                        serial_println!(
-                            "\nSVC: SYS_SIM_DELETE slot {} profile {} DENIED ({})",
-                            slot,
-                            profile_id,
-                            blocked
-                        );
-                        return 1;
-                    }
+                        Ok(allowed) => verdict_text(allowed),
+                        Err(blocked) => {
+                            serial_println!(
+                                "\nSVC: SYS_SIM_DELETE slot {} profile {} DENIED ({})",
+                                slot,
+                                profile_id,
+                                blocked
+                            );
+                            return 1;
+                        }
+                    };
                     let result = crate::sim::delete(slot, profile_id);
                     audit_transition(
                         slot,
@@ -864,13 +938,15 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                         ProfileState::Disabled,
                         ProfileState::Deleted,
                         &result,
+                        Some(&verdict),
                     );
                     match result {
                         Ok(()) => {
                             serial_println!(
-                                "\nSVC: SYS_SIM_DELETE slot {} profile {} authorized",
+                                "\nSVC: SYS_SIM_DELETE slot {} profile {} authorized [{}]",
                                 slot,
-                                profile_id
+                                profile_id,
+                                verdict
                             );
                             release_binding_after_delete(slot, profile_id);
                             0
@@ -1016,7 +1092,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                     // Evaluated before `mvno::bind` takes the registry lock;
                     // no lock is held across the (possibly EL0-excursion)
                     // evaluation. A block leaves the registry untouched.
-                    if let Err(blocked) = marshal_gate(
+                    let verdict = match marshal_gate(
                         &MarshalAction::MvnoBind {
                             account,
                             slot,
@@ -1026,15 +1102,18 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                         "Unbound",
                         &format!("Bound(account {account})"),
                     ) {
-                        serial_println!(
-                            "\nSVC: SYS_MVNO_BIND account {} slot {} profile {} DENIED ({})",
-                            account,
-                            slot,
-                            profile_id,
-                            blocked
-                        );
-                        return 1;
-                    }
+                        Ok(allowed) => verdict_text(allowed),
+                        Err(blocked) => {
+                            serial_println!(
+                                "\nSVC: SYS_MVNO_BIND account {} slot {} profile {} DENIED ({})",
+                                account,
+                                slot,
+                                profile_id,
+                                blocked
+                            );
+                            return 1;
+                        }
+                    };
                     let result = crate::mvno::bind(account, slot, profile_id);
                     let (authorized, reason) = audit_outcome(&result);
                     audit_event(
@@ -1042,15 +1121,16 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                         "Unbound",
                         &format!("Bound(account {account})"),
                         authorized,
-                        reason,
+                        Some(reason_with_verdict(reason, &verdict)),
                     );
                     match result {
                         Ok(()) => {
                             serial_println!(
-                                "\nSVC: SYS_MVNO_BIND account {} slot {} profile {} authorized",
+                                "\nSVC: SYS_MVNO_BIND account {} slot {} profile {} authorized [{}]",
                                 account,
                                 slot,
-                                profile_id
+                                profile_id,
+                                verdict
                             );
                             0
                         }
@@ -1086,20 +1166,23 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             // evaluated before `suspend_account` touches the registry.
             match check(&crate::capabilities::mvno_suspend_resource(account)) {
                 Ok(()) => {
-                    if let Err(blocked) = marshal_gate(
+                    let verdict = match marshal_gate(
                         &MarshalAction::MvnoSuspend { account },
                         &crate::capabilities::mvno_account_resource(account),
                         "Active",
                         "Suspended",
                     ) {
-                        serial_println!(
-                            "\nSVC: SYS_MVNO_SUSPEND account {} DENIED ({})",
-                            account,
-                            blocked
-                        );
-                        return 1;
-                    }
-                    suspend_account(account)
+                        Ok(allowed) => verdict_text(allowed),
+                        Err(blocked) => {
+                            serial_println!(
+                                "\nSVC: SYS_MVNO_SUSPEND account {} DENIED ({})",
+                                account,
+                                blocked
+                            );
+                            return 1;
+                        }
+                    };
+                    suspend_account(account, &verdict)
                 }
                 Err(e) => {
                     serial_println!("\nSVC: SYS_MVNO_SUSPEND account {} DENIED ({})", account, e);
@@ -1113,19 +1196,22 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             // (`mvno.reactivate_account`), then the registry mutation.
             match check(&crate::capabilities::mvno_account_resource(account)) {
                 Ok(()) => {
-                    if let Err(blocked) = marshal_gate(
+                    let verdict = match marshal_gate(
                         &MarshalAction::MvnoReactivate { account },
                         &crate::capabilities::mvno_account_resource(account),
                         "Suspended",
                         "Active",
                     ) {
-                        serial_println!(
-                            "\nSVC: SYS_MVNO_REACTIVATE account {} DENIED ({})",
-                            account,
-                            blocked
-                        );
-                        return 1;
-                    }
+                        Ok(allowed) => verdict_text(allowed),
+                        Err(blocked) => {
+                            serial_println!(
+                                "\nSVC: SYS_MVNO_REACTIVATE account {} DENIED ({})",
+                                account,
+                                blocked
+                            );
+                            return 1;
+                        }
+                    };
                     let result = crate::mvno::reactivate(account);
                     let (authorized, reason) = audit_outcome(&result);
                     audit_event(
@@ -1133,13 +1219,14 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                         "Suspended",
                         "Active",
                         authorized,
-                        reason,
+                        Some(reason_with_verdict(reason, &verdict)),
                     );
                     match result {
                         Ok(()) => {
                             serial_println!(
-                                "\nSVC: SYS_MVNO_REACTIVATE account {} authorized",
-                                account
+                                "\nSVC: SYS_MVNO_REACTIVATE account {} authorized [{}]",
+                                account,
+                                verdict
                             );
                             0
                         }
@@ -1168,6 +1255,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         SYS_DATA_SESSION_CLOSE => data_session_close(arg1, arg2 as usize, arg3),
         SYS_DATA_RECONCILE => data_reconcile(),
         SYS_DATA_RESET => data_reset(arg1),
+        SYS_DATA_PERIOD => data_period(arg1),
         // The one arm that may not return to EL0 (see this constant's doc
         // comment and `el0_proof::finish`): on the proof path it resumes an
         // EL1 continuation and never comes back here; with no excursion in
@@ -1197,11 +1285,17 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
 /// lifecycle view, the sim lock inside it) and has released both on return;
 /// the `sim::disable` calls below then take only the sim lock. Never
 /// registry-while-holding-sim.
-fn suspend_account(account: u64) -> u64 {
+fn suspend_account(account: u64, verdict: &str) -> u64 {
     let account_subject = crate::capabilities::mvno_account_resource(account);
     let result = crate::mvno::suspend(account);
     let (authorized, reason) = audit_outcome(&result);
-    audit_event(&account_subject, "Active", "Suspended", authorized, reason);
+    audit_event(
+        &account_subject,
+        "Active",
+        "Suspended",
+        authorized,
+        Some(reason_with_verdict(reason, verdict)),
+    );
     let forced = match result {
         Ok(forced) => forced,
         Err(e) => {
@@ -1214,9 +1308,10 @@ fn suspend_account(account: u64) -> u64 {
         }
     };
     serial_println!(
-        "\nSVC: SYS_MVNO_SUSPEND account {} authorized ({} Enabled profile(s) to force-disable)",
+        "\nSVC: SYS_MVNO_SUSPEND account {} authorized ({} Enabled profile(s) to force-disable) [{}]",
         account,
-        forced.len()
+        forced.len(),
+        verdict
     );
 
     let mut ok = true;
@@ -1680,6 +1775,20 @@ fn data_reconcile() -> u64 {
     }
     let (observed, usage_rows) = crate::data::snapshot_for_reconcile();
     let incidents = runix_mobile::reconcile::reconcile(&observed);
+    // Billing periods: a SEPARATE pure check over copies (`period::
+    // check_periods`), at the tick read now, with the DEMO grace (see
+    // `data_codes::DEMO_GRACE_MILLIS` for why it is long: it keeps this from
+    // firing mid-walk in the live boot, where the period is over almost at
+    // once). The existing reconciler's incidents above are untouched; period
+    // incidents are reported the same way and added to the same total.
+    let period_incidents = runix_mobile::period::check_periods(
+        &crate::data::period_snapshot(),
+        now_ticks(),
+        runix_kernel_arm::data_codes::millis_to_ticks(
+            frequency_hz(),
+            runix_kernel_arm::data_codes::DEMO_GRACE_MILLIS,
+        ),
+    );
     serial_println!(
         "\nSVC: SYS_DATA_RECONCILE snapshot: {} account(s), {} profile(s), {} session(s)",
         observed.accounts.len(),
@@ -1702,16 +1811,121 @@ fn data_reconcile() -> u64 {
             incident
         );
     }
+    for incident in &period_incidents {
+        // Evidence, exactly like the incidents above: authorized=false because
+        // the observed state (an elapsed period nobody reset, or a rewound
+        // clock) is not the expected one; `expected`/`observed` are ticks.
+        audit_event(
+            &format!("{}:period:{}", resource, incident.account),
+            &format!("expected {}", incident.expected),
+            &format!("observed {}", incident.observed),
+            false,
+            Some(format!(
+                "RECONCILER EVIDENCE (observed drift, not a denial; nothing was corrected): billing period: {incident}"
+            )),
+        );
+        serial_println!(
+            "SVC: SYS_DATA_RECONCILE period incident {} (WORM-recorded as evidence; nothing corrected)",
+            incident
+        );
+    }
     // After the snapshot was built and the incidents recorded.
     crate::data::mark_observed(&usage_rows);
+    let total = incidents.len() + period_incidents.len();
     let (entries, chain_ok) = audit_chain_summary();
     serial_println!(
         "SVC: SYS_DATA_RECONCILE authorized ({} incident(s); WORM entries {}, chain verified {})",
-        incidents.len(),
+        total,
         entries,
         chain_ok
     );
-    incidents.len() as u64
+    total as u64
+}
+
+/// `SYS_DATA_PERIOD(account)`: read-only ADVICE about the account's billing
+/// period.
+///
+/// Body: (1) capability `data:session:{account}`, re-run every call; (2) read
+/// the generic timer -- the `now` the model is given, read at the moment the
+/// CALLER asked and not before; (3) `data::advise_period` assesses the period
+/// (pure `runix_mobile::period`) and, if it has elapsed, records the tick of the
+/// FIRST request; (4) the first request is WORM-audited, worded as an advisory
+/// REQUEST exactly like the usage feed's escalation entries; (5) a code is
+/// returned. It resets nothing, restricts nothing, closes nothing and takes no
+/// MARSHAL decision: a request is carried out by the caller through
+/// `SYS_DATA_RESET`, under that syscall's own capability and MARSHAL gate.
+///
+/// WHY `data:session:{account}` and no new scope: the advice discloses nothing a
+/// holder of that scope cannot already learn (a session open tells it whether
+/// the account is over its cap), grants no ability to change anything, and its
+/// one write -- `reset_requested_since` -- is bookkeeping that only ever records
+/// a fact the clock already made true (the period HAS elapsed) and can only be
+/// set once per period; it is the same class of write as the reconciler's
+/// `last_used`. A separate `data:period:{id}` scope would cost one more token to
+/// issue per account for no extra protection. It is NOT the usage-feed or reset
+/// scope: those can push an account over its cap or lift one, and holding the
+/// right to ask "is my period over" must not imply either.
+///
+/// WORM wording: only the FIRST request for a period is audited (the
+/// transition into "requested"; `PeriodAdvice::first_request`). Later polls
+/// return the same code and print the serial line but add no entry, so a caller
+/// cannot grow the audit chain without bound by polling. Capability denials
+/// and the no-period refusal are serial-only, like every other data syscall's
+/// non-decision refusals.
+fn data_period(account: u64) -> u64 {
+    use runix_kernel_arm::data_codes::{
+        describe_period_assessment, period_assessment_code, PERIOD_DENIED, PERIOD_NO_PERIOD,
+    };
+    let resource = crate::capabilities::data_session_resource(account);
+    if let Err(e) = check(&resource) {
+        serial_println!("\nSVC: SYS_DATA_PERIOD account {} DENIED ({})", account, e);
+        return PERIOD_DENIED;
+    }
+    // The explicit `now` for the pure model, read here at call time. Nothing
+    // reads a clock on a schedule; this runs only because a caller asked.
+    let now = now_ticks();
+    let Some(advice) = crate::data::advise_period(account, now) else {
+        // Serial-only on purpose, like the capability denial above: this refusal
+        // is reachable on every call by any holder of the session scope, so
+        // WORM-recording it would let a caller grow the audit chain without
+        // bound by polling an account that has no period (the same property
+        // the first-request-only rule below protects).
+        serial_println!(
+            "\nSVC: SYS_DATA_PERIOD account {} FAILED (no billing period for this account)",
+            account
+        );
+        return PERIOD_NO_PERIOD;
+    };
+    let described = describe_period_assessment(&advice.assessment);
+    let code = period_assessment_code(&advice.assessment);
+    if advice.first_request {
+        // Worded as a REQUEST on purpose (see `data_account`'s escalation
+        // entry): authorized=true records that the advice was issued, NOT that a
+        // reset happened. The real reset, if a caller makes it, is its own
+        // MARSHAL-gated `used N -> used 0` entry on `data:reset:{id}`.
+        audit_event(
+            &resource,
+            "billing period in progress",
+            "REQUEST ResetUsage (advisory; nothing was performed by this syscall)",
+            true,
+            Some(format!(
+                "billing period elapsed; request to the caller to issue the governed SYS_DATA_RESET; first requested at tick {now}; {described}"
+            )),
+        );
+        serial_println!(
+            "\nSVC: SYS_DATA_PERIOD account {} reset REQUEST WORM-recorded (advisory; nothing was reset; first requested at tick {})",
+            account,
+            now
+        );
+    }
+    serial_println!(
+        "\nSVC: SYS_DATA_PERIOD account {} authorized (now tick {}; {}; returns code {})",
+        account,
+        now,
+        described,
+        code
+    );
+    code
 }
 
 /// `SYS_DATA_RESET(account)`: the governed usage-period reset.
@@ -1726,7 +1940,9 @@ fn data_reconcile() -> u64 {
 ///    lock is held here: the evaluation can drive a nested EL0 excursion, which
 ///    must never run under a spin lock. A block returns with state untouched;
 /// 4. only now the data lock, via `data::reset_usage`: counter to
-///    `reset_usage()`, reconciler `last_used` cleared, one critical section;
+///    `reset_usage()`, reconciler `last_used` cleared and -- if the account has
+///    a billing period -- `next_period(old, now)` installed with the request
+///    marker cleared, one critical section;
 /// 5. the WORM entry (before/after counter) and the serial line.
 ///
 /// This lifts a cap, so it is the consequential data action. It does NOT close
@@ -1734,8 +1950,8 @@ fn data_reconcile() -> u64 {
 /// opening a session afterwards is a separate decision by the policy engine.
 fn data_reset(account: u64) -> u64 {
     use runix_kernel_arm::data_codes::{
-        demo_entitlement, reset_blocked_code, RESET_DENIED_CAPABILITY, RESET_NO_ENTITLEMENT,
-        RESET_NO_SUCH_ACCOUNT, RESET_OK,
+        demo_entitlement, describe_period_started, reset_blocked_code, RESET_DENIED_CAPABILITY,
+        RESET_NO_ENTITLEMENT, RESET_NO_SUCH_ACCOUNT, RESET_OK,
     };
     let resource = crate::capabilities::data_reset_resource(account);
     if let Err(e) = check(&resource) {
@@ -1773,38 +1989,60 @@ fn data_reset(account: u64) -> u64 {
         return RESET_NO_SUCH_ACCOUNT;
     }
     // No lock held across this call. A block leaves usage and `last_used` alone.
-    if let Err(blocked) = marshal_gate(
+    // Fail-CLOSED on an unreachable MARSHAL (`unreachable_policy`): a reset
+    // restores service, so no verdict means no reset; that denial is audited
+    // inside `enforce_gate`.
+    let verdict = match marshal_gate(
         &MarshalAction::DataResetUsage { account },
         &resource,
         "usage period in force",
         "new usage period (counter reset)",
     ) {
-        serial_println!(
-            "\nSVC: SYS_DATA_RESET account {} DENIED ({})",
-            account,
-            blocked
-        );
-        return reset_blocked_code(&blocked);
-    }
-    // Capability and MARSHAL both passed: only now the data lock.
-    let (before, after) = crate::data::reset_usage(account);
+        Ok(allowed) => verdict_text(allowed),
+        Err(blocked) => {
+            serial_println!(
+                "\nSVC: SYS_DATA_RESET account {} DENIED ({})",
+                account,
+                blocked
+            );
+            return reset_blocked_code(&blocked);
+        }
+    };
+    // Capability and MARSHAL both passed: only now the data lock. `now` is read
+    // HERE, after the gate (which can take ~1 s), because it is the tick the
+    // reset took effect: the next billing period starts when the counter was
+    // actually zeroed, not when the caller asked. A denied reset returned above
+    // without reaching this, so it starts no period and leaves the request
+    // marker (and an elapsed period) exactly as they were.
+    let now = now_ticks();
+    let (before, after, started) = crate::data::reset_usage(account, now);
+    let period_text = describe_period_started(&started);
     audit_event(
         &resource,
         &format!("used {}", before.used_bytes),
         &format!("used {}", after.used_bytes),
         true,
-        Some(String::from(
-            "usage period reset (new period); reconciler memory cleared; no session, standing or profile changed",
+        Some(reason_with_verdict(
+            Some(format!(
+                "usage period reset (new period); reconciler memory cleared; no session, standing or profile changed; {period_text}"
+            )),
+            &verdict,
         )),
     );
     let (entries, chain_ok) = audit_chain_summary();
     serial_println!(
-        "\nSVC: SYS_DATA_RESET account {} authorized (usage {} -> {}; new period; MARSHAL did not block it (verdict on the evaluation line above); WORM entries {}, chain verified {})",
+        "\nSVC: SYS_DATA_RESET account {} authorized (usage {} -> {}; new period; {}; WORM entries {}, chain verified {})",
         account,
         before.used_bytes,
         after.used_bytes,
+        verdict,
         entries,
         chain_ok
+    );
+    serial_println!(
+        "SVC: SYS_DATA_RESET account {} billing period: {}",
+        account,
+        period_text
     );
     RESET_OK
 }
@@ -1813,20 +2051,30 @@ fn check(resource: &str) -> Result<(), runix_capability_manager::CapabilityError
     crate::capabilities::check(resource, now_ticks())
 }
 
-/// Applies the shared enforcement to one evaluation outcome. A *local
-/// failure* denial (the kernel could not run the evaluation; fail closed) is
-/// additionally appended to the WORM chain as `authorized: false` with the
-/// reason, against the intended transition `subject: from -> to`, since it is
-/// a security-relevant denial that is not a remote governance decision.
-/// `Refuse`/`HardStop` denials are left exactly as they were (no audit entry).
+/// Applies the shared enforcement to one evaluation outcome under the
+/// action's `policy`. A *local failure* denial (the kernel could not run the
+/// evaluation; fail closed) and an *unreachable fail-closed* denial (the
+/// action's policy refuses to proceed without a verdict) are additionally
+/// appended to the WORM chain as `authorized: false` with the reason, against
+/// the intended transition `subject: from -> to`, since each is a
+/// security-relevant denial that is the kernel's own decision, not a remote
+/// governance verdict. `Refuse`/`HardStop` denials are left exactly as they
+/// were (no audit entry).
+///
+/// `Ok` carries the verdict that let the action through, so the success path
+/// can record it ([`verdict_text`]).
 fn enforce_gate(
+    policy: UnreachablePolicy,
     outcome: GateOutcome,
     subject: &str,
     from: &str,
     to: &str,
-) -> Result<(), MarshalEnforcementError> {
-    let result = esim_marshal::enforce(outcome);
-    if let Err(blocked @ MarshalEnforcementError::Local(_)) = &result {
+) -> Result<GateOutcome, MarshalEnforcementError> {
+    let result = esim_marshal::enforce(policy, outcome).map(|()| outcome);
+    if let Err(
+        blocked @ (MarshalEnforcementError::Local(_) | MarshalEnforcementError::Unreachable),
+    ) = &result
+    {
         audit_event(subject, from, to, false, Some(format!("{blocked}")));
         let (entries, chain_ok) = audit_chain_summary();
         serial_println!(
@@ -1844,9 +2092,11 @@ fn enforce_gate(
 /// The MARSHAL gate for the MVNO syscalls: evaluates `action` (building the
 /// Kerkese request via `MarshalAction`) and applies the shared enforcement
 /// ([`enforce_gate`]: `Refuse`/`HardStop` and local evaluation failures block,
-/// `Unreachable` and `Execute` pass). `Err` carries the blocking reason for
-/// the DENIED line. `subject`/`from`/`to` describe the intended transition for
-/// the local-failure audit entry.
+/// `Unreachable` blocks only for a fail-closed action -- see
+/// `MarshalAction::unreachable_policy` -- and passes otherwise; `Execute`
+/// passes). `Err` carries the blocking reason for the DENIED line; `Ok`
+/// carries the verdict that allowed it. `subject`/`from`/`to` describe the
+/// intended transition for the local-failure / unreachable audit entry.
 ///
 /// Must be called with **no lock held** -- `marshal_transport::evaluate` can
 /// drive a nested EL0 excursion. Callers therefore evaluate before taking the
@@ -1856,7 +2106,7 @@ fn marshal_gate(
     subject: &str,
     from: &str,
     to: &str,
-) -> Result<(), MarshalEnforcementError> {
+) -> Result<GateOutcome, MarshalEnforcementError> {
     let outcome = crate::marshal_transport::evaluate(action, MARSHAL_PRINCIPAL);
-    enforce_gate(outcome, subject, from, to)
+    enforce_gate(action.unreachable_policy(), outcome, subject, from, to)
 }

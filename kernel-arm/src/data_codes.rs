@@ -26,6 +26,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use runix_mobile::account::AccountStatus;
+use runix_mobile::period::{BillingPeriod, PeriodAssessment};
 use runix_mobile::policy::{
     AccountStandingForData, ActionRequest, DataEntitlement, DataUsage, DenyReason,
     PolicyDecisionRecord, ProfileLifecycleForData, SessionDecision, UsageAssessment,
@@ -35,8 +36,8 @@ use runix_mobile::reconcile::{
     Standing,
 };
 
-use crate::data_state::{DataSession, UsageEntry};
-use crate::marshal_action::{enforce, Blocked, GateOutcome};
+use crate::data_state::{DataSession, PeriodStarted, UsageEntry};
+use crate::marshal_action::{enforce, Blocked, GateOutcome, UnreachablePolicy};
 use crate::sim::ProfileState;
 
 // --- SYS_DATA_ACCOUNT return codes ----------------------------------------
@@ -160,26 +161,64 @@ pub const RESET_DENIED_LOCAL_FAILURE: u64 = 3;
 pub const RESET_NO_ENTITLEMENT: u64 = 4;
 /// No such account in the registry.
 pub const RESET_NO_SUCH_ACCOUNT: u64 = 5;
+/// MARSHAL was unreachable and the reset's policy is fail-closed. The kernel's
+/// own decision, not a remote verdict. Nothing changed.
+pub const RESET_DENIED_UNREACHABLE: u64 = 6;
 
 /// The `SYS_DATA_RESET` return code for a MARSHAL block: a remote
-/// `Refuse`/`HardStop` and a local evaluation failure are distinguishable to
-/// the caller (the same split the DENIED line makes). Exhaustive.
+/// `Refuse`/`HardStop`, a local evaluation failure and an unreachable-MARSHAL
+/// fail-closed are distinguishable to the caller (the same split the DENIED
+/// line makes). Exhaustive.
 pub const fn reset_blocked_code(blocked: &Blocked) -> u64 {
     match blocked {
         Blocked::Remote(_) => RESET_DENIED_MARSHAL,
         Blocked::Local(_) => RESET_DENIED_LOCAL_FAILURE,
+        Blocked::Unreachable => RESET_DENIED_UNREACHABLE,
     }
 }
 
 /// The whole MARSHAL half of the reset's decision, pure: `RESET_OK` means the
-/// gate lets the mutation proceed (`Execute`, or `Unreachable` -- Option B
-/// fail-open); anything else is the code the syscall returns with state
-/// untouched. `svc.rs` runs the real evaluation and the local-failure WORM
-/// audit; this is the decision they feed, pinned by `cargo test --lib`.
-pub fn reset_gate_code(outcome: GateOutcome) -> u64 {
-    match enforce(outcome) {
+/// gate lets the mutation proceed (`Execute`, or `Unreachable` only under a
+/// fail-open `policy`); anything else is the code the syscall returns with
+/// state untouched. `svc.rs` passes the action's own policy
+/// (`MarshalAction::DataResetUsage`'s `unreachable_policy()`), runs the real
+/// evaluation and the WORM audit of local-failure/unreachable denials; this is
+/// the decision they feed, pinned by `cargo test --lib`.
+pub fn reset_gate_code(policy: UnreachablePolicy, outcome: GateOutcome) -> u64 {
+    match enforce(policy, outcome) {
         Ok(()) => RESET_OK,
         Err(b) => reset_blocked_code(&b),
+    }
+}
+
+// --- SYS_DATA_PERIOD return codes ---------------------------------------------
+// READ-ONLY ADVICE about an account's billing period. `0..=2` are the model's
+// assessment (see [`period_assessment_code`]); `3..` are "no advice was
+// produced", so a caller tells "the period is over" from "the call did not
+// happen" the same way `SYS_DATA_ACCOUNT` callers do (`code >= PERIOD_NO_PERIOD`).
+// NOTHING here is an action: code 1 is a REQUEST that the caller issue the
+// governed `SYS_DATA_RESET` under its own capability.
+
+/// The period is in progress (`start <= now < end`). No request.
+pub const PERIOD_ACTIVE: u64 = 0;
+/// The period has elapsed (`now >= end`): a reset is REQUESTED. Nothing was
+/// reset; the caller must carry it out through `SYS_DATA_RESET`.
+pub const PERIOD_RESET_REQUESTED: u64 = 1;
+/// `now < start`: the clock went backwards (or the period is from the future).
+/// Never read as "active" and never a reset request; surfaced as an anomaly.
+pub const PERIOD_CLOCK_BEFORE_START: u64 = 2;
+/// The account has no billing period (fail closed: no advice is invented).
+pub const PERIOD_NO_PERIOD: u64 = 3;
+/// The caller lacks `data:session:{account}`.
+pub const PERIOD_DENIED: u64 = 4;
+
+/// Encode the model's assessment as the `SYS_DATA_PERIOD` return value.
+/// Exhaustive: a new `PeriodAssessment` variant fails to compile here.
+pub const fn period_assessment_code(a: &PeriodAssessment) -> u64 {
+    match a {
+        PeriodAssessment::Active { .. } => PERIOD_ACTIVE,
+        PeriodAssessment::Elapsed { .. } => PERIOD_RESET_REQUESTED,
+        PeriodAssessment::ClockBeforeStart { .. } => PERIOD_CLOCK_BEFORE_START,
     }
 }
 
@@ -271,7 +310,102 @@ pub fn demo_entitlement(account: u64) -> Option<DataEntitlement> {
     }
 }
 
+// --- DEMO billing periods -----------------------------------------------------
+
+/// DEMO DATA ONLY: length of account 0's billing period, in milliseconds of the
+/// generic timer. Converted to ticks from the counter's ACTUAL frequency
+/// ([`millis_to_ticks`]) -- never a hardcoded tick count (a fixed count tried
+/// once for the capability expiry turned out to be under a millisecond; see
+/// `svc::frequency_hz`).
+///
+/// 500 ms is chosen from two measured facts about the boot (see the el0.rs
+/// walk): the counter is already several seconds old when the walk's first
+/// `SYS_DATA_PERIOD` runs (24 reclamation evaluations, the TCP proof and two
+/// MARSHAL evaluations precede it), so the period (which starts at tick 0) is
+/// long over with a wide margin; and the gap between the governed reset and the
+/// `SYS_DATA_PERIOD` after it is a few syscalls (milliseconds), a tiny fraction
+/// of 500 ms.
+pub const DEMO_PERIOD_MILLIS: u64 = 500;
+
+/// DEMO DATA ONLY: the reconciler's grace before an elapsed, unactioned period
+/// is reported (`period::check_periods`'s `grace_ticks`). Deliberately LONG
+/// next to [`DEMO_PERIOD_MILLIS`]: the demo period is over almost as soon as
+/// the walk starts, and the walk (several ~1 s MARSHAL evaluations) runs for
+/// seconds after the first `SYS_DATA_PERIOD` request, in boots where the reset
+/// is denied (no MARSHAL proxy: fail-closed) and the period therefore stays
+/// elapsed. A grace shorter than the walk would make the live reconciler report
+/// `PeriodElapsedNoReset` mid-walk and change the incident counts the CI
+/// asserts. The grace starts at the request (`reset_requested_since`) or the
+/// period end, whichever is later, so it is measured from the walk, not from
+/// boot. The path that DOES fire is exercised by `period_proof.rs` on
+/// synthetic ticks.
+pub const DEMO_GRACE_MILLIS: u64 = 20_000;
+
+/// `millis` of a counter running at `freq_hz`, in ticks: `freq_hz * millis /
+/// 1000`, saturating (never wraps, never panics). A zero result for a nonzero
+/// `millis` (a counter slower than 1 kHz, or `freq_hz == 0` from an unset
+/// `CNTFRQ_EL0`) is raised to 1 tick so a period built from it is valid.
+pub const fn millis_to_ticks(freq_hz: u64, millis: u64) -> u64 {
+    let t = freq_hz.saturating_mul(millis) / 1000;
+    if t == 0 && millis != 0 {
+        1
+    } else {
+        t
+    }
+}
+
+/// DEMO DATA ONLY (same spirit as [`demo_entitlement`]): the compiled-in
+/// account -> billing-period table. Account 0 gets a period that starts at tick
+/// 0 and lasts [`DEMO_PERIOD_MILLIS`] at `freq_hz`; every other account has NO
+/// period (`None`: `SYS_DATA_PERIOD` answers [`PERIOD_NO_PERIOD`], fail closed).
+/// There is no provisioning path and no real billing cycle.
+pub fn demo_period(account: u64, freq_hz: u64) -> Option<BillingPeriod> {
+    match account {
+        0 => BillingPeriod::new(0, millis_to_ticks(freq_hz, DEMO_PERIOD_MILLIS)).ok(),
+        _ => None,
+    }
+}
+
 // --- Description strings (serial + WORM) -------------------------------------
+
+/// One-line, replayable description of a period assessment (ticks of the
+/// generic timer), e.g. `elapsed: overdue 31250000 ticks, 1 period(s) missed;
+/// reset REQUESTED (advisory: nothing was reset)`.
+pub fn describe_period_assessment(a: &PeriodAssessment) -> String {
+    match a {
+        PeriodAssessment::Active { elapsed, remaining } => format!(
+            "active: {elapsed} ticks in, {remaining} remaining; no reset requested"
+        ),
+        PeriodAssessment::Elapsed {
+            overdue_ticks,
+            periods_missed,
+        } => format!(
+            "elapsed: overdue {overdue_ticks} ticks, {periods_missed} period(s) missed; reset REQUESTED (advisory: nothing was reset)"
+        ),
+        PeriodAssessment::ClockBeforeStart {
+            start_tick,
+            now_tick,
+        } => format!(
+            "clock before start: now {now_tick} < period start {start_tick}; anomaly, no reset requested"
+        ),
+    }
+}
+
+/// What the governed reset did about the billing period, for the serial log and
+/// the WORM reason.
+pub fn describe_period_started(s: &PeriodStarted) -> String {
+    match s {
+        PeriodStarted::NoPeriod => String::from("no billing period for this account; none started"),
+        PeriodStarted::Started(p) => format!(
+            "next billing period started at tick {} (length {} ticks); reset request cleared",
+            p.start_tick(),
+            p.length_ticks()
+        ),
+        PeriodStarted::Rejected(e) => {
+            format!("next billing period NOT started ({e}); old period and request kept")
+        }
+    }
+}
 
 fn cap_text(e: &DataEntitlement) -> String {
     match e.cap_bytes() {
@@ -491,38 +625,159 @@ mod tests {
             RESET_DENIED_LOCAL_FAILURE,
             RESET_NO_ENTITLEMENT,
             RESET_NO_SUCH_ACCOUNT,
+            RESET_DENIED_UNREACHABLE,
         ];
         for (i, c) in all.iter().enumerate() {
-            assert_eq!(*c, i as u64, "codes are the dense list 0..=5");
+            assert_eq!(*c, i as u64, "codes are the dense list 0..=6");
         }
     }
 
     #[test]
+    fn period_codes_are_pinned_distinct_and_advice_codes_precede_refusals() {
+        let all = [
+            PERIOD_ACTIVE,
+            PERIOD_RESET_REQUESTED,
+            PERIOD_CLOCK_BEFORE_START,
+            PERIOD_NO_PERIOD,
+            PERIOD_DENIED,
+        ];
+        for (i, c) in all.iter().enumerate() {
+            assert_eq!(*c, i as u64, "codes are the dense list 0..=4");
+        }
+        assert_eq!(
+            period_assessment_code(&PeriodAssessment::Active {
+                elapsed: 1,
+                remaining: 1
+            }),
+            0
+        );
+        assert_eq!(
+            period_assessment_code(&PeriodAssessment::Elapsed {
+                overdue_ticks: 0,
+                periods_missed: 1
+            }),
+            1
+        );
+        assert_eq!(
+            period_assessment_code(&PeriodAssessment::ClockBeforeStart {
+                start_tick: 5,
+                now_tick: 1
+            }),
+            2
+        );
+    }
+
+    #[test]
+    fn millis_to_ticks_scales_from_the_frequency_and_never_wraps_or_hits_zero() {
+        // QEMU's virt generic timer runs at 62.5 MHz.
+        assert_eq!(millis_to_ticks(62_500_000, 500), 31_250_000);
+        assert_eq!(millis_to_ticks(1_000, 1), 1);
+        assert_eq!(millis_to_ticks(62_500_000, 0), 0);
+        // Unset / too-slow counter: still a valid (>= 1) tick count.
+        assert_eq!(millis_to_ticks(0, 500), 1);
+        assert_eq!(millis_to_ticks(1, 500), 1);
+        // Saturates instead of wrapping.
+        assert_eq!(millis_to_ticks(u64::MAX, u64::MAX), u64::MAX / 1000);
+        // Strictly increasing in millis at a realistic frequency.
+        assert!(millis_to_ticks(62_500_000, 20_000) > millis_to_ticks(62_500_000, 500));
+    }
+
+    #[test]
+    fn demo_period_table_has_exactly_account_zero_from_tick_zero() {
+        let p = demo_period(0, 62_500_000).expect("account 0 has a demo period");
+        assert_eq!(p.start_tick(), 0);
+        assert_eq!(p.length_ticks(), 31_250_000);
+        // Valid even for a degenerate frequency (never a ZeroLength None).
+        assert_eq!(demo_period(0, 0).unwrap().length_ticks(), 1);
+        for a in [1u64, 2, 15, 99, u64::MAX] {
+            assert_eq!(demo_period(a, 62_500_000), None, "account {a}: no period");
+        }
+        // The grace is much longer than the period (see DEMO_GRACE_MILLIS).
+        const _: () = assert!(DEMO_GRACE_MILLIS > 10 * DEMO_PERIOD_MILLIS);
+    }
+
+    #[test]
+    fn period_descriptions_are_pinned() {
+        assert_eq!(
+            describe_period_assessment(&PeriodAssessment::Active {
+                elapsed: 10,
+                remaining: 90
+            }),
+            "active: 10 ticks in, 90 remaining; no reset requested"
+        );
+        assert_eq!(
+            describe_period_assessment(&PeriodAssessment::Elapsed {
+                overdue_ticks: 7,
+                periods_missed: 1
+            }),
+            "elapsed: overdue 7 ticks, 1 period(s) missed; reset REQUESTED (advisory: nothing was reset)"
+        );
+        assert_eq!(
+            describe_period_assessment(&PeriodAssessment::ClockBeforeStart {
+                start_tick: 500,
+                now_tick: 400
+            }),
+            "clock before start: now 400 < period start 500; anomaly, no reset requested"
+        );
+        let p = BillingPeriod::new(900, 500).unwrap();
+        assert_eq!(
+            describe_period_started(&PeriodStarted::Started(p)),
+            "next billing period started at tick 900 (length 500 ticks); reset request cleared"
+        );
+        assert!(describe_period_started(&PeriodStarted::NoPeriod).contains("none started"));
+        let e = runix_mobile::period::PeriodError::ResetBeforeStart {
+            start_tick: 9,
+            reset_at_tick: 1,
+        };
+        assert!(describe_period_started(&PeriodStarted::Rejected(e)).contains("NOT started"));
+    }
+
+    #[test]
     fn reset_gate_decision_blocks_exactly_what_marshal_blocks() {
-        use crate::marshal_action::LocalFailure;
+        use crate::marshal_action::{LocalFailure, MarshalAction};
         use runix_citadel_integration::ShadowMarshalOutcome::*;
-        // Execute and Unreachable (Option B fail-open) let the reset proceed.
-        assert_eq!(reset_gate_code(GateOutcome::Remote(Execute)), RESET_OK);
-        assert_eq!(reset_gate_code(GateOutcome::Remote(Unreachable)), RESET_OK);
-        // Refuse and HardStop block it, state untouched.
+        // The reset's REAL policy is fail-closed: only Execute lets it proceed.
+        let policy = MarshalAction::DataResetUsage { account: 0 }.unreachable_policy();
+        assert_eq!(policy, UnreachablePolicy::FailClosed);
         assert_eq!(
-            reset_gate_code(GateOutcome::Remote(Refuse)),
-            RESET_DENIED_MARSHAL
+            reset_gate_code(policy, GateOutcome::Remote(Execute)),
+            RESET_OK
         );
+        // Unreachable is DENIED with its own code, not waved through.
         assert_eq!(
-            reset_gate_code(GateOutcome::Remote(HardStop)),
-            RESET_DENIED_MARSHAL
+            reset_gate_code(policy, GateOutcome::Remote(Unreachable)),
+            RESET_DENIED_UNREACHABLE
         );
-        // Every local failure fails CLOSED, with its own code.
-        for l in [
-            LocalFailure::SetupFailed,
-            LocalFailure::SpawnFailed,
-            LocalFailure::ExcursionFaulted,
-        ] {
+        // A hypothetical fail-open policy would let it proceed (the matrix
+        // cell the policy decides).
+        assert_eq!(
+            reset_gate_code(
+                UnreachablePolicy::FailOpen,
+                GateOutcome::Remote(Unreachable)
+            ),
+            RESET_OK
+        );
+        // Refuse and HardStop block it, state untouched, under both policies.
+        for p in [UnreachablePolicy::FailOpen, UnreachablePolicy::FailClosed] {
             assert_eq!(
-                reset_gate_code(GateOutcome::LocalFailure(l)),
-                RESET_DENIED_LOCAL_FAILURE
+                reset_gate_code(p, GateOutcome::Remote(Refuse)),
+                RESET_DENIED_MARSHAL
             );
+            assert_eq!(
+                reset_gate_code(p, GateOutcome::Remote(HardStop)),
+                RESET_DENIED_MARSHAL
+            );
+            // Every local failure fails CLOSED, with its own code.
+            for l in [
+                LocalFailure::SetupFailed,
+                LocalFailure::SpawnFailed,
+                LocalFailure::ExcursionFaulted,
+            ] {
+                assert_eq!(
+                    reset_gate_code(p, GateOutcome::LocalFailure(l)),
+                    RESET_DENIED_LOCAL_FAILURE
+                );
+            }
         }
     }
 

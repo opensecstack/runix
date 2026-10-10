@@ -42,3 +42,4 @@ or a broken link is fine.
 |---|----------|--------|
 | [0001](0001-data-syscalls-not-marshal-gated.md) | Data policy syscalls are not MARSHAL-gated; the engine only requests | Accepted (2026-10-10); amended by 0002 |
 | [0002](0002-usage-reset-is-marshal-gated.md) | The usage-period reset is the one MARSHAL-gated data action | Accepted (2026-10-11) |
+| [0003](0003-unreachable-marshal-policy-is-per-action.md) | What happens when MARSHAL is unreachable is decided per action | Accepted for the reset; open for the other gated actions (2026-10-11) |

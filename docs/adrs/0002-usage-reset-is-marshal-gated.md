@@ -1,7 +1,10 @@
 # 0002: The usage-period reset is the one MARSHAL-gated data action
 
 **Status**: Accepted, 2026-10-11. Amends [0001](0001-data-syscalls-not-marshal-gated.md)
-(which stays in force for every other data syscall).
+(which stays in force for every other data syscall). Refined by
+[0003](0003-unreachable-marshal-policy-is-per-action.md): decision 4 below, as
+first written, said an unreachable MARSHAL lets a reset through; it no longer
+does (the reset is fail-closed), and the text now says so.
 
 ## Context
 
@@ -42,10 +45,13 @@ relationship or the business.
    how a legitimate period reset is signalled so the reconciler does not report
    a usage regression. It does not close sessions, change account standing, or
    touch profiles. The before and after byte counts go to the WORM chain.
-4. **The failure policy is the common one.** A Refuse or HardStop denies the
-   reset and leaves usage unchanged. A local failure of the evaluation machinery
-   fails closed and is audited. An unreachable MARSHAL fails open, as for every
-   other gated action (see `docs/STATUS.md`, "the MARSHAL gate for mobile").
+4. **The failure policy.** A Refuse or HardStop denies the reset and leaves
+   usage unchanged. A local failure of the evaluation machinery fails closed and
+   is audited. An unreachable MARSHAL **also fails closed for the reset**
+   (decided in [0003](0003-unreachable-marshal-policy-is-per-action.md); this
+   record first shipped with the reset failing open like every other gated
+   action, which let anyone who could break the link obtain a reset). The reset
+   is the only gated mobile action with this property today.
 5. **ADR 0001's guarantee is narrowed, not dropped.** There is still no gating
    of any other data syscall. The CI tripwire that used to forbid any
    `MARSHAL evaluation for data` line now allows exactly one label,
@@ -71,14 +77,19 @@ Better:
 
 Worse, or left open:
 
-- **Unreachable MARSHAL lets a reset through.** The same fail-open policy that
-  applies to every gated mobile action means a reset proceeds ungoverned while
-  the proxy is unreachable. This is the most consequential reset-specific
-  weakness, because a reset restores service.
+- **A reset needs a reachable MARSHAL.** Since [0003](0003-unreachable-marshal-policy-is-per-action.md)
+  the reset is fail-closed: with the proxy unreachable (or no proxy configured,
+  as in the plain boot configurations) the reset is denied. This closes what
+  this record first listed as the most consequential reset-specific weakness (a
+  reset proceeding ungoverned because the link was broken), at the price that a
+  proxy outage now refuses resets.
 - **Usage is still caller-asserted.** Resetting the counter does not make the
   numbers measured; a holder of the usage-feed capability can still misreport.
 - **Nothing resets automatically.** A billing-period boundary still needs a
-  caller to issue the reset; there is no timer and no schedule.
+  caller to issue the reset; the kernel has no timer-driven actor. (A pure
+  billing-period model and a read-only `SYS_DATA_PERIOD` now let a caller learn
+  that a period has elapsed and that a reset is requested; carrying it out is
+  still a governed caller action.)
 - **One more MARSHAL evaluation per boot** (eight, up from seven), a measured
   cost of roughly half a second of host CPU.
 - **Upstream dependency.** Until the `rbacMap` entry is merged, a live CITADEL
@@ -89,9 +100,10 @@ Worse, or left open:
 
 - **Leave the reset ungated like the other data syscalls.** Rejected. It lifts a
   cap, which is the consequential direction ADR 0001 reserved.
-- **Reset on a schedule inside the kernel.** Rejected for now: it needs a clock
-  and a billing-period model that do not exist, and it would be an ungoverned
-  writer unless it routed through the same gate.
+- **Reset on a schedule inside the kernel.** Rejected: it would be an ungoverned
+  writer unless it routed through the same gate, and the kernel has no
+  timer-driven actor to carry it. (The period model needed to know *when* a
+  reset is due now exists as pure data; see the note under Consequences.)
 - **Let the engine request a reset.** Rejected. A reset is not something the
   engine should ever suggest on its own; the engine requests restrictions, and
   lifting one is an operator or billing decision.

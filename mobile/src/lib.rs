@@ -12,6 +12,9 @@ extern crate alloc;
 
 /// Subscriber / account / plan model and its invariants (Beta item 3, step 1).
 pub mod account;
+/// Pure billing-period model: explicit-tick elapsed assessment and reset
+/// requests, no clock and no authority (Beta item 4 follow-up).
+pub mod period;
 /// Data policy engine: entitlements, usage, pure session decisions and action
 /// requests (Beta item 4, step 1).
 pub mod policy;

@@ -844,27 +844,78 @@ jobs:
           if grep "MARSHAL evaluation for data" /tmp/arm-boot.log | grep -qvF "data.reset_usage"; then exit 1; fi
           test "$(grep -c "MARSHAL evaluation for data" /tmp/arm-boot.log)" -eq 1
           # Governed usage-period reset (SYS_DATA_RESET): it lifts a cap, so it is
-          # capability-gated (data:reset:0, its own scope) AND MARSHAL-gated. The
-          # walk runs it after the second ENABLE: usage 1600/1000, no session. In
-          # this boot config the gate reads Unreachable (fail-open).
+          # capability-gated (data:reset:0, its own scope) AND MARSHAL-gated, and its
+          # unreachable policy is FAIL-CLOSED (MarshalAction::unreachable_policy): a reset
+          # restores service, so no MARSHAL verdict means no reset. This boot config has
+          # no MARSHAL proxy (every evaluation reads Unreachable), so these assertions
+          # PROVE the fail-closed behaviour: the walk's reset (after the second ENABLE,
+          # usage 1600/1000, no session) is DENIED, audited to WORM as authorized=false,
+          # the counter stays 1600, and the later session open stays DENIED CapExceeded.
+          # The guestfwd steps below prove the Execute and Refuse sides.
           grep -q "Runix ARM kernel: data reset capability issued (account 0" /tmp/arm-boot.log
-          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=0: Unreachable" \
-            /tmp/arm-boot.log
-          grep -q "SVC: SYS_DATA_RESET account 0 authorized (usage 1600 -> 0; new period; MARSHAL did not block it (verdict on the evaluation line above); " \
-            /tmp/arm-boot.log
-          # Order matters: the SAME session open is DENIED CapExceeded before the
-          # reset (the cap is still in force) and Allowed after it (service
-          # restored); the reconcile after the reset sees zero incidents (no
-          # UsageRegression, because the reset cleared the reconciler's memory).
-          sed -n '1,/SYS_DATA_RESET account 0 authorized/p' /tmp/arm-boot.log > /tmp/arm-boot-pre-reset.log
-          sed -n '/SYS_DATA_RESET account 0 authorized/,$p' /tmp/arm-boot.log > /tmp/arm-boot-post-reset.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=0: Unreachable" /tmp/arm-boot.log
+          grep -qF "SVC: SYS_DATA_RESET account 0 DENIED (MARSHAL unreachable: fail-closed for this action)" /tmp/arm-boot.log
+          grep -qF "SVC: MARSHAL unreachable: fail-closed for this action denial audited to WORM (usage period in force -> new usage period (counter reset), authorized=false;" /tmp/arm-boot.log
+          if grep -q "SVC: SYS_DATA_RESET account 0 authorized" /tmp/arm-boot.log; then exit 1; fi
+          # Order matters: the evaluation precedes the denial; the SAME session open is
+          # DENIED CapExceeded before the reset and STILL DENIED after it (the denied
+          # reset left the cap in force: usage still 1600); the reconcile after it sees
+          # the unchanged over-cap usage (one incident, no session open) rather than the
+          # zero incidents a successful reset would give.
+          sed -n '1,/SYS_DATA_RESET account 0 DENIED (MARSHAL unreachable/p' /tmp/arm-boot.log > /tmp/arm-boot-pre-reset.log
+          sed -n '/SYS_DATA_RESET account 0 DENIED (MARSHAL unreachable/,$p' /tmp/arm-boot.log > /tmp/arm-boot-post-reset.log
+          grep -q "MARSHAL evaluation for data.reset_usage account=0: Unreachable" /tmp/arm-boot-pre-reset.log
           test "$(grep -c "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 DENIED (CapExceeded; " /tmp/arm-boot-pre-reset.log)" -ge 2
-          grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 authorized (Allow; .*used=0 " \
-            /tmp/arm-boot-post-reset.log
-          grep -q "SVC: SYS_DATA_RECONCILE authorized (0 incident(s);" /tmp/arm-boot-post-reset.log
+          grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 DENIED (CapExceeded; .*used=1600 " /tmp/arm-boot-post-reset.log
+          if grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 authorized" /tmp/arm-boot-post-reset.log; then exit 1; fi
+          grep -q "SVC: SYS_DATA_RECONCILE incident anomalous-usage-no-escalation account:0: expected 150%, observed 1600/1000" /tmp/arm-boot-post-reset.log
+          grep -q "SVC: SYS_DATA_RECONCILE authorized (1 incident(s);" /tmp/arm-boot-post-reset.log
           if grep -q "incident usage-regression" /tmp/arm-boot.log; then exit 1; fi
+          # Every fail-open success records that MARSHAL did NOT govern it (no proxy in
+          # this boot config, so every gated syscall that proceeds was Unreachable).
+          grep -qF "SVC: SYS_MVNO_BIND account 0 slot 0 profile 0 authorized [MARSHAL verdict: Unreachable (fail-open: not governed)]" /tmp/arm-boot.log
+          grep -qF "SVC: SYS_SIM_ENABLE slot 0 profile 0 authorized [MARSHAL verdict: Unreachable (fail-open: not governed)]" /tmp/arm-boot.log
+          grep -qF "force-disable) [MARSHAL verdict: Unreachable (fail-open: not governed)]" /tmp/arm-boot.log
+          grep -qF "SVC: SYS_MVNO_REACTIVATE account 0 authorized [MARSHAL verdict: Unreachable (fail-open: not governed)]" /tmp/arm-boot.log
+          grep -qF "SVC: SYS_SIM_DELETE slot 0 profile 0 authorized [MARSHAL verdict: Unreachable (fail-open: not governed)]" /tmp/arm-boot.log
           # No capability for data:reset:99: denied before MARSHAL or any state.
           grep -q "SVC: SYS_DATA_RESET account 99 DENIED" /tmp/arm-boot.log
+          # Billing periods (kernel-arm/src/data_state.rs, runix_mobile::period). A period
+          # is DATA and nothing resets on a schedule: SYS_DATA_PERIOD is read-only ADVICE
+          # computed from the generic timer when a CALLER asks. Account 0's DEMO period
+          # starts at tick 0 and lasts 500 ms (from the counter frequency); the walk's
+          # first PERIOD call runs >= ~2.3 s into the counter (measured, fast host; slower
+          # runners only make it later), so "elapsed" is race-free: an elapsed period
+          # stays elapsed. No new MARSHAL evaluation (the one-data-evaluation count above
+          # still holds).
+          grep -q "Runix ARM kernel: demo billing period installed (account 0, start tick 0, length " /tmp/arm-boot.log
+          # First call, after the 700-byte feed: elapsed -> a reset is REQUESTED (code 1).
+          grep -q "SVC: SYS_DATA_PERIOD account 0 authorized (now tick [0-9]*; elapsed: .*reset REQUESTED (advisory: nothing was reset); returns code 1)" /tmp/arm-boot-pre-reset.log
+          # The request is WORM-recorded ONCE, worded as an advisory REQUEST (nothing was
+          # reset), exactly like the usage feed's advisory entries.
+          grep -q "SVC: SYS_DATA_PERIOD account 0 reset REQUEST WORM-recorded (advisory; nothing was reset; first requested at tick " /tmp/arm-boot-pre-reset.log
+          test "$(grep -c "SYS_DATA_PERIOD account 0 reset REQUEST WORM-recorded" /tmp/arm-boot.log)" -eq 1
+          # In this config the reset is DENIED (fail-closed), so it started no period:
+          # the call after it STILL reads elapsed (code 1), never active (code 0), and no
+          # "next billing period started" line exists.
+          grep -q "SVC: SYS_DATA_PERIOD account 0 authorized (now tick [0-9]*; elapsed: .*returns code 1)" /tmp/arm-boot-post-reset.log
+          test "$(grep -c "SVC: SYS_DATA_PERIOD account 0 authorized" /tmp/arm-boot.log)" -eq 2
+          if grep -q "SVC: SYS_DATA_PERIOD account 0 authorized (.*returns code 0)" /tmp/arm-boot.log; then exit 1; fi
+          if grep -q "next billing period started" /tmp/arm-boot.log; then exit 1; fi
+          # No capability for data:session:99: denied before any period is read.
+          grep -q "SVC: SYS_DATA_PERIOD account 99 DENIED" /tmp/arm-boot.log
+          # The live reconciler's grace (20 s DEMO) is far longer than the walk, so it
+          # reports no period incident here and the incident counts above are unchanged
+          # (the paths that DO fire are proven on synthetic ticks just below).
+          if grep -q "period incident" /tmp/arm-boot.log; then exit 1; fi
+          # EL1-only proof of assess_period / period_request / next_period / check_periods
+          # on synthetic ticks (kernel-arm/src/period_proof.rs), including the
+          # PeriodElapsedNoReset and ClockBeforeStart incidents the live walk cannot reach.
+          grep -q "Runix ARM kernel: period proof next_period(reset at 3100) -> (3100, 500)" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: period proof incident account 2: clock at tick 1000 is before period start 5000" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: period proof incident account 1: period elapsed, no reset by tick 150 (now 1000)" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: period proof PASS" /tmp/arm-boot.log
+          if grep -q "Runix ARM kernel: period proof FAILED" /tmp/arm-boot.log; then exit 1; fi
           # Network selection driven by a registry account's standing (own local registry;
           # kernel-arm/src/mvno_proof.rs, EL1-only): allowed while Active,
           # refused once suspended.
@@ -1085,27 +1136,78 @@ jobs:
           if grep "MARSHAL evaluation for data" /tmp/arm-boot-nosecure.log | grep -qvF "data.reset_usage"; then exit 1; fi
           test "$(grep -c "MARSHAL evaluation for data" /tmp/arm-boot-nosecure.log)" -eq 1
           # Governed usage-period reset (SYS_DATA_RESET): it lifts a cap, so it is
-          # capability-gated (data:reset:0, its own scope) AND MARSHAL-gated. The
-          # walk runs it after the second ENABLE: usage 1600/1000, no session. In
-          # this boot config the gate reads Unreachable (fail-open).
+          # capability-gated (data:reset:0, its own scope) AND MARSHAL-gated, and its
+          # unreachable policy is FAIL-CLOSED (MarshalAction::unreachable_policy): a reset
+          # restores service, so no MARSHAL verdict means no reset. This boot config has
+          # no MARSHAL proxy (every evaluation reads Unreachable), so these assertions
+          # PROVE the fail-closed behaviour: the walk's reset (after the second ENABLE,
+          # usage 1600/1000, no session) is DENIED, audited to WORM as authorized=false,
+          # the counter stays 1600, and the later session open stays DENIED CapExceeded.
+          # The guestfwd steps below prove the Execute and Refuse sides.
           grep -q "Runix ARM kernel: data reset capability issued (account 0" /tmp/arm-boot-nosecure.log
-          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=0: Unreachable" \
-            /tmp/arm-boot-nosecure.log
-          grep -q "SVC: SYS_DATA_RESET account 0 authorized (usage 1600 -> 0; new period; MARSHAL did not block it (verdict on the evaluation line above); " \
-            /tmp/arm-boot-nosecure.log
-          # Order matters: the SAME session open is DENIED CapExceeded before the
-          # reset (the cap is still in force) and Allowed after it (service
-          # restored); the reconcile after the reset sees zero incidents (no
-          # UsageRegression, because the reset cleared the reconciler's memory).
-          sed -n '1,/SYS_DATA_RESET account 0 authorized/p' /tmp/arm-boot-nosecure.log > /tmp/arm-boot-nosecure-pre-reset.log
-          sed -n '/SYS_DATA_RESET account 0 authorized/,$p' /tmp/arm-boot-nosecure.log > /tmp/arm-boot-nosecure-post-reset.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=0: Unreachable" /tmp/arm-boot-nosecure.log
+          grep -qF "SVC: SYS_DATA_RESET account 0 DENIED (MARSHAL unreachable: fail-closed for this action)" /tmp/arm-boot-nosecure.log
+          grep -qF "SVC: MARSHAL unreachable: fail-closed for this action denial audited to WORM (usage period in force -> new usage period (counter reset), authorized=false;" /tmp/arm-boot-nosecure.log
+          if grep -q "SVC: SYS_DATA_RESET account 0 authorized" /tmp/arm-boot-nosecure.log; then exit 1; fi
+          # Order matters: the evaluation precedes the denial; the SAME session open is
+          # DENIED CapExceeded before the reset and STILL DENIED after it (the denied
+          # reset left the cap in force: usage still 1600); the reconcile after it sees
+          # the unchanged over-cap usage (one incident, no session open) rather than the
+          # zero incidents a successful reset would give.
+          sed -n '1,/SYS_DATA_RESET account 0 DENIED (MARSHAL unreachable/p' /tmp/arm-boot-nosecure.log > /tmp/arm-boot-nosecure-pre-reset.log
+          sed -n '/SYS_DATA_RESET account 0 DENIED (MARSHAL unreachable/,$p' /tmp/arm-boot-nosecure.log > /tmp/arm-boot-nosecure-post-reset.log
+          grep -q "MARSHAL evaluation for data.reset_usage account=0: Unreachable" /tmp/arm-boot-nosecure-pre-reset.log
           test "$(grep -c "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 DENIED (CapExceeded; " /tmp/arm-boot-nosecure-pre-reset.log)" -ge 2
-          grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 authorized (Allow; .*used=0 " \
-            /tmp/arm-boot-nosecure-post-reset.log
-          grep -q "SVC: SYS_DATA_RECONCILE authorized (0 incident(s);" /tmp/arm-boot-nosecure-post-reset.log
+          grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 DENIED (CapExceeded; .*used=1600 " /tmp/arm-boot-nosecure-post-reset.log
+          if grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 authorized" /tmp/arm-boot-nosecure-post-reset.log; then exit 1; fi
+          grep -q "SVC: SYS_DATA_RECONCILE incident anomalous-usage-no-escalation account:0: expected 150%, observed 1600/1000" /tmp/arm-boot-nosecure-post-reset.log
+          grep -q "SVC: SYS_DATA_RECONCILE authorized (1 incident(s);" /tmp/arm-boot-nosecure-post-reset.log
           if grep -q "incident usage-regression" /tmp/arm-boot-nosecure.log; then exit 1; fi
+          # Every fail-open success records that MARSHAL did NOT govern it (no proxy in
+          # this boot config, so every gated syscall that proceeds was Unreachable).
+          grep -qF "SVC: SYS_MVNO_BIND account 0 slot 0 profile 0 authorized [MARSHAL verdict: Unreachable (fail-open: not governed)]" /tmp/arm-boot-nosecure.log
+          grep -qF "SVC: SYS_SIM_ENABLE slot 0 profile 0 authorized [MARSHAL verdict: Unreachable (fail-open: not governed)]" /tmp/arm-boot-nosecure.log
+          grep -qF "force-disable) [MARSHAL verdict: Unreachable (fail-open: not governed)]" /tmp/arm-boot-nosecure.log
+          grep -qF "SVC: SYS_MVNO_REACTIVATE account 0 authorized [MARSHAL verdict: Unreachable (fail-open: not governed)]" /tmp/arm-boot-nosecure.log
+          grep -qF "SVC: SYS_SIM_DELETE slot 0 profile 0 authorized [MARSHAL verdict: Unreachable (fail-open: not governed)]" /tmp/arm-boot-nosecure.log
           # No capability for data:reset:99: denied before MARSHAL or any state.
           grep -q "SVC: SYS_DATA_RESET account 99 DENIED" /tmp/arm-boot-nosecure.log
+          # Billing periods (kernel-arm/src/data_state.rs, runix_mobile::period). A period
+          # is DATA and nothing resets on a schedule: SYS_DATA_PERIOD is read-only ADVICE
+          # computed from the generic timer when a CALLER asks. Account 0's DEMO period
+          # starts at tick 0 and lasts 500 ms (from the counter frequency); the walk's
+          # first PERIOD call runs >= ~2.3 s into the counter (measured, fast host; slower
+          # runners only make it later), so "elapsed" is race-free: an elapsed period
+          # stays elapsed. No new MARSHAL evaluation (the one-data-evaluation count above
+          # still holds).
+          grep -q "Runix ARM kernel: demo billing period installed (account 0, start tick 0, length " /tmp/arm-boot-nosecure.log
+          # First call, after the 700-byte feed: elapsed -> a reset is REQUESTED (code 1).
+          grep -q "SVC: SYS_DATA_PERIOD account 0 authorized (now tick [0-9]*; elapsed: .*reset REQUESTED (advisory: nothing was reset); returns code 1)" /tmp/arm-boot-nosecure-pre-reset.log
+          # The request is WORM-recorded ONCE, worded as an advisory REQUEST (nothing was
+          # reset), exactly like the usage feed's advisory entries.
+          grep -q "SVC: SYS_DATA_PERIOD account 0 reset REQUEST WORM-recorded (advisory; nothing was reset; first requested at tick " /tmp/arm-boot-nosecure-pre-reset.log
+          test "$(grep -c "SYS_DATA_PERIOD account 0 reset REQUEST WORM-recorded" /tmp/arm-boot-nosecure.log)" -eq 1
+          # In this config the reset is DENIED (fail-closed), so it started no period:
+          # the call after it STILL reads elapsed (code 1), never active (code 0), and no
+          # "next billing period started" line exists.
+          grep -q "SVC: SYS_DATA_PERIOD account 0 authorized (now tick [0-9]*; elapsed: .*returns code 1)" /tmp/arm-boot-nosecure-post-reset.log
+          test "$(grep -c "SVC: SYS_DATA_PERIOD account 0 authorized" /tmp/arm-boot-nosecure.log)" -eq 2
+          if grep -q "SVC: SYS_DATA_PERIOD account 0 authorized (.*returns code 0)" /tmp/arm-boot-nosecure.log; then exit 1; fi
+          if grep -q "next billing period started" /tmp/arm-boot-nosecure.log; then exit 1; fi
+          # No capability for data:session:99: denied before any period is read.
+          grep -q "SVC: SYS_DATA_PERIOD account 99 DENIED" /tmp/arm-boot-nosecure.log
+          # The live reconciler's grace (20 s DEMO) is far longer than the walk, so it
+          # reports no period incident here and the incident counts above are unchanged
+          # (the paths that DO fire are proven on synthetic ticks just below).
+          if grep -q "period incident" /tmp/arm-boot-nosecure.log; then exit 1; fi
+          # EL1-only proof of assess_period / period_request / next_period / check_periods
+          # on synthetic ticks (kernel-arm/src/period_proof.rs), including the
+          # PeriodElapsedNoReset and ClockBeforeStart incidents the live walk cannot reach.
+          grep -q "Runix ARM kernel: period proof next_period(reset at 3100) -> (3100, 500)" /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: period proof incident account 2: clock at tick 1000 is before period start 5000" /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: period proof incident account 1: period elapsed, no reset by tick 150 (now 1000)" /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: period proof PASS" /tmp/arm-boot-nosecure.log
+          if grep -q "Runix ARM kernel: period proof FAILED" /tmp/arm-boot-nosecure.log; then exit 1; fi
           # Network selection driven by a registry account's standing (own local registry;
           # kernel-arm/src/mvno_proof.rs, EL1-only): allowed while Active,
           # refused once suspended.
@@ -1191,6 +1293,24 @@ jobs:
           grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=0: Execute" \
             /tmp/arm-boot-marshal-refuse.log
           grep -q "SVC: SYS_DATA_RESET account 0 authorized" /tmp/arm-boot-marshal-refuse.log
+          # ...and the success records the REAL verdict (a reachable MARSHAL
+          # answered), not the ungoverned fail-open text.
+          grep -qF "SVC: SYS_DATA_RESET account 0 authorized (usage 1600 -> 0; new period; MARSHAL verdict: Execute; " /tmp/arm-boot-marshal-refuse.log
+          grep -qF "SVC: SYS_MVNO_BIND account 0 slot 0 profile 0 authorized [MARSHAL verdict: Execute]" /tmp/arm-boot-marshal-refuse.log
+          # Billing period (SYS_DATA_PERIOD), race-free assertions only: the first call
+          # runs >= ~2.3 s into the counter against a 500 ms demo period that started
+          # at tick 0, so it reads elapsed (code 1) on any host (the counter only grows);
+          # the denial for account 99 and the EL1-only period proof do not depend on timing.
+          grep -q "SVC: SYS_DATA_PERIOD account 0 authorized (now tick [0-9]*; elapsed: .*returns code 1)" /tmp/arm-boot-marshal-refuse.log
+          grep -q "SVC: SYS_DATA_PERIOD account 0 reset REQUEST WORM-recorded (advisory; nothing was reset; first requested at tick " /tmp/arm-boot-marshal-refuse.log
+          grep -q "SVC: SYS_DATA_PERIOD account 99 DENIED" /tmp/arm-boot-marshal-refuse.log
+          grep -q "Runix ARM kernel: period proof PASS" /tmp/arm-boot-marshal-refuse.log
+          # The reset was AUTHORIZED here, so it started the next billing period (the
+          # deterministic serial line). Whether the PERIOD call right after it reads active
+          # is NOT asserted: it is active only if under 500 ms passed between the two
+          # calls (~15 ms measured), which a stalled runner could break; the plain boots
+          # above assert the opposite, race-free case (a denied reset starts no period).
+          grep -q "SVC: SYS_DATA_RESET account 0 billing period: next billing period started at tick [0-9]* (length [0-9]* ticks); reset request cleared" /tmp/arm-boot-marshal-refuse.log
 
       # Beta item 3.4: the MVNO MARSHAL gate itself. Same bridge as above, but
       # the selective listener Refuses only `mvno.suspend_account`: the walk's
@@ -1244,6 +1364,20 @@ jobs:
           grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 DENIED (CapExceeded; .*used=1600 " \
             /tmp/arm-boot-marshal-refuse-mvno-post-reset.log
           if grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 authorized" /tmp/arm-boot-marshal-refuse-mvno-post-reset.log; then exit 1; fi
+          # Billing period (SYS_DATA_PERIOD), race-free assertions only: the first call
+          # runs >= ~2.3 s into the counter against a 500 ms demo period that started
+          # at tick 0, so it reads elapsed (code 1) on any host (the counter only grows);
+          # the denial for account 99 and the EL1-only period proof do not depend on timing.
+          grep -q "SVC: SYS_DATA_PERIOD account 0 authorized (now tick [0-9]*; elapsed: .*returns code 1)" /tmp/arm-boot-marshal-refuse-mvno.log
+          grep -q "SVC: SYS_DATA_PERIOD account 0 reset REQUEST WORM-recorded (advisory; nothing was reset; first requested at tick " /tmp/arm-boot-marshal-refuse-mvno.log
+          grep -q "SVC: SYS_DATA_PERIOD account 99 DENIED" /tmp/arm-boot-marshal-refuse-mvno.log
+          grep -q "Runix ARM kernel: period proof PASS" /tmp/arm-boot-marshal-refuse-mvno.log
+          # The reset was DENIED here (Refuse), so no next period started: the PERIOD call
+          # after it is still elapsed (code 1) -- race-free, an elapsed period only gets
+          # more elapsed -- and no active (code 0) answer or "period started" line exists.
+          test "$(grep -c "SVC: SYS_DATA_PERIOD account 0 authorized (.*returns code 1)" /tmp/arm-boot-marshal-refuse-mvno.log)" -eq 2
+          if grep -q "SVC: SYS_DATA_PERIOD account 0 authorized (.*returns code 0)" /tmp/arm-boot-marshal-refuse-mvno.log; then exit 1; fi
+          if grep -q "next billing period started" /tmp/arm-boot-marshal-refuse-mvno.log; then exit 1; fi
       # Full real chain, the third case the REFUSE/Unreachable configs above
       # can't distinguish on their own (a Refuse from a canned stand-in
       # listener proves the transport, not that the real proxy's policy
@@ -1316,6 +1450,24 @@ jobs:
           grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=0: Execute" \
             /tmp/arm-boot-marshal-execute.log
           grep -q "SVC: SYS_DATA_RESET account 0 authorized" /tmp/arm-boot-marshal-execute.log
+          # The success lines record the real verdict (every evaluation above
+          # was a reachable Execute), not the ungoverned fail-open text.
+          grep -qF "SVC: SYS_DATA_RESET account 0 authorized (usage 1600 -> 0; new period; MARSHAL verdict: Execute; " /tmp/arm-boot-marshal-execute.log
+          grep -qF "SVC: SYS_SIM_ENABLE slot 0 profile 0 authorized [MARSHAL verdict: Execute]" /tmp/arm-boot-marshal-execute.log
+          # Billing period (SYS_DATA_PERIOD), race-free assertions only: the first call
+          # runs >= ~2.3 s into the counter against a 500 ms demo period that started
+          # at tick 0, so it reads elapsed (code 1) on any host (the counter only grows);
+          # the denial for account 99 and the EL1-only period proof do not depend on timing.
+          grep -q "SVC: SYS_DATA_PERIOD account 0 authorized (now tick [0-9]*; elapsed: .*returns code 1)" /tmp/arm-boot-marshal-execute.log
+          grep -q "SVC: SYS_DATA_PERIOD account 0 reset REQUEST WORM-recorded (advisory; nothing was reset; first requested at tick " /tmp/arm-boot-marshal-execute.log
+          grep -q "SVC: SYS_DATA_PERIOD account 99 DENIED" /tmp/arm-boot-marshal-execute.log
+          grep -q "Runix ARM kernel: period proof PASS" /tmp/arm-boot-marshal-execute.log
+          # The reset was AUTHORIZED here, so it started the next billing period (the
+          # deterministic serial line). Whether the PERIOD call right after it reads active
+          # is NOT asserted: it is active only if under 500 ms passed between the two
+          # calls (~15 ms measured), which a stalled runner could break; the plain boots
+          # above assert the opposite, race-free case (a denied reset starts no period).
+          grep -q "SVC: SYS_DATA_RESET account 0 billing period: next billing period started at tick [0-9]* (length [0-9]* ticks); reset request cleared" /tmp/arm-boot-marshal-execute.log
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke

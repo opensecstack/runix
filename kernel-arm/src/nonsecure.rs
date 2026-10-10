@@ -462,9 +462,40 @@ fn el1_setup() -> ! {
     // el0_demo's SYS_DATA_RESET(99) is the denial proof.
     crate::capabilities::issue_and_hold(crate::capabilities::data_reset_resource(0), now);
     serial_println!("Runix ARM kernel: data reset capability issued (account 0, demo trust root)");
+    // Billing period for account 0 (DEMO DATA ONLY, like the entitlement table
+    // and the demo account): a period is plain DATA -- start tick and length --
+    // and this is the only place one is created; afterwards only a governed
+    // SYS_DATA_RESET advances it. It starts at tick 0 and lasts
+    // `DEMO_PERIOD_MILLIS`, converted to ticks from the counter's actual
+    // frequency (`CNTFRQ_EL0`), not a hardcoded count. Nothing is scheduled:
+    // whether it has elapsed is computed from an explicit `now` only when a
+    // caller asks (SYS_DATA_PERIOD) or the reconciler runs. No new capability:
+    // SYS_DATA_PERIOD uses the data:session:0 grant above (see svc.rs).
+    let freq = crate::svc::frequency_hz();
+    match runix_kernel_arm::data_codes::demo_period(0, freq) {
+        Some(p) => match crate::data::set_period(0, p) {
+            Ok(()) => serial_println!(
+                "Runix ARM kernel: demo billing period installed (account 0, start tick {}, length {} ticks = {} ms at {} Hz, DEMO DATA ONLY)",
+                p.start_tick(),
+                p.length_ticks(),
+                runix_kernel_arm::data_codes::DEMO_PERIOD_MILLIS,
+                freq
+            ),
+            Err(_) => {
+                serial_println!("Runix ARM kernel: demo billing period install FAILED (table full)")
+            }
+        },
+        None => serial_println!(
+            "Runix ARM kernel: demo billing period install FAILED (no valid period for account 0)"
+        ),
+    }
     // Network-selection proof (`mvno_proof.rs`) on its own local registry;
     // EL1-only, no syscall, does not touch the global registry above.
     crate::mvno_proof::prove_selection();
+    // Billing-period model proof on synthetic ticks (`period_proof.rs`):
+    // EL1-only, touches no live state, reaches the incidents the live walk
+    // cannot (PeriodElapsedNoReset, ClockBeforeStart).
+    crate::period_proof::prove_periods();
 
     // The general-purpose IPC channel space (`ipc_channel.rs`) is addressed
     // separately from RIL's, so it needs its own grant -- an `ril:0` token

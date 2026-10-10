@@ -31,7 +31,9 @@
 //!   no virtio-net device, connect failure or timeout, the process not
 //!   reporting back within its bounded budget, an undecodable reply):
 //!   `Remote(Unreachable)` -> **fail-open** (Option B,
-//!   `docs/MARSHAL-ENFORCEMENT-POLICY.md`).
+//!   `docs/MARSHAL-ENFORCEMENT-POLICY.md`) UNLESS the action's
+//!   `MarshalAction::unreachable_policy()` is `FailClosed` (today only the
+//!   data usage-period reset), in which case it is blocked and WORM-audited.
 //! - **The kernel failed to run the evaluation** (process setup failing,
 //!   including out of memory; thread spawn failing; the EL0 excursion
 //!   faulting): `LocalFailure(..)` -> **fail-closed**. A buggy or hostile
@@ -59,7 +61,7 @@
 //! same "no parallel type for the same four-outcome shape" discipline
 //! `kernel/src/grid_sandbox.rs` already applies on the x86_64 side.
 
-use runix_kernel_arm::marshal_action::{Blocked, GateOutcome, MarshalAction};
+use runix_kernel_arm::marshal_action::{Blocked, GateOutcome, MarshalAction, UnreachablePolicy};
 
 /// Evaluates whether a destructive eSIM lifecycle operation (`"enable"` or
 /// `"delete"` — see this module's doc comment) should be allowed to
@@ -94,6 +96,9 @@ pub type MarshalEnforcementError = Blocked;
 /// for every local evaluation failure. The decision is the pure
 /// [`runix_kernel_arm::marshal_action::enforce`] (host-tested); this is its
 /// stable name for callers.
-pub fn enforce(outcome: GateOutcome) -> Result<(), MarshalEnforcementError> {
-    runix_kernel_arm::marshal_action::enforce(outcome)
+pub fn enforce(
+    policy: UnreachablePolicy,
+    outcome: GateOutcome,
+) -> Result<(), MarshalEnforcementError> {
+    runix_kernel_arm::marshal_action::enforce(policy, outcome)
 }

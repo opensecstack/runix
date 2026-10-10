@@ -21,6 +21,14 @@
 //! - NOT here: entitlements (`data_codes::demo_entitlement`), account
 //!   standing and profile lifecycle (owned by `mvno.rs` / `sim.rs`; copied in
 //!   by the caller), capabilities, WORM audit.
+//! - Billing periods (`runix_mobile::period::BillingPeriod` per account id) and,
+//!   next to each, `reset_requested_since` -- the tick at which the kernel first
+//!   told a caller "this period is over, please reset". A period is DATA: the
+//!   only things that ever start one are [`DataState::set_period`] (boot-time
+//!   demo data) and [`DataState::start_next_period`] (the governed reset's
+//!   success path); nothing here reads a clock, resets on a schedule, or acts on
+//!   an elapsed period. `now` is always an explicit argument the caller read
+//!   from the generic timer at the moment it asked.
 //!
 //! # Lock order: this state is a LEAF
 //!
@@ -34,6 +42,10 @@
 
 use alloc::vec::Vec;
 
+use runix_mobile::period::{
+    assess_period, next_period, period_request, BillingPeriod, ObservedPeriod, PeriodAssessment,
+    PeriodError, PeriodRequest,
+};
 use runix_mobile::policy::{
     apply_usage, evaluate_usage, reset_usage, AccountStandingForData, DataEntitlement, DataUsage,
     NetworkClass, PolicyDecisionRecord, ProfileLifecycleForData, SessionDecision, SessionRequest,
@@ -70,6 +82,47 @@ pub struct DataSession {
     pub roaming: bool,
 }
 
+/// One account's billing period plus the request bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeriodEntry {
+    pub account: u64,
+    pub period: BillingPeriod,
+    /// Tick at which a reset request was FIRST issued for the current period
+    /// (`None` before any, and again after a governed reset starts the next
+    /// period). The reconciler reads it to measure how long a request stayed
+    /// unactioned (`period::check_periods`); it is evidence, never authority.
+    pub reset_requested_since: Option<u64>,
+}
+
+/// What [`DataState::advise_period`] found. ADVICE ONLY: `request` is the
+/// pure model's statement that a reset is due, not a reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeriodAdvice {
+    pub assessment: PeriodAssessment,
+    /// `Some(ResetUsage)` iff the period has elapsed (never for a rewound
+    /// clock -- see `period::period_request`).
+    pub request: Option<PeriodRequest>,
+    /// `true` only on the call that recorded `reset_requested_since` (the first
+    /// request for this period). The caller audits that one transition rather
+    /// than every poll, so polling cannot grow the WORM chain without bound.
+    pub first_request: bool,
+}
+
+/// What [`DataState::start_next_period`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeriodStarted {
+    /// The account has no period (nothing to start; behaves as before periods
+    /// existed).
+    NoPeriod,
+    /// The next period is installed and the request marker cleared.
+    Started(BillingPeriod),
+    /// `next_period` refused (the reset tick is before the old period's start:
+    /// a rewound clock). The OLD period and marker are left exactly as they
+    /// were, so the anomaly stays visible to the reconciler
+    /// (`ClockBeforeStart`) instead of being papered over.
+    Rejected(PeriodError),
+}
+
 /// What `decide_and_open` did with the session table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionRecorded {
@@ -96,6 +149,7 @@ pub struct OpenOutcome {
 pub struct DataState {
     usage: Vec<UsageEntry>,
     sessions: Vec<DataSession>,
+    periods: Vec<PeriodEntry>,
 }
 
 impl DataState {
@@ -103,6 +157,7 @@ impl DataState {
         Self {
             usage: Vec::new(),
             sessions: Vec::new(),
+            periods: Vec::new(),
         }
     }
 
@@ -161,6 +216,104 @@ impl DataState {
             }
             None => (DataUsage { used_bytes: 0 }, reset_usage()),
         }
+    }
+
+    /// Install `period` as `account`'s current billing period and clear any
+    /// outstanding request marker (a replaced period is a fresh one). DEMO
+    /// DATA ONLY at boot; the runtime path is [`Self::start_next_period`]. A
+    /// first period for a new account needs a free row (same bound as the usage
+    /// table); a full table refuses rather than evicting.
+    pub fn set_period(&mut self, account: u64, period: BillingPeriod) -> Result<(), TableFull> {
+        if let Some(e) = self.periods.iter_mut().find(|e| e.account == account) {
+            e.period = period;
+            e.reset_requested_since = None;
+            return Ok(());
+        }
+        if self.periods.len() >= MAX_DATA_ACCOUNTS {
+            return Err(TableFull);
+        }
+        self.periods.push(PeriodEntry {
+            account,
+            period,
+            reset_requested_since: None,
+        });
+        Ok(())
+    }
+
+    /// `account`'s current period, if it has one.
+    pub fn period_of(&self, account: u64) -> Option<BillingPeriod> {
+        self.periods
+            .iter()
+            .find(|e| e.account == account)
+            .map(|e| e.period)
+    }
+
+    /// Assess `account`'s period at the caller-supplied `now` and, if a reset
+    /// is due, remember WHEN it was first requested. `None`: no period.
+    ///
+    /// READ-ONLY ADVICE. The one write is `reset_requested_since`, set the first
+    /// time a request is issued and never moved afterwards (a later poll must
+    /// not make an old request look young -- the reconciler's grace runs from
+    /// the first one). Nothing is reset, restricted or closed here.
+    pub fn advise_period(&mut self, account: u64, now: u64) -> Option<PeriodAdvice> {
+        let e = self.periods.iter_mut().find(|e| e.account == account)?;
+        let assessment = assess_period(&e.period, now);
+        let request = period_request(&e.period, now);
+        let first_request = request.is_some() && e.reset_requested_since.is_none();
+        if first_request {
+            e.reset_requested_since = Some(now);
+        }
+        Some(PeriodAdvice {
+            assessment,
+            request,
+            first_request,
+        })
+    }
+
+    /// The governed reset took effect at tick `now`: install
+    /// `next_period(old, now)` (start = `now`, same length) and clear the
+    /// request marker. Called ONLY from the reset's success path, after its
+    /// capability check and MARSHAL gate; a denied reset never reaches it, so a
+    /// denied reset starts no period and leaves the request outstanding.
+    pub fn start_next_period(&mut self, account: u64, now: u64) -> PeriodStarted {
+        let Some(e) = self.periods.iter_mut().find(|e| e.account == account) else {
+            return PeriodStarted::NoPeriod;
+        };
+        match next_period(&e.period, now) {
+            Ok(next) => {
+                e.period = next;
+                e.reset_requested_since = None;
+                PeriodStarted::Started(next)
+            }
+            Err(err) => PeriodStarted::Rejected(err),
+        }
+    }
+
+    /// The governed reset in ONE critical section: usage back to zero
+    /// ([`Self::reset_usage`]) and the next period started at `now`
+    /// ([`Self::start_next_period`]). One section, so no reader sees a zeroed
+    /// counter inside an old, elapsed period (or the reverse).
+    pub fn reset_usage_and_period(
+        &mut self,
+        account: u64,
+        now: u64,
+    ) -> (DataUsage, DataUsage, PeriodStarted) {
+        let (before, after) = self.reset_usage(account);
+        let started = self.start_next_period(account, now);
+        (before, after, started)
+    }
+
+    /// The reconciler's view of every period: copies, in table order
+    /// (`check_periods` is order-independent).
+    pub fn period_snapshot(&self) -> Vec<ObservedPeriod> {
+        self.periods
+            .iter()
+            .map(|e| ObservedPeriod {
+                account: e.account,
+                period: e.period,
+                reset_requested_since: e.reset_requested_since,
+            })
+            .collect()
     }
 
     /// Evaluate a session request against the CURRENT usage and, only if the
@@ -487,6 +640,170 @@ mod tests {
         let (rows, sessions) = s.snapshot();
         let o = build_observed(&accts, &[], &rows, &sessions, demo_entitlement);
         assert!(reconcile(&o).is_empty());
+    }
+
+    // ---- billing periods ----
+
+    fn bp(start: u64, len: u64) -> BillingPeriod {
+        BillingPeriod::new(start, len).unwrap()
+    }
+
+    #[test]
+    fn account_without_a_period_gets_no_advice_and_no_period_is_started() {
+        let mut s = DataState::new();
+        assert_eq!(s.period_of(0), None);
+        assert_eq!(s.advise_period(0, 10_000), None);
+        assert_eq!(s.start_next_period(0, 10_000), PeriodStarted::NoPeriod);
+        assert!(s.period_snapshot().is_empty());
+    }
+
+    #[test]
+    fn active_period_gives_no_request_and_no_marker() {
+        let mut s = DataState::new();
+        s.set_period(0, bp(0, 500)).unwrap();
+        let a = s.advise_period(0, 499).unwrap();
+        assert_eq!(a.request, None);
+        assert!(!a.first_request);
+        assert_eq!(s.period_snapshot()[0].reset_requested_since, None);
+    }
+
+    #[test]
+    fn elapsed_period_requests_and_records_only_the_first_request_tick() {
+        let mut s = DataState::new();
+        s.set_period(0, bp(0, 500)).unwrap();
+        let a = s.advise_period(0, 500).unwrap();
+        assert_eq!(a.request, Some(PeriodRequest::ResetUsage));
+        assert!(a.first_request);
+        assert_eq!(s.period_snapshot()[0].reset_requested_since, Some(500));
+        // A later poll repeats the request but does not move the marker.
+        let b = s.advise_period(0, 9_000).unwrap();
+        assert_eq!(b.request, Some(PeriodRequest::ResetUsage));
+        assert!(!b.first_request);
+        assert_eq!(s.period_snapshot()[0].reset_requested_since, Some(500));
+    }
+
+    #[test]
+    fn advice_never_resets_or_restricts_anything() {
+        let mut s = DataState::new();
+        s.set_period(0, bp(0, 10)).unwrap();
+        s.feed_usage(0, 1600).unwrap();
+        open(&mut s, 1, false);
+        let tables_before = s.snapshot();
+        let period_before = s.period_of(0);
+        s.advise_period(0, 1_000_000).unwrap();
+        s.advise_period(0, 2_000_000).unwrap();
+        assert_eq!(s.snapshot(), tables_before);
+        assert_eq!(s.period_of(0), period_before);
+    }
+
+    #[test]
+    fn rewound_clock_is_not_a_request_and_sets_no_marker() {
+        let mut s = DataState::new();
+        s.set_period(0, bp(1_000, 500)).unwrap();
+        let a = s.advise_period(0, 10).unwrap();
+        assert!(matches!(
+            a.assessment,
+            PeriodAssessment::ClockBeforeStart { .. }
+        ));
+        assert_eq!(a.request, None);
+        assert_eq!(s.period_snapshot()[0].reset_requested_since, None);
+    }
+
+    #[test]
+    fn governed_reset_starts_the_next_period_and_clears_the_marker() {
+        let mut s = DataState::new();
+        s.set_period(0, bp(0, 500)).unwrap();
+        s.feed_usage(0, 1600).unwrap();
+        s.advise_period(0, 800).unwrap();
+        let (b, a, started) = s.reset_usage_and_period(0, 900);
+        assert_eq!((b.used_bytes, a.used_bytes), (1600, 0));
+        assert_eq!(started, PeriodStarted::Started(bp(900, 500)));
+        assert_eq!(s.period_of(0), Some(bp(900, 500)));
+        assert_eq!(s.period_snapshot()[0].reset_requested_since, None);
+        // The new period is Active: no request.
+        assert_eq!(s.advise_period(0, 901).unwrap().request, None);
+        // It elapses one length later and requests afresh (a NEW first
+        // request, so it would be audited again).
+        let adv = s.advise_period(0, 1_400).unwrap();
+        assert_eq!(adv.request, Some(PeriodRequest::ResetUsage));
+        assert!(adv.first_request);
+    }
+
+    #[test]
+    fn a_reset_for_an_account_without_a_period_behaves_as_before() {
+        let mut s = DataState::new();
+        s.feed_usage(0, 1600).unwrap();
+        let (b, a, started) = s.reset_usage_and_period(0, 900);
+        assert_eq!((b.used_bytes, a.used_bytes), (1600, 0));
+        assert_eq!(started, PeriodStarted::NoPeriod);
+        assert!(s.period_snapshot().is_empty());
+    }
+
+    #[test]
+    fn a_reset_before_the_period_start_keeps_the_old_period_and_marker() {
+        let mut s = DataState::new();
+        s.set_period(0, bp(1_000, 500)).unwrap();
+        s.advise_period(0, 2_000).unwrap(); // elapsed: marker = 2000
+        let (_, _, started) = s.reset_usage_and_period(0, 5);
+        assert!(matches!(
+            started,
+            PeriodStarted::Rejected(PeriodError::ResetBeforeStart { .. })
+        ));
+        assert_eq!(s.period_of(0), Some(bp(1_000, 500)));
+        assert_eq!(s.period_snapshot()[0].reset_requested_since, Some(2_000));
+    }
+
+    #[test]
+    fn only_the_governed_reset_touches_the_period_and_marker() {
+        // `svc.rs` calls reset_usage_and_period only after the capability and
+        // MARSHAL gates; a denial returns before it. The state-level half of
+        // that guarantee: no other method (feed, sessions, the reconciler's
+        // bookkeeping, even the usage half of the reset alone) moves a period
+        // or its marker, so a denied reset leaves the request outstanding.
+        let mut s = DataState::new();
+        s.set_period(0, bp(0, 500)).unwrap();
+        s.advise_period(0, 700).unwrap();
+        let before = s.period_snapshot();
+        s.feed_usage(0, 5).unwrap();
+        open(&mut s, 0, false);
+        let (rows, _) = s.snapshot();
+        s.mark_observed(&rows);
+        s.close_session(0, 0, 0);
+        s.reset_usage(0);
+        assert_eq!(s.period_snapshot(), before);
+    }
+
+    #[test]
+    fn period_table_is_bounded_and_replacing_clears_the_marker() {
+        let mut s = DataState::new();
+        for a in 0..MAX_DATA_ACCOUNTS as u64 {
+            s.set_period(a, bp(0, 10)).unwrap();
+        }
+        assert_eq!(
+            s.set_period(MAX_DATA_ACCOUNTS as u64, bp(0, 10)),
+            Err(TableFull)
+        );
+        s.advise_period(3, 100).unwrap();
+        assert_eq!(s.period_snapshot()[3].reset_requested_since, Some(100));
+        s.set_period(3, bp(100, 10)).unwrap();
+        assert_eq!(s.period_snapshot()[3].reset_requested_since, None);
+        assert_eq!(s.period_snapshot().len(), MAX_DATA_ACCOUNTS);
+    }
+
+    #[test]
+    fn snapshot_feeds_check_periods_with_the_marker() {
+        use runix_mobile::period::{check_periods, PeriodIncidentKind};
+        let mut s = DataState::new();
+        s.set_period(0, bp(0, 500)).unwrap();
+        // Overdue, never requested: grace runs from the period end (500).
+        assert!(check_periods(&s.period_snapshot(), 510, 10).is_empty());
+        assert_eq!(check_periods(&s.period_snapshot(), 511, 10).len(), 1);
+        // Requested late (tick 5000): the grace restarts from the request.
+        s.advise_period(0, 5_000).unwrap();
+        assert!(check_periods(&s.period_snapshot(), 5_010, 10).is_empty());
+        let r = check_periods(&s.period_snapshot(), 5_011, 10);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].kind, PeriodIncidentKind::PeriodElapsedNoReset);
     }
 
     #[test]

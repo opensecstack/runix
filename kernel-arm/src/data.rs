@@ -9,9 +9,9 @@
 //! snapshot builder) is in the lib target (`data_state.rs`, `data_codes.rs`)
 //! where `cargo test --lib` covers it.
 //!
-//! # Why four of the five data syscalls are not MARSHAL-gated (Beta item 4.3)
+//! # Why five of the six data syscalls are not MARSHAL-gated (Beta item 4.3)
 //!
-//! (The fifth, `SYS_DATA_RESET`, IS gated -- see the paragraph beginning "The
+//! (The sixth, `SYS_DATA_RESET`, IS gated -- see the paragraph beginning "The
 //! usage-period RESET" below. `docs/adrs/0001-data-syscalls-not-marshal-gated.md`
 //! records the decision and names the reset as its revisit trigger.)
 //!
@@ -31,6 +31,16 @@
 //!   restriction; it only ever narrows what is allowed).
 //! - `SYS_DATA_RECONCILE` reads, reports and WORM-records evidence; its only
 //!   write to this state is the `last_used` bookkeeping.
+//!
+//! - `SYS_DATA_PERIOD` is read-only ADVICE about the account's billing period:
+//!   it reads the generic timer at the moment it is asked, assesses the period
+//!   (`runix_mobile::period`) and says "elapsed: a reset is requested". Its one
+//!   write is `reset_requested_since`, the tick the request was first issued
+//!   (evidence for the reconciler, never moved afterwards). It resets nothing
+//!   and restricts nothing, and nothing in the kernel resets on a timer: a
+//!   period is DATA, and only a governed `SYS_DATA_RESET` (below) starts the
+//!   next one. It reuses the `data:session:{account}` scope rather than
+//!   inventing a new one -- see `svc.rs`'s `data_period` for why.
 //!
 //! None of them is a governance-consequential state change, so none gets a new
 //! MARSHAL action type or gate; the consequential action a request can lead to
@@ -54,7 +64,10 @@
 //! (`data:usage:{account}`), separate from session access
 //! (`data:session:{account}`): holding the right to open or close sessions
 //! does not imply the right to meter the account (and neither implies the
-//! reset's `data:reset:{account}`).
+//! reset's `data:reset:{account}`). On its success path the reset ALSO starts
+//! the account's next billing period (start = the tick the reset took effect,
+//! same length) and clears the request marker, in the same critical section;
+//! a denied or failed reset changes neither.
 //!
 //! Every policy decision, every engine request and every reconciler incident
 //! is still WORM-audited (on the same chain as the eSIM/MVNO transitions, via
@@ -75,14 +88,18 @@
 //!
 //! # DEMO DATA ONLY
 //!
-//! Entitlements come from `data_codes::demo_entitlement` (account 0 only);
-//! there is no provisioning path.
+//! Entitlements come from `data_codes::demo_entitlement` and billing periods
+//! from `data_codes::demo_period` (account 0 only, installed at boot by
+//! `nonsecure.rs`); there is no provisioning path.
 
 use alloc::vec::Vec;
 use spin::Mutex;
 
 use runix_kernel_arm::data_codes::{build_observed, ProfileRow};
-use runix_kernel_arm::data_state::{DataSession, DataState, OpenOutcome, TableFull, UsageEntry};
+use runix_kernel_arm::data_state::{
+    DataSession, DataState, OpenOutcome, PeriodAdvice, PeriodStarted, TableFull, UsageEntry,
+};
+use runix_mobile::period::{BillingPeriod, ObservedPeriod};
 use runix_mobile::policy::{
     AccountStandingForData, DataEntitlement, DataUsage, ProfileLifecycleForData,
 };
@@ -104,10 +121,32 @@ pub fn feed_usage(account: u64, bytes: u64) -> Result<(DataUsage, DataUsage), Ta
 
 /// Start a new usage period for `account` (the governed `SYS_DATA_RESET`, called
 /// only AFTER its capability check and MARSHAL gate passed): usage back to
-/// `reset_usage()`, reconciler `last_used` cleared, one critical section.
-/// Returns `(before, after)`. Sessions, standing and profiles are not touched.
-pub fn reset_usage(account: u64) -> (DataUsage, DataUsage) {
-    DATA.lock().reset_usage(account)
+/// `reset_usage()`, reconciler `last_used` cleared, and -- if the account has a
+/// billing period -- the NEXT period installed with start = `now` and the
+/// reset-request marker cleared, all in one critical section. `now` is the
+/// generic-timer tick the caller read after the gate passed. Returns `(before,
+/// after, period outcome)`. Sessions, standing and profiles are not touched.
+pub fn reset_usage(account: u64, now: u64) -> (DataUsage, DataUsage, PeriodStarted) {
+    DATA.lock().reset_usage_and_period(account, now)
+}
+
+/// Install `period` as `account`'s billing period (boot-time DEMO DATA only;
+/// see `data_codes::demo_period`). No syscall reaches this: a period is only
+/// ever set here at boot or advanced by [`reset_usage`].
+pub fn set_period(account: u64, period: BillingPeriod) -> Result<(), TableFull> {
+    DATA.lock().set_period(account, period)
+}
+
+/// Assess `account`'s period at `now` (read by the caller from the generic timer
+/// at the moment it asked) and record the first reset request. `None`: no
+/// period. Advice only -- nothing is reset or restricted.
+pub fn advise_period(account: u64, now: u64) -> Option<PeriodAdvice> {
+    DATA.lock().advise_period(account, now)
+}
+
+/// Copies of every billing period (with its request marker) for the reconciler.
+pub fn period_snapshot() -> Vec<ObservedPeriod> {
+    DATA.lock().period_snapshot()
 }
 
 /// Decide a session and, iff allowed, record it -- one critical section. The
