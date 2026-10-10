@@ -42,6 +42,15 @@
 //! `svc.rs` keeps the order by releasing the registry lock *before* it calls
 //! `sim::disable` for the forced-disable list.
 //!
+//! The data policy state (`data.rs`'s `DATA` mutex, Beta item 4.3) is a
+//! **leaf below both**: it is never held while calling into this module,
+//! `sim.rs`, or `svc.rs`'s audit, and nothing here or in `sim.rs` calls into
+//! it. The data syscalls read [`standing`]/[`owner_of`]/[`accounts`] (registry
+//! lock, released on return) and `sim::profile_state`/`sim::profiles` (sim
+//! lock) FIRST, copy the answers out, and only then take the data lock for a
+//! pure update -- so the order is registry -> sim -> data and no reverse edge
+//! exists.
+//!
 //! # MARSHAL gating of the MVNO syscalls (Beta item 3.4)
 //!
 //! `SYS_MVNO_BIND`/`SUSPEND`/`REACTIVATE` (`BIND` requires both the account's
@@ -170,4 +179,31 @@ pub fn standing_in(reg: &AccountRegistry, account: u64) -> Option<AccountStandin
         AccountStatus::Suspended => AccountStanding::Suspended,
         AccountStatus::Closed => AccountStanding::Closed,
     })
+}
+
+/// Live standing of `account` in the global registry, as the registry's own
+/// status (the data syscalls map it with `data_codes::standing_for_data` /
+/// `standing_for_reconcile`). `None` if there is no such account. Takes the
+/// registry lock internally and releases it on return.
+pub fn standing(account: u64) -> Option<AccountStatus> {
+    REGISTRY
+        .lock()
+        .account(AccountId(account))
+        .map(|a| a.status)
+}
+
+/// The account `(slot, profile)` is bound to, if any. Registry lock only.
+pub fn owner_of(slot: usize, profile: u8) -> Option<u64> {
+    REGISTRY.lock().owner_of(key(slot, profile)).map(|a| a.0)
+}
+
+/// Every account and its live status, in registry order (a copy; the lock is
+/// released on return). The reconciler's account list.
+pub fn accounts() -> Vec<(u64, AccountStatus)> {
+    REGISTRY
+        .lock()
+        .accounts()
+        .iter()
+        .map(|a| (a.id.0, a.status))
+        .collect()
 }

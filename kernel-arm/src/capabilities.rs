@@ -133,6 +133,37 @@ pub fn mvno_suspend_resource(account: u64) -> String {
     alloc::format!("mvno:suspend:{account}")
 }
 
+/// The resource string a capability must match to authorize the data-SESSION
+/// syscalls on `account` -- `SYS_DATA_SESSION_OPEN` and `SYS_DATA_SESSION_CLOSE`
+/// (Beta item 4.3). Opening a session asks the policy engine "may this account
+/// use data on this profile right now"; closing one is the caller carrying out
+/// a restriction. Neither can change what the account has been billed.
+pub fn data_session_resource(account: u64) -> String {
+    alloc::format!("data:session:{account}")
+}
+
+/// The resource string a capability must match to authorize
+/// `SYS_DATA_ACCOUNT` on `account` -- the usage FEED. Deliberately a separate
+/// string from [`data_session_resource`]: the feed is privileged in a way
+/// session access is not, because pushing bytes into an account's counter can
+/// push it over its cap and so DENY service (and trip the engine's
+/// suspension request). Whoever may merely open or close the account's own
+/// sessions must not thereby be able to meter it; a wholly separate string
+/// means a separately issued token is required, the same split as
+/// [`mvno_suspend_resource`] versus [`mvno_account_resource`].
+pub fn data_usage_resource(account: u64) -> String {
+    alloc::format!("data:usage:{account}")
+}
+
+/// The resource string a capability must match to authorize
+/// `SYS_DATA_RECONCILE`. Not account-scoped: the reconciler reads every
+/// account's state in one pass (and writes only incident evidence to the
+/// WORM log plus its own `last_used` bookkeeping), so there is no per-account
+/// slice to scope it to.
+pub fn data_reconcile_resource() -> String {
+    String::from("data:reconcile")
+}
+
 /// The resource-string convention for physical-MMIO-range access -- the
 /// ARM analogue of `kernel/src/capabilities.rs::ioport_range_resource`, for
 /// a context that has no port I/O at all. Names an authorized `(base,
@@ -444,6 +475,72 @@ mod tests {
         assert!(token
             .verify(&demo_verifying_key(), &sim_profile_resource(0, 2), now)
             .is_err());
+    }
+
+    #[test]
+    fn data_resource_format() {
+        assert_eq!(data_session_resource(0), "data:session:0");
+        assert_eq!(data_usage_resource(0), "data:usage:0");
+        assert_eq!(data_session_resource(99), "data:session:99");
+        assert_eq!(data_usage_resource(99), "data:usage:99");
+        assert_eq!(data_reconcile_resource(), "data:reconcile");
+    }
+
+    #[test]
+    fn data_session_access_does_not_imply_usage_feed_or_another_account() {
+        // The feed can push an account over its cap (deny service), so it is
+        // scoped apart from session access: a session token must not verify
+        // for the usage resource, for another account's session, or for the
+        // reconciler -- and vice versa.
+        let now = 0u64;
+        let issue = |resource: String| {
+            CapabilityToken::issue(
+                "el0:arm-demo",
+                resource,
+                now,
+                now + 100,
+                "demo-key",
+                &demo_signing_key(),
+            )
+        };
+        let vk = demo_verifying_key();
+        let session = issue(data_session_resource(0));
+        assert!(session.verify(&vk, &data_session_resource(0), now).is_ok());
+        assert!(session.verify(&vk, &data_usage_resource(0), now).is_err());
+        assert!(session
+            .verify(&vk, &data_session_resource(99), now)
+            .is_err());
+        assert!(session.verify(&vk, &data_usage_resource(99), now).is_err());
+        assert!(session
+            .verify(&vk, &data_reconcile_resource(), now)
+            .is_err());
+
+        let usage = issue(data_usage_resource(0));
+        assert!(usage.verify(&vk, &data_usage_resource(0), now).is_ok());
+        assert!(usage.verify(&vk, &data_session_resource(0), now).is_err());
+        assert!(usage.verify(&vk, &data_usage_resource(99), now).is_err());
+        assert!(usage.verify(&vk, &data_reconcile_resource(), now).is_err());
+
+        let reconcile = issue(data_reconcile_resource());
+        assert!(reconcile
+            .verify(&vk, &data_reconcile_resource(), now)
+            .is_ok());
+        assert!(reconcile
+            .verify(&vk, &data_session_resource(0), now)
+            .is_err());
+        assert!(reconcile.verify(&vk, &data_usage_resource(0), now).is_err());
+    }
+
+    #[test]
+    fn data_resources_do_not_collide_with_mvno_or_sim_resources() {
+        for a in [0u64, 1, 99, u64::MAX] {
+            assert_ne!(data_session_resource(a), data_usage_resource(a));
+            assert_ne!(data_session_resource(a), mvno_account_resource(a));
+            assert_ne!(data_usage_resource(a), mvno_suspend_resource(a));
+        }
+        assert_ne!(data_session_resource(0), data_session_resource(1));
+        assert_ne!(data_usage_resource(0), data_usage_resource(1));
+        assert_ne!(data_reconcile_resource(), sim_resource(0));
     }
 
     #[test]

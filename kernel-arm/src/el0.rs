@@ -32,6 +32,11 @@
 //! account-99 capability denials. Every pre-existing syscall and ordering
 //! assertion below is kept.
 //!
+//! Beta item 4.3 adds the data policy walk (`SYS_DATA_ACCOUNT` /
+//! `SESSION_OPEN` / `SESSION_CLOSE` / `RECONCILE`, see "The data policy
+//! additions" below). None of those is MARSHAL-gated, so the walk still
+//! performs exactly seven evaluations.
+//!
 //! # Why the IPC walk is sequential send-then-recv from one context
 //!
 //! The IPC pair is exercised exactly the way the RIL pair already is: this
@@ -89,6 +94,26 @@
 //! are MARSHAL-gated too (Beta item 3.4; transparent here: Unreachable and
 //! Execute both pass), so the walk performs seven evaluations per boot
 //! (bind, enable, suspend, reactivate, enable, delete x2).
+//!
+//! # The data policy additions
+//!
+//! Immediately after the first `ENABLE`/`STATUS (Enabled)` (profile 0 is bound
+//! to account 0 and Enabled there) and before `SUSPEND(0)`: `SESSION_OPEN`
+//! (allow, usage 0), `SESSION_OPEN` with the roaming flag (denied
+//! RoamingDataNotAllowed), `ACCOUNT(0, 900)` (engine requests a throttle),
+//! `SESSION_OPEN` (allow-throttled), `ACCOUNT(0, 700)` (total 1600: engine
+//! REQUESTS suspension), `SESSION_OPEN` (denied CapExceeded), `RECONCILE`
+//! (raises `UsageOverCapNotRestricted` and `AnomalousUsageNoEscalation`). The
+//! existing `SUSPEND(0)` that follows IS the caller carrying out that
+//! request through the governed path. After the forced-disable `STATUS`:
+//! `RECONCILE` (the usage incidents are gone; the still-open session on the
+//! now-Disabled profile raises `SessionWithoutEnabledProfile`),
+//! `SESSION_CLOSE` (the caller finishing the restriction), `RECONCILE` (clean).
+//! That last reconcile is deliberately placed while the account is Suspended:
+//! once reactivated it is Active with usage still over threshold and no
+//! billing-period reset, which the reconciler would rightly flag again.
+//! Denial proofs: `SESSION_OPEN(0, 0, 1)` on the installed-but-unbound
+//! profile, and `SESSION_OPEN(99, ..)` / `ACCOUNT(99, ..)` with no capability.
 //!
 //! The denial half intentionally uses `CREATE(99)`/`STATUS(99, 0)` rather
 //! than repeating every operation on slot 99: the point is that the
@@ -208,6 +233,12 @@ const SYS_IPC_RECV: u64 = 12;
 const SYS_MVNO_BIND: u64 = 16;
 const SYS_MVNO_SUSPEND: u64 = 17;
 const SYS_MVNO_REACTIVATE: u64 = 18;
+// 19..=22 are the data policy set (Beta item 4.3); kept in sync with `svc.rs`
+// by hand, like everything above.
+const SYS_DATA_ACCOUNT: u64 = 19;
+const SYS_DATA_SESSION_OPEN: u64 = 20;
+const SYS_DATA_SESSION_CLOSE: u64 = 21;
+const SYS_DATA_RECONCILE: u64 = 22;
 
 /// The EL0 demo itself. `.balign 4096` for the same reason
 /// `userspace::user_hello` does: this crate's EL0 permissions *are*
@@ -337,10 +368,71 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x1, #0",
         "mov x2, #0",
         "svc #0",
+        // --- Data policy demo (Beta item 4.3). Placed here deliberately:
+        // profile 0 is bound to account 0 and Enabled right now, which is the
+        // only moment a data session can be allowed, and it precedes the
+        // MARSHAL-gated SYS_MVNO_SUSPEND below, which is the CALLER carrying
+        // out the engine's suspension request. None of the data syscalls is
+        // MARSHAL-gated, so this adds no evaluation to the walk (still seven).
+        // The plan is the kernel's DEMO entitlement for account 0: cap 1000
+        // bytes, throttle at 80%, no roaming, suspension requested at 150%.
+        // SYS_DATA_SESSION_OPEN(0, 0, 0) -- usage 0: allowed. x3 packs the
+        // profile (bits 0..=7) and the roaming flag (bit 8); see svc.rs.
+        "mov x0, {sys_data_session_open}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "mov x3, #0",
+        "svc #0",
+        // SYS_DATA_SESSION_OPEN(0, 0, 0 | roaming) -- DENIED
+        // RoamingDataNotAllowed: the plan does not cover roaming. The
+        // already-open home session is left alone (closing is the caller's
+        // act, never the policy path's).
+        "mov x0, {sys_data_session_open}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "mov x3, #0x100",
+        "svc #0",
+        // SYS_DATA_ACCOUNT(0, 900) -- usage 900/1000 = 90% >= the 80%
+        // throttle point: the engine REQUESTS a throttle (x0 = 2). Nothing is
+        // throttled by this syscall; it only meters and advises.
+        "mov x0, {sys_data_account}",
+        "mov x1, #0",
+        "mov x2, #900",
+        "svc #0",
+        // SYS_DATA_SESSION_OPEN(0, 0, 0) -- now allowed-throttled (re-open of
+        // the live session: refreshed, not duplicated).
+        "mov x0, {sys_data_session_open}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "mov x3, #0",
+        "svc #0",
+        // SYS_DATA_ACCOUNT(0, 700) -- total 1600 >= 150% of the cap: the
+        // engine REQUESTS suspension (x0 = 3). Requested, not done: the
+        // account is still Active and the session still open afterwards.
+        "mov x0, {sys_data_account}",
+        "mov x1, #0",
+        "mov x2, #700",
+        "svc #0",
+        // SYS_DATA_SESSION_OPEN(0, 0, 0) -- DENIED CapExceeded: usage is past
+        // the cap. The existing session is still open (not closed for us).
+        "mov x0, {sys_data_session_open}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "mov x3, #0",
+        "svc #0",
+        // SYS_DATA_RECONCILE -- observes the drift between that request and
+        // reality: the account is Active with an open session at 160% of its
+        // cap, so it raises UsageOverCapNotRestricted and
+        // AnomalousUsageNoEscalation. Evidence only; nothing is corrected.
+        "mov x0, {sys_data_reconcile}",
+        "svc #0",
         // SYS_MVNO_SUSPEND(0) while profile 0 is Enabled -- the registry
         // flips the account to Suspended and svc.rs force-disables the
         // profile, then re-audits (the "audit clean" line). A distinct
         // capability (mvno:suspend:0) from bind/reactivate (mvno:account:0).
+        // This is also the CALLER carrying out the data engine's
+        // SuspendAccount request (SYS_DATA_ACCOUNT returned 3 above), through
+        // the governed path: capability, MARSHAL gate, WORM.
         "mov x0, {sys_mvno_suspend}",
         "mov x1, #0",
         "svc #0",
@@ -349,6 +441,27 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x0, {sys_sim_status}",
         "mov x1, #0",
         "mov x2, #0",
+        "svc #0",
+        // SYS_DATA_RECONCILE -- the suspension satisfied the engine's
+        // request: the two usage incidents are gone (the account is no longer
+        // Active). What remains is a real finding: the data session was never
+        // closed, and it now sits on a Disabled profile
+        // (SessionWithoutEnabledProfile). Suspending does not close sessions
+        // behind the caller's back; that is the caller's act, next.
+        "mov x0, {sys_data_reconcile}",
+        "svc #0",
+        // SYS_DATA_SESSION_CLOSE(0, 0, 0) -- the caller applying the rest of
+        // the restriction (audited).
+        "mov x0, {sys_data_session_close}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "mov x3, #0",
+        "svc #0",
+        // SYS_DATA_RECONCILE -- clean: no incidents. (Placed while the
+        // account is Suspended: after REACTIVATE it is Active again with
+        // usage still over threshold and no billing reset, which the
+        // reconciler would correctly flag again.)
+        "mov x0, {sys_data_reconcile}",
         "svc #0",
         // SYS_SIM_ENABLE(0, 0) -- now DENIED (MVNO ...): the capability
         // passes, but the owning account is Suspended. Refused before the
@@ -438,6 +551,14 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x1, #0",
         "mov x2, #1",
         "svc #0",
+        // SYS_DATA_SESSION_OPEN(0, 0, 1) -- DENIED (profile not bound to this
+        // account): the capability is held and the profile exists, but it has
+        // no owner. Fail closed before the policy engine is consulted.
+        "mov x0, {sys_data_session_open}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "mov x3, #1",
+        "svc #0",
         // SYS_MVNO_BIND(99, 0, 1) / SYS_MVNO_SUSPEND(99) -- an account this
         // context holds no capability for: DENIED before the registry is
         // consulted, re-checked per call like every other syscall here.
@@ -448,6 +569,18 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "svc #0",
         "mov x0, {sys_mvno_suspend}",
         "mov x1, #99",
+        "svc #0",
+        // SYS_DATA_SESSION_OPEN(99, 0, 0) / SYS_DATA_ACCOUNT(99, 1) -- an
+        // account this context holds no data capability for: DENIED before
+        // any state is read or changed.
+        "mov x0, {sys_data_session_open}",
+        "mov x1, #99",
+        "mov x2, #0",
+        "mov x3, #0",
+        "svc #0",
+        "mov x0, {sys_data_account}",
+        "mov x1, #99",
+        "mov x2, #1",
         "svc #0",
         // SYS_MVNO_BIND(0, 0, 2) -- the account capability (mvno:account:0)
         // IS held but the profile capability (sim:0:2) is NOT (nonsecure.rs
@@ -529,5 +662,9 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         sys_mvno_bind = const SYS_MVNO_BIND,
         sys_mvno_suspend = const SYS_MVNO_SUSPEND,
         sys_mvno_reactivate = const SYS_MVNO_REACTIVATE,
+        sys_data_account = const SYS_DATA_ACCOUNT,
+        sys_data_session_open = const SYS_DATA_SESSION_OPEN,
+        sys_data_session_close = const SYS_DATA_SESSION_CLOSE,
+        sys_data_reconcile = const SYS_DATA_RECONCILE,
     );
 }

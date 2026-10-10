@@ -43,6 +43,8 @@ extern crate alloc;
 /// scope and always compiles the real, non-test branch.
 #[cfg(test)]
 pub mod capabilities;
+pub mod data_codes;
+pub mod data_state;
 pub mod elf;
 pub mod loader;
 pub mod marshal_action;

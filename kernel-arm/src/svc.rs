@@ -71,6 +71,62 @@
 //!   drive a nested EL0 excursion (see `marshal_transport::evaluate`), which
 //!   must never happen under a spin lock. Status reads are not gated.
 //!
+//! - `SYS_DATA_ACCOUNT` (19) / `SYS_DATA_SESSION_OPEN` (20) /
+//!   `SYS_DATA_SESSION_CLOSE` (21) / `SYS_DATA_RECONCILE` (22): the data policy
+//!   layer (Beta item 4.3, `data.rs` + the lib-side `data_state.rs`/
+//!   `data_codes.rs`, wrapping `runix_mobile::policy` and `::reconcile`).
+//!   Same per-call capability check, over three separately scoped resources:
+//!   `data:usage:{account}` (the usage FEED), `data:session:{account}`
+//!   (open/close) and `data:reconcile`. The feed is scoped apart from session
+//!   access because it is privileged: it can push an account over its cap
+//!   (denying service) and over the escalation threshold (the engine then
+//!   asks for suspension), so the right to open or close sessions must not
+//!   imply the right to meter the account.
+//!
+//!   ```text
+//!   num  syscall                      args (x1, x2, x3)                capability
+//!   19   SYS_DATA_ACCOUNT             account, bytes                   data:usage:{account}
+//!   20   SYS_DATA_SESSION_OPEN        account, slot, profile|roam<<8   data:session:{account}
+//!   21   SYS_DATA_SESSION_CLOSE       account, slot, profile           data:session:{account}
+//!   22   SYS_DATA_RECONCILE           (none)                           data:reconcile
+//!   ```
+//!
+//!   Returns (encodings pinned and tested in `data_codes.rs`): `ACCOUNT` ->
+//!   `0` none / `1` notify / `2` throttle / `3` suspend-account REQUESTED
+//!   (`>= 4` is a refusal); `SESSION_OPEN` -> `0` allow / `1` allow-throttled
+//!   / `2..=6` the engine's deny reasons (suspended, closed, profile not
+//!   enabled, roaming not allowed, cap exceeded) / `7..=13` kernel-side
+//!   refusals (no capability, no entitlement, no such account, profile not
+//!   bound to this account, unknown profile, malformed argument, table full);
+//!   `SESSION_CLOSE` -> `0` closed / `1` denied / `2` not open / `3` bad
+//!   argument; `RECONCILE` -> the incident count (`u64::MAX` = denied). The
+//!   third `SESSION_OPEN` argument packs `profile` in bits 0..=7 and the
+//!   roaming flag in bit 8 (the ABI has three argument registers and the call
+//!   needs four values; the profile id is a `u8`; reserved bits are rejected).
+//!
+//!   **Not MARSHAL-gated, by design.** The policy engine only REQUESTS and the
+//!   reconciler only OBSERVES; a request is carried out by the CALLER through
+//!   an existing governed syscall under its OWN capability (for a
+//!   `SuspendAccount` request that is `SYS_MVNO_SUSPEND`: capability, MARSHAL,
+//!   WORM). The data syscalls never suspend, disable, close or mutate
+//!   account/profile state in response to a request -- they update a usage
+//!   counter or the session table and read policy, which are not
+//!   governance-consequential state changes. So no new MARSHAL action type
+//!   exists and the walk's evaluation count is unchanged. They ARE audited:
+//!   every decision, every refusal after the capability check, every request
+//!   the engine makes (worded as a REQUEST, not an action) and every
+//!   reconciler incident goes to the same WORM chain. See `data.rs` for the
+//!   fuller argument and the lock order (registry -> sim -> data; data is a
+//!   leaf).
+//!
+//!   `SYS_DATA_RECONCILE` is structurally read-only: it builds a snapshot
+//!   from copies of live state, hands it to the pure `reconcile`, prints and
+//!   WORM-records each incident as EVIDENCE (`authorized=false` with an
+//!   explicit "not a denial" reason: the observed state is not the expected,
+//!   authorized one), and its only write is the usage table's `last_used`
+//!   bookkeeping, done after the snapshot is built. It calls no `mvno::`/
+//!   `sim::` mutator and no `data::` mutator other than `mark_observed`.
+//!
 //! # The MVNO gate on `SYS_SIM_ENABLE`
 //!
 //! After its capability check and *before* the MARSHAL round trip,
@@ -217,6 +273,24 @@ pub const SYS_MVNO_SUSPEND: u64 = 17;
 /// `mvno_account_resource(account)`; then the MARSHAL gate
 /// (`mvno.reactivate_account`).
 pub const SYS_MVNO_REACTIVATE: u64 = 18;
+
+/// `SYS_DATA_ACCOUNT(account, bytes)`: feed `bytes` of usage into the
+/// account's counter, assess it, WORM-audit the decision and return the
+/// engine's request as a code (`data_codes::action_request_code`). Capability:
+/// `data_usage_resource(account)` -- the privileged feed. Not MARSHAL-gated;
+/// performs no suspension (see this module's doc comment).
+pub const SYS_DATA_ACCOUNT: u64 = 19;
+/// `SYS_DATA_SESSION_OPEN(account, slot, profile | roaming<<8)`: ask the
+/// policy engine whether `account` may use data on a profile bound to it;
+/// record the session iff allowed. Capability: `data_session_resource(account)`.
+pub const SYS_DATA_SESSION_OPEN: u64 = 20;
+/// `SYS_DATA_SESSION_CLOSE(account, slot, profile)`: the caller removing a
+/// session (carrying out a restriction). Capability: `data_session_resource`.
+pub const SYS_DATA_SESSION_CLOSE: u64 = 21;
+/// `SYS_DATA_RECONCILE()`: read-only reconciliation of live state against
+/// policy; incidents are printed and WORM-recorded, nothing is corrected.
+/// Capability: `data_reconcile_resource()`.
+pub const SYS_DATA_RECONCILE: u64 = 22;
 
 /// `SYS_RIL_RECV`'s return-value convention: `0..=255` is a received byte,
 /// `256`/`257` are out-of-band sentinels distinct from any real byte value
@@ -1049,6 +1123,10 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                 }
             }
         }
+        SYS_DATA_ACCOUNT => data_account(arg1, arg2),
+        SYS_DATA_SESSION_OPEN => data_session_open(arg1, arg2 as usize, arg3),
+        SYS_DATA_SESSION_CLOSE => data_session_close(arg1, arg2 as usize, arg3),
+        SYS_DATA_RECONCILE => data_reconcile(),
         // The one arm that may not return to EL0 (see this constant's doc
         // comment and `el0_proof::finish`): on the proof path it resumes an
         // EL1 continuation and never comes back here; with no excursion in
@@ -1160,6 +1238,439 @@ fn suspend_account(account: u64) -> u64 {
     } else {
         1
     }
+}
+
+/// Appends the WORM entry for a data-session decision or refusal. Subject is
+/// the session resource (`data:session:{account}`); the transition is the
+/// session's `Closed -> Open...` intent, `authorized` says whether it
+/// happened, and `reason` carries the replayable description.
+fn audit_data_session(account: u64, authorized: bool, to: &str, reason: String) {
+    audit_event(
+        &crate::capabilities::data_session_resource(account),
+        "Closed",
+        to,
+        authorized,
+        Some(reason),
+    );
+}
+
+/// `SYS_DATA_ACCOUNT(account, bytes)`: the usage feed. Capability
+/// `data:usage:{account}` (privileged -- see this module's doc comment), then
+/// the entitlement (DEMO table; unknown account fails closed), then the
+/// counter update, then the engine's `evaluate_usage`. The decision and, when
+/// the engine escalates, the REQUEST are WORM-audited; the request is returned
+/// as a code for the caller to act on. This function performs none of it: no
+/// suspension, no disable, no session close.
+fn data_account(account: u64, bytes: u64) -> u64 {
+    use runix_kernel_arm::data_codes::{
+        action_request_code, demo_entitlement, describe_usage_assessment, USAGE_DENIED,
+        USAGE_NO_ENTITLEMENT, USAGE_NO_SUCH_ACCOUNT, USAGE_TABLE_FULL,
+    };
+    let resource = crate::capabilities::data_usage_resource(account);
+    if let Err(e) = check(&resource) {
+        serial_println!("\nSVC: SYS_DATA_ACCOUNT account {} DENIED ({})", account, e);
+        return USAGE_DENIED;
+    }
+    let Some(entitlement) = demo_entitlement(account) else {
+        audit_event(
+            &resource,
+            "Metered",
+            "Metered",
+            false,
+            Some(String::from(
+                "refused: no data entitlement for this account",
+            )),
+        );
+        serial_println!(
+            "\nSVC: SYS_DATA_ACCOUNT account {} DENIED (no data entitlement for this account)",
+            account
+        );
+        return USAGE_NO_ENTITLEMENT;
+    };
+    if crate::mvno::standing(account).is_none() {
+        audit_event(
+            &resource,
+            "Metered",
+            "Metered",
+            false,
+            Some(String::from("refused: no such account in the registry")),
+        );
+        serial_println!(
+            "\nSVC: SYS_DATA_ACCOUNT account {} DENIED (no such account)",
+            account
+        );
+        return USAGE_NO_SUCH_ACCOUNT;
+    }
+    let (before, after) = match crate::data::feed_usage(account, bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            audit_event(
+                &resource,
+                "Metered",
+                "Metered",
+                false,
+                Some(String::from("refused: usage table full, bytes not counted")),
+            );
+            serial_println!(
+                "\nSVC: SYS_DATA_ACCOUNT account {} bytes {} FAILED (usage table full)",
+                account,
+                bytes
+            );
+            return USAGE_TABLE_FULL;
+        }
+    };
+    let assessment = runix_mobile::policy::evaluate_usage(&entitlement, &after);
+    let described = describe_usage_assessment(&entitlement, &after, &assessment);
+    audit_event(
+        &resource,
+        &format!("used {}", before.used_bytes),
+        &format!("used {}", after.used_bytes),
+        true,
+        Some(format!("usage fed {bytes} bytes; {described}")),
+    );
+    if let Some(request) = assessment.escalation {
+        // Worded as a REQUEST on purpose: authorized=true records that the
+        // feed was authorized and the engine's advice was issued, NOT that
+        // anything was done. The `to` state is not a state name an auditor
+        // could mistake for a completed transition (the real suspension, if
+        // the caller makes it, is its own MARSHAL-gated `Active -> Suspended`
+        // entry on `mvno:account:{id}`).
+        audit_event(
+            &resource,
+            &format!("band {:?}", assessment.band),
+            &format!("REQUEST {request:?} (advisory; nothing was performed by this syscall)"),
+            true,
+            Some(String::from(
+                "policy engine request to the caller, to be carried out through the governed path",
+            )),
+        );
+    }
+    let code = action_request_code(assessment.escalation);
+    serial_println!(
+        "\nSVC: SYS_DATA_ACCOUNT account {} bytes {} authorized ({}; returns request code {})",
+        account,
+        bytes,
+        described,
+        code
+    );
+    code
+}
+
+/// `SYS_DATA_SESSION_OPEN(account, slot, profile | roaming<<8)`. Capability
+/// `data:session:{account}`; then every input the engine needs is read from
+/// LIVE state, never taken from the caller: standing from the MVNO registry,
+/// lifecycle from `sim::profile_state`, usage from the data table, plan from
+/// the DEMO entitlement table; only the network class comes from the caller
+/// (there is no modem to ask yet). The profile MUST be bound to this account
+/// -- an unbound or foreign profile is refused (fail closed) before the engine
+/// is consulted, so an account cannot open a session on someone else's SIM.
+/// The session is recorded iff the engine allows it.
+fn data_session_open(account: u64, slot: usize, packed: u64) -> u64 {
+    use runix_kernel_arm::data_codes::{
+        demo_entitlement, describe_session_record, lifecycle_for_data, session_decision_code,
+        standing_for_data, unpack_profile_roaming, SESSION_FAILED_TABLE_FULL,
+        SESSION_REFUSED_BAD_ARGUMENT, SESSION_REFUSED_CAPABILITY, SESSION_REFUSED_NO_ENTITLEMENT,
+        SESSION_REFUSED_NO_SUCH_ACCOUNT, SESSION_REFUSED_PROFILE_NOT_BOUND,
+        SESSION_REFUSED_UNKNOWN_PROFILE,
+    };
+    use runix_kernel_arm::data_state::SessionRecorded;
+    use runix_mobile::policy::{DenyReason, SessionDecision};
+
+    let resource = crate::capabilities::data_session_resource(account);
+    if let Err(e) = check(&resource) {
+        serial_println!(
+            "\nSVC: SYS_DATA_SESSION_OPEN account {} slot {} DENIED ({})",
+            account,
+            slot,
+            e
+        );
+        return SESSION_REFUSED_CAPABILITY;
+    }
+    let Some((profile, roaming)) = unpack_profile_roaming(packed) else {
+        audit_data_session(
+            account,
+            false,
+            "Open",
+            format!("refused: malformed packed argument {packed:#x}"),
+        );
+        serial_println!(
+            "\nSVC: SYS_DATA_SESSION_OPEN account {} slot {} FAILED (malformed profile/roaming argument {:#x}: only bits 0..=8 are defined)",
+            account,
+            slot,
+            packed
+        );
+        return SESSION_REFUSED_BAD_ARGUMENT;
+    };
+    let Some(entitlement) = demo_entitlement(account) else {
+        audit_data_session(
+            account,
+            false,
+            "Open",
+            format!("refused: no data entitlement for account {account}"),
+        );
+        serial_println!(
+            "\nSVC: SYS_DATA_SESSION_OPEN account {} slot {} profile {} DENIED (no data entitlement for this account)",
+            account,
+            slot,
+            profile
+        );
+        return SESSION_REFUSED_NO_ENTITLEMENT;
+    };
+    let Some(status) = crate::mvno::standing(account) else {
+        audit_data_session(
+            account,
+            false,
+            "Open",
+            format!("refused: no such account {account}"),
+        );
+        serial_println!(
+            "\nSVC: SYS_DATA_SESSION_OPEN account {} slot {} profile {} DENIED (no such account)",
+            account,
+            slot,
+            profile
+        );
+        return SESSION_REFUSED_NO_SUCH_ACCOUNT;
+    };
+    // Binding check before the lifecycle read, so a profile that is not this
+    // account's reveals nothing about its state through a different code.
+    let owner = crate::mvno::owner_of(slot, profile);
+    if owner != Some(account) {
+        let who = match owner {
+            None => String::from("bound to no account"),
+            Some(o) => format!("bound to account {o}"),
+        };
+        audit_data_session(
+            account,
+            false,
+            "Open",
+            format!("refused: slot {slot} profile {profile} is {who}, not account {account}"),
+        );
+        serial_println!(
+            "\nSVC: SYS_DATA_SESSION_OPEN account {} slot {} profile {} DENIED (profile not bound to this account: {})",
+            account,
+            slot,
+            profile,
+            who
+        );
+        return SESSION_REFUSED_PROFILE_NOT_BOUND;
+    }
+    let lifecycle = match crate::sim::profile_state(slot, profile) {
+        Ok(state) => lifecycle_for_data(state),
+        Err(e) => {
+            audit_data_session(
+                account,
+                false,
+                "Open",
+                format!("refused: no lifecycle for slot {slot} profile {profile} ({e})"),
+            );
+            serial_println!(
+                "\nSVC: SYS_DATA_SESSION_OPEN account {} slot {} profile {} DENIED (unknown profile: {})",
+                account,
+                slot,
+                profile,
+                e
+            );
+            return SESSION_REFUSED_UNKNOWN_PROFILE;
+        }
+    };
+
+    // Registry and sim locks are released; one short, pure critical section
+    // under the leaf data lock decides and records.
+    let outcome = crate::data::decide_and_open(
+        account,
+        slot,
+        profile,
+        roaming,
+        standing_for_data(status),
+        lifecycle,
+        entitlement,
+    );
+    let described = describe_session_record(&outcome.record);
+    match (outcome.record.decision, outcome.recorded) {
+        (SessionDecision::Deny(reason), _) => {
+            audit_data_session(
+                account,
+                false,
+                "Open",
+                format!("denied {reason:?}; {described}"),
+            );
+            // Name the cause first (CI greps the reason right after DENIED).
+            let cause = match reason {
+                DenyReason::ProfileNotEnabled(state) => format!("ProfileNotEnabled({state:?})"),
+                other => format!("{other:?}"),
+            };
+            serial_println!(
+                "\nSVC: SYS_DATA_SESSION_OPEN account {} slot {} profile {} DENIED ({}; {})",
+                account,
+                slot,
+                profile,
+                cause,
+                described
+            );
+            session_decision_code(outcome.record.decision)
+        }
+        (_, SessionRecorded::TableFull) => {
+            audit_data_session(
+                account,
+                false,
+                "Open",
+                format!("allowed by policy but not recorded: session table full; {described}"),
+            );
+            serial_println!(
+                "\nSVC: SYS_DATA_SESSION_OPEN account {} slot {} profile {} FAILED (data session table full; {})",
+                account,
+                slot,
+                profile,
+                described
+            );
+            SESSION_FAILED_TABLE_FULL
+        }
+        (decision, _) => {
+            let to = if decision == SessionDecision::AllowThrottled {
+                "Open (throttled)"
+            } else {
+                "Open"
+            };
+            audit_data_session(account, true, to, format!("allowed; {described}"));
+            serial_println!(
+                "\nSVC: SYS_DATA_SESSION_OPEN account {} slot {} profile {} authorized ({:?}; {})",
+                account,
+                slot,
+                profile,
+                decision,
+                described
+            );
+            // `Allow` is 0 and `AllowThrottled` is 1 (pinned in data_codes).
+            session_decision_code(decision)
+        }
+    }
+}
+
+/// `SYS_DATA_SESSION_CLOSE(account, slot, profile)`: removes the session. This
+/// is the CALLER carrying out a restriction (or finishing normally) -- the
+/// policy path never does it for them -- and it is audited like any other
+/// change to what the account may do. It can only ever narrow access, which
+/// is why the same `data:session:{account}` capability as OPEN suffices.
+fn data_session_close(account: u64, slot: usize, arg: u64) -> u64 {
+    use runix_kernel_arm::data_codes::{
+        unpack_profile_roaming, CLOSE_BAD_ARGUMENT, CLOSE_DENIED, CLOSE_NOT_OPEN, CLOSE_OK,
+    };
+    if let Err(e) = check(&crate::capabilities::data_session_resource(account)) {
+        serial_println!(
+            "\nSVC: SYS_DATA_SESSION_CLOSE account {} slot {} DENIED ({})",
+            account,
+            slot,
+            e
+        );
+        return CLOSE_DENIED;
+    }
+    // Plain profile id: the roaming bit has no meaning for a close, and a
+    // caller that sets it is confused about which call it is making.
+    let Some((profile, false)) = unpack_profile_roaming(arg) else {
+        serial_println!(
+            "\nSVC: SYS_DATA_SESSION_CLOSE account {} slot {} FAILED (malformed profile argument {:#x})",
+            account,
+            slot,
+            arg
+        );
+        return CLOSE_BAD_ARGUMENT;
+    };
+    if crate::data::close_session(account, slot, profile) {
+        audit_event(
+            &crate::capabilities::data_session_resource(account),
+            "Open",
+            "Closed (by caller via SYS_DATA_SESSION_CLOSE)",
+            true,
+            Some(format!("slot {slot} profile {profile}")),
+        );
+        serial_println!(
+            "\nSVC: SYS_DATA_SESSION_CLOSE account {} slot {} profile {} authorized (closed by the caller)",
+            account,
+            slot,
+            profile
+        );
+        CLOSE_OK
+    } else {
+        audit_event(
+            &crate::capabilities::data_session_resource(account),
+            "Closed",
+            "Closed",
+            false,
+            Some(format!(
+                "slot {slot} profile {profile}: no such open session"
+            )),
+        );
+        serial_println!(
+            "\nSVC: SYS_DATA_SESSION_CLOSE account {} slot {} profile {} FAILED (no such open session)",
+            account,
+            slot,
+            profile
+        );
+        CLOSE_NOT_OPEN
+    }
+}
+
+/// `SYS_DATA_RECONCILE()`: read-only reconciliation. Capability
+/// `data:reconcile`.
+///
+/// STRUCTURALLY READ-ONLY. The body is: (1) build an immutable `Observed`
+/// snapshot from COPIES of live state (`data::snapshot_for_reconcile`), (2)
+/// call the pure `runix_mobile::reconcile::reconcile` on it, (3) print and
+/// WORM-record each incident, (4) `data::mark_observed` -- the usage table's
+/// `last_used` bookkeeping, the reconciler's own memory of what it saw. It
+/// calls no `mvno::` or `sim::` function that mutates, and no `data::`
+/// function other than `mark_observed`; it holds no lock while auditing. So it
+/// cannot change an account's standing, a profile's lifecycle, a usage counter
+/// or a session. Correction is a separate, governed, operator-initiated act
+/// (e.g. `SYS_MVNO_SUSPEND`, `SYS_DATA_SESSION_CLOSE`): the reconciler's job
+/// is to make sure nobody can say "we did not know".
+///
+/// WORM arguments for an incident: it is EVIDENCE, not a denial and not a
+/// transition. `authorized` is `false` because the observed state is not the
+/// expected, policy-authorized one; `from`/`to` are `expected <fact>` /
+/// `observed <fact>`; the reason says in words that this is reconciler
+/// evidence, that it is not a denial, and that nothing was corrected.
+fn data_reconcile() -> u64 {
+    use runix_kernel_arm::data_codes::RECONCILE_DENIED;
+    let resource = crate::capabilities::data_reconcile_resource();
+    if let Err(e) = check(&resource) {
+        serial_println!("\nSVC: SYS_DATA_RECONCILE DENIED ({})", e);
+        return RECONCILE_DENIED;
+    }
+    let (observed, usage_rows) = crate::data::snapshot_for_reconcile();
+    let incidents = runix_mobile::reconcile::reconcile(&observed);
+    serial_println!(
+        "\nSVC: SYS_DATA_RECONCILE snapshot: {} account(s), {} profile(s), {} session(s)",
+        observed.accounts.len(),
+        observed.profiles.len(),
+        observed.sessions.len()
+    );
+    for incident in &incidents {
+        audit_event(
+            &format!("{}:{}", resource, incident.subject),
+            &format!("expected {}", incident.expected),
+            &format!("observed {}", incident.observed),
+            false,
+            Some(format!(
+                "RECONCILER EVIDENCE (observed drift, not a denial; nothing was corrected): {}",
+                incident.kind
+            )),
+        );
+        serial_println!(
+            "SVC: SYS_DATA_RECONCILE incident {} (WORM-recorded as evidence; nothing corrected)",
+            incident
+        );
+    }
+    // After the snapshot was built and the incidents recorded.
+    crate::data::mark_observed(&usage_rows);
+    let (entries, chain_ok) = audit_chain_summary();
+    serial_println!(
+        "SVC: SYS_DATA_RECONCILE authorized ({} incident(s); WORM entries {}, chain verified {})",
+        incidents.len(),
+        entries,
+        chain_ok
+    );
+    incidents.len() as u64
 }
 
 fn check(resource: &str) -> Result<(), runix_capability_manager::CapabilityError> {

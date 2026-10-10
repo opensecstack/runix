@@ -799,6 +799,58 @@ jobs:
             /tmp/arm-boot.log
           grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.reactivate_account account=0: Unreachable" \
             /tmp/arm-boot.log
+          # Data policy layer (Beta item 4.3: kernel-arm/src/data.rs +
+          # data_state.rs/data_codes.rs wrapping runix_mobile::policy and
+          # ::reconcile). The engine only REQUESTS and the reconciler only
+          # OBSERVES; the requests are carried out by the caller through the
+          # existing governed syscalls, so none of the four data syscalls is
+          # MARSHAL-gated (asserted below: no data action is ever evaluated).
+          # Account 0 is compiled-in DEMO data: cap 1000 bytes, throttle at
+          # 80%, no roaming, suspension requested at 150%. The walk runs it
+          # between the first ENABLE and the existing SUSPEND(0), which is the
+          # caller carrying out the engine's suspension request.
+          grep -q "Runix ARM kernel: data session capability issued (account 0" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: data usage capability issued (account 0" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: data reconcile capability issued" /tmp/arm-boot.log
+          grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 authorized (Allow; " \
+            /tmp/arm-boot.log
+          # Roaming is not in the plan: denied, the home session is left open.
+          grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 DENIED (RoamingDataNotAllowed; " \
+            /tmp/arm-boot.log
+          # 900/1000 bytes: the engine REQUESTS a throttle (returned as code 2).
+          grep -q "SVC: SYS_DATA_ACCOUNT account 0 bytes 900 authorized (.*request=Some(Throttle); returns request code 2)" \
+            /tmp/arm-boot.log
+          grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 authorized (AllowThrottled; " \
+            /tmp/arm-boot.log
+          # 1600/1000 (>= 150%): the engine REQUESTS suspension (code 3). A request,
+          # not an action: the session is still open for the reconcile below.
+          grep -q "SVC: SYS_DATA_ACCOUNT account 0 bytes 700 authorized (.*request=Some(SuspendAccount); returns request code 3)" \
+            /tmp/arm-boot.log
+          grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 DENIED (CapExceeded; " \
+            /tmp/arm-boot.log
+          # Reconciler, account still Active with an open session over its cap:
+          # both drift incidents, printed and WORM-recorded as evidence only.
+          grep -q "SVC: SYS_DATA_RECONCILE incident usage-over-cap-not-restricted account:0: expected Suspended, observed 1600/1000" \
+            /tmp/arm-boot.log
+          grep -q "SVC: SYS_DATA_RECONCILE incident anomalous-usage-no-escalation account:0: expected 150%, observed 1600/1000" \
+            /tmp/arm-boot.log
+          grep -q "SVC: SYS_DATA_RECONCILE authorized (2 incident(s);" /tmp/arm-boot.log
+          # After the (existing, MARSHAL-gated) SUSPEND the usage incidents are gone;
+          # the session left open on the force-disabled profile is a real finding.
+          grep -q "SVC: SYS_DATA_RECONCILE incident session-without-enabled-profile session:0@0/0: expected Enabled, observed Disabled" \
+            /tmp/arm-boot.log
+          grep -q "SVC: SYS_DATA_RECONCILE authorized (1 incident(s);" /tmp/arm-boot.log
+          # The caller closes it (audited), and the next reconcile is clean.
+          grep -q "SVC: SYS_DATA_SESSION_CLOSE account 0 slot 0 profile 0 authorized" /tmp/arm-boot.log
+          grep -q "SVC: SYS_DATA_RECONCILE authorized (0 incident(s);" /tmp/arm-boot.log
+          # Fail closed on a profile that is not this account's (installed, never bound).
+          grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 1 DENIED (profile not bound to this account" \
+            /tmp/arm-boot.log
+          # No capability for account 99: denied per call, before any state is read.
+          grep -q "SVC: SYS_DATA_SESSION_OPEN account 99 slot 0 DENIED" /tmp/arm-boot.log
+          grep -q "SVC: SYS_DATA_ACCOUNT account 99 DENIED" /tmp/arm-boot.log
+          # Not MARSHAL-gated: no data action is ever sent for evaluation.
+          if grep -q "MARSHAL evaluation for data" /tmp/arm-boot.log; then exit 1; fi
           # Network selection driven by a registry account's standing (own local registry;
           # kernel-arm/src/mvno_proof.rs, EL1-only): allowed while Active,
           # refused once suspended.
@@ -960,6 +1012,55 @@ jobs:
             /tmp/arm-boot-nosecure.log
           grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.reactivate_account account=0: Unreachable" \
             /tmp/arm-boot-nosecure.log
+          # Data policy layer (Beta item 4.3: kernel-arm/src/data.rs +
+          # data_state.rs/data_codes.rs wrapping runix_mobile::policy and
+          # ::reconcile). The engine only REQUESTS and the reconciler only
+          # OBSERVES; the requests are carried out by the caller through the
+          # existing governed syscalls, so none of the four data syscalls is
+          # MARSHAL-gated (asserted below: no data action is ever evaluated).
+          # Account 0 is compiled-in DEMO data: cap 1000 bytes, throttle at
+          # 80%, no roaming, suspension requested at 150%. The walk runs it
+          # between the first ENABLE and the existing SUSPEND(0), which is the
+          # caller carrying out the engine's suspension request.
+          grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 authorized (Allow; " \
+            /tmp/arm-boot-nosecure.log
+          # Roaming is not in the plan: denied, the home session is left open.
+          grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 DENIED (RoamingDataNotAllowed; " \
+            /tmp/arm-boot-nosecure.log
+          # 900/1000 bytes: the engine REQUESTS a throttle (returned as code 2).
+          grep -q "SVC: SYS_DATA_ACCOUNT account 0 bytes 900 authorized (.*request=Some(Throttle); returns request code 2)" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 authorized (AllowThrottled; " \
+            /tmp/arm-boot-nosecure.log
+          # 1600/1000 (>= 150%): the engine REQUESTS suspension (code 3). A request,
+          # not an action: the session is still open for the reconcile below.
+          grep -q "SVC: SYS_DATA_ACCOUNT account 0 bytes 700 authorized (.*request=Some(SuspendAccount); returns request code 3)" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 0 DENIED (CapExceeded; " \
+            /tmp/arm-boot-nosecure.log
+          # Reconciler, account still Active with an open session over its cap:
+          # both drift incidents, printed and WORM-recorded as evidence only.
+          grep -q "SVC: SYS_DATA_RECONCILE incident usage-over-cap-not-restricted account:0: expected Suspended, observed 1600/1000" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_DATA_RECONCILE incident anomalous-usage-no-escalation account:0: expected 150%, observed 1600/1000" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_DATA_RECONCILE authorized (2 incident(s);" /tmp/arm-boot-nosecure.log
+          # After the (existing, MARSHAL-gated) SUSPEND the usage incidents are gone;
+          # the session left open on the force-disabled profile is a real finding.
+          grep -q "SVC: SYS_DATA_RECONCILE incident session-without-enabled-profile session:0@0/0: expected Enabled, observed Disabled" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_DATA_RECONCILE authorized (1 incident(s);" /tmp/arm-boot-nosecure.log
+          # The caller closes it (audited), and the next reconcile is clean.
+          grep -q "SVC: SYS_DATA_SESSION_CLOSE account 0 slot 0 profile 0 authorized" /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_DATA_RECONCILE authorized (0 incident(s);" /tmp/arm-boot-nosecure.log
+          # Fail closed on a profile that is not this account's (installed, never bound).
+          grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 1 DENIED (profile not bound to this account" \
+            /tmp/arm-boot-nosecure.log
+          # No capability for account 99: denied per call, before any state is read.
+          grep -q "SVC: SYS_DATA_SESSION_OPEN account 99 slot 0 DENIED" /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_DATA_ACCOUNT account 99 DENIED" /tmp/arm-boot-nosecure.log
+          # Not MARSHAL-gated: no data action is ever sent for evaluation.
+          if grep -q "MARSHAL evaluation for data" /tmp/arm-boot-nosecure.log; then exit 1; fi
           # Network selection driven by a registry account's standing (own local registry;
           # kernel-arm/src/mvno_proof.rs, EL1-only): allowed while Active,
           # refused once suspended.

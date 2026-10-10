@@ -155,6 +155,10 @@
 extern crate alloc;
 
 mod capabilities;
+// Beta item 4.3: kernel-side owner of the data policy state (usage counters,
+// open-session table) and the reconciler's live-state snapshot; the pure
+// logic is in the lib target (data_state.rs / data_codes.rs).
+mod data;
 mod el0;
 // The generic one-shot EL1-to-EL0 continuation (`enter_el0`/`resume_el1` and
 // the claim/resume/abort plumbing around them), extracted from `el0_proof.rs`
