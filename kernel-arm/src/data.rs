@@ -44,9 +44,13 @@
 //! (`data:session:{account}`): holding the right to open or close sessions
 //! does not imply the right to meter the account.
 //!
-//! Every refusal and every decision is still WORM-audited (on the same chain
-//! as the eSIM/MVNO transitions, via `svc.rs`'s `audit_event`): "not gated" is
-//! not "not recorded".
+//! Every policy decision, every engine request and every reconciler incident
+//! is still WORM-audited (on the same chain as the eSIM/MVNO transitions, via
+//! `svc.rs`'s `audit_event`): "not gated" is not "not recorded". The audit is
+//! NOT total, though: capability denials print to the serial log only (the
+//! same as every other syscall here), as do a malformed `SESSION_CLOSE`
+//! argument and a close of a session that is not open, and a reconcile pass
+//! that finds nothing writes no entry.
 //!
 //! # Lock order
 //!

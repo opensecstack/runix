@@ -2315,11 +2315,13 @@ all, root-caused and fixed; see the bug entry below.
 
 ## Mobile Beta: eSIM lifecycle, MVNO accounts, the MARSHAL gate, and the EL0 process model
 
-Beta items 1–3 (eSIM lifecycle, the MARSHAL gate, the MVNO account core) are
-built and QEMU-verified under `kernel-arm/`, with the pure policy core in
-`mobile/`. Item 4 (the data policy engine) is not started. The MARSHAL gate's
-transport is an EL0 process, so the EL0 process model those items run on is
-described last. The trust consequences of everything below are in
+Beta items 1–4 (eSIM lifecycle, the MARSHAL gate, the MVNO account core, the
+data policy engine) are built under `kernel-arm/`, with the pure policy cores in
+`mobile/`, and the QEMU boot walk asserts them in CI. Item 4 covers account
+entitlements only. It decides and it reconciles, but it has no data path, no
+real metering and no persistence, and it never acts on its own (see the data
+section). The MARSHAL gate's transport is an EL0 process, so the EL0 process
+model those items run on is described last. The trust consequences of everything below are in
 [THREAT_MODEL.md](THREAT_MODEL.md)'s mobile block; this section is what was
 built and what it does not do.
 
@@ -2410,8 +2412,8 @@ account's capacity frees.
 
 Simplifications, all deliberate at this stage:
 
-- In-memory only. Accounts, bindings, sim state and the WORM chain are lost
-  on reboot.
+- In-memory only. Accounts, bindings, sim state, data usage and sessions, and
+  the WORM chain are lost on reboot.
 - The one account is compiled in (`open_demo_account`, `AccountRegistry::demo`).
   It is demo data, not a subscriber base.
 - The MARSHAL principal is the placeholder `el0:arm-demo`, not a token subject
@@ -2423,6 +2425,8 @@ Simplifications, all deliberate at this stage:
 
 One gate covers five action types: `esim.enable`, `esim.delete`,
 `mvno.bind_profile`, `mvno.suspend_account` and `mvno.reactivate_account`.
+The data syscalls are outside it by design (see the data policy engine
+section, which also explains why).
 `marshal_action.rs`'s `MarshalAction` builds each Kerkese envelope. The eSIM
 envelope is byte-identical to the format it had before the gate was
 generalized, and a host test pins that. `esim_marshal::evaluate` wraps
@@ -2483,6 +2487,293 @@ Not closed:
 - The verdict is not authenticated end to end. `MarshalResponse::Decision`
   carries an outcome and an opaque JSON body with no signature, and the link
   is plaintext TCP. See THREAT_MODEL.md.
+
+### Data policy engine (`mobile/src/policy.rs`, `reconcile.rs`; `kernel-arm/src/data.rs`, `data_state.rs`, `data_codes.rs`, `svc.rs`)
+
+What was built is the account-entitlement layer. An account's plan is a
+`DataEntitlement`: an optional byte cap (`None` is unlimited), a throttle
+percentage, a roaming-data flag, and an escalation percentage. The engine
+decides session and usage questions against that plan. The reconciler compares
+observed live state with the same plan and reports drift. Both are pure code in
+`mobile/` (`runix-mobile`): no I/O, no clock, no stored state.
+
+Not built, and nothing above implies it:
+
+- **Per-sandbox-tier traffic classes (T1/T2/T3).** Policy is per account. No
+  sandbox tier affects a decision.
+- **A data path or real metering.** Usage is whatever the holder of
+  `data:usage:{id}` reports through `SYS_DATA_ACCOUNT`, a demo syscall. Nothing
+  measures bytes, and no code path consults a data session before network I/O.
+- **Billing or rating.**
+- **Persistence.** Counters and sessions are in memory and are lost on reboot.
+- **A billing-period clock.** The engine has no notion of time. `reset_usage()`
+  exists, but no kernel code calls it and no syscall exposes it. Once an
+  account's counter reaches its cap it stays there until reboot.
+
+**The engine only requests, and nothing in this block acts on its own.** This
+is the governing invariant. The rest follows from it.
+
+- `ActionRequest` (`NotifyOnly`, `Throttle`, `SuspendAccount`) is advice.
+  `evaluate_usage` returns it, and nothing performs it.
+- The data syscalls never suspend, disable, close, or change account or profile
+  state in response to a request. `SYS_DATA_ACCOUNT` changes a usage counter.
+  `SYS_DATA_SESSION_OPEN` and `SYS_DATA_SESSION_CLOSE` change the session table.
+  `SYS_DATA_RECONCILE` writes only the usage table's `last_used` bookkeeping.
+- The demo's suspension is carried out by the caller. The boot walk issues
+  `SYS_MVNO_SUSPEND(0)`, which needs `mvno:suspend:0` and passes the MARSHAL gate
+  (`mvno.suspend_account`) before the registry changes. The walk issues it
+  unconditionally and does not branch on the code `SYS_DATA_ACCOUNT` returned.
+- The reconciler is read-only in its types. `reconcile` takes an immutable
+  `&Observed` and returns `Incident`s, each a kind, a subject and two facts. It
+  holds no handle to live state.
+
+The reason is that a usage counter, or a reconciler, that suspended an account
+on its own would be an ungoverned writer. It would bypass the MARSHAL gate and
+the WORM chain, which is the parallel authorization path this project forbids.
+Correcting drift is a separate governed act, and it goes through the same gates
+as any other suspension.
+
+**The engine (`mobile/src/policy.rs`)**
+
+- **Pure and replayable.** `evaluate_session` and `evaluate_usage` are functions
+  of their arguments. `PolicyDecisionRecord::decide` captures inputs and outputs,
+  and `replays()` recomputes from the recorded request and compares. That catches
+  a record edited after the fact. It does not catch a record forged in full,
+  because anyone can recompute a consistent one. The kernel does not store the
+  struct. It writes a one-line text form (`describe_session_record`) that carries
+  every input, so an auditor can rebuild the record. Nothing in the kernel parses
+  those entries back or calls `replays()`.
+- **Validated entitlements.** `DataEntitlement` has private fields and one
+  constructor, `DataEntitlement::new`. It rejects a throttle above 100, an
+  escalation below 100, and an escalation above `MAX_ESCALATE_PERCENT` (10,000).
+  An incoherent plan cannot be built, so it cannot be evaluated. The upper bound
+  catches a raw byte count typed into a percent field. The compiled-in demo plans
+  are const literals in the same module, and a test proves they validate.
+- **Exact arithmetic.** Each band test is `used * 100 >= cap * percent` in
+  `u128`. There are no floats and no rounding, and "at the threshold" counts as
+  reaching it (`>=`). Usage is added with a saturating add, so a wrapped counter
+  cannot reopen a capped account.
+- **Session root cause first.** A session decision checks account standing
+  (`Suspended`, then `Closed`), then profile lifecycle (anything but `Enabled`),
+  then network class (roaming without `roaming_data_allowed`), then usage. The
+  first failing check is the one reported. A suspended account's denial reads as
+  suspension, not as over cap.
+
+Usage bands, strongest first (`evaluate_usage`), with cap `C`, usage `U`, throttle
+`T` and escalation `E`:
+
+| Band | Condition | Request | Session |
+|---|---|---|---|
+| `Anomalous` | `U*100 >= C*E` | `SuspendAccount` | denied `CapExceeded` |
+| `CapReached` | `U >= C` | `NotifyOnly` | denied `CapExceeded` |
+| `Throttled` | `U*100 >= C*T` | `Throttle` | allowed, throttled |
+| `Normal` | otherwise | none | allowed |
+
+Because `E >= 100`, `Anomalous` implies the cap is also reached. The suspension
+request is additional to the denial. Only `Anomalous` requests suspension, so a
+plain cap-reached session is denied without one. At `E = 100` the `CapReached`
+band cannot be reached.
+
+Special plans:
+
+- **Unlimited (`cap = None`)** is always `Normal` and never escalates, at any
+  usage, including `u64::MAX`. The kernel's demo table has no unlimited plan, so
+  this is covered by host tests only.
+- **Zero allowance (`cap = Some(0)`)** is a valid plan. Every session is denied
+  `CapExceeded`, even at zero usage. The band is `CapReached` with a `NotifyOnly`
+  request, never `Anomalous`. An account that cannot use data is not asked to be
+  suspended for that.
+
+**The reconciler (`mobile/src/reconcile.rs`)**
+
+- The caller builds an `Observed` snapshot from copies of live state. The
+  snapshot carries the policy-intended values (caps, escalation percentages,
+  roaming permission), so the reconciler compares state with the plan without
+  importing any other module's types.
+- **Bounded.** 64 accounts, 256 profiles, 256 sessions. A snapshot over a bound
+  produces one `snapshot-too-large` incident and nothing else, because
+  truncating would silently skip records.
+- **Duplicates are excluded.** Records sharing a key are reported and left out of
+  every other check, since which copy counts would depend on input order. Output
+  is sorted by kind, subject and facts, so it does not depend on the order the
+  caller listed records in.
+- **`usage-regression` cannot fire through any syscall today.** The counter only
+  goes up, and `last_used` records only what the reconciler saw. It is a tripwire
+  for tampering. A future period reset must clear `last_used` in the same critical
+  section, or it will report the reset as tampering (see `data_state.rs`).
+- **The checks**, by group. Snapshot: `snapshot-too-large`. Binding and profile:
+  `duplicate-account`, `duplicate-profile`, `enabled-profile-under-inactive-account`,
+  `enabled-profile-unbound`, `profile-owner-unknown`, `multiple-enabled-in-slot`.
+  Usage: `usage-regression`, `usage-over-cap-not-restricted` (active account, usage
+  at or over cap, an open session), `anomalous-usage-no-escalation` (active account,
+  usage at or past the escalation threshold). Sessions:
+  `session-without-enabled-profile`, `session-account-mismatch`,
+  `roaming-session-not-permitted`.
+
+**Kernel glue.** `data.rs` owns the one `DATA` lock around `DataState`
+(`data_state.rs`): a usage table and a session table, each bounded at 16
+(`MAX_DATA_ACCOUNTS`, `MAX_DATA_SESSIONS`). A full table refuses and never evicts.
+`DATA` is a leaf lock. No method calls out while holding it, and the syscall
+handlers copy what they need before they audit. `data_codes.rs` holds the return
+codes, the argument packing, the enum adapters, the demo plan table and the WORM
+description strings, all host-tested.
+
+**Syscalls.** `svc.rs`'s dispatch arms 19–22 (`SYS_DATA_*`), with `el0.rs` keeping
+its own copies of the numbers, as the other mobile syscalls do.
+
+| No. | Syscall | Arguments (x1, x2, x3) | Capability | Returns |
+|---|---|---|---|---|
+| 19 | `SYS_DATA_ACCOUNT` | account, bytes | `data:usage:{account}` | `0` none, `1` notify, `2` throttle, `3` suspend requested (advice); `4`–`7` refused |
+| 20 | `SYS_DATA_SESSION_OPEN` | account, slot, profile \| roaming<<8 | `data:session:{account}` | `0` allow, `1` allow throttled; `2`–`6` engine denial; `7`–`13` refused |
+| 21 | `SYS_DATA_SESSION_CLOSE` | account, slot, profile | `data:session:{account}` | `0` closed, `1` denied, `2` not open, `3` bad argument |
+| 22 | `SYS_DATA_RECONCILE` | none | `data:reconcile` | incident count; `u64::MAX` if denied |
+
+The refusal codes are named. For `SYS_DATA_ACCOUNT`: `4` no capability, `5` no
+entitlement for the account, `6` no such account, `7` usage table full (bytes not
+counted). For `SYS_DATA_SESSION_OPEN`: `7` no capability, `8` no entitlement, `9`
+no such account, `10` profile not bound to this account, `11` unknown profile, `12`
+malformed argument, `13` allowed by policy but the session table is full, so
+nothing was recorded.
+
+**The packed third argument.** `SYS_DATA_SESSION_OPEN` takes the profile id in bits
+0–7 and the roaming flag in bit 8. Bits 9–63 must be zero, or the call returns
+`12`. The ABI passes three argument registers, and a session open needs four
+values. The profile id is a `u8`, so its register has spare bits to carry the
+flag, which avoids a second ABI widening for one bit. Rejecting reserved bits
+means a caller that meant a wider id or a future flag is refused, not served the
+wrong profile. `SYS_DATA_SESSION_CLOSE` takes a plain profile id. A roaming bit
+there is a bad-argument error, because a caller that sets it is confused about
+which call it is making.
+
+**Check order inside each call.**
+
+- *Session open:* capability; packed argument; entitlement; account exists;
+  ownership (the profile must be bound to this account); lifecycle; engine. The
+  ownership check comes before the lifecycle read, so the state of another
+  account's profile is not revealed through a different code. The decision and the
+  insert happen in one critical section under the `DATA` lock.
+- *Usage feed:* capability; entitlement; account exists; saturating add; engine;
+  WORM entries. The feed does not consult account standing or profile binding.
+- *Close:* capability; plain profile argument; the open row is removed if present.
+- *Reconcile:* capability; snapshot from copies; `reconcile`; WORM entries for each
+  incident; `mark_observed`; incident count.
+
+**Separate capability scopes.** `data:usage:{id}` is separate from
+`data:session:{id}` because the feed is privileged. Counting bytes into an account
+can push it over its cap, which denies it service, and over the escalation
+threshold, which makes the engine request suspension. Holding the right to open
+and close sessions does not imply the right to meter. `data:reconcile` is not
+account-scoped, because the reconciler reads every account in one pass and writes
+only evidence and its own bookkeeping.
+
+**Not MARSHAL-gated, and why.** None of the four changes governance-consequential
+state. The feed moves a counter, open and close change the session table, and the
+reconciler reads. The consequential act a request can lead to, suspension, stays on
+`SYS_MVNO_SUSPEND`, which is gated. The code comments also record why a gate here
+would be wrong: the reclamation work and the walk's evaluation budget are built
+around the gated set staying as it is. The CI boot assertions, in both boots,
+fail if any log line contains `MARSHAL evaluation for data`. That is a tripwire on
+the log. The structural guarantee is that `MarshalAction` has no data variant, so
+adding a data action would mean changing the enum. The walk still performs seven
+evaluations per boot.
+
+**Audit trail.** Data entries go to the same chain as the eSIM and MVNO transitions
+(`ESIM_WORM_LOG`). Calls past the capability check normally append at least one
+entry. The exceptions are listed at the end of this subsection.
+
+- `data:usage:{id}`, feed: `used N -> used M`, `authorized=true`. Refusals (no
+  entitlement, no such account, table full) are `authorized=false`, with
+  `Metered -> Metered`.
+- `data:usage:{id}`, advisory request: `band X -> REQUEST <action> (advisory;
+  nothing was performed by this syscall)`, `authorized=true`. One is written for
+  every escalation, including `NotifyOnly` and `Throttle`, not only suspension.
+  `authorized=true` here means the feed was authorized and advice was issued. It
+  does not mean any state changed.
+- `data:session:{id}`, decision: an allowed open is `Closed -> Open` (or
+  `Open (throttled)`), `authorized=true`. An engine denial or a kernel-side refusal
+  is `Closed -> Open` with `authorized=false`, and the cause is in the reason. An
+  allowed open that the full table could not record is `authorized=false`, and its
+  reason says so.
+- `data:session:{id}`, close: `Open -> Closed (by caller via SYS_DATA_SESSION_CLOSE)`,
+  `authorized=true`. Closing a session that is not open is `Closed -> Closed`,
+  `authorized=false`.
+- `data:reconcile:<subject>`, incident: `expected <fact> -> observed <fact>`,
+  `authorized=false`, with a reason beginning `RECONCILER EVIDENCE (observed drift,
+  not a denial; nothing was corrected)`. **This `authorized=false` is not a
+  denial.** A reader tells the two apart by the `data:reconcile:` subject prefix and
+  that reason.
+
+Not audited, serial line only: capability denials on all four syscalls, a malformed
+argument to `SYS_DATA_SESSION_CLOSE`, and a reconcile pass with zero incidents.
+
+**What the boot walk proves.** The walk in `el0.rs` runs between the first `ENABLE`
+(profile 0 is bound to account 0 and `Enabled`) and the existing `SUSPEND(0)`. That
+is the only point where a session can be allowed in the walk. In order:
+
+1. `SESSION_OPEN(0, 0, 0)`: allowed (`0`), usage 0.
+2. `SESSION_OPEN(0, 0, roaming)`: denied `RoamingDataNotAllowed` (`5`). The home
+   session is left open.
+3. `ACCOUNT(0, 900)`: 900 of 1000 bytes, so `Throttle` is requested (`2`).
+4. `SESSION_OPEN(0, 0, 0)`: `AllowThrottled` (`1`). The live row is refreshed, not
+   duplicated.
+5. `ACCOUNT(0, 700)`: 1600 bytes, 160% of cap, so `SuspendAccount` is requested
+   (`3`). The account is still Active and the session still open.
+6. `SESSION_OPEN(0, 0, 0)`: denied `CapExceeded` (`6`). The open session is not
+   closed.
+7. `RECONCILE`: two incidents, `usage-over-cap-not-restricted` (expected
+   `Suspended`, observed `1600/1000`) and `anomalous-usage-no-escalation` (expected
+   `150%`, observed `1600/1000`).
+8. `SUSPEND(0)`, the existing MARSHAL-gated suspension. Profile 0 is force-disabled.
+9. `RECONCILE`: one incident, `session-without-enabled-profile` (expected
+   `Enabled`, observed `Disabled`). The usage incidents are gone. Suspension does
+   not close sessions.
+10. `SESSION_CLOSE(0, 0, 0)`: closed by the caller (`0`, audited).
+11. `RECONCILE`: zero incidents.
+
+Denial proofs: `SESSION_OPEN(0, 0, 1)` on profile 1, which is installed but never
+bound, is refused with `10`. `SESSION_OPEN(99, ...)` and `ACCOUNT(99, ...)` are
+refused by the capability check.
+
+Documented choices:
+
+- **Reconcile passes run while the account is suspended.** After `REACTIVATE` the
+  account is Active again, its usage is still 1600, and there is no period reset.
+  At 160% of cap, `anomalous-usage-no-escalation` fires for an Active account
+  whether or not a session is open. The reconciler would correctly raise it again,
+  so a clean pass is possible only while the account is suspended.
+- **Real demo numbers.** Account 0 is the only entry in the kernel's plan table:
+  cap 1000 bytes, throttle at 80% (800), escalation at 150% (1500), roaming not
+  allowed. The walk feeds 900 and then 700. Nothing else in the boot exercises a
+  second account's plan.
+
+**Tests.** 65 host tests cover the data layer: 19 in `policy.rs` and 21 in
+`reconcile.rs` (`mobile/`), 11 in `data_state.rs` and 14 in `data_codes.rs` (the
+`kernel-arm` lib target). They cover the band boundaries at `u64::MAX`, the
+replay property, the deny-reason precedence, the table bounds, idempotent opens,
+and the encodings of every return code. The kernel-side refusal codes (`7`–`13`)
+are pinned as values and checked for distinctness. The boot walk exercises only
+some of them.
+
+**Gaps, specific to this section.**
+
+- Usage is caller-asserted. Nothing measures it, so whoever holds `data:usage`
+  decides the numbers.
+- There is no governed reset. An over-cap account is denied until reboot.
+- Policy only requests. A caller that ignores a suspension request leaves the
+  account Active, and an already-open session stays open.
+- Sessions are a kernel table that no traffic path reads. A denial is a
+  bookkeeping fact until a data path exists.
+- Sessions survive suspension and deletion. Only `SYS_DATA_SESSION_CLOSE` removes
+  them.
+- Calls past the capability check append WORM entries, and nothing bounds the log.
+  The reconciler re-records the same incidents on every call while drift persists.
+- The reconciler runs only when called, and a clean pass leaves no WORM entry.
+- The snapshot and the session-open decision read live state under separate locks.
+  That is consistent with one EL0 context and IRQs masked during the SVC handler,
+  and not otherwise.
+- The usage feed does not check standing or binding, so a suspended account keeps
+  accruing counted usage.
+- Demo plans and the single account are compiled in. There is no provisioning path.
 
 ### EL0 process model (`elf.rs`, `loader.rs`, `process.rs`, `scheduler.rs`, `el0_exec.rs`, `net_process.rs`)
 

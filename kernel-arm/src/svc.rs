@@ -3,8 +3,9 @@
 //! `el1_vectors.rs`'s vector-8 `SVC` handling; see that module's doc
 //! comment for how the syscall number/arg actually get here.
 //!
-//! Fifteen syscalls for EL0 callers (plus three EL1-continuation ones, see
-//! `SYS_EL0_PROOF_DONE` and friends), matching `el0.rs`'s demo exactly (kept
+//! Nineteen syscalls for EL0 callers (twelve base, three MVNO, four data;
+//! plus three EL1-continuation ones, see `SYS_EL0_PROOF_DONE` and friends),
+//! matching `el0.rs`'s demo exactly (kept
 //! in sync by hand, not shared constants -- see `el0.rs`'s own doc comment on
 //! why):
 //! - `SYS_WRITE`: unconditional -- proves the `SVC` gate itself works,
@@ -112,10 +113,12 @@
 //!   account/profile state in response to a request -- they update a usage
 //!   counter or the session table and read policy, which are not
 //!   governance-consequential state changes. So no new MARSHAL action type
-//!   exists and the walk's evaluation count is unchanged. They ARE audited:
-//!   every decision, every refusal after the capability check, every request
-//!   the engine makes (worded as a REQUEST, not an action) and every
-//!   reconciler incident goes to the same WORM chain. See `data.rs` for the
+//!   exists and the walk's evaluation count is unchanged. They ARE audited,
+//!   but not exhaustively: every policy decision, every request the engine
+//!   makes (worded as a REQUEST, not an action) and every reconciler incident
+//!   goes to the same WORM chain. Capability denials, a malformed
+//!   `SESSION_CLOSE` argument, a close of a session that is not open, and a
+//!   reconcile pass with zero incidents are serial-only. See `data.rs` for the
 //!   fuller argument and the lock order (registry -> sim -> data; data is a
 //!   leaf).
 //!
