@@ -53,12 +53,20 @@
 //!   a profile. Arguments: `BIND(account, slot, profile)`, `SUSPEND(account)`,
 //!   `REACTIVATE(account)`; return `0` on success, `1` on denial or failure.
 //!   Every applied change is appended to the same WORM chain as the eSIM
-//!   transitions. **Known, tracked gap: these three are capability-gated and
-//!   audited but NOT MARSHAL-gated yet** -- `esim_marshal::evaluate`
-//!   hardcodes `esim.{action}` slot/profile envelopes, so generalizing it
-//!   (with the upstream rbacMap and `citadel_proxy` policy) is Beta item 3.4.
-//!   Documented here rather than papered over; CLAUDE.md requires privileged
-//!   actions to flow through MARSHAL and these will once 3.4 lands.
+//!   transitions. **All three are MARSHAL-gated (Beta item 3.4)** through the
+//!   same enforcement the eSIM pair uses (`esim_marshal::enforce`, fed by
+//!   `marshal_transport::evaluate` with a `MarshalAction`): bind claims
+//!   ownership of a profile, suspend cuts service, reactivate re-grants it,
+//!   so each is evaluated as `mvno.bind_profile` / `mvno.suspend_account` /
+//!   `mvno.reactivate_account`. Order is capability checks, then MARSHAL
+//!   evaluate + enforce, then (only then) the registry mutation. A
+//!   `Refuse`/`HardStop` prints `SVC: SYS_MVNO_<X> account A [...] DENIED
+//!   (MARSHAL <Outcome>)`, returns `1`, and leaves the registry untouched (no
+//!   WORM entry, no forced disable); `Unreachable` (no proxy configured, or
+//!   it did not answer) is fail-open exactly as for eSIM. The evaluation runs
+//!   **before** the registry lock is taken and holds no lock at all -- it may
+//!   drive a nested EL0 excursion (see `marshal_transport::evaluate`), which
+//!   must never happen under a spin lock. Status reads are not gated.
 //!
 //! # The MVNO gate on `SYS_SIM_ENABLE`
 //!
@@ -122,6 +130,7 @@ use crate::esim_marshal::{self, MarshalEnforcementError};
 use crate::serial::write_byte;
 use crate::serial_println;
 use crate::sim::{ProfileState, SimError};
+use runix_kernel_arm::marshal_action::MarshalAction;
 
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_RIL_ACCESS: u64 = 2;
@@ -186,16 +195,17 @@ pub const SYS_MARSHAL_PROOF_DONE: u64 = 15;
 
 /// `SYS_MVNO_BIND(account, slot, profile)`: bind an eSIM profile to an
 /// account. Capabilities: BOTH `mvno_account_resource(account)` and
-/// `sim_profile_resource(slot, profile)` (either missing denies). See this module's
-/// doc comment for the (tracked) absence of a MARSHAL gate.
+/// `sim_profile_resource(slot, profile)` (either missing denies), then the
+/// MARSHAL gate (`mvno.bind_profile`). See this module's doc comment.
 pub const SYS_MVNO_BIND: u64 = 16;
 /// `SYS_MVNO_SUSPEND(account)`: `Active -> Suspended`, force-disabling every
 /// Enabled profile the account owns. Capability:
 /// `mvno_suspend_resource(account)` -- scoped apart from general account
-/// access.
+/// access; then the MARSHAL gate (`mvno.suspend_account`).
 pub const SYS_MVNO_SUSPEND: u64 = 17;
 /// `SYS_MVNO_REACTIVATE(account)`: `Suspended -> Active`. Capability:
-/// `mvno_account_resource(account)`.
+/// `mvno_account_resource(account)`; then the MARSHAL gate
+/// (`mvno.reactivate_account`).
 pub const SYS_MVNO_REACTIVATE: u64 = 18;
 
 /// `SYS_RIL_RECV`'s return-value convention: `0..=255` is a received byte,
@@ -232,8 +242,9 @@ const SIM_STATUS_DENIED: u64 = 4;
 /// `1` would have been indistinguishable from "profile 1 was created."
 const SIM_CREATE_FAILED: u64 = 256;
 
-/// The `principal` passed to `esim_marshal::evaluate` at both its call
-/// sites below.
+/// The `principal` passed to every MARSHAL evaluation below (the eSIM pair
+/// via `esim_marshal::evaluate`, the three MVNO syscalls via
+/// [`marshal_gate`]).
 ///
 /// This is a **placeholder**, not a real identity lookup: `check()` (this
 /// module's own wrapper around `capabilities::check`) only ever returns
@@ -250,7 +261,7 @@ const SIM_CREATE_FAILED: u64 = 256;
 /// `kernel-arm` grows a per-context/per-thread capability model — at
 /// that point, thread the matched token's `subject` through from
 /// `check()`'s call site instead of hardcoding this.
-const ESIM_MARSHAL_PRINCIPAL: &str = "el0:arm-demo";
+const MARSHAL_PRINCIPAL: &str = "el0:arm-demo";
 
 /// The audit chain every real eSIM lifecycle transition appends to.
 ///
@@ -592,7 +603,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                     // outright -- `sim::enable` is never reached, exactly as
                     // for a capability denial.
                     let outcome =
-                        esim_marshal::evaluate("enable", slot, profile_id, ESIM_MARSHAL_PRINCIPAL);
+                        esim_marshal::evaluate("enable", slot, profile_id, MARSHAL_PRINCIPAL);
                     if let Err(MarshalEnforcementError::Blocked(blocked)) =
                         esim_marshal::enforce(outcome)
                     {
@@ -704,7 +715,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                     // Same MARSHAL gate as enable, for the other half of the
                     // consequential pair -- deletion is irreversible.
                     let outcome =
-                        esim_marshal::evaluate("delete", slot, profile_id, ESIM_MARSHAL_PRINCIPAL);
+                        esim_marshal::evaluate("delete", slot, profile_id, MARSHAL_PRINCIPAL);
                     if let Err(MarshalEnforcementError::Blocked(blocked)) =
                         esim_marshal::enforce(outcome)
                     {
@@ -855,8 +866,9 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             // profile's `sim:{slot}:{profile}`, so holding account access
             // alone cannot claim a profile the caller has no authority over.
             // Either failing denies, and the DENIED line names which.
-            // Capability and audit only -- NOT MARSHAL-gated yet; known,
-            // tracked gap (Beta item 3.4), see this module's doc comment.
+            // After the capability checks: the MARSHAL gate
+            // (`mvno.bind_profile`), then the registry mutation. See this
+            // module's doc comment.
             let account_res = crate::capabilities::mvno_account_resource(account);
             let profile_res = crate::capabilities::sim_profile_resource(slot, profile_id);
             let account_check = check(&account_res);
@@ -871,6 +883,23 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             };
             match authority {
                 Ok(()) => {
+                    // Evaluated before `mvno::bind` takes the registry lock;
+                    // no lock is held across the (possibly EL0-excursion)
+                    // evaluation. A block leaves the registry untouched.
+                    if let Err(blocked) = marshal_gate(&MarshalAction::MvnoBind {
+                        account,
+                        slot,
+                        profile: profile_id,
+                    }) {
+                        serial_println!(
+                            "\nSVC: SYS_MVNO_BIND account {} slot {} profile {} DENIED (MARSHAL {:?})",
+                            account,
+                            slot,
+                            profile_id,
+                            blocked
+                        );
+                        return 1;
+                    }
                     let result = crate::mvno::bind(account, slot, profile_id);
                     let (authorized, reason) = audit_outcome(&result);
                     audit_event(
@@ -918,10 +947,20 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             let account = arg1;
             // `mvno_suspend_resource`, *not* `mvno_account_resource`: holding
             // general account access must not imply the authority to cut
-            // service. Capability and audit only -- NOT MARSHAL-gated yet
-            // (Beta item 3.4), see this module's doc comment.
+            // service. Then the MARSHAL gate (`mvno.suspend_account`),
+            // evaluated before `suspend_account` touches the registry.
             match check(&crate::capabilities::mvno_suspend_resource(account)) {
-                Ok(()) => suspend_account(account),
+                Ok(()) => {
+                    if let Err(blocked) = marshal_gate(&MarshalAction::MvnoSuspend { account }) {
+                        serial_println!(
+                            "\nSVC: SYS_MVNO_SUSPEND account {} DENIED (MARSHAL {:?})",
+                            account,
+                            blocked
+                        );
+                        return 1;
+                    }
+                    suspend_account(account)
+                }
                 Err(e) => {
                     serial_println!("\nSVC: SYS_MVNO_SUSPEND account {} DENIED ({})", account, e);
                     1
@@ -930,10 +969,18 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         }
         SYS_MVNO_REACTIVATE => {
             let account = arg1;
-            // Capability and audit only -- NOT MARSHAL-gated yet (Beta item
-            // 3.4), see this module's doc comment.
+            // Capability check, then the MARSHAL gate
+            // (`mvno.reactivate_account`), then the registry mutation.
             match check(&crate::capabilities::mvno_account_resource(account)) {
                 Ok(()) => {
+                    if let Err(blocked) = marshal_gate(&MarshalAction::MvnoReactivate { account }) {
+                        serial_println!(
+                            "\nSVC: SYS_MVNO_REACTIVATE account {} DENIED (MARSHAL {:?})",
+                            account,
+                            blocked
+                        );
+                        return 1;
+                    }
                     let result = crate::mvno::reactivate(account);
                     let (authorized, reason) = audit_outcome(&result);
                     audit_event(
@@ -1086,4 +1133,20 @@ fn suspend_account(account: u64) -> u64 {
 
 fn check(resource: &str) -> Result<(), runix_capability_manager::CapabilityError> {
     crate::capabilities::check(resource, now_ticks())
+}
+
+/// The MARSHAL gate for the MVNO syscalls: evaluates `action` (building the
+/// Kerkese request via `MarshalAction`) and applies the shared enforcement
+/// (`esim_marshal::enforce`: `Refuse`/`HardStop` block, `Unreachable` and
+/// `Execute` pass). `Err` carries the blocking outcome for the DENIED line.
+///
+/// Must be called with **no lock held** -- `marshal_transport::evaluate` can
+/// drive a nested EL0 excursion. Callers therefore evaluate before taking the
+/// `mvno` registry lock (which every `mvno::*` call takes internally).
+fn marshal_gate(action: &MarshalAction<'_>) -> Result<(), esim_marshal::ShadowMarshalOutcome> {
+    let outcome = crate::marshal_transport::evaluate(action, MARSHAL_PRINCIPAL);
+    match esim_marshal::enforce(outcome) {
+        Ok(()) => Ok(()),
+        Err(MarshalEnforcementError::Blocked(blocked)) => Err(blocked),
+    }
 }

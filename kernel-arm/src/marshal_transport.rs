@@ -11,7 +11,8 @@
 //! EL1-to-EL0 continuation, after `el0_proof.rs` and `tcp_proof.rs` -- see
 //! `tcp_proof.rs`'s own doc comment for the mechanism itself. Unlike those
 //! two (each driven once, from the boot sequence), [`evaluate`] is called
-//! *per syscall* -- every `SYS_SIM_ENABLE`/`SYS_SIM_DELETE` that reaches
+//! *per syscall* -- every `SYS_SIM_ENABLE`/`SYS_SIM_DELETE` (and, since Beta
+//! item 3.4, `SYS_MVNO_BIND`/`SUSPEND`/`REACTIVATE`) that reaches
 //! `esim_marshal::evaluate` drives one fresh excursion, with its own fresh
 //! `AddressSpace` and thread (there is no process-reuse mechanism in this
 //! crate yet -- see `process.rs`'s own doc comment on why a scheduled
@@ -42,10 +43,10 @@
 use crate::el0_exec;
 use crate::net_process;
 use crate::serial_println;
-use alloc::format;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use runix_citadel_integration::ShadowMarshalOutcome;
 use runix_ipc::marshal::{MarshalOutcome, MarshalRequest, MarshalResponse};
+use runix_kernel_arm::marshal_action::MarshalAction;
 use spin::Mutex;
 
 /// The compiled `net-driver-host-arm` binary -- the same ELF `tcp_proof.rs`
@@ -225,10 +226,15 @@ extern "C" fn marshal_transport_thread() -> ! {
 // evaluate()
 // ---------------------------------------------------------------------------
 
-/// Evaluates one eSIM lifecycle operation against a real MARSHAL deployment,
-/// if one is configured ([`set_marshal_proxy`]) -- `esim_marshal::evaluate`'s
-/// real transport body, see this module's own doc comment. `action` is
-/// `"enable"` or `"delete"`, exactly as `svc.rs` passes it today.
+/// Evaluates one governed action ([`MarshalAction`]: an eSIM `enable`/`delete`
+/// or one of the three MVNO account mutations) against a real MARSHAL
+/// deployment, if one is configured ([`set_marshal_proxy`]) --
+/// `esim_marshal::evaluate`'s real transport body, see this module's own doc
+/// comment. Prints `MARSHAL evaluation for <label>: <Outcome>`.
+///
+/// **Callers must hold no spin lock** (e.g. `mvno`'s registry): the configured
+/// path can run a nested EL0 excursion, which re-enters the kernel through
+/// `SVC` and reschedules.
 ///
 /// `None` configured (the default): returns
 /// [`ShadowMarshalOutcome::Unreachable`] with no process spawned at all --
@@ -248,7 +254,7 @@ extern "C" fn marshal_transport_thread() -> ! {
 /// [`ShadowMarshalOutcome::Unreachable`], the same "no usable Decision"
 /// bucket `grid_sandbox::shadow_marshal_evaluate` uses for every one of its
 /// own non-`Decision` outcomes.
-pub fn evaluate(action: &str, slot: usize, profile: u8, principal: &str) -> ShadowMarshalOutcome {
+pub fn evaluate(action: &MarshalAction<'_>, principal: &str) -> ShadowMarshalOutcome {
     let Some((remote_ip, remote_port)) = *MARSHAL_PROXY.lock() else {
         return ShadowMarshalOutcome::Unreachable;
     };
@@ -271,17 +277,15 @@ pub fn evaluate(action: &str, slot: usize, profile: u8, principal: &str) -> Shad
     let saved_spsr = el0_exec::read_spsr_el1();
     let saved_sp_el0 = el0_exec::read_sp_el0();
 
-    let outcome = evaluate_configured(action, slot, profile, principal, remote_ip, remote_port);
+    let outcome = evaluate_configured(action, principal, remote_ip, remote_port);
 
     el0_exec::write_elr_el1(saved_elr);
     el0_exec::write_spsr_el1(saved_spsr);
     el0_exec::write_sp_el0(saved_sp_el0);
 
     serial_println!(
-        "Runix ARM kernel: MARSHAL evaluation for {} slot={} profile={}: {:?}",
-        action,
-        slot,
-        profile,
+        "Runix ARM kernel: MARSHAL evaluation for {}: {:?}",
+        action.label(),
         outcome
     );
 
@@ -289,9 +293,7 @@ pub fn evaluate(action: &str, slot: usize, profile: u8, principal: &str) -> Shad
 }
 
 fn evaluate_configured(
-    action: &str,
-    slot: usize,
-    profile: u8,
+    action: &MarshalAction<'_>,
     principal: &str,
     remote_ip: [u8; 4],
     remote_port: u16,
@@ -299,22 +301,19 @@ fn evaluate_configured(
     let scan = crate::virtio_mmio::probe();
     let Some(dev) = scan.net else {
         serial_println!(
-            "Runix ARM kernel: MARSHAL evaluation for {} slot={} profile={}: no virtio-net \
+            "Runix ARM kernel: MARSHAL evaluation for {}: no virtio-net \
              device found",
-            action,
-            slot,
-            profile
+            action.label()
         );
         return ShadowMarshalOutcome::Unreachable;
     };
 
     // Same "dry_run: true, minimal but genuinely well-formed envelope"
     // convention as `grid_sandbox::shadow_marshal_evaluate`'s own
-    // `kerkese_json`, adapted for an eSIM action's own `slot`/`profile`
-    // fields in place of `module_id`/`instance_id`.
-    let kerkese_json = format!(
-        r#"{{"kerkese_version":"1.0","dry_run":true,"action":{{"type":"esim.{action}","slot":{slot},"profile":{profile}}},"actor":{{"user_id":"{principal}","role":"operator"}},"execution_id":"esim-{action}-{slot}-{profile}"}}"#
-    );
+    // `kerkese_json`; the per-action fields (eSIM slot/profile, MVNO
+    // account/slot/profile) are `MarshalAction`'s job -- pure builders with
+    // host tests, see `marshal_action.rs`.
+    let kerkese_json = action.kerkese_json(principal);
     let encoded = MarshalRequest {
         kerkese_json: kerkese_json.into_bytes(),
     }
@@ -339,11 +338,9 @@ fn evaluate_configured(
             Ok(result) => result,
             Err(reason) => {
                 serial_println!(
-                    "Runix ARM kernel: MARSHAL evaluation for {} slot={} profile={}: setup \
+                    "Runix ARM kernel: MARSHAL evaluation for {}: setup \
                      failed ({})",
-                    action,
-                    slot,
-                    profile,
+                    action.label(),
                     reason
                 );
                 return ShadowMarshalOutcome::Unreachable;
@@ -354,11 +351,9 @@ fn evaluate_configured(
     // call above stopped passing `Some`, not a real runtime condition.
     let Some(response_phys) = response_phys else {
         serial_println!(
-            "Runix ARM kernel: MARSHAL evaluation for {} slot={} profile={}: setup did not \
+            "Runix ARM kernel: MARSHAL evaluation for {}: setup did not \
              return a response region",
-            action,
-            slot,
-            profile
+            action.label()
         );
         return ShadowMarshalOutcome::Unreachable;
     };
@@ -376,10 +371,8 @@ fn evaluate_configured(
 
     if let Err(err) = crate::scheduler::spawn_with_address_space(marshal_transport_thread, space) {
         serial_println!(
-            "Runix ARM kernel: MARSHAL evaluation for {} slot={} profile={}: spawn failed ({})",
-            action,
-            slot,
-            profile,
+            "Runix ARM kernel: MARSHAL evaluation for {}: spawn failed ({})",
+            action.label(),
             err
         );
         return ShadowMarshalOutcome::Unreachable;
@@ -397,11 +390,9 @@ fn evaluate_configured(
     }
     if !FINISHED.load(Ordering::Relaxed) {
         serial_println!(
-            "Runix ARM kernel: MARSHAL evaluation for {} slot={} profile={}: the EL0 thread \
+            "Runix ARM kernel: MARSHAL evaluation for {}: the EL0 thread \
              never reported back after {} boot-thread yields",
-            action,
-            slot,
-            profile,
+            action.label(),
             yields
         );
         return ShadowMarshalOutcome::Unreachable;
@@ -418,11 +409,9 @@ fn evaluate_configured(
 
     if faulted {
         serial_println!(
-            "Runix ARM kernel: MARSHAL evaluation for {} slot={} profile={}: the EL0 process \
+            "Runix ARM kernel: MARSHAL evaluation for {}: the EL0 process \
              faulted instead of finishing",
-            action,
-            slot,
-            profile
+            action.label()
         );
         return ShadowMarshalOutcome::Unreachable;
     }

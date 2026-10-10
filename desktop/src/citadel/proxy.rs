@@ -217,7 +217,23 @@ fn build_enriched_envelope(envelope: &KernelMinimalEnvelope, signing_key: &Signi
     let ts_utc = identity::format_rfc3339_utc(identity::now_unix_secs());
 
     let mut extra = std::collections::BTreeMap::new();
-    let description = if policy::is_esim_action(&envelope.action.action_type) {
+    let description = if policy::is_mvno_action(&envelope.action.action_type) {
+        // `policy::check` guarantees `account` (and, for bind, slot/profile).
+        let account = envelope.action.account.unwrap_or_default();
+        extra.insert("account".to_string(), account.to_string());
+        if envelope.action.action_type == policy::MVNO_BIND_PROFILE_ACTION {
+            let slot = envelope.action.slot.unwrap_or_default();
+            let profile = envelope.action.profile.unwrap_or_default();
+            extra.insert("slot".to_string(), slot.to_string());
+            extra.insert("profile".to_string(), profile.to_string());
+            format!(
+                "{} account={account} slot={slot} profile={profile}",
+                envelope.action.action_type
+            )
+        } else {
+            format!("{} account={account}", envelope.action.action_type)
+        }
+    } else if policy::is_esim_action(&envelope.action.action_type) {
         // `policy::check` guarantees both are present for eSIM actions.
         let slot = envelope.action.slot.unwrap_or_default();
         let profile = envelope.action.profile.unwrap_or_default();
@@ -834,6 +850,128 @@ mod tests {
             forwarded.sod.operator_user_id,
             forwarded.sod.verifier_user_id
         );
+    }
+
+    /// Drives one kernel-shaped MVNO request through the proxy against a
+    /// capturing mock CITADEL; returns the response, the WORM (module,
+    /// instance) pair and the forwarded `Kerkese`.
+    fn mvno_round_trip(json: &str) -> (MarshalResponse, (String, String), Kerkese) {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let mock_addr = listener.local_addr().expect("local_addr");
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = captured.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let body = read_http_request(&mut stream);
+                *captured_clone.lock().unwrap() = Some(body);
+                let _ = stream.write_all(CANNED_EXECUTE_RESPONSE.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        let transport =
+            HttpKerkeseTransport::new(Some(format!("http://{mock_addr}/marshal/kerkese")));
+
+        let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+        let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
+        let signing_key = test_signing_key();
+        let worm_log = std::sync::Arc::new(Mutex::new(WormLog::default()));
+        let worm_log_clone = worm_log.clone();
+        let handle = std::thread::spawn(move || {
+            serve_one(&proxy_listener, &transport, &signing_key, &worm_log_clone)
+        });
+
+        let req = MarshalRequest {
+            kerkese_json: json.as_bytes().to_vec(),
+        };
+        let response = round_trip(proxy_addr, &req);
+        handle
+            .join()
+            .expect("proxy thread panicked")
+            .expect("serve_one");
+
+        let ids = {
+            let log = worm_log.lock().unwrap();
+            let entries = log.entries();
+            assert_eq!(entries.len(), 1);
+            assert!(entries[0].authorized);
+            (
+                entries[0].module_id.clone(),
+                entries[0].instance_id.clone().unwrap_or_default(),
+            )
+        };
+        let forwarded: Kerkese =
+            serde_json::from_slice(&captured.lock().unwrap().take().expect("body captured"))
+                .expect("forwarded body is a real Kerkese");
+        (response, ids, forwarded)
+    }
+
+    fn assert_execute(response: &MarshalResponse) {
+        assert!(matches!(
+            response,
+            MarshalResponse::Decision {
+                outcome: MarshalOutcome::Execute,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn forwards_mvno_bind_profile_as_an_enriched_envelope() {
+        let (response, ids, forwarded) = mvno_round_trip(
+            r#"{"kerkese_version":"1.0","dry_run":true,"action":{"type":"mvno.bind_profile","account":3,"slot":0,"profile":2},"actor":{"user_id":"el0:arm-demo","role":"operator"},"execution_id":"mvno-bind-3-0-2"}"#,
+        );
+        assert_execute(&response);
+        assert_eq!(
+            ids,
+            ("mvno".to_string(), "account-3-slot-0-profile-2".to_string())
+        );
+        assert_eq!(forwarded.action.action_type, "mvno.bind_profile");
+        assert_eq!(
+            forwarded.action.description,
+            "mvno.bind_profile account=3 slot=0 profile=2"
+        );
+        let extra = &forwarded.evidence.extra;
+        assert_eq!(extra.get("account"), Some(&"3".to_string()));
+        assert_eq!(extra.get("slot"), Some(&"0".to_string()));
+        assert_eq!(extra.get("profile"), Some(&"2".to_string()));
+        assert!(!extra.contains_key("module_id"));
+        assert_eq!(
+            extra.get("kernel_execution_id"),
+            Some(&"mvno-bind-3-0-2".to_string())
+        );
+        assert_eq!(forwarded.sod.operator_user_id, "el0:arm-demo");
+        assert_ne!(
+            forwarded.sod.operator_user_id,
+            forwarded.sod.verifier_user_id
+        );
+    }
+
+    #[test]
+    fn forwards_mvno_suspend_and_reactivate_as_enriched_envelopes() {
+        for verb in ["suspend", "reactivate"] {
+            let json = format!(
+                r#"{{"kerkese_version":"1.0","dry_run":true,"action":{{"type":"mvno.{verb}_account","account":5}},"actor":{{"user_id":"el0:arm-demo","role":"operator"}},"execution_id":"mvno-{verb}-5"}}"#
+            );
+            let (response, ids, forwarded) = mvno_round_trip(&json);
+            assert_execute(&response);
+            assert_eq!(ids, ("mvno".to_string(), "account-5".to_string()), "{verb}");
+            assert_eq!(forwarded.action.action_type, format!("mvno.{verb}_account"));
+            assert_eq!(
+                forwarded.action.description,
+                format!("mvno.{verb}_account account=5")
+            );
+            let extra = &forwarded.evidence.extra;
+            assert_eq!(extra.get("account"), Some(&"5".to_string()));
+            assert!(!extra.contains_key("slot"));
+            assert!(!extra.contains_key("profile"));
+            assert!(!extra.contains_key("module_id"));
+            assert_eq!(forwarded.sod.operator_user_id, "el0:arm-demo");
+            assert_ne!(
+                forwarded.sod.operator_user_id,
+                forwarded.sod.verifier_user_id
+            );
+        }
     }
 
     /// Proves the policy check actually gates forwarding: a request this

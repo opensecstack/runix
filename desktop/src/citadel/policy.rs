@@ -32,9 +32,12 @@
 //! 1. **Action-type recognition.** The proxy only vouches for action types
 //!    it explicitly recognizes ([`RECOGNIZED_ACTION_TYPES`]) — matching
 //!    CITADEL's own `rbacMap` entries for `grid_sandbox.spawn_instance`
-//!    and `esim.enable`/`esim.delete` (`citadel/internal/marshal/types.go`;
-//!    eSIM actions are identified by `slot`/`profile` instead of
-//!    `module_id`/`instance_id`, and [`check`] enforces that split), so this rejects a request for
+//!    `esim.enable`/`esim.delete`, and `mvno.bind_profile`/
+//!    `mvno.suspend_account`/`mvno.reactivate_account`
+//!    (`citadel/internal/marshal/types.go`; eSIM actions are identified by
+//!    `slot`/`profile`, MVNO actions by `account` (plus `slot`/`profile`
+//!    for `mvno.bind_profile` only), instead of `module_id`/`instance_id`,
+//!    and [`check`] enforces those per-family splits), so this rejects a request for
 //!    an action type CITADEL wouldn't even authorize an "operator" role for
 //!    regardless of SoD. An unrecognized action type is refused before any
 //!    envelope is built.
@@ -69,14 +72,18 @@ use serde::Deserialize;
 
 /// Action types this proxy is willing to vouch for as Verifier — kept in
 /// sync with `citadel/internal/marshal/types.go`'s `rbacMap`'s
-/// `grid_sandbox.spawn_instance` and `esim.enable`/`esim.delete` entries
-/// (both the `"admin"` and `"operator"` role lists carry them today). A request for anything else is
+/// `grid_sandbox.spawn_instance`, `esim.enable`/`esim.delete` and
+/// `mvno.bind_profile`/`mvno.suspend_account`/`mvno.reactivate_account`
+/// entries (both the `"admin"` and `"operator"` role lists carry them today). A request for anything else is
 /// refused before an envelope is even built, regardless of how well-formed
 /// it otherwise is.
 pub const RECOGNIZED_ACTION_TYPES: &[&str] = &[
     "grid_sandbox.spawn_instance",
     ESIM_ENABLE_ACTION,
     ESIM_DELETE_ACTION,
+    MVNO_BIND_PROFILE_ACTION,
+    MVNO_SUSPEND_ACCOUNT_ACTION,
+    MVNO_REACTIVATE_ACCOUNT_ACTION,
 ];
 
 /// `kernel-arm/src/marshal_transport.rs` sends these two (`esim.{action}`)
@@ -84,6 +91,21 @@ pub const RECOGNIZED_ACTION_TYPES: &[&str] = &[
 /// opensecstack added to `rbacMap` (admin + operator lists, `types.go`).
 pub const ESIM_ENABLE_ACTION: &str = "esim.enable";
 pub const ESIM_DELETE_ACTION: &str = "esim.delete";
+
+/// `kernel-arm` sends these (`mvno.{verb}`) for the MVNO account lifecycle;
+/// they are the `mvno.*` entries added to `rbacMap` (admin + operator).
+pub const MVNO_BIND_PROFILE_ACTION: &str = "mvno.bind_profile";
+pub const MVNO_SUSPEND_ACCOUNT_ACTION: &str = "mvno.suspend_account";
+pub const MVNO_REACTIVATE_ACCOUNT_ACTION: &str = "mvno.reactivate_account";
+
+/// Whether `action_type` is one of the MVNO actions, identified by
+/// `account` (and, for `mvno.bind_profile` only, `slot`/`profile`).
+pub fn is_mvno_action(action_type: &str) -> bool {
+    matches!(
+        action_type,
+        MVNO_BIND_PROFILE_ACTION | MVNO_SUSPEND_ACCOUNT_ACTION | MVNO_REACTIVATE_ACCOUNT_ACTION
+    )
+}
 
 /// Whether `action_type` is one of the eSIM lifecycle actions, whose
 /// identifying fields are `slot`/`profile` rather than `module_id`/
@@ -145,6 +167,9 @@ pub struct KernelMinimalAction {
     /// eSIM actions only: the profile id within `slot`.
     #[serde(default)]
     pub profile: Option<u64>,
+    /// MVNO actions only (`mvno.*`): the account id.
+    #[serde(default)]
+    pub account: Option<u64>,
 }
 
 impl KernelMinimalAction {
@@ -152,12 +177,27 @@ impl KernelMinimalAction {
     /// verification entry to. For `grid_sandbox.spawn_instance` that is the
     /// envelope's own fields; for eSIM actions, which have no module or
     /// instance, it is the fixed module `"esim"` and an instance of
-    /// `slot-{slot}-profile-{profile}` (empty parts if a field is missing --
+    /// `slot-{slot}-profile-{profile}`; for MVNO actions it is the fixed
+    /// module `"mvno"` and an instance of `account-{account}` (or
+    /// `account-{account}-slot-{slot}-profile-{profile}` for
+    /// `mvno.bind_profile`) (empty parts if a field is missing --
     /// [`check`] refuses that case, but the refusal itself still gets
     /// recorded, so this must not panic).
     pub fn audit_ids(&self) -> (String, String) {
-        if is_esim_action(&self.action_type) {
-            let part = |v: Option<u64>| v.map_or_else(String::new, |n| n.to_string());
+        let part = |v: Option<u64>| v.map_or_else(String::new, |n| n.to_string());
+        if is_mvno_action(&self.action_type) {
+            let instance = if self.action_type == MVNO_BIND_PROFILE_ACTION {
+                format!(
+                    "account-{}-slot-{}-profile-{}",
+                    part(self.account),
+                    part(self.slot),
+                    part(self.profile)
+                )
+            } else {
+                format!("account-{}", part(self.account))
+            };
+            ("mvno".to_string(), instance)
+        } else if is_esim_action(&self.action_type) {
             (
                 "esim".to_string(),
                 format!("slot-{}-profile-{}", part(self.slot), part(self.profile)),
@@ -236,7 +276,38 @@ pub fn check(envelope: &KernelMinimalEnvelope) -> Result<(), PolicyError> {
         ));
     }
 
-    if is_esim_action(&envelope.action.action_type) {
+    if is_mvno_action(&envelope.action.action_type) {
+        // MVNO actions are identified by `account` (plus slot/profile for
+        // bind); module/instance ids have no meaning here.
+        let is_bind = envelope.action.action_type == MVNO_BIND_PROFILE_ACTION;
+        if envelope.action.account.is_none() {
+            return Err(PolicyError::MissingField("account"));
+        }
+        if is_bind {
+            if envelope.action.slot.is_none() {
+                return Err(PolicyError::MissingField("slot"));
+            }
+            if envelope.action.profile.is_none() {
+                return Err(PolicyError::MissingField("profile"));
+            }
+        } else {
+            if envelope.action.slot.is_some() {
+                return Err(PolicyError::UnexpectedField("slot"));
+            }
+            if envelope.action.profile.is_some() {
+                return Err(PolicyError::UnexpectedField("profile"));
+            }
+        }
+        if !envelope.action.module_id.is_empty() {
+            return Err(PolicyError::UnexpectedField("module_id"));
+        }
+        if !envelope.action.instance_id.is_empty() {
+            return Err(PolicyError::UnexpectedField("instance_id"));
+        }
+    } else if is_esim_action(&envelope.action.action_type) {
+        if envelope.action.account.is_some() {
+            return Err(PolicyError::UnexpectedField("account"));
+        }
         // eSIM actions are identified by (slot, profile); module/instance
         // ids have no meaning here, and accepting them would let a caller
         // smuggle free-form strings into the enriched envelope's evidence.
@@ -253,6 +324,9 @@ pub fn check(envelope: &KernelMinimalEnvelope) -> Result<(), PolicyError> {
             return Err(PolicyError::UnexpectedField("instance_id"));
         }
     } else {
+        if envelope.action.account.is_some() {
+            return Err(PolicyError::UnexpectedField("account"));
+        }
         if envelope.action.slot.is_some() {
             return Err(PolicyError::UnexpectedField("slot"));
         }
@@ -315,6 +389,7 @@ mod tests {
                 instance_id: "app-1".into(),
                 slot: None,
                 profile: None,
+                account: None,
             },
             actor: KernelMinimalActor {
                 user_id: "kernel:grid_sandbox".into(),
@@ -374,6 +449,7 @@ mod tests {
             instance_id: String::new(),
             slot: Some(0),
             profile: Some(1),
+            account: None,
         };
         e.actor.user_id = "el0:arm-demo".into();
         e
@@ -447,5 +523,151 @@ mod tests {
             serde_json::from_str(json).expect("should parse the real grid_sandbox.rs shape");
         assert!(check(&envelope).is_ok());
         assert!(envelope.verifier.is_none());
+    }
+    fn mvno_envelope(action_type: &str) -> KernelMinimalEnvelope {
+        let mut e = valid_envelope();
+        let bind = action_type == MVNO_BIND_PROFILE_ACTION;
+        e.action = KernelMinimalAction {
+            action_type: action_type.into(),
+            module_id: String::new(),
+            instance_id: String::new(),
+            slot: bind.then_some(1),
+            profile: bind.then_some(2),
+            account: Some(7),
+        };
+        e.actor.user_id = "el0:arm-demo".into();
+        e
+    }
+
+    const MVNO_ALL: [&str; 3] = [
+        MVNO_BIND_PROFILE_ACTION,
+        MVNO_SUSPEND_ACCOUNT_ACTION,
+        MVNO_REACTIVATE_ACCOUNT_ACTION,
+    ];
+
+    #[test]
+    fn accepts_well_formed_mvno_requests() {
+        for t in MVNO_ALL {
+            assert!(check(&mvno_envelope(t)).is_ok(), "{t}");
+            assert!(RECOGNIZED_ACTION_TYPES.contains(&t));
+        }
+    }
+
+    #[test]
+    fn rejects_mvno_request_missing_account() {
+        for t in MVNO_ALL {
+            let mut e = mvno_envelope(t);
+            e.action.account = None;
+            assert_eq!(check(&e), Err(PolicyError::MissingField("account")), "{t}");
+        }
+    }
+
+    #[test]
+    fn rejects_mvno_bind_missing_slot_or_profile() {
+        let mut e = mvno_envelope(MVNO_BIND_PROFILE_ACTION);
+        e.action.slot = None;
+        assert_eq!(check(&e), Err(PolicyError::MissingField("slot")));
+        let mut e = mvno_envelope(MVNO_BIND_PROFILE_ACTION);
+        e.action.profile = None;
+        assert_eq!(check(&e), Err(PolicyError::MissingField("profile")));
+    }
+
+    #[test]
+    fn rejects_mvno_suspend_and_reactivate_carrying_slot_or_profile() {
+        for t in [MVNO_SUSPEND_ACCOUNT_ACTION, MVNO_REACTIVATE_ACCOUNT_ACTION] {
+            let mut e = mvno_envelope(t);
+            e.action.slot = Some(0);
+            assert_eq!(check(&e), Err(PolicyError::UnexpectedField("slot")), "{t}");
+            let mut e = mvno_envelope(t);
+            e.action.profile = Some(0);
+            assert_eq!(
+                check(&e),
+                Err(PolicyError::UnexpectedField("profile")),
+                "{t}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_mvno_request_carrying_module_or_instance_id() {
+        for t in MVNO_ALL {
+            let mut e = mvno_envelope(t);
+            e.action.module_id = "grid-sandbox-host".into();
+            assert_eq!(
+                check(&e),
+                Err(PolicyError::UnexpectedField("module_id")),
+                "{t}"
+            );
+            let mut e = mvno_envelope(t);
+            e.action.instance_id = "x".into();
+            assert_eq!(
+                check(&e),
+                Err(PolicyError::UnexpectedField("instance_id")),
+                "{t}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_esim_and_grid_sandbox_requests_carrying_account() {
+        for t in [ESIM_ENABLE_ACTION, ESIM_DELETE_ACTION] {
+            let mut e = esim_envelope(t);
+            e.action.account = Some(1);
+            assert_eq!(
+                check(&e),
+                Err(PolicyError::UnexpectedField("account")),
+                "{t}"
+            );
+        }
+        let mut e = valid_envelope();
+        e.action.account = Some(1);
+        assert_eq!(check(&e), Err(PolicyError::UnexpectedField("account")));
+    }
+
+    #[test]
+    fn mvno_audit_ids_are_derived_and_never_panic() {
+        assert_eq!(
+            mvno_envelope(MVNO_SUSPEND_ACCOUNT_ACTION)
+                .action
+                .audit_ids(),
+            ("mvno".to_string(), "account-7".to_string())
+        );
+        assert_eq!(
+            mvno_envelope(MVNO_REACTIVATE_ACCOUNT_ACTION)
+                .action
+                .audit_ids(),
+            ("mvno".to_string(), "account-7".to_string())
+        );
+        assert_eq!(
+            mvno_envelope(MVNO_BIND_PROFILE_ACTION).action.audit_ids(),
+            ("mvno".to_string(), "account-7-slot-1-profile-2".to_string())
+        );
+        let mut e = mvno_envelope(MVNO_BIND_PROFILE_ACTION);
+        e.action.account = None;
+        e.action.slot = None;
+        e.action.profile = None;
+        assert_eq!(
+            e.action.audit_ids(),
+            ("mvno".to_string(), "account--slot--profile-".to_string())
+        );
+        e.action.action_type = MVNO_SUSPEND_ACCOUNT_ACTION.into();
+        assert_eq!(
+            e.action.audit_ids(),
+            ("mvno".to_string(), "account-".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_the_real_mvno_envelope_shapes_kernel_arm_sends() {
+        let jsons = [
+            r#"{"kerkese_version":"1.0","dry_run":true,"action":{"type":"mvno.bind_profile","account":3,"slot":0,"profile":1},"actor":{"user_id":"el0:arm-demo","role":"operator"},"execution_id":"mvno-bind-3-0-1"}"#,
+            r#"{"kerkese_version":"1.0","dry_run":true,"action":{"type":"mvno.suspend_account","account":3},"actor":{"user_id":"el0:arm-demo","role":"operator"},"execution_id":"mvno-suspend-3"}"#,
+            r#"{"kerkese_version":"1.0","dry_run":true,"action":{"type":"mvno.reactivate_account","account":3},"actor":{"user_id":"el0:arm-demo","role":"operator"},"execution_id":"mvno-reactivate-3"}"#,
+        ];
+        for json in jsons {
+            let envelope: KernelMinimalEnvelope =
+                serde_json::from_str(json).expect("should parse the real kernel-arm shape");
+            assert!(check(&envelope).is_ok(), "{json}");
+        }
     }
 }

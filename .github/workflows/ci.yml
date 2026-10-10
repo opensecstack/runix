@@ -510,10 +510,21 @@ jobs:
         # boot (via the project's Fedora WSL dev environment, where `nc`
         # actually works) that every expected line still appears well inside
         # the old 20s budget; the extra 5s is margin, not a measured need.
+        #
+        # `timeout` bumped 25 -> 35 for Beta item 3.4: the three MVNO
+        # syscalls are MARSHAL-gated now, so the EL0 walk performs seven
+        # evaluations per boot instead of four, and in this config every one
+        # is a bounded connect-and-time-out attempt. MEASURED natively (QEMU
+        # TCG on the Windows dev box, no guestfwd, all evaluations
+        # Unreachable): the full serial output is complete by ~6-9s (secure)
+        # / ~6-7s (non-secure) with seven evaluations vs ~4.5s with four
+        # (~1-1.5s per extra attempt). The 35s ceiling is margin for a slower
+        # runner plus the tcp_proof guestfwd round trip, which the Windows box
+        # cannot run -- UNMEASURED on ubuntu-latest.
         run: |
           python3 ../kernel/tests/support/tcp_proof_listener.py &
           sleep 0.3
-          timeout 25 qemu-system-aarch64 \
+          timeout 35 qemu-system-aarch64 \
             -M virt,secure=on,gic-version=2 -cpu cortex-a53 -nographic \
             -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
             -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001" \
@@ -746,7 +757,9 @@ jobs:
           # DENIED under the Suspended account, reactivates, and re-enables.
           # An installed-but-never-bound profile is DENIED too (fail closed), and
           # account 99 (no capability) is DENIED. The MVNO syscalls are
-          # capability-gated + audited but not MARSHAL-gated yet (Beta item 3.4).
+          # capability-gated, then MARSHAL-gated (Beta item 3.4), then audited;
+          # with no proxy route in this boot config the gate reads Unreachable
+          # (fail-open), see the MARSHAL evaluation greps below.
           grep -q "Runix ARM kernel: MVNO account capability issued (account 0" /tmp/arm-boot.log
           grep -q "Runix ARM kernel: MVNO suspend capability issued (account 0" /tmp/arm-boot.log
           grep -q "Runix ARM kernel: MVNO demo account opened (account 0" /tmp/arm-boot.log
@@ -767,6 +780,20 @@ jobs:
           grep -q "SVC: SYS_MVNO_BIND account 0 slot 0 profile 2 DENIED (resource sim:0:2" \
             /tmp/arm-boot.log
           grep -q "SVC: SYS_MVNO_SUSPEND account 99 DENIED" /tmp/arm-boot.log
+          # Beta item 3.4: the three MVNO syscalls are evaluated by MARSHAL
+          # (generalized esim gate, kernel-arm/src/marshal_action.rs) between
+          # their capability check and the registry mutation. This boot config
+          # has no guestfwd route for 10.0.2.100:9100, so each evaluation
+          # attempts the connection and falls back to Unreachable (fail-open,
+          # the syscall still proceeds -- the "authorized" greps above). The
+          # denied BIND/SUSPEND calls (accounts 99, profile 2) fail the
+          # capability check first and are never evaluated.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.bind_profile account=0 slot=0 profile=0: Unreachable" \
+            /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.suspend_account account=0: Unreachable" \
+            /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.reactivate_account account=0: Unreachable" \
+            /tmp/arm-boot.log
           # Network selection driven by a registry account's standing (own local registry;
           # kernel-arm/src/mvno_proof.rs, EL1-only): allowed while Active,
           # refused once suspended.
@@ -800,11 +827,12 @@ jobs:
         # installed yet to catch it) -- see main.rs's doc comment and
         # docs/STATUS.md's "Real bugs" section for the full account.
         # `timeout` bumped 20 -> 25 for the same reason the secure boot
-        # above was -- see that step's comment.
+        # above was, then 25 -> 35 for Beta item 3.4 -- see that step's
+        # comment (measured natively: ~6-7s non-secure).
         run: |
           python3 ../kernel/tests/support/tcp_proof_listener.py &
           sleep 0.3
-          timeout 25 qemu-system-aarch64 \
+          timeout 35 qemu-system-aarch64 \
             -M virt,gic-version=2 -cpu cortex-a53 -nographic \
             -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
             -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001" \
@@ -891,7 +919,9 @@ jobs:
           # DENIED under the Suspended account, reactivates, and re-enables.
           # An installed-but-never-bound profile is DENIED too (fail closed), and
           # account 99 (no capability) is DENIED. The MVNO syscalls are
-          # capability-gated + audited but not MARSHAL-gated yet (Beta item 3.4).
+          # capability-gated, then MARSHAL-gated (Beta item 3.4), then audited;
+          # with no proxy route in this boot config the gate reads Unreachable
+          # (fail-open), see the MARSHAL evaluation greps below.
           grep -q "SVC: SYS_MVNO_BIND account 0 slot 0 profile 0 authorized" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_MVNO_SUSPEND account 0 authorized (1 Enabled profile(s) to force-disable)" \
             /tmp/arm-boot-nosecure.log
@@ -909,6 +939,14 @@ jobs:
           grep -q "SVC: SYS_MVNO_BIND account 0 slot 0 profile 2 DENIED (resource sim:0:2" \
             /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_MVNO_SUSPEND account 99 DENIED" /tmp/arm-boot-nosecure.log
+          # Beta item 3.4 MARSHAL gate on the MVNO syscalls: Unreachable
+          # (fail-open) here, same as the secure boot above.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.bind_profile account=0 slot=0 profile=0: Unreachable" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.suspend_account account=0: Unreachable" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.reactivate_account account=0: Unreachable" \
+            /tmp/arm-boot-nosecure.log
           # Network selection driven by a registry account's standing (own local registry;
           # kernel-arm/src/mvno_proof.rs, EL1-only): allowed while Active,
           # refused once suspended.
@@ -931,22 +969,32 @@ jobs:
       # marshal_transport's MARSHAL proxy at 10.0.2.100:9100; the two boot
       # steps above leave that port unmapped (proving fail-open, see their
       # own comments) -- this step instead bridges it to
-      # grid_sandbox_marshal_shadow_listener.py (reused verbatim from the
-      # x86_64 side: a test-only stand-in that answers the real wire format
-      # with a canned Refuse, same role marshal_proof_listener.py plays for
-      # marshal_tcp_roundtrip.rs -- not itself a MARSHAL proxy). Two
-      # `guestfwd` routes in one `-netdev user,...` string: 9000 for
-      # tcp_proof.rs's own already-running TCP proof (unrelated to this
-      # step, but still exercised every boot), 9100 for this step's actual
-      # subject.
+      # arm_marshal_selective_listener.py (a test-only stand-in that answers
+      # the real wire format, same role marshal_proof_listener.py plays for
+      # marshal_tcp_roundtrip.rs -- not itself a MARSHAL proxy; it reuses
+      # grid_sandbox_marshal_shadow_listener.py's wire helpers). Since Beta
+      # item 3.4 the EL0 walk's first gated syscall is MVNO bind, not eSIM
+      # enable, and the old Refuse-everything/serve-one-connection listener
+      # could only ever prove the first one -- the selective listener serves
+      # many connections and refuses only the action types named by
+      # `--refuse` prefixes (here `esim.`: bind/suspend/reactivate Execute,
+      # enable/delete Refuse). Two `guestfwd` routes in one `-netdev user,...`
+      # string: 9000 for tcp_proof.rs's own already-running TCP proof
+      # (unrelated to this step, but still exercised every boot), 9100 for
+      # this step's actual subject. Background listeners are killed on step
+      # exit (the selective listener never exits on its own and the next step
+      # reuses its port).
       - name: boot in QEMU and check MARSHAL REFUSE denies eSIM enable (Beta item 2.6)
         run: |
+          trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
           python3 ../kernel/tests/support/tcp_proof_listener.py &
           sleep 0.3
-          python3 ../kernel/tests/support/grid_sandbox_marshal_shadow_listener.py &
+          python3 ../kernel/tests/support/arm_marshal_selective_listener.py 9004 --refuse esim. &
           sleep 0.3
           # `timeout` bumped 20 -> 30: Beta item 3.3's EL0 walk adds one more
           # authorized ENABLE (one more esim_marshal::evaluate round trip).
+          # Item 3.4 adds three more (MVNO) evaluations, but with a listener
+          # answering they are fast round trips, not timed-out attempts.
           # UNMEASURED margin (guestfwd can't run on the Windows dev box);
           # tighten from the first CI run's real timing.
           timeout 30 qemu-system-aarch64 \
@@ -964,6 +1012,47 @@ jobs:
           # literal point of this item.
           grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 0 DENIED (MARSHAL Refuse)" \
             /tmp/arm-boot-marshal-refuse.log
+          # The selective listener executes the MVNO actions, so bind still
+          # succeeded here (the profile is bound and enable reached MARSHAL).
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.bind_profile account=0 slot=0 profile=0: Execute" \
+            /tmp/arm-boot-marshal-refuse.log
+          grep -q "SVC: SYS_MVNO_BIND account 0 slot 0 profile 0 authorized" \
+            /tmp/arm-boot-marshal-refuse.log
+
+      # Beta item 3.4: the MVNO MARSHAL gate itself. Same bridge as above, but
+      # the selective listener Refuses only `mvno.suspend_account`: the walk's
+      # SYS_MVNO_SUSPEND must be DENIED at the syscall boundary with the
+      # registry untouched -- no "authorized", no forced disable, no audit
+      # line for it (those only print after the gate passes).
+      - name: boot in QEMU and check MARSHAL REFUSE denies MVNO suspend (Beta item 3.4)
+        run: |
+          trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
+          python3 ../kernel/tests/support/tcp_proof_listener.py &
+          sleep 0.3
+          python3 ../kernel/tests/support/arm_marshal_selective_listener.py 9004 --refuse mvno.suspend_account &
+          sleep 0.3
+          # UNMEASURED margin, same as the step above (guestfwd can't run on
+          # the Windows dev box).
+          timeout 30 qemu-system-aarch64 \
+            -M virt,secure=on,gic-version=2 -cpu cortex-a53 -nographic \
+            -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
+            -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001,guestfwd=tcp:10.0.2.100:9100-cmd:nc 127.0.0.1 9004" \
+            -device virtio-net-device,netdev=net0 \
+            -global virtio-mmio.force-legacy=false \
+            | tee /tmp/arm-boot-marshal-refuse-mvno.log || true
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.suspend_account account=0: Refuse" \
+            /tmp/arm-boot-marshal-refuse-mvno.log
+          grep -q "SVC: SYS_MVNO_SUSPEND account 0 DENIED (MARSHAL Refuse)" \
+            /tmp/arm-boot-marshal-refuse-mvno.log
+          # Registry untouched: the suspend body never ran.
+          if grep -q "SVC: SYS_MVNO_SUSPEND account 0 authorized" /tmp/arm-boot-marshal-refuse-mvno.log; then exit 1; fi
+          if grep -q "SVC: SYS_MVNO_SUSPEND account 0 forced disable" /tmp/arm-boot-marshal-refuse-mvno.log; then exit 1; fi
+          if grep -q "SVC: SYS_MVNO_SUSPEND account 0 audit clean" /tmp/arm-boot-marshal-refuse-mvno.log; then exit 1; fi
+          # The other gated syscalls were evaluated and executed normally.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.bind_profile account=0 slot=0 profile=0: Execute" \
+            /tmp/arm-boot-marshal-refuse-mvno.log
+          grep -q "SVC: SYS_MVNO_BIND account 0 slot 0 profile 0 authorized" \
+            /tmp/arm-boot-marshal-refuse-mvno.log
       # Full real chain, the third case the REFUSE/Unreachable configs above
       # can't distinguish on their own (a Refuse from a canned stand-in
       # listener proves the transport, not that the real proxy's policy
@@ -974,7 +1063,13 @@ jobs:
       # slot+profile), attaches its own distinct Verifier identity, and
       # makes a real HTTP call to mock_citadel_server.py (canned EXECUTE).
       # Ports: 9105 (mock CITADEL HTTP) <- citadel_proxy 9104 <- guestfwd
-      # 10.0.2.100:9100. Before the proxy learned `esim.*` this exact chain
+      # 10.0.2.100:9100. The mock is mock_citadel_server_multi.py, not
+      # mock_citadel_server.py: since Beta item 3.4 the walk performs seven
+      # evaluations per boot (eSIM enable/delete and the three MVNO
+      # syscalls), each a fresh proxy request, and the one-shot original
+      # serves exactly one and exits. The proxy must also recognize
+      # mvno.bind_profile / mvno.suspend_account / mvno.reactivate_account
+      # (desktop/src/citadel/policy.rs) or those lines read Unreachable/Refuse. Before the proxy learned `esim.*` this exact chain
       # answered `POLICY_REFUSE: action type "esim.enable" is not one this
       # proxy recognizes`, which would have failed the `: Execute` grep
       # below. (The same request/response was checked host-side, without
@@ -985,9 +1080,10 @@ jobs:
         run: cargo build -p runix-desktop --bin citadel_proxy --release
       - name: boot in QEMU and check a real citadel_proxy EXECUTE admits eSIM enable (Beta item 2.6 follow-up)
         run: |
+          trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
           python3 ../kernel/tests/support/tcp_proof_listener.py &
           sleep 0.3
-          python3 ../kernel/tests/support/mock_citadel_server.py &
+          python3 ../kernel/tests/support/mock_citadel_server_multi.py &
           sleep 0.3
           CITADEL_PROXY_LISTEN_ADDR=127.0.0.1:9104 \
             RUNIX_CITADEL_URL=http://127.0.0.1:9105/marshal/kerkese \
@@ -1007,6 +1103,16 @@ jobs:
           grep -q "Runix ARM kernel: MARSHAL evaluation for enable slot=0 profile=0: Execute" \
             /tmp/arm-boot-marshal-execute.log
           grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 0 authorized" \
+            /tmp/arm-boot-marshal-execute.log
+          # Beta item 3.4: the real proxy admits the three MVNO actions end to
+          # end (kernel request -> citadel_proxy policy -> mock CITADEL EXECUTE).
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.bind_profile account=0 slot=0 profile=0: Execute" \
+            /tmp/arm-boot-marshal-execute.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.suspend_account account=0: Execute" \
+            /tmp/arm-boot-marshal-execute.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.reactivate_account account=0: Execute" \
+            /tmp/arm-boot-marshal-execute.log
+          grep -q "SVC: SYS_MVNO_SUSPEND account 0 authorized" \
             /tmp/arm-boot-marshal-execute.log
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every

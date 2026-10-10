@@ -45,4 +45,5 @@ extern crate alloc;
 pub mod capabilities;
 pub mod elf;
 pub mod loader;
+pub mod marshal_action;
 pub mod vm;

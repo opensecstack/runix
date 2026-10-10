@@ -85,8 +85,10 @@
 //! denied (MVNO), proving the gate fails closed. Finally `BIND(99, ..)` and
 //! `SUSPEND(99)` are denied for lack of a capability, and `BIND(0, 0, 2)` is
 //! denied because the account capability is held but the profile capability
-//! (`sim:0:2`) is not -- `BIND` needs both. The MVNO syscalls are
-//! capability-gated and audited but not yet MARSHAL-gated (Beta item 3.4).
+//! (`sim:0:2`) is not -- `BIND` needs both. The three MVNO syscalls
+//! are MARSHAL-gated too (Beta item 3.4; transparent here: Unreachable and
+//! Execute both pass), so the walk performs seven evaluations per boot
+//! (bind, enable, suspend, reactivate, enable, delete x2).
 //!
 //! The denial half intentionally uses `CREATE(99)`/`STATUS(99, 0)` rather
 //! than repeating every operation on slot 99: the point is that the

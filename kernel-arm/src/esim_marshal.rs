@@ -4,6 +4,15 @@
 //! `kernel/src/grid_sandbox.rs`'s `shadow_marshal_evaluate` /
 //! `enforce_marshal_decision` pair on the x86_64 kernel.
 //!
+//! # Shared by the MVNO syscalls (Beta item 3.4)
+//!
+//! Despite the name, [`enforce`] / [`MarshalEnforcementError`] are *the* single
+//! enforcement point for every MARSHAL-gated syscall in this crate: the three
+//! MVNO account syscalls (`SYS_MVNO_BIND`/`SUSPEND`/`REACTIVATE`) call
+//! `marshal_transport::evaluate` with a [`MarshalAction`] value and then this
+//! module's [`enforce`], rather than growing a parallel gate. The name is kept
+//! (no rename churn); [`evaluate`] below remains the eSIM-specific wrapper.
+//!
 //! # Real transport, via `marshal_transport.rs`
 //!
 //! [`evaluate`] now delegates to [`crate::marshal_transport::evaluate`] --
@@ -37,6 +46,7 @@
 //! `kernel/src/grid_sandbox.rs` already applies on the x86_64 side.
 
 pub use runix_citadel_integration::ShadowMarshalOutcome;
+use runix_kernel_arm::marshal_action::MarshalAction;
 
 /// Evaluates whether a destructive eSIM lifecycle operation (`"enable"` or
 /// `"delete"` — see this module's doc comment) should be allowed to
@@ -55,7 +65,14 @@ pub fn evaluate(
     profile: u8,
     principal: &str,
 ) -> ShadowMarshalOutcome {
-    crate::marshal_transport::evaluate(operation, slot, profile, principal)
+    crate::marshal_transport::evaluate(
+        &MarshalAction::Esim {
+            op: operation,
+            slot,
+            profile,
+        },
+        principal,
+    )
 }
 
 /// What [`enforce`] hands back when a reachable MARSHAL deployment refused

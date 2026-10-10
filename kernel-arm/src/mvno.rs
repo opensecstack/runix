@@ -42,16 +42,17 @@
 //! `svc.rs` keeps the order by releasing the registry lock *before* it calls
 //! `sim::disable` for the forced-disable list.
 //!
-//! # Known, tracked gap: the MVNO syscalls are not MARSHAL-gated yet
+//! # MARSHAL gating of the MVNO syscalls (Beta item 3.4)
 //!
-//! (`BIND` requires both the account's and the profile's own capability --
-//! see `svc.rs`.) `SYS_MVNO_BIND`/`SUSPEND`/`REACTIVATE` are
-//! capability-gated and WORM-audited, but **not** routed through `esim_marshal::evaluate` -- that
-//! function hardcodes `esim.{action}` slot/profile envelopes, so generalizing
-//! it (plus the upstream rbacMap and `citadel_proxy` policy entries) is
-//! Beta item 3.4. CLAUDE.md requires privileged actions to flow through
-//! MARSHAL; this is a documented, scheduled omission, not an oversight.
-//! (`SYS_SIM_ENABLE`'s existing MARSHAL gate is unchanged.)
+//! `SYS_MVNO_BIND`/`SUSPEND`/`REACTIVATE` (`BIND` requires both the account's
+//! and the profile's own capability -- see `svc.rs`) are capability-gated,
+//! then MARSHAL-gated (`mvno.bind_profile` / `mvno.suspend_account` /
+//! `mvno.reactivate_account`, through the shared `esim_marshal::enforce`),
+//! then WORM-audited. The MARSHAL evaluation happens in `svc.rs` **before**
+//! any function here is called: `evaluate` may run a nested EL0 excursion, so
+//! it must never run under [`REGISTRY`]'s lock (every public function below
+//! takes that lock internally). A `Refuse`/`HardStop` therefore leaves this
+//! registry untouched. Nothing in this module talks to MARSHAL.
 //!
 //! # Demo data
 //!
