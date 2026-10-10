@@ -729,6 +729,11 @@ jobs:
           # Deleting an Enabled profile must be rejected at the syscall
           # boundary, not silently turned into disable-then-delete -- the
           # one "expected failure" in this walk (see sim.rs's doc comment).
+          # Install over an Enabled profile must be rejected: before the per-operation
+          # source-state fix, sim.rs let `install` act on an Enabled profile, silently
+          # demoting it and overwriting its identity.
+          grep -q "SVC: SYS_SIM_INSTALL slot 0 profile 0 FAILED (wrong state for this operation (Enabled))" \
+            /tmp/arm-boot.log
           grep -q "SVC: SYS_SIM_DELETE slot 0 profile 0 FAILED (wrong state for this operation (Enabled))" \
             /tmp/arm-boot.log
           grep -q "SVC: SYS_SIM_DISABLE slot 0 profile 0 authorized" /tmp/arm-boot.log

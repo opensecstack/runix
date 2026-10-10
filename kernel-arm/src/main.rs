@@ -199,7 +199,9 @@ mod ril_channel;
 // item 2.4), plus its boot-time interleaving proof.
 mod scheduler;
 mod serial;
-mod sim;
+// Lives in the lib target so its state machine is host-testable (cargo test
+// --lib); re-exported here so crate::sim::* paths are unchanged.
+pub(crate) use runix_kernel_arm::sim;
 // Spike-only (see docs/BETA_MOBILE_PROGRESS.md Item 2 / 2.3): never called
 // from this boot sequence, exists only to force real smoltcp codegen.
 mod smoltcp_spike;

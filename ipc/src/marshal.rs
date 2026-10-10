@@ -197,6 +197,12 @@ pub enum MarshalError {
     BadResponse(String),
     /// Anything else.
     Other(String),
+    /// The proxy itself evaluated the request against its local policy and
+    /// explicitly REFUSED it (a definite negative answer, not an outage).
+    /// Consumers that enforce must treat this as a refusal, never as
+    /// "MARSHAL unreachable". The string is a human-readable reason (at most
+    /// [`MAX_MESSAGE_LEN`] bytes on the wire). Wire kind byte 4.
+    PolicyRefused(String),
 }
 
 impl MarshalError {
@@ -206,6 +212,7 @@ impl MarshalError {
             MarshalError::Timeout => 1,
             MarshalError::BadResponse(_) => 2,
             MarshalError::Other(_) => 3,
+            MarshalError::PolicyRefused(_) => 4,
         }
     }
 
@@ -214,7 +221,8 @@ impl MarshalError {
         match self {
             MarshalError::Unreachable(msg)
             | MarshalError::BadResponse(msg)
-            | MarshalError::Other(msg) => encode_string(out, msg),
+            | MarshalError::Other(msg)
+            | MarshalError::PolicyRefused(msg) => encode_string(out, msg),
             MarshalError::Timeout => {}
         }
     }
@@ -234,6 +242,10 @@ impl MarshalError {
             3 => {
                 let (msg, n) = decode_string(buf.get(1..)?)?;
                 Some((MarshalError::Other(msg), 1 + n))
+            }
+            4 => {
+                let (msg, n) = decode_string(buf.get(1..)?)?;
+                Some((MarshalError::PolicyRefused(msg), 1 + n))
             }
             _ => None,
         }
@@ -361,11 +373,49 @@ mod tests {
             MarshalError::Timeout,
             MarshalError::BadResponse(String::from("not json")),
             MarshalError::Other(String::from("???")),
+            MarshalError::PolicyRefused(String::from("POLICY_REFUSE: nope")),
         ] {
             let resp = MarshalResponse::Error(err);
             let bytes = resp.encode();
             assert_eq!(MarshalResponse::decode(&bytes), Some((resp, bytes.len())));
         }
+    }
+
+    #[test]
+    fn policy_refused_wire_layout_and_old_kinds_unchanged() {
+        let b = MarshalResponse::Error(MarshalError::PolicyRefused(String::from("no"))).encode();
+        assert_eq!(b, alloc::vec![1, 4, 2, 0, b'n', b'o']);
+        let b = MarshalResponse::Error(MarshalError::Other(String::from("x"))).encode();
+        assert_eq!(b, alloc::vec![1, 3, 1, 0, b'x']);
+        let b = MarshalResponse::Error(MarshalError::Timeout).encode();
+        assert_eq!(b, alloc::vec![1, 1]);
+        // Unknown kind still rejected.
+        assert_eq!(MarshalResponse::decode(&[1, 5, 0, 0]), None);
+    }
+
+    #[test]
+    fn truncated_policy_refused_asks_for_more_not_garbage() {
+        let full =
+            MarshalResponse::Error(MarshalError::PolicyRefused(String::from("reason"))).encode();
+        for cut in 0..full.len() {
+            assert_eq!(MarshalResponse::decode(&full[..cut]), None);
+        }
+    }
+
+    #[test]
+    fn policy_refused_oversize_reason_rejected_like_other_strings() {
+        // Decoder rejects a declared length over MAX_MESSAGE_LEN.
+        let mut wire = alloc::vec![1u8, 4];
+        wire.extend_from_slice(&((MAX_MESSAGE_LEN as u16) + 1).to_le_bytes());
+        wire.extend(core::iter::repeat(b'a').take(MAX_MESSAGE_LEN + 1));
+        assert_eq!(MarshalResponse::decode(&wire), None);
+        let mut other = wire.clone();
+        other[1] = 3;
+        assert_eq!(MarshalResponse::decode(&other), None);
+        // Exactly the bound is accepted.
+        let ok = MarshalResponse::Error(MarshalError::PolicyRefused("a".repeat(MAX_MESSAGE_LEN)));
+        let bytes = ok.encode();
+        assert_eq!(MarshalResponse::decode(&bytes), Some((ok, bytes.len())));
     }
 
     #[test]

@@ -15,6 +15,7 @@
 use alloc::format;
 use alloc::string::String;
 use runix_citadel_integration::ShadowMarshalOutcome;
+use runix_ipc::marshal::{MarshalError, MarshalOutcome, MarshalResponse};
 
 /// One governed action. `Esim::op` is `"enable"` or `"delete"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +195,34 @@ pub fn enforce(outcome: GateOutcome) -> Result<(), Blocked> {
     }
 }
 
+/// Pure classification of a decoded proxy reply (`None` = no reply bytes or
+/// undecodable) into the remote verdict.
+///
+/// - `Decision{outcome}` passes through;
+/// - `Error(PolicyRefused(_))` is an explicit negative answer from the proxy's
+///   own policy layer: `Refuse` (blocked by [`enforce`]);
+/// - `Error(Unreachable|Timeout|BadResponse|Other)` and `None` are "no usable
+///   Decision": `Unreachable` (fail-open). A refusal must never land here.
+pub fn classify_response(resp: Option<&MarshalResponse>) -> ShadowMarshalOutcome {
+    match resp {
+        Some(MarshalResponse::Decision { outcome, .. }) => match outcome {
+            MarshalOutcome::Execute => ShadowMarshalOutcome::Execute,
+            MarshalOutcome::Refuse => ShadowMarshalOutcome::Refuse,
+            MarshalOutcome::HardStop => ShadowMarshalOutcome::HardStop,
+        },
+        Some(MarshalResponse::Error(MarshalError::PolicyRefused(_))) => {
+            ShadowMarshalOutcome::Refuse
+        }
+        Some(MarshalResponse::Error(
+            MarshalError::Unreachable(_)
+            | MarshalError::Timeout
+            | MarshalError::BadResponse(_)
+            | MarshalError::Other(_),
+        ))
+        | None => ShadowMarshalOutcome::Unreachable,
+    }
+}
+
 /// First source port handed to a MARSHAL evaluation. `49152` itself is left
 /// to the TCP proof (`tcp_proof.rs` / the driver's `TCP_LOCAL_PORT`).
 pub const MARSHAL_LOCAL_PORT_BASE: u16 = 49153;
@@ -286,6 +315,56 @@ mod tests {
             format!("{}", Blocked::Local(LocalFailure::ExcursionFaulted)),
             "MARSHAL local failure: ExcursionFaulted"
         );
+    }
+
+    #[test]
+    fn classify_response_table() {
+        use alloc::vec::Vec;
+        use ShadowMarshalOutcome::*;
+        let dec = |o| MarshalResponse::Decision {
+            outcome: o,
+            decision_json: Vec::new(),
+        };
+        let err = |e| MarshalResponse::Error(e);
+        let s = || String::from("x");
+        assert_eq!(
+            classify_response(Some(&dec(MarshalOutcome::Execute))),
+            Execute
+        );
+        assert_eq!(
+            classify_response(Some(&dec(MarshalOutcome::Refuse))),
+            Refuse
+        );
+        assert_eq!(
+            classify_response(Some(&dec(MarshalOutcome::HardStop))),
+            HardStop
+        );
+        assert_eq!(
+            classify_response(Some(&err(MarshalError::PolicyRefused(s())))),
+            Refuse
+        );
+        assert_eq!(
+            classify_response(Some(&err(MarshalError::Unreachable(s())))),
+            Unreachable
+        );
+        assert_eq!(
+            classify_response(Some(&err(MarshalError::Timeout))),
+            Unreachable
+        );
+        assert_eq!(
+            classify_response(Some(&err(MarshalError::BadResponse(s())))),
+            Unreachable
+        );
+        assert_eq!(
+            classify_response(Some(&err(MarshalError::Other(s())))),
+            Unreachable
+        );
+        assert_eq!(classify_response(None), Unreachable);
+        // And a policy refusal is blocked end to end.
+        assert!(enforce(GateOutcome::Remote(classify_response(Some(&err(
+            MarshalError::PolicyRefused(s())
+        )))))
+        .is_err());
     }
 
     const P: &str = "el0:arm-demo";

@@ -198,11 +198,14 @@ fn record_proxy_verification(
 
 /// Translates a [`PolicyError`] into the [`MarshalResponse`] sent back to
 /// the kernel caller when this proxy refuses to vouch for a request —
-/// `MarshalError::Other`, since a policy refusal is neither a transport
-/// failure nor a malformed-response condition, the two cases
-/// [`MarshalError`]'s other variants exist for.
+/// `MarshalError::PolicyRefused`: a definite negative answer from this
+/// proxy's own policy layer. It is deliberately distinct from every
+/// transport/malformed-response variant, because kernel callers treat those
+/// as "MARSHAL unavailable" (fail-open) but must treat a refusal as a refusal.
 fn policy_error_response(err: PolicyError) -> MarshalResponse {
-    MarshalResponse::Error(MarshalError::Other(truncate_message(err.to_string())))
+    MarshalResponse::Error(MarshalError::PolicyRefused(truncate_message(
+        err.to_string(),
+    )))
 }
 
 /// Builds the real, enriched [`Kerkese`] envelope this proxy forwards to
@@ -1010,10 +1013,10 @@ mod tests {
             .expect("serve_one");
 
         match response {
-            MarshalResponse::Error(MarshalError::Other(msg)) => {
+            MarshalResponse::Error(MarshalError::PolicyRefused(msg)) => {
                 assert!(msg.contains("POLICY_REFUSE"));
             }
-            other => panic!("expected Error(Other) carrying a policy refusal, got {other:?}"),
+            other => panic!("expected Error(PolicyRefused), got {other:?}"),
         }
 
         // A policy refusal is a verification decision too — recorded as

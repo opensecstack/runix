@@ -373,6 +373,16 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x1, #0",
         "mov x2, #0",
         "svc #0",
+        // SYS_SIM_INSTALL(0, 0, 0x6666) -- expected to FAIL: re-installing
+        // over the live Enabled profile would swap its identity (and, with
+        // the old shared transition table, demote it). sim.rs now allows
+        // install from Created only, so this is WrongState(Enabled) and the
+        // profile's identity stays 0x1234.
+        "mov x0, {sys_sim_install}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "mov x3, #0x6666",
+        "svc #0",
         // SYS_SIM_DELETE(0, 0) -- expected to FAIL, and that failure is the
         // point: the capability check passes (sim:delete:0:0 is held) and
         // the MARSHAL gate passes, but the profile is still Enabled and

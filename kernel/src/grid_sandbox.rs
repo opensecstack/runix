@@ -36,7 +36,7 @@ use ed25519_dalek::SigningKey;
 use lazy_static::lazy_static;
 use runix_capability_manager::CapabilityToken;
 use runix_citadel_integration::{CitadelError, ShadowMarshalOutcome, WormLog};
-use runix_ipc::marshal::{MarshalOutcome, MarshalRequest, MarshalResponse};
+use runix_ipc::marshal::{MarshalError, MarshalOutcome, MarshalRequest, MarshalResponse};
 use spin::Mutex;
 use x86_64::structures::paging::{Page, PageTableFlags};
 use x86_64::VirtAddr;
@@ -232,6 +232,12 @@ fn shadow_marshal_evaluate(module_id: &str, instance_id: &str) -> ShadowMarshalO
                     MarshalOutcome::Refuse => ShadowMarshalOutcome::Refuse,
                     MarshalOutcome::HardStop => ShadowMarshalOutcome::HardStop,
                 },
+                // An explicit policy refusal from the proxy's own policy layer
+                // is a definite negative answer, not an outage: it must be
+                // observed (and, when enforcing, blocked) as `Refuse`.
+                Some(MarshalResponse::Error(MarshalError::PolicyRefused(_))) => {
+                    ShadowMarshalOutcome::Refuse
+                }
                 Some(MarshalResponse::Error(_)) | None => ShadowMarshalOutcome::Unreachable,
             }
         }

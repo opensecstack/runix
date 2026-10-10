@@ -2293,36 +2293,256 @@ separate freestanding crate from `kernel/` (which is deeply `x86_64`-specific
   nothing," and confining `AP[1]=1` to a small, dedicated page range never
   triggers the QEMU issue in the first place. See `mmu.rs`'s doc comment
   on `Level3Table` for the full account.
-- **Basic SIM provisioning** (`sim.rs`) — closing out Alpha mobile's last
-  unstarted roadmap item. A minimal per-slot profile state machine
-  (`Uninitialized -> Provisioned -> Activated`), gated by the *same*
-  capability check the RIL syscalls use: this slice generalized the demo
-  capability store (`ril_capability.rs`, now `capabilities.rs`) from a
-  single RIL-only slot to a small set of tokens covering any resource
-  kind, specifically so SIM slots and RIL channels could be authorized
-  independently for the one EL0 context. Proven end to end: `el0_demo`
-  walks slot 0 through `SYS_SIM_STATUS` (`Uninitialized`) ->
-  `SYS_SIM_PROVISION` (`Provisioned`) -> `SYS_SIM_ACTIVATE` (`Activated`),
-  confirming each transition with another `SYS_SIM_STATUS`, then gets
-  denied on `SYS_SIM_PROVISION`/`SYS_SIM_STATUS` for an unauthorized
-  slot — proving the capability boundary is uniform across resource
-  kinds, not something special-cased for RIL. Deliberately not a real
-  SIM/eSIM implementation: no APDU protocol, and `provision`'s "identity"
-  is one opaque `u64` (the `SVC` ABI only carries plain register
-  arguments — a real ICCID/IMSI needs ~15-20 digits, more than fits in
-  one), not real ICCID/IMSI digit strings. A fixed-size-buffer syscall ABI
-  is real follow-up work, not something to fake by packing digits into a
-  register.
+- **Basic SIM provisioning** (`sim.rs`, Alpha form) — the first minimal
+  per-slot state machine (`Uninitialized -> Provisioned -> Activated`, behind
+  `SYS_SIM_PROVISION`/`SYS_SIM_ACTIVATE`), gated by the same capability check
+  the RIL syscalls use. It proved the SIM capability boundary is uniform
+  across resource kinds rather than special-cased for RIL. **Superseded in
+  Beta** by the eSIM lifecycle below: those two syscalls no longer exist
+  (`svc.rs` now dispatches `SYS_SIM_CREATE`..`SYS_SIM_STATUS`, numbers 5–10),
+  and the identity limit it recorded (one opaque `u64`, not an ICCID/IMSI)
+  still applies.
 
-Not yet started: the real RIL/SIM *protocol* work itself (talking to
-actual radio/SIM hardware, not just proving the isolation boundary and
-provisioning state machine they'll run under) — per `mobile/src/lib.rs`'s
-doc comment, that starts once the shared kernel boots on target hardware;
-everything above is still QEMU-only.
+Not yet started: the real RIL/SIM *protocol* (APDU and eUICC command sets,
+talking to actual radio and SIM hardware, not just the isolation boundary
+and state machines they run under). Per `mobile/src/lib.rs`'s doc comment,
+that starts once the shared kernel boots on target hardware. Everything in
+this section, Beta included, is still QEMU-only.
 
 Non-secure boot (`-M virt` without `secure=on`, which resets straight to
 EL1 instead of EL3) now works too — previously produced no UART output at
 all, root-caused and fixed; see the bug entry below.
+
+## Mobile Beta: eSIM lifecycle, MVNO accounts, the MARSHAL gate, and the EL0 process model
+
+Beta items 1–3 (eSIM lifecycle, the MARSHAL gate, the MVNO account core) are
+built and QEMU-verified under `kernel-arm/`, with the pure policy core in
+`mobile/`. Item 4 (the data policy engine) is not started. The MARSHAL gate's
+transport is an EL0 process, so the EL0 process model those items run on is
+described last. The trust consequences of everything below are in
+[THREAT_MODEL.md](THREAT_MODEL.md)'s mobile block; this section is what was
+built and what it does not do.
+
+### eSIM lifecycle (`kernel-arm/src/sim.rs`, `svc.rs`)
+
+Each profile is in one of four states: `Created`, `Disabled`, `Enabled`,
+`Deleted`. There are four slots (`SLOT_COUNT`), each holding up to four
+profile containers (`MAX_PROFILES_PER_SLOT`). Every profile state change goes
+through one function, `SimSlot::transition`, which validates the whole
+transition before mutating anything. The legal transitions are
+`Created -> Disabled` (install), `Disabled -> Enabled` (which demotes whatever
+was `Enabled` in the same slot, under the same lock), `Enabled -> Disabled`,
+and `Disabled -> Deleted`. Two invariants follow from that table: at most one
+profile per slot is `Enabled`, and `Enabled -> Deleted` is a `WrongState`
+error that carries the from-state, so a caller learns to disable first.
+`Deleted` is terminal. Deleted containers are never reclaimed, so a slot can
+fill with them, but profile IDs stay stable for the boot.
+
+Capabilities are scoped per operation and checked on every call. Create
+checks `sim:{slot}`. Install, enable, disable and status check
+`sim:{slot}:{profile}`. Delete checks `sim:delete:{slot}:{profile}`, a
+separate resource, so general profile access does not confer the authority to
+destroy a profile.
+
+Enable and delete are the consequential pair: enable silently demotes the
+slot's active subscription, and delete is irreversible. Both pass the MARSHAL
+gate (below) before the state change, and enable also passes the MVNO gate
+first. Disable is not MARSHAL-gated because it is the recoverable direction,
+but it is audited.
+
+Audit happens at the syscall boundary (`svc.rs`'s `audit_transition`), not in
+`sim.rs`, because only the boundary knows the requesting context. It records
+the *intended* from/to, derived from the operation attempted, together with
+`authorized` and the error. It does not read `profile_state` before and after:
+`sim.rs` releases its lock between calls, so a before/after pair could straddle
+another context's transition and record a change that never happened.
+
+Gaps, specific to this section:
+
+- **Fixed (2026-10-10):** `sim::disable` used to accept a `Created` profile,
+  because one legality table keyed only on the target state served both
+  `install` and `disable`. A never-installed profile could be disabled and then
+  enabled, reaching `Enabled` with `identity` still `None`. The symmetric hole
+  was real too: `install` over an `Enabled` profile silently demoted it and
+  overwrote its identity. Every operation now carries its own required source
+  state (`Install` from `Created`, `Enable` and `Delete` from `Disabled`,
+  `Disable` from `Enabled`) and `SimSlot::transition` stays the single
+  enforcement point for the slot-wide invariants. The state machine is in the
+  lib target and has 13 host tests, including an exhaustive operation by
+  source-state matrix; the boot walk also proves the install-over-`Enabled`
+  rejection.
+- `identity` is one opaque `u64`, not an ICCID or IMSI. The register-only
+  `SVC` ABI cannot carry the 15–20 digits a real identifier needs.
+
+### MVNO account layer (`mobile/`, `kernel-arm/src/mvno.rs`)
+
+The policy is split from the kernel. `mobile/` (`runix-mobile`) is `core` and
+`alloc` only, with no I/O and no clock. Its `account.rs` `AccountRegistry`
+enforces every invariant in one `apply(Change, lifecycles)` function that
+validates fully before mutating. The registry is bounded (`MAX_ACCOUNTS` 16,
+`MAX_PROFILES_PER_ACCOUNT` 4). It never stores eSIM lifecycle state; it reads
+that through a `ProfileLifecycles` view, and an unknown lifecycle fails
+closed. A closed account keeps its bindings and never frees its slot.
+
+`mobile/src/selection.rs`'s `select_network` is pure. Every refusal is its own
+`RefusalReason` (eight variants), so "account suspended", "no allowed
+candidate" and "roaming not permitted" are distinguishable to a caller. Inputs
+over `MAX_CANDIDATES` (32) or `MAX_ALLOWED_NETWORKS` (64) are refused, not
+truncated, and ranking does not depend on modem order.
+
+`kernel-arm/src/mvno.rs` is the only enforcement point. It holds one registry
+behind a spin lock, with lock order registry then sim, never the reverse.
+Three syscalls manage accounts:
+
+- `SYS_MVNO_BIND` (16) needs both `mvno:account:{id}` and the profile's
+  `sim:{slot}:{profile}`, so account access alone cannot claim a profile.
+- `SYS_MVNO_SUSPEND` (17) needs `mvno:suspend:{id}`. Suspend is scoped apart
+  from general account access because it cuts service.
+- `SYS_MVNO_REACTIVATE` (18) needs `mvno:account:{id}`.
+
+Enable is fail-closed on the MVNO side. A profile that is not bound to an
+Active account is denied before any MARSHAL round trip. Suspend is a two-step
+handshake: the registry flips the account to `Suspended` and returns the
+`force_disable` list, then `svc.rs` applies `sim::disable` to each entry,
+audits each one, and re-checks "no `Enabled` profile under a non-Active
+account" against live sim state. Delete releases the profile's binding so the
+account's capacity frees.
+
+Simplifications, all deliberate at this stage:
+
+- In-memory only. Accounts, bindings, sim state and the WORM chain are lost
+  on reboot.
+- The one account is compiled in (`open_demo_account`, `AccountRegistry::demo`).
+  It is demo data, not a subscriber base.
+- The MARSHAL principal is the placeholder `el0:arm-demo`, not a token subject
+  (see the MARSHAL section and the THREAT_MODEL gaps).
+- Selection is proven on a fixed candidate list at boot, against a local
+  registry (`mvno_proof.rs`). No modem, RIL or carrier source feeds it.
+
+### MARSHAL gate for mobile (`marshal_action.rs`, `marshal_transport.rs`, `esim_marshal.rs`)
+
+One gate covers five action types: `esim.enable`, `esim.delete`,
+`mvno.bind_profile`, `mvno.suspend_account` and `mvno.reactivate_account`.
+`marshal_action.rs`'s `MarshalAction` builds each Kerkese envelope. The eSIM
+envelope is byte-identical to the format it had before the gate was
+generalized, and a host test pins that. `esim_marshal::evaluate` wraps
+`marshal_transport::evaluate`, and `esim_marshal::enforce` is the shared
+enforcement. There is no separate MVNO path. The registry lock is never held
+across an evaluation, because an evaluation can drive a nested EL0 excursion.
+
+The transport runs each evaluation in a fresh `net-driver-host-arm` EL0
+process, with its own address space and its own TCP source port. The process
+sends the encoded `runix-ipc` `MarshalRequest` to the configured proxy and
+copies the reply back via `SYS_MARSHAL_PROOF_DONE` (15). The kernel decodes
+the reply with `MarshalResponse::decode`. Every request sets `"dry_run": true`,
+which is hardcoded in `kerkese_json`, and `citadel_proxy` forwards that flag
+upstream. The principal is `el0:arm-demo`, role `operator`.
+
+How the result is classified (`marshal_transport.rs`, `esim_marshal::enforce`):
+
+| Result | Covers | Policy |
+|---|---|---|
+| `Remote(Unreachable)` | No proxy configured (no process spawned), no device, connect failure, no report within 64 boot-thread yields, empty or undecodable reply, **and every `MarshalResponse::Error` kind except `PolicyRefused`** | Fail-open: the operation proceeds |
+| `Remote(Refuse)` / `Remote(HardStop)` | A decoded CITADEL decision, **or** `MarshalError::PolicyRefused` from `citadel_proxy`'s own policy layer | Blocked, registry and sim untouched, **not WORM-audited** |
+| `LocalFailure(SetupFailed / SpawnFailed / ExcursionFaulted)` | The kernel could not run the evaluation: out of memory, thread spawn, EL0 fault | Fail-closed, `DENIED (MARSHAL local failure: ...)`, WORM-audited with `authorized=false` |
+
+The fail-open row has a consequence that has to be stated plainly. While the
+MARSHAL proxy is unreachable, every consequential mobile operation (eSIM enable
+and delete, MVNO bind, suspend and reactivate) proceeds without governance.
+Any failure of the link (proxy down, connection refused, no answer within the
+budget) turns the gate off for that operation. A proxy policy rejection is
+NOT fail-open any more: it used to be (`citadel_proxy` returned its own
+`POLICY_REFUSE` as `MarshalError::Other` and the kernel mapped every `Error`
+to the unreachable class, so an explicit "no" was treated as an outage). It
+now travels as its own wire variant, `MarshalError::PolicyRefused` (response
+tag 1, error-kind byte 4, same bounded string encoding as the other kinds),
+which both kernels classify as a refusal (`marshal_action::classify_response`
+on ARM, `grid_sandbox::shadow_marshal_evaluate` on x86). The kernel and the
+proxy must be deployed together: a proxy built before this change still sends
+`Other("POLICY_REFUSE...")`, which stays fail-open. A kernel envelope that
+fails to parse at all is still `BadResponse` and so still fail-open.
+
+The desktop side (`desktop/src/citadel/{policy,proxy}.rs`) recognizes
+`esim.enable`, `esim.delete` and the three `mvno.*` actions. Each action family
+has its own field rules: eSIM actions require `slot` and `profile`, MVNO
+actions require `account`, and each family rejects the others' fields. The
+proxy attaches its own Verifier identity (`sig_verifier`) and records its own
+WORM verification entry, attributed to module `esim` or `mvno`. CITADEL's
+server-side `rbacMap` carries entries for these actions (`esim.*` merged from
+`opensecstack` `b575903`; `mvno.*` via opensecstack PR #83).
+
+Not closed:
+
+- The proxy cannot construct `actor_token` or `sig_operator`. It attaches only
+  its own Verifier signature, so a live Gate 1/2 decision for a real operator
+  is not reachable from this code.
+- The signing key is the demo key.
+- CI's mock CITADEL (`mock_citadel_server_multi.py`) answers EXECUTE for any
+  request. The CI steps prove the kernel, proxy, policy and wire chain. They do
+  not prove a live Gate 2 pass.
+- The verdict is not authenticated end to end. `MarshalResponse::Decision`
+  carries an outcome and an opaque JSON body with no signature, and the link
+  is plaintext TCP. See THREAT_MODEL.md.
+
+### EL0 process model (`elf.rs`, `loader.rs`, `process.rs`, `scheduler.rs`, `el0_exec.rs`, `net_process.rs`)
+
+Built and QEMU-verified:
+
+- **ELF64 parser** (`elf.rs`): accepts `ET_EXEC` and `EM_AARCH64` only, and
+  checks every `PT_LOAD` range against the image length before anything is
+  copied from it.
+- **Loader with W^X** (`loader.rs`): maps segments into an address space. A
+  segment that is both writable and executable is rejected
+  (`SegmentWritableAndExecutable`). That is stricter than the x86_64 loader,
+  which maps such a segment. A 64 KiB unmapped guard gap sits between the
+  segments and the 16 KiB EL0 stack. Nothing has yet faulted into that gap, so
+  it is a layout property that has not been tested.
+- **Per-process address spaces** (`process.rs`): each process has a private
+  level-1 table, seeded from the kernel's. Private pages live in the window
+  `0x8000_0000`–`0xBFFF_FFFF` (level-1 index 2), which never shares
+  translation structures with code EL1 must keep fetching. There is no
+  `TTBR0`/`TTBR1` split: the kernel stays identity-mapped under `TTBR0_EL1`,
+  because a split means relinking the kernel high, which is more change than
+  the mobile work needed. There are no ASIDs. Every switch is a full
+  `tlbi vmalle1`, because the mappings are Global. `AddressSpace::destroy()` is
+  the reclamation path (see the bug entry below).
+- **Cooperative scheduler** (`scheduler.rs`): round robin. A switch saves the
+  AAPCS64 callee-saved set, including `d8`–`d15` (the low halves of
+  `v8`–`v15`), 160 bytes in all. Threads may own an address space, and
+  `TTBR0_EL1` is written only when it changes. Exited threads are reaped.
+- **One-shot EL0 entry** (`el0_exec.rs`): an EL1 frame `eret`s to EL0 and
+  resumes when the EL0 code issues its done syscall (`SYS_EL0_PROOF_DONE` 13,
+  `SYS_NET_PROOF_DONE` 14, `SYS_MARSHAL_PROOF_DONE` 15). At most one excursion
+  is in flight at a time, and EL0 can finish but cannot yield.
+- **`net-driver-host-arm`**: a separate compiled ELF, embedded at build time,
+  containing a ported virtio-mmio/virtio-net driver and `smoltcp`. Its one
+  kernel-mediated authority is the MMIO window for its own virtio slot, checked
+  by `check_mmio_window` (containment, computed with `checked_add`). It does
+  real outbound TCP, both for the `10.0.2.100:9000` proof round trip and for
+  MARSHAL requests. Its poll loops are bounded by iteration counts
+  (2,000,000 for the connect-and-exchange loops, 200,000 for the graceful
+  close), not by time.
+- **Channels** (`ipc_channel.rs`): four single-byte mailboxes in their own
+  `ipc:{n}` space, re-checked on every call (`SYS_IPC_SEND` 11,
+  `SYS_IPC_RECV` 12).
+
+Not present, stated so none of it is assumed:
+
+- **Timer-driven preemption.** The generic timer is read for the current time,
+  but never raises an interrupt that reschedules. EL0 code runs until it
+  issues a syscall, and the kernel cannot interrupt it.
+- **Guard pages under EL1 thread stacks.** Those stacks are 8 KiB heap blocks.
+- **A per-thread EL1 entry stack and a general `SYS_YIELD`.** Until these
+  exist, EL0 can finish but cannot yield, and only one excursion runs at a time.
+- **A typed IPC layer for the channels.** They carry raw bytes. The MARSHAL
+  path does use the typed `runix-ipc` wire format.
+- **A per-process capability model.** One global capability set serves the
+  single EL0 context, which is why the MARSHAL principal is a placeholder.
+- **A real secure world.** EL3 here is this crate's own boot code
+  (`vectors.rs`, `nonsecure.rs`), not TF-A firmware, so no secure-world code
+  runs or is isolated from the kernel.
+- **Persistent storage, the real RIL/SIM/eUICC protocol, and real hardware.**
+  Everything runs under QEMU (`virt`, `cortex-a53`).
 
 ## Real bugs worth knowing before touching the relevant code again
 
@@ -2544,6 +2764,46 @@ back via genuine `strb`/`ldrb` through `SP_EL0`, echoed via `SYS_WRITE`
 mapping, verified in QEMU for both the `secure=on` and no-`secure`
 boot paths. See `mmu.rs`'s doc comment on `Level3Table` for the complete
 account.
+
+- **A resource leak that silently turned MARSHAL off (`kernel-arm`).** Every
+  MARSHAL evaluation process leaked its address space (~332 KiB) and its
+  thread stack. The 4 MiB EL1 heap drained after roughly eight evaluations.
+  The next evaluation's setup failed with out-of-memory, and that failure was
+  mapped to `Unreachable`, which is fail-open. From then on MARSHAL was off for
+  the rest of the boot, and the only trace was an ordinary `Unreachable` line.
+  Two fixes, both needed:
+  1. **Real reclamation.** `AddressSpace::destroy()` (`process.rs`) frees only
+     memory the space owns. `reclaim.rs`'s `plan_frees` validates every extent
+     before any free (4 KiB alignment, non-empty, inside the heap, no
+     overlaps, so a double free is refused). `destroy` refuses the live
+     `TTBR0_EL1` space and never frees an MMIO window, and it flushes the TLB
+     before any frame is freed. The virtio device is reset first, so it cannot
+     DMA into memory the heap has since reused. Exited threads are reaped by
+     `scheduler::reap_exited`. `reclaim_proof.rs` runs 24 evaluations and checks
+     that every thread was reaped and that heap use stays within a 16 KiB
+     budget. The measured drift was zero.
+  2. **A policy split.** A local failure of the evaluation machinery (setup or
+     out-of-memory, spawn, EL0 fault) now fails closed and is WORM-audited.
+     Only an unreachable remote stays fail-open. The reason: a buggy or hostile
+     EL0 caller can exhaust resources just by repeating governed syscalls, so
+     treating a local failure as fail-open would let it bypass MARSHAL.
+
+  Residual leaks, tracked and not yet closed: the boot proofs' own one-off
+  threads and address spaces (about 332 KiB, once per boot), and an evaluation
+  that times out or faults before its process exits.
+
+- **Source-port reuse: only the first MARSHAL evaluation per boot reached the
+  listener (`kernel-arm`).** Every evaluation process connected from the same
+  source port, 49152. The EL0 driver never sets smoltcp's random seed, so the
+  initial sequence number did not vary between processes, and no process sent a
+  FIN. Behind SLIRP's `guestfwd`, the second and later connections were
+  therefore indistinguishable from the first, and the listener only ever saw
+  one. Fix: each evaluation gets its own source port, 49153 through 65152,
+  wrapping (`marshal_action.rs`'s `marshal_local_port`, pinned by
+  `marshal_local_ports_are_distinct_in_range_and_wrap_safely`), and the process
+  closes its connection gracefully within a bounded poll budget. This failure
+  appeared only with several evaluations in one boot, so single-evaluation
+  proofs did not catch it. It needed a real multi-evaluation run to show.
 
 ## MARSHAL Verifier identity: the `citadel_proxy` becomes a real second principal
 

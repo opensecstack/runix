@@ -113,11 +113,52 @@ pub struct EsimProfile {
     pub state: ProfileState,
 }
 
+/// The four state-changing operations on an existing profile. Each names
+/// exactly one documented source state and one target state, so
+/// `SimSlot::transition` checks the *operation*, not just the target: the
+/// same target (`Disabled`) is reached by two different operations
+/// (`Install` from `Created`, `Disable` from `Enabled`) that must not be
+/// interchangeable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Op {
+    Install,
+    Enable,
+    Disable,
+    Delete,
+}
+
+impl Op {
+    /// The one source state this operation is legal from.
+    fn source_state(self) -> ProfileState {
+        match self {
+            Op::Install => ProfileState::Created,
+            Op::Enable => ProfileState::Disabled,
+            Op::Disable => ProfileState::Enabled,
+            Op::Delete => ProfileState::Disabled,
+        }
+    }
+
+    fn target_state(self) -> ProfileState {
+        match self {
+            Op::Install => ProfileState::Disabled,
+            Op::Enable => ProfileState::Enabled,
+            Op::Disable => ProfileState::Disabled,
+            Op::Delete => ProfileState::Deleted,
+        }
+    }
+}
+
 struct SimSlot {
     profiles: Vec<EsimProfile>,
 }
 
 impl SimSlot {
+    const fn new() -> Self {
+        SimSlot {
+            profiles: Vec::new(),
+        }
+    }
+
     fn find(&self, profile_id: u8) -> Result<usize, SimError> {
         self.profiles
             .iter()
@@ -125,10 +166,39 @@ impl SimSlot {
             .ok_or(SimError::NoSuchProfile)
     }
 
+    fn create(&mut self) -> Result<u8, SimError> {
+        if self.profiles.len() >= MAX_PROFILES_PER_SLOT {
+            return Err(SimError::SlotFull);
+        }
+        let id = self.profiles.len() as u8;
+        self.profiles.push(EsimProfile {
+            id,
+            identity: None,
+            state: ProfileState::Created,
+        });
+        Ok(id)
+    }
+
+    fn install(&mut self, profile_id: u8, identity: u64) -> Result<(), SimError> {
+        self.transition(profile_id, Op::Install)?;
+        // Only after the transition is accepted -- a rejected install leaves
+        // no identity behind. `find` cannot fail here: `transition` just
+        // resolved the same ID under the same lock.
+        let idx = self.find(profile_id)?;
+        self.profiles[idx].identity = Some(identity);
+        Ok(())
+    }
+
     /// The **only** place a profile's state ever changes. Everything public
     /// in this module routes through here, so the two slot-wide invariants
     /// (at most one `Enabled` profile; no direct `Enabled -> Deleted`) have
     /// exactly one enforcement point rather than one per operation.
+    ///
+    /// The source-state check is per *operation* (`Op::source_state`), so e.g.
+    /// `Disable` cannot be applied to a never-installed `Created` profile
+    /// and `Install` cannot be applied to a live `Enabled` one. `Created` is
+    /// never a target (creation is `create`, not a transition) and `Deleted`
+    /// is never a source, which is what makes it terminal.
     ///
     /// Validates fully *before* mutating anything: on `Err` the slot is
     /// untouched, and on `Ok` the enable case has both the
@@ -136,26 +206,13 @@ impl SimSlot {
     /// caller holds the `SLOTS` lock across this whole call, no other
     /// context can observe the in-between state where zero or two profiles
     /// in this slot are `Enabled`.
-    fn transition(&mut self, profile_id: u8, to: ProfileState) -> Result<(), SimError> {
+    fn transition(&mut self, profile_id: u8, op: Op) -> Result<(), SimError> {
         let idx = self.find(profile_id)?;
         let from = self.profiles[idx].state;
-
-        // The legality table, as one match rather than scattered per-caller
-        // checks. Note `Created` is absent as a target: creation is not a
-        // transition (that's `create`), so `to == Created` is always
-        // rejected, and `Deleted` has no arm as a source, which is what
-        // makes it terminal.
-        let legal = match to {
-            ProfileState::Disabled => {
-                from == ProfileState::Created || from == ProfileState::Enabled
-            }
-            ProfileState::Enabled => from == ProfileState::Disabled,
-            ProfileState::Deleted => from == ProfileState::Disabled,
-            ProfileState::Created => false,
-        };
-        if !legal {
+        if from != op.source_state() {
             return Err(SimError::WrongState(from));
         }
+        let to = op.target_state();
 
         // Exactly-one-Enabled: enabling X demotes whatever was Enabled
         // before, in the same critical section as enabling X. Done after
@@ -173,9 +230,7 @@ impl SimSlot {
     }
 }
 
-const EMPTY_SLOT: SimSlot = SimSlot {
-    profiles: Vec::new(),
-};
+const EMPTY_SLOT: SimSlot = SimSlot::new();
 
 static SLOTS: Mutex<[SimSlot; SLOT_COUNT]> = Mutex::new([EMPTY_SLOT; SLOT_COUNT]);
 
@@ -187,37 +242,23 @@ static SLOTS: Mutex<[SimSlot; SLOT_COUNT]> = Mutex::new([EMPTY_SLOT; SLOT_COUNT]
 /// `identity`; `install` is what gives it one.
 pub fn create(slot: usize) -> Result<u8, SimError> {
     let mut slots = SLOTS.lock();
-    let s = slots.get_mut(slot).ok_or(SimError::NoSuchSlot)?;
-    if s.profiles.len() >= MAX_PROFILES_PER_SLOT {
-        return Err(SimError::SlotFull);
-    }
-    let id = s.profiles.len() as u8;
-    s.profiles.push(EsimProfile {
-        id,
-        identity: None,
-        state: ProfileState::Created,
-    });
-    Ok(id)
+    slots.get_mut(slot).ok_or(SimError::NoSuchSlot)?.create()
 }
 
 /// Installs (in RSP terms: downloads) a profile into its container:
-/// `Created -> Disabled`, setting `identity`.
+/// `Created -> Disabled`, setting `identity`, and legal from `Created` only.
 ///
 /// A freshly installed profile is `Disabled`, not `Enabled` -- installing a
 /// profile does not steal the slot's active subscription out from under
-/// whatever is already `Enabled`. `enable` is a separate, explicit step.
-/// Re-installing an already-installed profile is rejected (`WrongState`),
-/// not silently overwritten with a second identity.
+/// whatever is already `Enabled`. Re-installing an already-installed profile
+/// (`Disabled`, `Enabled` or `Deleted`) is rejected (`WrongState`), never
+/// silently overwritten with a second identity.
 pub fn install(slot: usize, profile_id: u8, identity: u64) -> Result<(), SimError> {
     let mut slots = SLOTS.lock();
-    let s = slots.get_mut(slot).ok_or(SimError::NoSuchSlot)?;
-    s.transition(profile_id, ProfileState::Disabled)?;
-    // Only after the transition is accepted -- a rejected install leaves no
-    // identity behind. `find` cannot fail here: `transition` just resolved
-    // the same ID under the same lock.
-    let idx = s.find(profile_id)?;
-    s.profiles[idx].identity = Some(identity);
-    Ok(())
+    slots
+        .get_mut(slot)
+        .ok_or(SimError::NoSuchSlot)?
+        .install(profile_id, identity)
 }
 
 /// Enables a profile: `Disabled -> Enabled`, atomically disabling whichever
@@ -228,17 +269,22 @@ pub fn install(slot: usize, profile_id: u8, identity: u64) -> Result<(), SimErro
 /// first.
 pub fn enable(slot: usize, profile_id: u8) -> Result<(), SimError> {
     let mut slots = SLOTS.lock();
-    let s = slots.get_mut(slot).ok_or(SimError::NoSuchSlot)?;
-    s.transition(profile_id, ProfileState::Enabled)
+    slots
+        .get_mut(slot)
+        .ok_or(SimError::NoSuchSlot)?
+        .transition(profile_id, Op::Enable)
 }
 
-/// Disables the active profile: `Enabled -> Disabled`. Leaves the slot with
-/// no `Enabled` profile at all, which is a legitimate state (an eUICC with
-/// every profile disabled has no active subscription).
+/// Disables the active profile: `Enabled -> Disabled`, and only from
+/// `Enabled` (a never-installed `Created` profile is `WrongState`). Leaves
+/// the slot with no `Enabled` profile at all, which is a legitimate state (an
+/// eUICC with every profile disabled has no active subscription).
 pub fn disable(slot: usize, profile_id: u8) -> Result<(), SimError> {
     let mut slots = SLOTS.lock();
-    let s = slots.get_mut(slot).ok_or(SimError::NoSuchSlot)?;
-    s.transition(profile_id, ProfileState::Disabled)
+    slots
+        .get_mut(slot)
+        .ok_or(SimError::NoSuchSlot)?
+        .transition(profile_id, Op::Disable)
 }
 
 /// Deletes a profile: `Disabled -> Deleted`, and only from `Disabled`.
@@ -249,8 +295,10 @@ pub fn disable(slot: usize, profile_id: u8) -> Result<(), SimError> {
 /// record and can never transition again.
 pub fn delete(slot: usize, profile_id: u8) -> Result<(), SimError> {
     let mut slots = SLOTS.lock();
-    let s = slots.get_mut(slot).ok_or(SimError::NoSuchSlot)?;
-    s.transition(profile_id, ProfileState::Deleted)
+    slots
+        .get_mut(slot)
+        .ok_or(SimError::NoSuchSlot)?
+        .transition(profile_id, Op::Delete)
 }
 
 /// Reads one profile's current state. Always succeeds for an existing
@@ -323,5 +371,188 @@ impl core::fmt::Display for SimError {
             ),
             SimError::WrongState(s) => write!(f, "wrong state for this operation ({s:?})"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ProfileState::*;
+
+    fn st(s: &SimSlot, id: u8) -> ProfileState {
+        s.profiles[s.find(id).unwrap()].state
+    }
+
+    fn assert_wrong(r: Result<(), SimError>, from: ProfileState) {
+        match r {
+            Err(SimError::WrongState(f)) => assert_eq!(f, from),
+            other => panic!("expected WrongState({from:?}), got {other:?}"),
+        }
+    }
+
+    /// A slot with profile 0 driven to `target` by legal operations only.
+    fn at(target: ProfileState) -> SimSlot {
+        let mut s = SimSlot::new();
+        let id = s.create().unwrap();
+        if target != Created {
+            s.install(id, 0x1234).unwrap();
+        }
+        if target == Enabled || target == Deleted {
+            s.transition(id, Op::Enable).unwrap();
+        }
+        if target == Deleted {
+            s.transition(id, Op::Disable).unwrap();
+            s.transition(id, Op::Delete).unwrap();
+        }
+        assert_eq!(st(&s, id), target);
+        s
+    }
+
+    #[test]
+    fn full_legal_walk() {
+        let mut s = SimSlot::new();
+        let id = s.create().unwrap();
+        assert_eq!(st(&s, id), Created);
+        assert_eq!(s.profiles[0].identity, None);
+        s.install(id, 7).unwrap();
+        assert_eq!(st(&s, id), Disabled);
+        assert_eq!(s.profiles[0].identity, Some(7));
+        s.transition(id, Op::Enable).unwrap();
+        assert_eq!(st(&s, id), Enabled);
+        s.transition(id, Op::Disable).unwrap();
+        assert_eq!(st(&s, id), Disabled);
+        s.transition(id, Op::Delete).unwrap();
+        assert_eq!(st(&s, id), Deleted);
+    }
+
+    #[test]
+    fn disable_on_created_rejected_so_no_identityless_enable() {
+        let mut s = at(Created);
+        assert_wrong(s.transition(0, Op::Disable), Created);
+        assert_eq!(st(&s, 0), Created);
+        // The original attack: disable then enable must not reach Enabled.
+        assert_wrong(s.transition(0, Op::Enable), Created);
+        assert_eq!(st(&s, 0), Created);
+        assert_eq!(s.profiles[0].identity, None);
+    }
+
+    #[test]
+    fn enable_on_created_rejected() {
+        let mut s = at(Created);
+        assert_wrong(s.transition(0, Op::Enable), Created);
+    }
+
+    #[test]
+    fn install_over_non_created_rejected() {
+        for from in [Disabled, Enabled, Deleted] {
+            let mut s = at(from);
+            assert_wrong(s.install(0, 0x9999), from);
+            assert_eq!(st(&s, 0), from);
+            assert_eq!(s.profiles[0].identity, Some(0x1234));
+        }
+    }
+
+    #[test]
+    fn double_install_rejected() {
+        let mut s = at(Created);
+        s.install(0, 1).unwrap();
+        assert_wrong(s.install(0, 2), Disabled);
+        assert_eq!(s.profiles[0].identity, Some(1));
+    }
+
+    #[test]
+    fn delete_from_each_state() {
+        assert_wrong(at(Created).transition(0, Op::Delete), Created);
+        assert!(at(Disabled).transition(0, Op::Delete).is_ok());
+        assert_wrong(at(Enabled).transition(0, Op::Delete), Enabled);
+        assert_wrong(at(Deleted).transition(0, Op::Delete), Deleted);
+    }
+
+    #[test]
+    fn deleted_is_terminal_for_every_op() {
+        for op in [Op::Install, Op::Enable, Op::Disable, Op::Delete] {
+            let mut s = at(Deleted);
+            assert_wrong(s.transition(0, op), Deleted);
+        }
+    }
+
+    #[test]
+    fn every_op_accepts_only_its_source_state() {
+        let all = [Created, Disabled, Enabled, Deleted];
+        for op in [Op::Install, Op::Enable, Op::Disable, Op::Delete] {
+            for from in all {
+                let mut s = at(from);
+                let r = s.transition(0, op);
+                if from == op.source_state() {
+                    assert!(r.is_ok(), "{op:?} from {from:?}");
+                    assert_eq!(st(&s, 0), op.target_state());
+                } else {
+                    assert_wrong(r, from);
+                    assert_eq!(st(&s, 0), from);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn enable_demotes_previous_enabled() {
+        let mut s = SimSlot::new();
+        let a = s.create().unwrap();
+        let b = s.create().unwrap();
+        s.install(a, 1).unwrap();
+        s.install(b, 2).unwrap();
+        s.transition(a, Op::Enable).unwrap();
+        s.transition(b, Op::Enable).unwrap();
+        assert_eq!(st(&s, a), Disabled);
+        assert_eq!(st(&s, b), Enabled);
+        let n = s.profiles.iter().filter(|p| p.state == Enabled).count();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn rejected_enable_leaves_active_profile_alone() {
+        let mut s = SimSlot::new();
+        let a = s.create().unwrap();
+        let b = s.create().unwrap(); // stays Created
+        s.install(a, 1).unwrap();
+        s.transition(a, Op::Enable).unwrap();
+        assert_wrong(s.transition(b, Op::Enable), Created);
+        assert_eq!(st(&s, a), Enabled);
+        assert_eq!(st(&s, b), Created);
+    }
+
+    #[test]
+    fn errors_leave_slot_untouched() {
+        let mut s = at(Enabled);
+        let before = s.profiles.clone();
+        assert!(s.install(0, 5).is_err());
+        assert!(s.transition(0, Op::Enable).is_err());
+        assert!(s.transition(0, Op::Delete).is_err());
+        assert!(matches!(
+            s.transition(9, Op::Disable),
+            Err(SimError::NoSuchProfile)
+        ));
+        assert_eq!(s.profiles.len(), before.len());
+        for (x, y) in s.profiles.iter().zip(before.iter()) {
+            assert_eq!((x.id, x.identity, x.state), (y.id, y.identity, y.state));
+        }
+    }
+
+    #[test]
+    fn slot_full_bound() {
+        let mut s = SimSlot::new();
+        for _ in 0..MAX_PROFILES_PER_SLOT {
+            s.create().unwrap();
+        }
+        assert!(matches!(s.create(), Err(SimError::SlotFull)));
+    }
+
+    #[test]
+    fn display_strings_unchanged() {
+        use std::string::ToString;
+        assert_eq!(
+            SimError::WrongState(Enabled).to_string(),
+            "wrong state for this operation (Enabled)"
+        );
     }
 }

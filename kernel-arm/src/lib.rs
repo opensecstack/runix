@@ -47,4 +47,5 @@ pub mod elf;
 pub mod loader;
 pub mod marshal_action;
 pub mod reclaim;
+pub mod sim;
 pub mod vm;

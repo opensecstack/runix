@@ -25,8 +25,9 @@
 //! request-building convention (`dry_run: true`, a minimal but genuinely
 //! well-formed envelope), and the same outcome mapping
 //! (`MarshalResponse::Decision{outcome,..}` passes through;
+//! `Error(PolicyRefused(_))` is `Remote(Refuse)`; any other
 //! `MarshalResponse::Error(_)`, an undecodable reply, or no reply at all
-//! are all `Remote(Unreachable)`), with one deliberate divergence: local
+//! is `Remote(Unreachable)`), with one deliberate divergence: local
 //! failures of the kernel's own evaluation machinery are a separate
 //! `GateOutcome::LocalFailure` that fails closed -- see [`evaluate`]. The transport underneath
 //! differs -- that function reaches a user-space MARSHAL proxy via
@@ -47,9 +48,9 @@ use crate::net_process;
 use crate::serial_println;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use runix_citadel_integration::ShadowMarshalOutcome;
-use runix_ipc::marshal::{MarshalOutcome, MarshalRequest, MarshalResponse};
+use runix_ipc::marshal::{MarshalError, MarshalRequest, MarshalResponse};
 use runix_kernel_arm::marshal_action::{
-    marshal_local_port, GateOutcome, LocalFailure, MarshalAction,
+    classify_response, marshal_local_port, GateOutcome, LocalFailure, MarshalAction,
 };
 use spin::Mutex;
 
@@ -253,7 +254,14 @@ extern "C" fn marshal_transport_thread() -> ! {
 /// - the remote connect failed or timed out (`status != 0` / empty reply);
 /// - the EL0 process did not report back within the bounded 64-yield budget
 ///   (ambiguous with a slow network, so not blamed on the kernel);
-/// - the reply did not decode, or decoded as `MarshalResponse::Error`.
+/// - the reply did not decode, or decoded as `MarshalResponse::Error` of kind
+///   `Unreachable`/`Timeout`/`BadResponse`/`Other` (no usable Decision).
+///
+/// **`Remote(Refuse)` (blocked)**
+/// - `Decision{Refuse}`, and `MarshalResponse::Error(PolicyRefused(_))`: the
+///   proxy's own policy layer explicitly refused the request. That is a
+///   definite negative answer, not an outage, so it is never fail-open.
+///   (Pure table: `marshal_action::classify_response`.)
 ///
 /// **`LocalFailure(..)` (fail-closed: the kernel failed to run the evaluation)**
 /// - `net_process::setup` failing, including out of memory for a page or
@@ -485,13 +493,17 @@ pub(crate) fn evaluate_configured(
     // `MARSHAL_BUFFER_CAPACITY`, the exact size `setup` mapped.
     let bytes = unsafe { core::slice::from_raw_parts(response_phys as *const u8, len) };
 
-    match MarshalResponse::decode(bytes) {
-        Some((MarshalResponse::Decision { outcome, .. }, _)) => Remote(match outcome {
-            MarshalOutcome::Execute => ShadowMarshalOutcome::Execute,
-            MarshalOutcome::Refuse => ShadowMarshalOutcome::Refuse,
-            MarshalOutcome::HardStop => ShadowMarshalOutcome::HardStop,
-        }),
-        // Remote class: an undecodable or error reply is "no usable Decision".
-        Some((MarshalResponse::Error(_), _)) | None => Remote(ShadowMarshalOutcome::Unreachable),
+    let decoded = MarshalResponse::decode(bytes).map(|(r, _)| r);
+    if let Some(MarshalResponse::Error(MarshalError::PolicyRefused(reason))) = &decoded {
+        // Reason is at most MAX_MESSAGE_LEN bytes (wire bound); `{:?}` escapes
+        // control characters so it stays on one line.
+        serial_println!(
+            "Runix ARM kernel: MARSHAL evaluation for {}: proxy policy refusal reason: {:?}",
+            action.label(),
+            reason
+        );
     }
+    // A policy refusal is an explicit negative answer (Refuse, blocked); every
+    // other error / undecodable reply is "no usable Decision" (Unreachable).
+    Remote(classify_response(decoded.as_ref()))
 }
