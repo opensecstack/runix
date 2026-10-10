@@ -170,6 +170,9 @@ pub struct NetBootInfo {
     pub mode: u64,
     pub remote_ip: [u8; 4],
     pub remote_port: u16,
+    /// Source port for `mode == 1` (`0` = driver default); fills what was
+    /// padding before -- see `net-driver-host-arm::NetBootInfo::local_port`.
+    pub local_port: u16,
     pub request_len: u64,
 }
 

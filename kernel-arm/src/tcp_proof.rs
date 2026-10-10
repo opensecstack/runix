@@ -304,6 +304,7 @@ pub fn prove_net_tcp() {
         mode: 0,
         remote_ip: [0; 4],
         remote_port: 0,
+        local_port: 0,
         request_len: 0,
     };
 

@@ -173,6 +173,17 @@ struct NetBootInfo {
     /// `Mode::MarshalRequest`-only: the remote TCP port, replacing the role
     /// [`TCP_REMOTE_PORT`] plays for `Mode::TcpProof`.
     remote_port: u16,
+    /// `Mode::MarshalRequest`-only: the local (source) TCP port to connect
+    /// from. Every MARSHAL evaluation is a fresh process on a fresh smoltcp
+    /// stack (same deterministic ISN, same 10.0.2.15) that never gets to
+    /// tear its flow down on the SLIRP side, so reusing one fixed source
+    /// port makes every evaluation after the first present a SYN whose
+    /// 4-tuple SLIRP still holds -- the caller therefore passes a distinct
+    /// port per evaluation. `0` (an unset/legacy value) falls back to
+    /// [`TCP_LOCAL_PORT`]. Occupies what was previously `repr(C)` padding
+    /// between `remote_port` and `request_len`, so no other offset and not
+    /// the struct's size changes. `Mode::TcpProof` ignores it.
+    local_port: u16,
     /// `Mode::MarshalRequest`-only: how many bytes at [`MARSHAL_REQUEST_VA`]
     /// are valid — the loader writes the encoded `MarshalRequest` there
     /// before `eret`ing and records its exact length here, since the
@@ -636,7 +647,11 @@ fn run_marshal_request(
         .connect(
             iface.context(),
             (IpAddress::Ipv4(remote_ip), info.remote_port),
-            TCP_LOCAL_PORT,
+            if info.local_port == 0 {
+                TCP_LOCAL_PORT
+            } else {
+                info.local_port
+            },
         )
         .is_err()
     {
@@ -704,12 +719,31 @@ fn run_marshal_request(
         }
     }
 
+    // Graceful close: send a FIN and keep polling (bounded) until the
+    // socket reaches Closed/TimeWait, so SLIRP sees the teardown instead
+    // of a flow that is silently abandoned when this process is destroyed.
+    // The poll clock continues past the main loop's last timestamp.
+    sockets.get_mut::<tcp::Socket>(handle).close();
+    for offset in 0..CLOSE_POLL_BUDGET {
+        let timestamp = Instant::from_millis(2_000_000 + offset as i64);
+        iface.poll(timestamp, device, &mut sockets);
+        let state = sockets.get_mut::<tcp::Socket>(handle).state();
+        if matches!(state, tcp::State::Closed | tcp::State::TimeWait) {
+            break;
+        }
+    }
+
     if received_len == 0 {
         (1, 0)
     } else {
         (0, received_len as u64)
     }
 }
+
+/// Upper bound on the post-response polls spent waiting for the TCP close
+/// handshake to finish in [`run_marshal_request`]. Generous relative to a
+/// local SLIRP round trip, small relative to the 2,000,000 main-loop bound.
+const CLOSE_POLL_BUDGET: u32 = 200_000;
 
 /// Renders a [`virtio_mmio::ProbeError`] without pulling in `core::fmt`'s
 /// heavier machinery at a call site that already has a plain byte-sink

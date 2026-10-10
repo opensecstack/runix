@@ -46,7 +46,7 @@ use crate::serial_println;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use runix_citadel_integration::ShadowMarshalOutcome;
 use runix_ipc::marshal::{MarshalOutcome, MarshalRequest, MarshalResponse};
-use runix_kernel_arm::marshal_action::MarshalAction;
+use runix_kernel_arm::marshal_action::{marshal_local_port, MarshalAction};
 use spin::Mutex;
 
 /// The compiled `net-driver-host-arm` binary -- the same ELF `tcp_proof.rs`
@@ -132,6 +132,10 @@ static RESPONSE_PHYS: AtomicU64 = AtomicU64::new(0);
 /// is never explicitly cleared (ANDing with `el0_exec::continuation_live()`
 /// already makes [`continuation_live`] false again once this excursion
 /// ends, one way or the other).
+/// Count of MARSHAL evaluations started this boot; feeds
+/// `marshal_local_port` so each gets its own TCP source port.
+static EVALUATION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 static MARSHAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// See [`MARSHAL_ACTIVE`]'s doc comment for why this is not simply
@@ -328,6 +332,10 @@ fn evaluate_configured(
         mode: 1,
         remote_ip,
         remote_port,
+        // A distinct source port per evaluation: every evaluation is a
+        // fresh process that never tears its flow down, so reusing one
+        // fixed port made SLIRP reject every SYN after the first.
+        local_port: marshal_local_port(EVALUATION_COUNTER.fetch_add(1, Ordering::Relaxed)),
         // Overwritten by `net_process::setup` to match `encoded`'s own
         // (possibly clamped) length -- see that function's doc comment.
         request_len: 0,

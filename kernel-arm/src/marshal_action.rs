@@ -111,9 +111,46 @@ impl MarshalAction<'_> {
     }
 }
 
+/// First source port handed to a MARSHAL evaluation. `49152` itself is left
+/// to the TCP proof (`tcp_proof.rs` / the driver's `TCP_LOCAL_PORT`).
+pub const MARSHAL_LOCAL_PORT_BASE: u16 = 49153;
+/// How many distinct ports the MARSHAL range spans before wrapping
+/// (49153..=65152, safely inside the ephemeral range, never 0).
+pub const MARSHAL_LOCAL_PORT_SPAN: u16 = 16000;
+
+/// Source port for the `n`th MARSHAL evaluation of this boot. Each
+/// evaluation is a fresh driver process that abandons its flow, so SLIRP
+/// may still hold the previous 4-tuple; a distinct port per evaluation
+/// keeps every SYN a new flow. Wraps inside a bounded range.
+pub fn marshal_local_port(n: u64) -> u16 {
+    MARSHAL_LOCAL_PORT_BASE + (n % MARSHAL_LOCAL_PORT_SPAN as u64) as u16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marshal_local_ports_are_distinct_in_range_and_wrap_safely() {
+        let first = marshal_local_port(0);
+        assert_eq!(first, MARSHAL_LOCAL_PORT_BASE);
+        assert_ne!(first, 49152);
+        for n in 0..(MARSHAL_LOCAL_PORT_SPAN as u64) {
+            let p = marshal_local_port(n);
+            assert!(p >= MARSHAL_LOCAL_PORT_BASE && p != 0);
+            assert!(
+                u32::from(p)
+                    < u32::from(MARSHAL_LOCAL_PORT_BASE) + u32::from(MARSHAL_LOCAL_PORT_SPAN)
+            );
+            if n > 0 {
+                assert_ne!(p, marshal_local_port(n - 1));
+            }
+        }
+        assert_ne!(marshal_local_port(1), marshal_local_port(2));
+        assert_eq!(marshal_local_port(MARSHAL_LOCAL_PORT_SPAN as u64), first);
+        // No overflow even at the extreme.
+        let _ = marshal_local_port(u64::MAX);
+    }
 
     const P: &str = "el0:arm-demo";
 
