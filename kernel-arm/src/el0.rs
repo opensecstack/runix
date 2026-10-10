@@ -25,6 +25,13 @@
 //! a general-purpose IPC channel (`ipc_channel.rs`) and getting denied on
 //! an unauthorized channel number.
 //!
+//! Beta item 3.3 extends the eSIM walk with the MVNO account layer (see the
+//! "MVNO" section below): `SYS_MVNO_BIND` before the first `ENABLE`, a
+//! suspend/denied-enable/reactivate/re-enable cycle around the existing
+//! `DELETE`-must-fail check, an unbound-profile enable denial, and
+//! account-99 capability denials. Every pre-existing syscall and ordering
+//! assertion below is kept.
+//!
 //! # Why the IPC walk is sequential send-then-recv from one context
 //!
 //! The IPC pair is exercised exactly the way the RIL pair already is: this
@@ -63,6 +70,23 @@
 //!   exists for. Nothing else in this demo uses `x3`, so if that load's
 //!   stack offset were wrong, this is the syscall that would show it (as a
 //!   garbage identity in `svc.rs`'s `SYS_SIM_INSTALL` print).
+//!
+//! # The MVNO additions
+//!
+//! `BIND(0,0,0)` sits between `INSTALL` and the first `ENABLE` because
+//! `svc.rs`'s MVNO gate refuses to enable an unbound profile. After the first
+//! `ENABLE`/`STATUS` the walk runs `SUSPEND(0)` (forced disable + audit),
+//! `STATUS` (Disabled), `ENABLE` (**DENIED (MVNO ...)**, the account is
+//! Suspended), `REACTIVATE(0)`, `ENABLE` (authorized again) and `STATUS`
+//! (Enabled) -- ending Enabled so the existing `DELETE`-must-fail /
+//! `DISABLE` / `DELETE` sequence runs unchanged. The successful `DELETE`
+//! also releases the binding (kernel-side). Afterwards a second profile is
+//! created and installed in slot 0 but never bound, and its `ENABLE` is
+//! denied (MVNO), proving the gate fails closed. Finally `BIND(99, ..)` and
+//! `SUSPEND(99)` are denied for lack of a capability, and `BIND(0, 0, 2)` is
+//! denied because the account capability is held but the profile capability
+//! (`sim:0:2`) is not -- `BIND` needs both. The MVNO syscalls are
+//! capability-gated and audited but not yet MARSHAL-gated (Beta item 3.4).
 //!
 //! The denial half intentionally uses `CREATE(99)`/`STATUS(99, 0)` rather
 //! than repeating every operation on slot 99: the point is that the
@@ -176,6 +200,12 @@ const SYS_SIM_DELETE: u64 = 9;
 const SYS_SIM_STATUS: u64 = 10;
 const SYS_IPC_SEND: u64 = 11;
 const SYS_IPC_RECV: u64 = 12;
+// 13..=15 are the EL1-continuation syscalls (`svc.rs`'s `SYS_*_PROOF_DONE`),
+// which this EL0 context never issues. 16..=18 are the MVNO set (Beta item
+// 3.3); kept in sync with `svc.rs` by hand, like everything above.
+const SYS_MVNO_BIND: u64 = 16;
+const SYS_MVNO_SUSPEND: u64 = 17;
+const SYS_MVNO_REACTIVATE: u64 = 18;
 
 /// The EL0 demo itself. `.balign 4096` for the same reason
 /// `userspace::user_hello` does: this crate's EL0 permissions *are*
@@ -282,6 +312,17 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x1, #0",
         "mov x2, #0",
         "svc #0",
+        // SYS_MVNO_BIND(account 0, slot 0, profile 0) -- binds the freshly
+        // installed profile to the demo account (opened by the kernel at
+        // boot; EL0 cannot open accounts). Must precede the ENABLE below:
+        // svc.rs's MVNO gate refuses to enable a profile bound to no
+        // account. Uses all three argument registers (x1 account, x2 slot,
+        // x3 profile).
+        "mov x0, {sys_mvno_bind}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "mov x3, #0",
+        "svc #0",
         // SYS_SIM_ENABLE(0, 0) -- Disabled -> Enabled, routed through
         // esim_marshal's gate. Expected to SUCCEED: proves the fail-open
         // stub doesn't block a legitimate authorized operation.
@@ -290,6 +331,42 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x2, #0",
         "svc #0",
         // SYS_SIM_STATUS(0, 0) -- expect state 2 (Enabled).
+        "mov x0, {sys_sim_status}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "svc #0",
+        // SYS_MVNO_SUSPEND(0) while profile 0 is Enabled -- the registry
+        // flips the account to Suspended and svc.rs force-disables the
+        // profile, then re-audits (the "audit clean" line). A distinct
+        // capability (mvno:suspend:0) from bind/reactivate (mvno:account:0).
+        "mov x0, {sys_mvno_suspend}",
+        "mov x1, #0",
+        "svc #0",
+        // SYS_SIM_STATUS(0, 0) -- expect state 1 (Disabled): the forced
+        // disable really reached sim.rs.
+        "mov x0, {sys_sim_status}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "svc #0",
+        // SYS_SIM_ENABLE(0, 0) -- now DENIED (MVNO ...): the capability
+        // passes, but the owning account is Suspended. Refused before the
+        // MARSHAL round trip and before sim::enable.
+        "mov x0, {sys_sim_enable}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "svc #0",
+        // SYS_MVNO_REACTIVATE(0) -- Suspended -> Active. Profiles stay
+        // Disabled until explicitly enabled again.
+        "mov x0, {sys_mvno_reactivate}",
+        "mov x1, #0",
+        "svc #0",
+        // SYS_SIM_ENABLE(0, 0) -- authorized again, restoring the Enabled
+        // state the DELETE-must-fail check below depends on.
+        "mov x0, {sys_sim_enable}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "svc #0",
+        // SYS_SIM_STATUS(0, 0) -- expect state 2 (Enabled) again.
         "mov x0, {sys_sim_status}",
         "mov x1, #0",
         "mov x2, #0",
@@ -324,6 +401,50 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x0, {sys_sim_status}",
         "mov x1, #0",
         "mov x2, #0",
+        "svc #0",
+        // Unbound-profile proof: a second profile in slot 0, installed (so
+        // it is genuinely Disabled and enable would succeed at the sim.rs
+        // level) but never bound to any account. Its per-profile capability
+        // (sim:0:1) is issued in nonsecure.rs for exactly this.
+        "mov x0, {sys_sim_create}",
+        "mov x1, #0",
+        "svc #0",
+        "mov x0, {sys_sim_install}",
+        "mov x1, #0",
+        "mov x2, #1",
+        "mov x3, #0x5678",
+        "svc #0",
+        // SYS_SIM_ENABLE(0, 1) -- DENIED (MVNO NotBound): fail closed on an
+        // unbound profile, even though the capability is held.
+        "mov x0, {sys_sim_enable}",
+        "mov x1, #0",
+        "mov x2, #1",
+        "svc #0",
+        // SYS_SIM_STATUS(0, 1) -- still state 1 (Disabled): the denied
+        // enable changed nothing.
+        "mov x0, {sys_sim_status}",
+        "mov x1, #0",
+        "mov x2, #1",
+        "svc #0",
+        // SYS_MVNO_BIND(99, 0, 1) / SYS_MVNO_SUSPEND(99) -- an account this
+        // context holds no capability for: DENIED before the registry is
+        // consulted, re-checked per call like every other syscall here.
+        "mov x0, {sys_mvno_bind}",
+        "mov x1, #99",
+        "mov x2, #0",
+        "mov x3, #1",
+        "svc #0",
+        "mov x0, {sys_mvno_suspend}",
+        "mov x1, #99",
+        "svc #0",
+        // SYS_MVNO_BIND(0, 0, 2) -- the account capability (mvno:account:0)
+        // IS held but the profile capability (sim:0:2) is NOT (nonsecure.rs
+        // deliberately issues none): DENIED naming the profile resource.
+        // Proves BIND needs both, not just account access.
+        "mov x0, {sys_mvno_bind}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "mov x3, #2",
         "svc #0",
         // SYS_SIM_CREATE(99) -- unauthorized slot: denied before
         // sim::create ever runs, same "checked on every operation, not
@@ -393,5 +514,8 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         sys_sim_status = const SYS_SIM_STATUS,
         sys_ipc_send = const SYS_IPC_SEND,
         sys_ipc_recv = const SYS_IPC_RECV,
+        sys_mvno_bind = const SYS_MVNO_BIND,
+        sys_mvno_suspend = const SYS_MVNO_SUSPEND,
+        sys_mvno_reactivate = const SYS_MVNO_REACTIVATE,
     );
 }

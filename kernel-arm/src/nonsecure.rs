@@ -397,6 +397,46 @@ fn el1_setup() -> ! {
     serial_println!(
         "Runix ARM kernel: eSIM delete capability issued (slot 0 profile 0, demo trust root)"
     );
+    // el0_demo's unbound-profile proof (Beta item 3.3) creates and installs a
+    // *second* profile in slot 0 (ID 1, since `sim::create` is sequential)
+    // that it never binds to an account, then tries to enable it. It needs
+    // the per-profile capability for that, or the capability check would
+    // deny first and the MVNO gate would never be what refuses it. Note
+    // there is deliberately no delete capability for profile 1. Likewise
+    // there is deliberately NO `sim:0:2` capability: el0_demo's
+    // BIND(0, 0, 2) holds the account capability but not the profile one,
+    // and must be denied (SYS_MVNO_BIND needs both).
+    crate::capabilities::issue_and_hold(crate::capabilities::sim_profile_resource(0, 1), now);
+    serial_println!(
+        "Runix ARM kernel: eSIM profile capability issued (slot 0 profile 1, demo trust root)"
+    );
+    // MVNO account layer (Beta item 3.3). Two grants for account 0, not one:
+    // general account access (bind, reactivate) and the separately scoped
+    // suspend authority -- the same split as sim_profile_resource versus
+    // sim_delete_resource. el0_demo also requests account 99 (no grant) to
+    // prove the check distinguishes.
+    crate::capabilities::issue_and_hold(crate::capabilities::mvno_account_resource(0), now);
+    serial_println!(
+        "Runix ARM kernel: MVNO account capability issued (account 0, demo trust root)"
+    );
+    crate::capabilities::issue_and_hold(crate::capabilities::mvno_suspend_resource(0), now);
+    serial_println!(
+        "Runix ARM kernel: MVNO suspend capability issued (account 0, demo trust root)"
+    );
+    // Open the demo account (DEMO DATA ONLY, like the signing key above): the
+    // registry assigns sequential ids, so this is account 0, the one the
+    // capabilities above and el0_demo's walk name. EL0 cannot open accounts.
+    match crate::mvno::open_demo_account() {
+        Ok(id) => serial_println!(
+            "Runix ARM kernel: MVNO demo account opened (account {}, DEMO DATA ONLY)",
+            id.0
+        ),
+        Err(e) => serial_println!("Runix ARM kernel: MVNO demo account open FAILED ({:?})", e),
+    }
+    // Network-selection proof (`mvno_proof.rs`) on its own local registry;
+    // EL1-only, no syscall, does not touch the global registry above.
+    crate::mvno_proof::prove_selection();
+
     // The general-purpose IPC channel space (`ipc_channel.rs`) is addressed
     // separately from RIL's, so it needs its own grant -- an `ril:0` token
     // deliberately does not reach `ipc:0`. Same channel 0 / channel 99

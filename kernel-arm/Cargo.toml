@@ -33,6 +33,9 @@ runix-capability-manager = { path = "../capability-manager" }
 # kind of freestanding caller), and verified to build for
 # `aarch64-unknown-none` and not just `x86_64-unknown-none`.
 runix-citadel-integration = { path = "../citadel-integration" }
+# MVNO account model + network selection (Beta item 3): pure core+alloc logic,
+# host-tested in its own crate; this crate is the only place it is *enforced*.
+runix-mobile = { path = "../mobile" }
 # Same path/`default-features = false` shape as `kernel/Cargo.toml`'s own
 # line (skips the `std` feature, which this `no_std`/`aarch64-unknown-none`
 # crate can't use) -- pulled in for `marshal_transport.rs`'s

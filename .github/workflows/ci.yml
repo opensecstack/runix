@@ -739,6 +739,44 @@ jobs:
           grep -q "^I$" /tmp/arm-boot.log
           grep -q "SVC: SYS_IPC_SEND channel 99 DENIED" /tmp/arm-boot.log
           grep -q "SVC: SYS_IPC_RECV channel 99 DENIED" /tmp/arm-boot.log
+          # MVNO account layer (Beta item 3.3: kernel-arm/src/mvno.rs wrapping
+          # runix-mobile). Account 0 is compiled-in demo data; the walk binds
+          # profile 0 before the first enable, then suspends the account while
+          # the profile is Enabled (forced disable + clean audit), shows enable
+          # DENIED under the Suspended account, reactivates, and re-enables.
+          # An installed-but-never-bound profile is DENIED too (fail closed), and
+          # account 99 (no capability) is DENIED. The MVNO syscalls are
+          # capability-gated + audited but not MARSHAL-gated yet (Beta item 3.4).
+          grep -q "Runix ARM kernel: MVNO account capability issued (account 0" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: MVNO suspend capability issued (account 0" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: MVNO demo account opened (account 0" /tmp/arm-boot.log
+          grep -q "SVC: SYS_MVNO_BIND account 0 slot 0 profile 0 authorized" /tmp/arm-boot.log
+          grep -q "SVC: SYS_MVNO_SUSPEND account 0 authorized (1 Enabled profile(s) to force-disable)" \
+            /tmp/arm-boot.log
+          grep -q "SVC: SYS_MVNO_SUSPEND account 0 forced disable slot 0 profile 0 ok" \
+            /tmp/arm-boot.log
+          grep -q "SVC: SYS_MVNO_SUSPEND account 0 audit clean" /tmp/arm-boot.log
+          grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 0 DENIED (MVNO AccountNotActive(Suspended))" \
+            /tmp/arm-boot.log
+          grep -q "SVC: SYS_MVNO_REACTIVATE account 0 authorized" /tmp/arm-boot.log
+          grep -q "SVC: SYS_SIM_DELETE slot 0 profile 0 unbound from account 0" /tmp/arm-boot.log
+          grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 1 DENIED (MVNO NotBound)" /tmp/arm-boot.log
+          grep -q "SVC: SYS_MVNO_BIND account 99 slot 0 profile 1 DENIED" /tmp/arm-boot.log
+          # Account capability held, profile capability (sim:0:2) NOT: BIND
+          # needs both, and the DENIED line names the failing resource.
+          grep -q "SVC: SYS_MVNO_BIND account 0 slot 0 profile 2 DENIED (resource sim:0:2" \
+            /tmp/arm-boot.log
+          grep -q "SVC: SYS_MVNO_SUSPEND account 99 DENIED" /tmp/arm-boot.log
+          # Network selection driven by a registry account's standing (own local registry;
+          # kernel-arm/src/mvno_proof.rs, EL1-only): allowed while Active,
+          # refused once suspended.
+          grep -q "Runix ARM kernel: MVNO network selection account 0 Active -> Allowed 310/260 (HomeNetwork)" \
+            /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: MVNO network selection account 0 Suspended -> Refused (AccountSuspended)" \
+            /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: MVNO network selection PASS" /tmp/arm-boot.log
+          # The suspend handshake must never report a leaked Enabled profile.
+          if grep -q "AUDIT FAILED" /tmp/arm-boot.log; then exit 1; fi
           # Beta mobile item 2.5, "Stage 3: real outbound TCP at EL0"
           # (kernel-arm/src/tcp_proof.rs): a genuine compiled
           # net-driver-host-arm binary, loaded as its own EL0 process with a
@@ -846,6 +884,41 @@ jobs:
             /tmp/arm-boot-nosecure.log
           grep -q "^I$" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_IPC_RECV channel 99 DENIED" /tmp/arm-boot-nosecure.log
+          # MVNO account layer (Beta item 3.3: kernel-arm/src/mvno.rs wrapping
+          # runix-mobile). Account 0 is compiled-in demo data; the walk binds
+          # profile 0 before the first enable, then suspends the account while
+          # the profile is Enabled (forced disable + clean audit), shows enable
+          # DENIED under the Suspended account, reactivates, and re-enables.
+          # An installed-but-never-bound profile is DENIED too (fail closed), and
+          # account 99 (no capability) is DENIED. The MVNO syscalls are
+          # capability-gated + audited but not MARSHAL-gated yet (Beta item 3.4).
+          grep -q "SVC: SYS_MVNO_BIND account 0 slot 0 profile 0 authorized" /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_MVNO_SUSPEND account 0 authorized (1 Enabled profile(s) to force-disable)" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_MVNO_SUSPEND account 0 forced disable slot 0 profile 0 ok" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_MVNO_SUSPEND account 0 audit clean" /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 0 DENIED (MVNO AccountNotActive(Suspended))" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_MVNO_REACTIVATE account 0 authorized" /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_SIM_DELETE slot 0 profile 0 unbound from account 0" /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 1 DENIED (MVNO NotBound)" /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_MVNO_BIND account 99 slot 0 profile 1 DENIED" /tmp/arm-boot-nosecure.log
+          # Account capability held, profile capability (sim:0:2) NOT: BIND
+          # needs both, and the DENIED line names the failing resource.
+          grep -q "SVC: SYS_MVNO_BIND account 0 slot 0 profile 2 DENIED (resource sim:0:2" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_MVNO_SUSPEND account 99 DENIED" /tmp/arm-boot-nosecure.log
+          # Network selection driven by a registry account's standing (own local registry;
+          # kernel-arm/src/mvno_proof.rs, EL1-only): allowed while Active,
+          # refused once suspended.
+          grep -q "Runix ARM kernel: MVNO network selection account 0 Active -> Allowed 310/260 (HomeNetwork)" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: MVNO network selection account 0 Suspended -> Refused (AccountSuspended)" \
+            /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: MVNO network selection PASS" /tmp/arm-boot-nosecure.log
+          # The suspend handshake must never report a leaked Enabled profile.
+          if grep -q "AUDIT FAILED" /tmp/arm-boot-nosecure.log; then exit 1; fi
           # Same net TCP proof as the secure boot above (see its comments)
           # -- tcp_proof.rs's address-space/loader/scheduler work is EL1/
           # EL0-side and security-state-independent, so it must hold on both
@@ -872,7 +945,11 @@ jobs:
           sleep 0.3
           python3 ../kernel/tests/support/grid_sandbox_marshal_shadow_listener.py &
           sleep 0.3
-          timeout 20 qemu-system-aarch64 \
+          # `timeout` bumped 20 -> 30: Beta item 3.3's EL0 walk adds one more
+          # authorized ENABLE (one more esim_marshal::evaluate round trip).
+          # UNMEASURED margin (guestfwd can't run on the Windows dev box);
+          # tighten from the first CI run's real timing.
+          timeout 30 qemu-system-aarch64 \
             -M virt,secure=on,gic-version=2 -cpu cortex-a53 -nographic \
             -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
             -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001,guestfwd=tcp:10.0.2.100:9100-cmd:nc 127.0.0.1 9004" \
@@ -912,11 +989,25 @@ jobs:
           sleep 0.3
           python3 ../kernel/tests/support/mock_citadel_server.py &
           sleep 0.3
-          CITADEL_PROXY_LISTEN_ADDR=127.0.0.1:9104             RUNIX_CITADEL_URL=http://127.0.0.1:9105/marshal/kerkese             ../target/release/citadel_proxy &
+          CITADEL_PROXY_LISTEN_ADDR=127.0.0.1:9104 \
+            RUNIX_CITADEL_URL=http://127.0.0.1:9105/marshal/kerkese \
+            ../target/release/citadel_proxy &
           sleep 0.3
-          timeout 25 qemu-system-aarch64             -M virt,secure=on,gic-version=2 -cpu cortex-a53 -nographic             -kernel target/aarch64-unknown-none/release/runix-kernel-arm             -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001,guestfwd=tcp:10.0.2.100:9100-cmd:nc 127.0.0.1 9104"             -device virtio-net-device,netdev=net0             -global virtio-mmio.force-legacy=false             | tee /tmp/arm-boot-marshal-execute.log || true
-          grep -q "Runix ARM kernel: MARSHAL evaluation for enable slot=0 profile=0: Execute"             /tmp/arm-boot-marshal-execute.log
-          grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 0 authorized"             /tmp/arm-boot-marshal-execute.log
+          # `timeout` bumped 25 -> 35: Beta item 3.3's EL0 walk adds one more
+          # authorized ENABLE (one more esim_marshal::evaluate round trip).
+          # UNMEASURED margin (guestfwd can't run on the Windows dev box);
+          # tighten from the first CI run's real timing.
+          timeout 35 qemu-system-aarch64 \
+            -M virt,secure=on,gic-version=2 -cpu cortex-a53 -nographic \
+            -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
+            -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001,guestfwd=tcp:10.0.2.100:9100-cmd:nc 127.0.0.1 9104" \
+            -device virtio-net-device,netdev=net0 \
+            -global virtio-mmio.force-legacy=false \
+            | tee /tmp/arm-boot-marshal-execute.log || true
+          grep -q "Runix ARM kernel: MARSHAL evaluation for enable slot=0 profile=0: Execute" \
+            /tmp/arm-boot-marshal-execute.log
+          grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 0 authorized" \
+            /tmp/arm-boot-marshal-execute.log
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke

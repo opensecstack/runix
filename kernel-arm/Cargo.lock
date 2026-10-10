@@ -323,8 +323,17 @@ dependencies = [
  "runix-capability-manager",
  "runix-citadel-integration",
  "runix-ipc",
+ "runix-mobile",
  "smoltcp",
  "spin",
+]
+
+[[package]]
+name = "runix-mobile"
+version = "0.0.1"
+dependencies = [
+ "runix-capability-manager",
+ "runix-citadel-integration",
 ]
 
 [[package]]

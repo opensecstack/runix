@@ -3,8 +3,10 @@
 //! `el1_vectors.rs`'s vector-8 `SVC` handling; see that module's doc
 //! comment for how the syscall number/arg actually get here.
 //!
-//! Twelve syscalls, matching `el0.rs`'s demo exactly (kept in sync by hand,
-//! not shared constants -- see `el0.rs`'s own doc comment on why):
+//! Fifteen syscalls for EL0 callers (plus three EL1-continuation ones, see
+//! `SYS_EL0_PROOF_DONE` and friends), matching `el0.rs`'s demo exactly (kept
+//! in sync by hand, not shared constants -- see `el0.rs`'s own doc comment on
+//! why):
 //! - `SYS_WRITE`: unconditional -- proves the `SVC` gate itself works,
 //!   the same role `kernel/src/syscall.rs`'s `SYS_WRITE` plays for `int
 //!   0x80` on the x86_64 side.
@@ -39,6 +41,38 @@
 //!   (`docs/RFC-IPC-RESPONSE-CAPABILITY.md`): that design solves
 //!   concurrent-client reply mixups, and this crate has one EL0 context --
 //!   see `ipc_channel.rs`'s doc comment.
+//! - `SYS_MVNO_BIND` (16) / `SYS_MVNO_SUSPEND` (17) / `SYS_MVNO_REACTIVATE`
+//!   (18): the MVNO account layer (Beta item 3.3, `mvno.rs` wrapping
+//!   `runix_mobile::account`). Same per-call capability check, over
+//!   `mvno:account:{id}` (bind, reactivate) and a *separately scoped*
+//!   `mvno:suspend:{id}` (suspend cuts service, so it is scoped apart from
+//!   general account access exactly as delete is from general profile
+//!   access). `BIND` additionally requires the profile's own
+//!   `sim:{slot}:{profile}` capability (both checked every call; the DENIED
+//!   line names the failing resource), so account access alone cannot claim
+//!   a profile. Arguments: `BIND(account, slot, profile)`, `SUSPEND(account)`,
+//!   `REACTIVATE(account)`; return `0` on success, `1` on denial or failure.
+//!   Every applied change is appended to the same WORM chain as the eSIM
+//!   transitions. **Known, tracked gap: these three are capability-gated and
+//!   audited but NOT MARSHAL-gated yet** -- `esim_marshal::evaluate`
+//!   hardcodes `esim.{action}` slot/profile envelopes, so generalizing it
+//!   (with the upstream rbacMap and `citadel_proxy` policy) is Beta item 3.4.
+//!   Documented here rather than papered over; CLAUDE.md requires privileged
+//!   actions to flow through MARSHAL and these will once 3.4 lands.
+//!
+//! # The MVNO gate on `SYS_SIM_ENABLE`
+//!
+//! After its capability check and *before* the MARSHAL round trip,
+//! `SYS_SIM_ENABLE` asks `mvno::gate_enable`: the profile must be bound to an
+//! `Active` account. An **unbound** profile is refused (fail closed), as is
+//! one whose owner is Suspended or Closed
+//! (`SVC: SYS_SIM_ENABLE ... DENIED (MVNO <error>)`). It runs first because
+//! it is a cheap, deterministic local check -- no point spending a network
+//! round trip to MARSHAL on a request that cannot succeed. `SYS_SIM_DELETE`
+//! releases the profile's binding after a successful delete so the account's
+//! capacity frees. `SYS_MVNO_SUSPEND` applies the registry's forced-disable
+//! list itself (the registry cannot) and then re-audits the invariant; see
+//! `mvno.rs` for the lock order (registry -> sim, never the reverse).
 //!
 //! # Three things worth knowing about the SIM set specifically
 //!
@@ -79,6 +113,7 @@
 //! not a second logging path of this module's own. See [`audit_transition`].
 
 use alloc::format;
+use alloc::string::String;
 use spin::Mutex;
 
 use runix_citadel_integration::WormLog;
@@ -148,6 +183,20 @@ pub const SYS_NET_PROOF_DONE: u64 = 14;
 /// shapes, and vice versa). Same "unknown syscall with no excursion in
 /// flight" `u64::MAX` fallback as the other two.
 pub const SYS_MARSHAL_PROOF_DONE: u64 = 15;
+
+/// `SYS_MVNO_BIND(account, slot, profile)`: bind an eSIM profile to an
+/// account. Capabilities: BOTH `mvno_account_resource(account)` and
+/// `sim_profile_resource(slot, profile)` (either missing denies). See this module's
+/// doc comment for the (tracked) absence of a MARSHAL gate.
+pub const SYS_MVNO_BIND: u64 = 16;
+/// `SYS_MVNO_SUSPEND(account)`: `Active -> Suspended`, force-disabling every
+/// Enabled profile the account owns. Capability:
+/// `mvno_suspend_resource(account)` -- scoped apart from general account
+/// access.
+pub const SYS_MVNO_SUSPEND: u64 = 17;
+/// `SYS_MVNO_REACTIVATE(account)`: `Suspended -> Active`. Capability:
+/// `mvno_account_resource(account)`.
+pub const SYS_MVNO_REACTIVATE: u64 = 18;
 
 /// `SYS_RIL_RECV`'s return-value convention: `0..=255` is a received byte,
 /// `256`/`257` are out-of-band sentinels distinct from any real byte value
@@ -242,16 +291,83 @@ fn audit_transition(
         Ok(()) => (true, None),
         Err(e) => (false, Some(format!("{e}"))),
     };
+    audit_event(
+        &subject,
+        &format!("{from:?}"),
+        &format!("{to:?}"),
+        authorized,
+        reason,
+    );
+}
+
+/// The subject-and-strings form of [`audit_transition`], for transitions that
+/// are not a `sim::ProfileState` change: MVNO account status changes
+/// (subject `mvno:account:{id}`, `Active -> Suspended`) and profile
+/// bind/unbind (subject the profile's `sim:{slot}:{profile}` resource,
+/// `Unbound -> Bound(account N)`). Same chain ([`ESIM_WORM_LOG`]), same
+/// "intended transition plus the outcome, recorded at the syscall boundary
+/// only" philosophy as [`audit_transition`] -- `mvno.rs`'s data model never
+/// logs. A refused change is recorded `authorized: false` with the
+/// registry's error as the reason.
+fn audit_event(subject: &str, from: &str, to: &str, authorized: bool, reason: Option<String>) {
     let mut guard = ESIM_WORM_LOG.lock();
     guard
         .get_or_insert_with(WormLog::new)
-        .record_lifecycle_transition(
-            &subject,
-            &format!("{from:?}"),
-            &format!("{to:?}"),
-            authorized,
-            reason,
-        );
+        .record_lifecycle_transition(subject, from, to, authorized, reason);
+}
+
+/// `(entry count, chain verifies)` for [`ESIM_WORM_LOG`] -- printed after the
+/// suspend handshake so the audit trail is visible in the serial log, not
+/// just asserted.
+fn audit_chain_summary() -> (usize, bool) {
+    let guard = ESIM_WORM_LOG.lock();
+    match guard.as_ref() {
+        Some(log) => (log.entries().len(), log.verify_chain()),
+        None => (0, true),
+    }
+}
+
+/// Maps a registry result to [`audit_event`]'s `(authorized, reason)`.
+fn audit_outcome<T>(r: &Result<T, runix_mobile::account::AccountError>) -> (bool, Option<String>) {
+    match r {
+        Ok(_) => (true, None),
+        Err(e) => (false, Some(format!("{e:?}"))),
+    }
+}
+
+/// Releases `(slot, profile_id)`'s MVNO binding after a successful
+/// `sim::delete` so the owning account's capacity frees (kernel-applied, like
+/// the suspend path's forced disable). A profile that was never bound has
+/// nothing to release and is silent. Called with no lock held.
+fn release_binding_after_delete(slot: usize, profile_id: u8) {
+    let subject = crate::capabilities::sim_profile_resource(slot, profile_id);
+    match crate::mvno::unbind(slot, profile_id) {
+        Ok(None) => {}
+        Ok(Some(owner)) => {
+            audit_event(
+                &subject,
+                &format!("Bound(account {})", owner.0),
+                "Unbound",
+                true,
+                None,
+            );
+            serial_println!(
+                "\nSVC: SYS_SIM_DELETE slot {} profile {} unbound from account {}",
+                slot,
+                profile_id,
+                owner.0
+            );
+        }
+        Err(e) => {
+            audit_event(&subject, "Bound", "Unbound", false, Some(format!("{e:?}")));
+            serial_println!(
+                "\nSVC: SYS_SIM_DELETE slot {} profile {} unbind FAILED ({:?})",
+                slot,
+                profile_id,
+                e
+            );
+        }
+    }
 }
 
 /// Reads the ARM generic timer's physical counter -- this crate's only
@@ -452,7 +568,23 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             let profile_id = arg2 as u8;
             match check(&crate::capabilities::sim_profile_resource(slot, profile_id)) {
                 Ok(()) => {
-                    // The MARSHAL gate, between the capability check and the
+                    // The MVNO gate (Beta item 3.3), first after the
+                    // capability check: the profile must be bound to an
+                    // Active account. Unbound is refused (fail closed), as is
+                    // a Suspended/Closed owner. Cheap and local, so it runs
+                    // *before* the MARSHAL round trip -- no network call for
+                    // a request that cannot succeed. `sim::enable` is never
+                    // reached on denial.
+                    if let Err(e) = crate::mvno::gate_enable(slot, profile_id) {
+                        serial_println!(
+                            "\nSVC: SYS_SIM_ENABLE slot {} profile {} DENIED (MVNO {:?})",
+                            slot,
+                            profile_id,
+                            e
+                        );
+                        return 1;
+                    }
+                    // The MARSHAL gate, between the MVNO gate and the
                     // real transition: enabling demotes whichever profile was
                     // this slot's active subscription, so it is one of the two
                     // consequential operations here (see this module's doc
@@ -599,6 +731,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                                 slot,
                                 profile_id
                             );
+                            release_binding_after_delete(slot, profile_id);
                             0
                         }
                         Err(e) => {
@@ -713,6 +846,131 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                 }
             }
         }
+        SYS_MVNO_BIND => {
+            let account = arg1;
+            let slot = arg2 as usize;
+            let profile_id = arg3 as u8;
+            // Two capabilities, both checked on every call (no short-circuit
+            // past the second): the account's own `mvno:account:{id}` AND the
+            // profile's `sim:{slot}:{profile}`, so holding account access
+            // alone cannot claim a profile the caller has no authority over.
+            // Either failing denies, and the DENIED line names which.
+            // Capability and audit only -- NOT MARSHAL-gated yet; known,
+            // tracked gap (Beta item 3.4), see this module's doc comment.
+            let account_res = crate::capabilities::mvno_account_resource(account);
+            let profile_res = crate::capabilities::sim_profile_resource(slot, profile_id);
+            let account_check = check(&account_res);
+            let profile_check = check(&profile_res);
+            let authority = match (account_check, profile_check) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(e), Ok(())) => Err(format!("resource {account_res}: {e}")),
+                (Ok(()), Err(e)) => Err(format!("resource {profile_res}: {e}")),
+                (Err(a), Err(p)) => Err(format!(
+                    "resource {account_res}: {a}; resource {profile_res}: {p}"
+                )),
+            };
+            match authority {
+                Ok(()) => {
+                    let result = crate::mvno::bind(account, slot, profile_id);
+                    let (authorized, reason) = audit_outcome(&result);
+                    audit_event(
+                        &crate::capabilities::sim_profile_resource(slot, profile_id),
+                        "Unbound",
+                        &format!("Bound(account {account})"),
+                        authorized,
+                        reason,
+                    );
+                    match result {
+                        Ok(()) => {
+                            serial_println!(
+                                "\nSVC: SYS_MVNO_BIND account {} slot {} profile {} authorized",
+                                account,
+                                slot,
+                                profile_id
+                            );
+                            0
+                        }
+                        Err(e) => {
+                            serial_println!(
+                                "\nSVC: SYS_MVNO_BIND account {} slot {} profile {} FAILED ({:?})",
+                                account,
+                                slot,
+                                profile_id,
+                                e
+                            );
+                            1
+                        }
+                    }
+                }
+                Err(e) => {
+                    serial_println!(
+                        "\nSVC: SYS_MVNO_BIND account {} slot {} profile {} DENIED ({})",
+                        account,
+                        slot,
+                        profile_id,
+                        e
+                    );
+                    1
+                }
+            }
+        }
+        SYS_MVNO_SUSPEND => {
+            let account = arg1;
+            // `mvno_suspend_resource`, *not* `mvno_account_resource`: holding
+            // general account access must not imply the authority to cut
+            // service. Capability and audit only -- NOT MARSHAL-gated yet
+            // (Beta item 3.4), see this module's doc comment.
+            match check(&crate::capabilities::mvno_suspend_resource(account)) {
+                Ok(()) => suspend_account(account),
+                Err(e) => {
+                    serial_println!("\nSVC: SYS_MVNO_SUSPEND account {} DENIED ({})", account, e);
+                    1
+                }
+            }
+        }
+        SYS_MVNO_REACTIVATE => {
+            let account = arg1;
+            // Capability and audit only -- NOT MARSHAL-gated yet (Beta item
+            // 3.4), see this module's doc comment.
+            match check(&crate::capabilities::mvno_account_resource(account)) {
+                Ok(()) => {
+                    let result = crate::mvno::reactivate(account);
+                    let (authorized, reason) = audit_outcome(&result);
+                    audit_event(
+                        &crate::capabilities::mvno_account_resource(account),
+                        "Suspended",
+                        "Active",
+                        authorized,
+                        reason,
+                    );
+                    match result {
+                        Ok(()) => {
+                            serial_println!(
+                                "\nSVC: SYS_MVNO_REACTIVATE account {} authorized",
+                                account
+                            );
+                            0
+                        }
+                        Err(e) => {
+                            serial_println!(
+                                "\nSVC: SYS_MVNO_REACTIVATE account {} FAILED ({:?})",
+                                account,
+                                e
+                            );
+                            1
+                        }
+                    }
+                }
+                Err(e) => {
+                    serial_println!(
+                        "\nSVC: SYS_MVNO_REACTIVATE account {} DENIED ({})",
+                        account,
+                        e
+                    );
+                    1
+                }
+            }
+        }
         // The one arm that may not return to EL0 (see this constant's doc
         // comment and `el0_proof::finish`): on the proof path it resumes an
         // EL1 continuation and never comes back here; with no excursion in
@@ -728,6 +986,101 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         // payload.
         SYS_MARSHAL_PROOF_DONE => crate::marshal_transport::finish(arg1, arg2),
         _ => u64::MAX,
+    }
+}
+
+/// The suspend handshake (see `mvno.rs`'s doc comment): the registry flips
+/// the account to `Suspended` and hands back the profiles that must be forced
+/// `Enabled -> Disabled`; this applies them, audits each, then re-verifies
+/// the "no Enabled profile under a non-Active account" invariant against live
+/// `sim.rs` state. The window is never left unreported: a non-empty audit is a
+/// loud `FAILED` line and a nonzero return.
+///
+/// Lock order: `mvno::suspend` takes the registry lock (and, via the
+/// lifecycle view, the sim lock inside it) and has released both on return;
+/// the `sim::disable` calls below then take only the sim lock. Never
+/// registry-while-holding-sim.
+fn suspend_account(account: u64) -> u64 {
+    let account_subject = crate::capabilities::mvno_account_resource(account);
+    let result = crate::mvno::suspend(account);
+    let (authorized, reason) = audit_outcome(&result);
+    audit_event(&account_subject, "Active", "Suspended", authorized, reason);
+    let forced = match result {
+        Ok(forced) => forced,
+        Err(e) => {
+            serial_println!(
+                "\nSVC: SYS_MVNO_SUSPEND account {} FAILED ({:?})",
+                account,
+                e
+            );
+            return 1;
+        }
+    };
+    serial_println!(
+        "\nSVC: SYS_MVNO_SUSPEND account {} authorized ({} Enabled profile(s) to force-disable)",
+        account,
+        forced.len()
+    );
+
+    let mut ok = true;
+    for k in forced {
+        let disabled = crate::sim::disable(k.slot, k.profile);
+        // Distinguishable from an operator-requested DISABLE in the chain.
+        let (authorized, reason) = match &disabled {
+            Ok(()) => (true, None),
+            Err(e) => (false, Some(format!("{e}"))),
+        };
+        audit_event(
+            &crate::capabilities::sim_profile_resource(k.slot, k.profile),
+            "Enabled",
+            "Disabled (forced by MVNO suspend)",
+            authorized,
+            reason,
+        );
+        match disabled {
+            Ok(()) => serial_println!(
+                "SVC: SYS_MVNO_SUSPEND account {} forced disable slot {} profile {} ok",
+                account,
+                k.slot,
+                k.profile
+            ),
+            Err(e) => {
+                ok = false;
+                serial_println!(
+                    "SVC: SYS_MVNO_SUSPEND account {} forced disable slot {} profile {} FAILED ({})",
+                    account,
+                    k.slot,
+                    k.profile,
+                    e
+                );
+            }
+        }
+    }
+
+    let leaked = crate::mvno::audit();
+    let (entries, chain_ok) = audit_chain_summary();
+    if leaked.is_empty() {
+        serial_println!(
+            "SVC: SYS_MVNO_SUSPEND account {} audit clean (no Enabled profile under a non-Active account; WORM entries {}, chain verified {})",
+            account,
+            entries,
+            chain_ok
+        );
+    } else {
+        ok = false;
+        for k in &leaked {
+            serial_println!(
+                "SVC: SYS_MVNO_SUSPEND account {} AUDIT FAILED: slot {} profile {} is Enabled under a non-Active account",
+                account,
+                k.slot,
+                k.profile
+            );
+        }
+    }
+    if ok && chain_ok {
+        0
+    } else {
+        1
     }
 }
 

@@ -1404,7 +1404,6 @@ version = "0.0.1"
 dependencies = [
  "runix-capability-manager",
  "runix-citadel-integration",
- "runix-wasm-runtime",
 ]
 
 [[package]]

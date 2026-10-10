@@ -181,6 +181,10 @@ mod load_proof;
 // reusing el0_exec's one-shot continuation mechanism a third time.
 mod marshal_transport;
 mod mmu;
+// Beta item 3.3: the kernel-side MVNO account registry (wrapping
+// `runix_mobile::account`) and its boot-time network-selection proof.
+mod mvno;
+mod mvno_proof;
 // Shared address-space/mapping/loading setup for spawning a
 // `net-driver-host-arm` process (extracted from `tcp_proof.rs` so a second
 // caller, a per-syscall MARSHAL-transport path, can reuse it instead of

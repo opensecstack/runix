@@ -106,6 +106,33 @@ pub fn sim_delete_resource(slot: usize, profile: u8) -> String {
     alloc::format!("sim:delete:{slot}:{profile}")
 }
 
+/// The resource string a capability must match to authorize general MVNO
+/// account operations on `account` -- `SYS_MVNO_BIND` and
+/// `SYS_MVNO_REACTIVATE` (Beta item 3.3). `account` is the registry's
+/// sequential `AccountId` (`runix_mobile::account::AccountId`), a plain
+/// `u64` here because `capability-manager` only ever sees an opaque string.
+///
+/// Deliberately `mvno:account:{id}`, not `sim:...`: an account is a different
+/// resource kind from a SIM slot/profile (one account owns many profiles), so
+/// holding `sim:0:0` must not reach account operations or vice versa -- the
+/// same "separate prefix, separate grant" reasoning as [`ipc_resource`] versus
+/// [`ril_resource`].
+pub fn mvno_account_resource(account: u64) -> String {
+    alloc::format!("mvno:account:{account}")
+}
+
+/// The resource string a capability must match to authorize
+/// `SYS_MVNO_SUSPEND` on `account` -- scoped apart from
+/// [`mvno_account_resource`] for the same reason [`sim_delete_resource`] is
+/// scoped apart from [`sim_profile_resource`]: suspending an account cuts
+/// service (every Enabled profile it owns is forcibly disabled), which is a
+/// consequential action general account access (bind, reactivate) must not
+/// imply. A wholly separate string means a separately issued token is
+/// required before `check` will authorize it.
+pub fn mvno_suspend_resource(account: u64) -> String {
+    alloc::format!("mvno:suspend:{account}")
+}
+
 /// The resource-string convention for physical-MMIO-range access -- the
 /// ARM analogue of `kernel/src/capabilities.rs::ioport_range_resource`, for
 /// a context that has no port I/O at all. Names an authorized `(base,
@@ -357,6 +384,67 @@ pub fn check(resource: &str, now: u64) -> Result<(), CapabilityError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mvno_account_resource_format() {
+        assert_eq!(mvno_account_resource(0), "mvno:account:0");
+        assert_eq!(mvno_account_resource(99), "mvno:account:99");
+    }
+
+    #[test]
+    fn mvno_suspend_resource_is_scoped_apart_from_account_access() {
+        assert_eq!(mvno_suspend_resource(0), "mvno:suspend:0");
+        // Holding general account access must not imply suspend authority,
+        // for any account number (same property as sim_delete_resource).
+        for a in [0u64, 1, 99, u64::MAX] {
+            assert_ne!(mvno_account_resource(a), mvno_suspend_resource(a));
+        }
+        // And neither collides with a different account's resource.
+        assert_ne!(mvno_account_resource(0), mvno_account_resource(1));
+        assert_ne!(mvno_suspend_resource(0), mvno_suspend_resource(1));
+    }
+
+    #[test]
+    fn mvno_resources_do_not_collide_with_sim_resources() {
+        assert_ne!(mvno_account_resource(0), sim_resource(0));
+        assert_ne!(mvno_account_resource(0), sim_profile_resource(0, 0));
+        assert_ne!(mvno_suspend_resource(0), sim_delete_resource(0, 0));
+    }
+
+    #[test]
+    fn mvno_token_for_account_access_does_not_verify_for_suspend() {
+        let now = 0u64;
+        let token = CapabilityToken::issue(
+            "el0:arm-demo",
+            mvno_account_resource(0),
+            now,
+            now + 100,
+            "demo-key",
+            &demo_signing_key(),
+        );
+        let vk = demo_verifying_key();
+        assert!(token.verify(&vk, &mvno_account_resource(0), now).is_ok());
+        assert!(token.verify(&vk, &mvno_suspend_resource(0), now).is_err());
+        assert!(token.verify(&vk, &mvno_account_resource(99), now).is_err());
+    }
+
+    #[test]
+    fn mvno_account_token_does_not_verify_for_a_sim_profile() {
+        // SYS_MVNO_BIND checks both resources independently; one token must
+        // never satisfy the other.
+        let now = 0u64;
+        let token = CapabilityToken::issue(
+            "el0:arm-demo",
+            mvno_account_resource(0),
+            now,
+            now + 100,
+            "demo-key",
+            &demo_signing_key(),
+        );
+        assert!(token
+            .verify(&demo_verifying_key(), &sim_profile_resource(0, 2), now)
+            .is_err());
+    }
 
     #[test]
     fn mmio_window_resource_round_trips_through_parse() {

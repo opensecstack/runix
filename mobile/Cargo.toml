@@ -9,8 +9,11 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# `runix-wasm-runtime` was dropped here (Beta item 3.3): nothing in this crate
+# used it, and its `wasmi` dependency had never been built for
+# `aarch64-unknown-none`, which `kernel-arm` needs this crate to build for.
+# The two below are the same ones `kernel-arm` already builds for that target.
 runix-capability-manager = { path = "../capability-manager" }
-runix-wasm-runtime = { path = "../wasm-runtime" }
 runix-citadel-integration = { path = "../citadel-integration" }
 
 [lib]
