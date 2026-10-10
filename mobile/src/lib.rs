@@ -12,5 +12,11 @@ extern crate alloc;
 
 /// Subscriber / account / plan model and its invariants (Beta item 3, step 1).
 pub mod account;
+/// Data policy engine: entitlements, usage, pure session decisions and action
+/// requests (Beta item 4, step 1).
+pub mod policy;
+/// Read-only reconciliation: observed state vs. policy, incidents only
+/// (Beta item 4, step 2).
+pub mod reconcile;
 /// Pure network-selection decision function (Beta item 3, step 2).
 pub mod selection;
