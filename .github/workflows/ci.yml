@@ -887,25 +887,36 @@ jobs:
           # literal point of this item.
           grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 0 DENIED (MARSHAL Refuse)" \
             /tmp/arm-boot-marshal-refuse.log
-      # A real-chain "Execute via citadel_proxy" boot config was tried here
-      # and deliberately dropped, not merely skipped: `citadel_proxy`'s own
-      # local policy layer (desktop/src/citadel/proxy.rs, upstream of
-      # CITADEL's server-side rbacMap that item 2.8 already extended) only
-      # recognizes `grid_sandbox.spawn_instance` as a valid action type
-      # today, confirmed by sending it a real, correctly-encoded
-      # `esim.enable` MarshalRequest directly (bypassing QEMU) and getting
-      # back `MarshalResponse::Error(Other("POLICY_REFUSE: action type
-      # \"esim.enable\" is not one this proxy recognizes..."))` --
-      # `policy_refusal_never_forwards_to_citadel`'s own test in that file
-      # proves this is intentional, not a bug. Teaching `citadel_proxy`
-      # about `esim.*` actions is real, separately-scoped work in that
-      # file (what identity/SoD shape an eSIM action needs), tracked as a
-      # follow-up rather than rushed into this item -- see
-      # docs/BETA_MOBILE_PROGRESS.md item 2.6's own notes. The REFUSE and
-      # Unreachable boot configs above already prove `esim_marshal`'s real
-      # transport end to end over the actual wire format; this would have
-      # only added a third proof that the *policy allowlist* also needs an
-      # entry, which is now stated directly instead.
+      # Full real chain, the third case the REFUSE/Unreachable configs above
+      # can't distinguish on their own (a Refuse from a canned stand-in
+      # listener proves the transport, not that the real proxy's policy
+      # layer admits an eSIM action at all): the `guestfwd` route for 9100
+      # now lands on the REAL `citadel_proxy` binary, which parses the
+      # kernel's `esim.enable` envelope, runs desktop/src/citadel/policy.rs's
+      # check (which recognizes `esim.enable`/`esim.delete` and requires
+      # slot+profile), attaches its own distinct Verifier identity, and
+      # makes a real HTTP call to mock_citadel_server.py (canned EXECUTE).
+      # Ports: 9105 (mock CITADEL HTTP) <- citadel_proxy 9104 <- guestfwd
+      # 10.0.2.100:9100. Before the proxy learned `esim.*` this exact chain
+      # answered `POLICY_REFUSE: action type "esim.enable" is not one this
+      # proxy recognizes`, which would have failed the `: Execute` grep
+      # below. (The same request/response was checked host-side, without
+      # QEMU, against this exact proxy + mock pair; the QEMU leg of this
+      # step is first exercised by CI.)
+      - name: build citadel_proxy (payload for the eSIM Execute boot config)
+        working-directory: .
+        run: cargo build -p runix-desktop --bin citadel_proxy --release
+      - name: boot in QEMU and check a real citadel_proxy EXECUTE admits eSIM enable (Beta item 2.6 follow-up)
+        run: |
+          python3 ../kernel/tests/support/tcp_proof_listener.py &
+          sleep 0.3
+          python3 ../kernel/tests/support/mock_citadel_server.py &
+          sleep 0.3
+          CITADEL_PROXY_LISTEN_ADDR=127.0.0.1:9104             RUNIX_CITADEL_URL=http://127.0.0.1:9105/marshal/kerkese             ../target/release/citadel_proxy &
+          sleep 0.3
+          timeout 25 qemu-system-aarch64             -M virt,secure=on,gic-version=2 -cpu cortex-a53 -nographic             -kernel target/aarch64-unknown-none/release/runix-kernel-arm             -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001,guestfwd=tcp:10.0.2.100:9100-cmd:nc 127.0.0.1 9104"             -device virtio-net-device,netdev=net0             -global virtio-mmio.force-legacy=false             | tee /tmp/arm-boot-marshal-execute.log || true
+          grep -q "Runix ARM kernel: MARSHAL evaluation for enable slot=0 profile=0: Execute"             /tmp/arm-boot-marshal-execute.log
+          grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 0 authorized"             /tmp/arm-boot-marshal-execute.log
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke

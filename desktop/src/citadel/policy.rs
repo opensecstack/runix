@@ -32,7 +32,9 @@
 //! 1. **Action-type recognition.** The proxy only vouches for action types
 //!    it explicitly recognizes ([`RECOGNIZED_ACTION_TYPES`]) — matching
 //!    CITADEL's own `rbacMap` entries for `grid_sandbox.spawn_instance`
-//!    (`citadel/internal/marshal/types.go`), so this rejects a request for
+//!    and `esim.enable`/`esim.delete` (`citadel/internal/marshal/types.go`;
+//!    eSIM actions are identified by `slot`/`profile` instead of
+//!    `module_id`/`instance_id`, and [`check`] enforces that split), so this rejects a request for
 //!    an action type CITADEL wouldn't even authorize an "operator" role for
 //!    regardless of SoD. An unrecognized action type is refused before any
 //!    envelope is built.
@@ -67,11 +69,28 @@ use serde::Deserialize;
 
 /// Action types this proxy is willing to vouch for as Verifier — kept in
 /// sync with `citadel/internal/marshal/types.go`'s `rbacMap`'s
-/// `grid_sandbox.spawn_instance` entries (both the `"admin"` and
-/// `"operator"` role lists carry it today). A request for anything else is
+/// `grid_sandbox.spawn_instance` and `esim.enable`/`esim.delete` entries
+/// (both the `"admin"` and `"operator"` role lists carry them today). A request for anything else is
 /// refused before an envelope is even built, regardless of how well-formed
 /// it otherwise is.
-pub const RECOGNIZED_ACTION_TYPES: &[&str] = &["grid_sandbox.spawn_instance"];
+pub const RECOGNIZED_ACTION_TYPES: &[&str] = &[
+    "grid_sandbox.spawn_instance",
+    ESIM_ENABLE_ACTION,
+    ESIM_DELETE_ACTION,
+];
+
+/// `kernel-arm/src/marshal_transport.rs` sends these two (`esim.{action}`)
+/// for `SYS_SIM_ENABLE`/`SYS_SIM_DELETE`; they are the `esim.*` entries
+/// opensecstack added to `rbacMap` (admin + operator lists, `types.go`).
+pub const ESIM_ENABLE_ACTION: &str = "esim.enable";
+pub const ESIM_DELETE_ACTION: &str = "esim.delete";
+
+/// Whether `action_type` is one of the eSIM lifecycle actions, whose
+/// identifying fields are `slot`/`profile` rather than `module_id`/
+/// `instance_id`.
+pub fn is_esim_action(action_type: &str) -> bool {
+    matches!(action_type, ESIM_ENABLE_ACTION | ESIM_DELETE_ACTION)
+}
 
 /// The `sinauth`-shaped subject identifier the kernel asserts as Actor —
 /// see `super::identity::PROXY_VERIFIER_USER_ID`'s doc comment for why this
@@ -120,6 +139,33 @@ pub struct KernelMinimalAction {
     pub module_id: String,
     #[serde(default)]
     pub instance_id: String,
+    /// eSIM actions only (`esim.enable`/`esim.delete`): the SIM slot index.
+    #[serde(default)]
+    pub slot: Option<u64>,
+    /// eSIM actions only: the profile id within `slot`.
+    #[serde(default)]
+    pub profile: Option<u64>,
+}
+
+impl KernelMinimalAction {
+    /// The `(module_id, instance_id)` pair this proxy attributes its WORM
+    /// verification entry to. For `grid_sandbox.spawn_instance` that is the
+    /// envelope's own fields; for eSIM actions, which have no module or
+    /// instance, it is the fixed module `"esim"` and an instance of
+    /// `slot-{slot}-profile-{profile}` (empty parts if a field is missing --
+    /// [`check`] refuses that case, but the refusal itself still gets
+    /// recorded, so this must not panic).
+    pub fn audit_ids(&self) -> (String, String) {
+        if is_esim_action(&self.action_type) {
+            let part = |v: Option<u64>| v.map_or_else(String::new, |n| n.to_string());
+            (
+                "esim".to_string(),
+                format!("slot-{}-profile-{}", part(self.slot), part(self.profile)),
+            )
+        } else {
+            (self.module_id.clone(), self.instance_id.clone())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -135,6 +181,8 @@ pub struct KernelMinimalActor {
 pub enum PolicyError {
     UnrecognizedActionType(String),
     EmptyIdentifier(&'static str),
+    MissingField(&'static str),
+    UnexpectedField(&'static str),
     MalformedIdentifier(&'static str, String),
     KernelAssertedVerifier,
 }
@@ -147,6 +195,12 @@ impl std::fmt::Display for PolicyError {
             }
             PolicyError::EmptyIdentifier(field) => {
                 write!(f, "POLICY_REFUSE: {field} is empty")
+            }
+            PolicyError::MissingField(field) => {
+                write!(f, "POLICY_REFUSE: {field} is required for this action type")
+            }
+            PolicyError::UnexpectedField(field) => {
+                write!(f, "POLICY_REFUSE: {field} is not valid for this action type")
             }
             PolicyError::MalformedIdentifier(field, value) => {
                 write!(f, "POLICY_REFUSE: {field} {value:?} contains characters outside [A-Za-z0-9._:-]")
@@ -182,24 +236,48 @@ pub fn check(envelope: &KernelMinimalEnvelope) -> Result<(), PolicyError> {
         ));
     }
 
-    if envelope.action.module_id.is_empty() {
-        return Err(PolicyError::EmptyIdentifier("module_id"));
-    }
-    if !is_well_formed_identifier(&envelope.action.module_id) {
-        return Err(PolicyError::MalformedIdentifier(
-            "module_id",
-            envelope.action.module_id.clone(),
-        ));
-    }
+    if is_esim_action(&envelope.action.action_type) {
+        // eSIM actions are identified by (slot, profile); module/instance
+        // ids have no meaning here, and accepting them would let a caller
+        // smuggle free-form strings into the enriched envelope's evidence.
+        if envelope.action.slot.is_none() {
+            return Err(PolicyError::MissingField("slot"));
+        }
+        if envelope.action.profile.is_none() {
+            return Err(PolicyError::MissingField("profile"));
+        }
+        if !envelope.action.module_id.is_empty() {
+            return Err(PolicyError::UnexpectedField("module_id"));
+        }
+        if !envelope.action.instance_id.is_empty() {
+            return Err(PolicyError::UnexpectedField("instance_id"));
+        }
+    } else {
+        if envelope.action.slot.is_some() {
+            return Err(PolicyError::UnexpectedField("slot"));
+        }
+        if envelope.action.profile.is_some() {
+            return Err(PolicyError::UnexpectedField("profile"));
+        }
+        if envelope.action.module_id.is_empty() {
+            return Err(PolicyError::EmptyIdentifier("module_id"));
+        }
+        if !is_well_formed_identifier(&envelope.action.module_id) {
+            return Err(PolicyError::MalformedIdentifier(
+                "module_id",
+                envelope.action.module_id.clone(),
+            ));
+        }
 
-    if envelope.action.instance_id.is_empty() {
-        return Err(PolicyError::EmptyIdentifier("instance_id"));
-    }
-    if !is_well_formed_identifier(&envelope.action.instance_id) {
-        return Err(PolicyError::MalformedIdentifier(
-            "instance_id",
-            envelope.action.instance_id.clone(),
-        ));
+        if envelope.action.instance_id.is_empty() {
+            return Err(PolicyError::EmptyIdentifier("instance_id"));
+        }
+        if !is_well_formed_identifier(&envelope.action.instance_id) {
+            return Err(PolicyError::MalformedIdentifier(
+                "instance_id",
+                envelope.action.instance_id.clone(),
+            ));
+        }
     }
 
     if envelope.actor.user_id.is_empty() {
@@ -235,6 +313,8 @@ mod tests {
                 action_type: "grid_sandbox.spawn_instance".into(),
                 module_id: "grid-sandbox-host".into(),
                 instance_id: "app-1".into(),
+                slot: None,
+                profile: None,
             },
             actor: KernelMinimalActor {
                 user_id: "kernel:grid_sandbox".into(),
@@ -284,6 +364,75 @@ mod tests {
         let mut e = valid_envelope();
         e.verifier = Some(serde_json::json!({"user_id": "kernel", "role": "operator"}));
         assert_eq!(check(&e), Err(PolicyError::KernelAssertedVerifier));
+    }
+
+    fn esim_envelope(action_type: &str) -> KernelMinimalEnvelope {
+        let mut e = valid_envelope();
+        e.action = KernelMinimalAction {
+            action_type: action_type.into(),
+            module_id: String::new(),
+            instance_id: String::new(),
+            slot: Some(0),
+            profile: Some(1),
+        };
+        e.actor.user_id = "el0:arm-demo".into();
+        e
+    }
+
+    #[test]
+    fn accepts_well_formed_esim_requests() {
+        assert!(check(&esim_envelope(ESIM_ENABLE_ACTION)).is_ok());
+        assert!(check(&esim_envelope(ESIM_DELETE_ACTION)).is_ok());
+    }
+
+    #[test]
+    fn rejects_esim_request_missing_slot_or_profile() {
+        let mut e = esim_envelope(ESIM_ENABLE_ACTION);
+        e.action.slot = None;
+        assert_eq!(check(&e), Err(PolicyError::MissingField("slot")));
+        let mut e = esim_envelope(ESIM_DELETE_ACTION);
+        e.action.profile = None;
+        assert_eq!(check(&e), Err(PolicyError::MissingField("profile")));
+    }
+
+    #[test]
+    fn rejects_esim_request_carrying_module_or_instance_id() {
+        let mut e = esim_envelope(ESIM_ENABLE_ACTION);
+        e.action.module_id = "grid-sandbox-host".into();
+        assert_eq!(check(&e), Err(PolicyError::UnexpectedField("module_id")));
+        let mut e = esim_envelope(ESIM_ENABLE_ACTION);
+        e.action.instance_id = "x".into();
+        assert_eq!(check(&e), Err(PolicyError::UnexpectedField("instance_id")));
+    }
+
+    #[test]
+    fn rejects_grid_sandbox_request_carrying_slot_or_profile() {
+        let mut e = valid_envelope();
+        e.action.slot = Some(0);
+        assert_eq!(check(&e), Err(PolicyError::UnexpectedField("slot")));
+    }
+
+    #[test]
+    fn audit_ids_are_derived_per_action_type() {
+        let e = esim_envelope(ESIM_ENABLE_ACTION);
+        assert_eq!(
+            e.action.audit_ids(),
+            ("esim".to_string(), "slot-0-profile-1".to_string())
+        );
+        let g = valid_envelope();
+        assert_eq!(
+            g.action.audit_ids(),
+            ("grid-sandbox-host".to_string(), "app-1".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_the_real_esim_envelope_shape_kernel_arm_sends() {
+        // Mirrors `kernel-arm/src/marshal_transport.rs`'s format string.
+        let json = r#"{"kerkese_version":"1.0","dry_run":true,"action":{"type":"esim.enable","slot":0,"profile":0},"actor":{"user_id":"el0:arm-demo","role":"operator"},"execution_id":"esim-enable-0-0"}"#;
+        let envelope: KernelMinimalEnvelope =
+            serde_json::from_str(json).expect("should parse the real kernel-arm shape");
+        assert!(check(&envelope).is_ok());
     }
 
     #[test]

@@ -217,11 +217,27 @@ fn build_enriched_envelope(envelope: &KernelMinimalEnvelope, signing_key: &Signi
     let ts_utc = identity::format_rfc3339_utc(identity::now_unix_secs());
 
     let mut extra = std::collections::BTreeMap::new();
-    extra.insert("module_id".to_string(), envelope.action.module_id.clone());
-    extra.insert(
-        "instance_id".to_string(),
-        envelope.action.instance_id.clone(),
-    );
+    let description = if policy::is_esim_action(&envelope.action.action_type) {
+        // `policy::check` guarantees both are present for eSIM actions.
+        let slot = envelope.action.slot.unwrap_or_default();
+        let profile = envelope.action.profile.unwrap_or_default();
+        extra.insert("slot".to_string(), slot.to_string());
+        extra.insert("profile".to_string(), profile.to_string());
+        format!(
+            "{} slot={slot} profile={profile}",
+            envelope.action.action_type
+        )
+    } else {
+        extra.insert("module_id".to_string(), envelope.action.module_id.clone());
+        extra.insert(
+            "instance_id".to_string(),
+            envelope.action.instance_id.clone(),
+        );
+        format!(
+            "grid_sandbox.spawn_instance module_id={} instance_id={}",
+            envelope.action.module_id, envelope.action.instance_id
+        )
+    };
     if !envelope.execution_id.is_empty() {
         // The kernel's own `execution_id` (today, its `instance_id` reused
         // — see `grid_sandbox.rs`) isn't a valid UUID, so it can't fill
@@ -256,10 +272,7 @@ fn build_enriched_envelope(envelope: &KernelMinimalEnvelope, signing_key: &Signi
         execution_id,
         action: KerkeseAction {
             action_type: envelope.action.action_type.clone(),
-            description: format!(
-                "grid_sandbox.spawn_instance module_id={} instance_id={}",
-                envelope.action.module_id, envelope.action.instance_id
-            ),
+            description,
         },
         actor,
         verifier,
@@ -329,8 +342,7 @@ fn build_response(
         Err(response) => return response,
     };
 
-    let module_id = envelope.action.module_id.clone();
-    let instance_id = envelope.action.instance_id.clone();
+    let (module_id, instance_id) = envelope.action.audit_ids();
 
     if let Err(err) = policy::check(&envelope) {
         record_proxy_verification(
@@ -747,6 +759,81 @@ mod tests {
         assert!(identity::proxy_verifying_key()
             .verify(payload.as_bytes(), &signature)
             .is_ok());
+    }
+
+    /// The eSIM path end to end: the exact envelope shape
+    /// `kernel-arm/src/marshal_transport.rs` sends is accepted, forwarded as
+    /// a real enriched `Kerkese` with the `esim.enable` action type and
+    /// slot/profile evidence, and recorded to WORM under the synthetic
+    /// `esim` / `slot-S-profile-P` identifiers.
+    #[test]
+    fn forwards_esim_enable_as_an_enriched_envelope() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let mock_addr = listener.local_addr().expect("local_addr");
+        let captured: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = captured.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let body = read_http_request(&mut stream);
+                *captured_clone.lock().unwrap() = Some(body);
+                let _ = stream.write_all(CANNED_EXECUTE_RESPONSE.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        let transport =
+            HttpKerkeseTransport::new(Some(format!("http://{mock_addr}/marshal/kerkese")));
+
+        let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+        let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
+        let signing_key = test_signing_key();
+        let worm_log = std::sync::Arc::new(Mutex::new(WormLog::default()));
+        let worm_log_clone = worm_log.clone();
+        let handle = std::thread::spawn(move || {
+            serve_one(&proxy_listener, &transport, &signing_key, &worm_log_clone)
+        });
+
+        let req = MarshalRequest {
+            kerkese_json: br#"{"kerkese_version":"1.0","dry_run":true,"action":{"type":"esim.enable","slot":0,"profile":2},"actor":{"user_id":"el0:arm-demo","role":"operator"},"execution_id":"esim-enable-0-2"}"#.to_vec(),
+        };
+        let response = round_trip(proxy_addr, &req);
+        handle
+            .join()
+            .expect("proxy thread panicked")
+            .expect("serve_one");
+        assert!(matches!(
+            response,
+            MarshalResponse::Decision {
+                outcome: MarshalOutcome::Execute,
+                ..
+            }
+        ));
+
+        {
+            let log = worm_log.lock().unwrap();
+            let entries = log.entries();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].module_id, "esim");
+            assert_eq!(entries[0].instance_id.as_deref(), Some("slot-0-profile-2"));
+            assert!(entries[0].authorized);
+        }
+
+        let forwarded: Kerkese =
+            serde_json::from_slice(&captured.lock().unwrap().take().expect("body captured"))
+                .expect("forwarded body is a real Kerkese");
+        assert_eq!(forwarded.action.action_type, "esim.enable");
+        assert_eq!(forwarded.action.description, "esim.enable slot=0 profile=2");
+        assert_eq!(forwarded.evidence.extra.get("slot"), Some(&"0".to_string()));
+        assert_eq!(
+            forwarded.evidence.extra.get("profile"),
+            Some(&"2".to_string())
+        );
+        assert!(!forwarded.evidence.extra.contains_key("module_id"));
+        assert_eq!(forwarded.sod.operator_user_id, "el0:arm-demo");
+        assert_ne!(
+            forwarded.sod.operator_user_id,
+            forwarded.sod.verifier_user_id
+        );
     }
 
     /// Proves the policy check actually gates forwarding: a request this
