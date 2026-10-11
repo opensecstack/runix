@@ -1,8 +1,7 @@
-# Runix Beta developer preview: release notes (DRAFT)
+# Runix Beta developer preview: release notes
 
-Draft. No version number, date or tag is assigned. This is a developer preview
-for people who will read the code, not a product release. The exit criteria
-and the evidence for every statement below are in
+This is a developer preview for people who will read the code, not a product
+release. The exit criteria and the evidence for every statement below are in
 [BETA_CRITERIA.md](BETA_CRITERIA.md); the full change list is in
 [../CHANGELOG.md](../CHANGELOG.md); detailed implementation state is in
 [STATUS.md](STATUS.md).

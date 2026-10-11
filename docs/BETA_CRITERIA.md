@@ -86,10 +86,14 @@ be described as having any of the following.
     (the CI runner gets no DNS answer from 8.8.8.8; see commit `ce9a203`) and
     `kernel/tests/syscall_cost.rs` (a timing measurement, not a pass/fail
     check). DNS resolution is therefore not CI-verified.
-13. **Not a release process.** No version number, signed artifacts, update
-    channel or support policy exists. RC and v1.0 scope (desktop shell, WORM
-    boot chain, attestation, secure dialer, VoIP, roaming governance) is not
-    started.
+13. **Not a full release process.** The Alpha has a tag (`v0.1.0-alpha`) and a
+    notes-only GitHub release with no binary artifacts attached. This Beta adds
+    a tag-triggered workflow (`.github/workflows/release.yml`) that builds the
+    x86_64 image, the aarch64 kernel ELF and the host ELFs and publishes
+    `SHA256SUMS` as a draft release, but nothing is signed: a checksum file is
+    not a signature. There is no update channel and no support policy. RC and
+    v1.0 scope (desktop shell, WORM boot chain, attestation, secure dialer,
+    VoIP, roaming governance) is not started.
 
 ## Summary
 

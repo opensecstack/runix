@@ -194,7 +194,19 @@ jobs:
             *-*) args+=(--prerelease) ;;
           esac
           if [ -f docs/RELEASE_NOTES_BETA_DRAFT.md ]; then
-            args+=(--notes-file docs/RELEASE_NOTES_BETA_DRAFT.md)
+            # The notes keep ordinary repo-relative links so they render in the
+            # repo. A release page has no such base, so rewrite them to links
+            # pinned to this tag. The tag goes into sed, so allow only a plain
+            # tag-name alphabet first (refuse anything else rather than escape).
+            case "$TAG" in
+              *[!0-9A-Za-z._-]*) echo "refusing tag name with unexpected characters" >&2; exit 1 ;;
+            esac
+            base="https://github.com/${GH_REPO}/blob/${TAG}"
+            sed -E \
+              -e "s#\]\(\.\./([A-Za-z0-9_./-]+)\)#](${base}/\1)#g" \
+              -e "s#\]\(([A-Za-z0-9_-]+\.md)\)#](${base}/docs/\1)#g" \
+              docs/RELEASE_NOTES_BETA_DRAFT.md > "$RUNNER_TEMP/release-notes.md"
+            args+=(--notes-file "$RUNNER_TEMP/release-notes.md")
           else
             printf 'Runix %s (draft). See CHANGELOG.md and docs/STATUS.md for what changed and what is implemented. Verify downloads against SHA256SUMS.\n' "$TAG" > "$RUNNER_TEMP/release-notes.md"
             args+=(--notes-file "$RUNNER_TEMP/release-notes.md")

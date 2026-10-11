@@ -7,7 +7,9 @@ microkernel and a WebAssembly application layer, with
 (MARSHAL, WORM, VIGIL, AUGUR) integrated as infrastructure rather than
 bolted on.
 
-We are currently in **Alpha**, pre-1.0, no shipped release. The kernel's
+Alpha is complete (tagged `v0.1.0-alpha`, with a notes-only GitHub release) and
+Beta is in progress, pre-1.0; see [docs/BETA_CRITERIA.md](docs/BETA_CRITERIA.md)
+for what Beta does and does not claim. The kernel's
 own bring-up is complete — boot, exception handling, paging, a kernel
 heap, PIC/PIT interrupts, a cooperative scheduler, a syscall ABI, IPC, a
 real ring 0 → ring 3 transition, per-process address spaces, an ELF
