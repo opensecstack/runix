@@ -479,7 +479,7 @@ jobs:
       # with MarshalEnforcement(Blocked(Refuse))), and configured but
       # unreachable (no route; spawn succeeds: fail-open). Every case is
       # recorded in the WormLog.
-      - name: cargo test grid_sandbox_marshal_shadow (real MARSHAL enforcement: blocks on a reachable Refuse, fail-open when unreachable)
+      - name: cargo test grid_sandbox_marshal_shadow (real MARSHAL enforcement - blocks on a reachable Refuse, fail-open when unreachable)
         working-directory: kernel
         run: |
           python3 tests/support/grid_sandbox_marshal_shadow_listener.py &

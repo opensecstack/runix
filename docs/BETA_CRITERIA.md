@@ -235,7 +235,7 @@ path; fails open on unreachable); (b) MET (to a mock CITADEL only);
 
 **Evidence:**
 - (a) `kernel/tests/grid_sandbox_marshal_shadow.rs` (CI step
-  `cargo test grid_sandbox_marshal_shadow (real MARSHAL enforcement: blocks on a reachable Refuse, fail-open when unreachable)`).
+  `cargo test grid_sandbox_marshal_shadow (real MARSHAL enforcement - blocks on a reachable Refuse, fail-open when unreachable)`).
   `Refuse`/`HARD_STOP` block, proven in CI against stand-ins and against a mock
   CITADEL that reproduces the real handler's HTTP 403 + Decision; no real
   CITADEL is exercised.
