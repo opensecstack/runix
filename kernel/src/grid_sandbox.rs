@@ -30,7 +30,7 @@ use crate::process::AddressSpace;
 use crate::scheduler;
 use crate::serial_println;
 use crate::userspace;
-use alloc::format;
+use alloc::string::String;
 use core::fmt;
 use ed25519_dalek::SigningKey;
 use lazy_static::lazy_static;
@@ -178,6 +178,46 @@ pub fn shadow_marshal_log_entries() -> alloc::vec::Vec<runix_citadel_integration
     SHADOW_MARSHAL_LOG.lock().entries().to_vec()
 }
 
+/// Appends `s` to `out` as the *contents* of a JSON string (no surrounding
+/// quotes): `"` and `\` are backslash-escaped, control characters
+/// U+0000-U+001F become `\u00XX` (lowercase hex), and every other character
+/// (including non-ASCII) passes through unchanged as valid UTF-8. Ordinary
+/// ids are therefore byte-identical to the unescaped form.
+pub fn json_escape_into(out: &mut String, s: &str) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => {
+                let b = c as u32 as usize;
+                out.push_str("\\u00");
+                out.push(HEX[b >> 4] as char);
+                out.push(HEX[b & 0xf] as char);
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+/// Builds the MARSHAL spawn request envelope with `module_id`/`instance_id`
+/// JSON-escaped, so a hostile id can neither break the JSON nor inject
+/// members. Output for ordinary ids is byte-for-byte the historical format.
+pub fn build_spawn_kerkese_json(module_id: &str, instance_id: &str) -> String {
+    let mut out = String::from(
+        r#"{"kerkese_version":"1.0","dry_run":true,"action":{"type":"grid_sandbox.spawn_instance","module_id":""#,
+    );
+    json_escape_into(&mut out, module_id);
+    out.push_str(r#"","instance_id":""#);
+    json_escape_into(&mut out, instance_id);
+    out.push_str(
+        r#""},"actor":{"user_id":"kernel:grid_sandbox","role":"operator"},"execution_id":""#,
+    );
+    json_escape_into(&mut out, instance_id);
+    out.push_str(r#""}"#);
+    out
+}
+
 /// Performs [`spawn_instance`]'s MARSHAL evaluation for an already-authorized
 /// `(module_id, instance_id)` pair, records the outcome in
 /// [`SHADOW_MARSHAL_LOG`] exactly as before (this observability path is
@@ -211,9 +251,7 @@ fn shadow_marshal_evaluate(module_id: &str, instance_id: &str) -> ShadowMarshalO
             // policy check passes. See that module's `identity`/`policy`
             // submodules for what fills in the rest of this envelope
             // before it ever reaches CITADEL.
-            let kerkese_json = format!(
-                r#"{{"kerkese_version":"1.0","dry_run":true,"action":{{"type":"grid_sandbox.spawn_instance","module_id":"{module_id}","instance_id":"{instance_id}"}},"actor":{{"user_id":"kernel:grid_sandbox","role":"operator"}},"execution_id":"{instance_id}"}}"#
-            );
+            let kerkese_json = build_spawn_kerkese_json(module_id, instance_id);
             let request = MarshalRequest {
                 kerkese_json: kerkese_json.into_bytes(),
             };

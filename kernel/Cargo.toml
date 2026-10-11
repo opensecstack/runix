@@ -106,6 +106,10 @@ name = "grid_sandbox_multi_instance"
 harness = false
 
 [[test]]
+name = "marshal_envelope_escape"
+harness = false
+
+[[test]]
 name = "citadel_demo"
 harness = false
 
