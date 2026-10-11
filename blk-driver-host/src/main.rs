@@ -26,6 +26,7 @@
 
 #![no_std]
 #![no_main]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 extern crate alloc;
 
@@ -409,6 +410,16 @@ struct BlkDevice {
 impl BlkDevice {
     fn request(&mut self, req_type: u32, sector: u64, data_writable: bool) -> (bool, u8) {
         write_header(self.base, req_type, sector);
+        // SAFETY: `post_chain`'s contract: the three `*_phys` addresses are
+        // the header/data/status parts of the one request-buffer page the
+        // kernel mapped and handed over via `BlkBootInfo::reqbuf_phys`
+        // (offsets 0, 16, 528; lengths 16, 512, 1; all inside 4096 B); the
+        // process owns that page for its whole life so it outlives the
+        // device's use. The chain has 3 entries, which must be <= the
+        // device's `qsize` (not checked anywhere: `queue_size` only checks
+        // the upper bound; see report). Only one request is ever in flight:
+        // `&mut self` plus `poll_for_completion` before returning, except
+        // after a poll timeout (see `poll_for_completion`).
         unsafe {
             self.queue.post_chain(&[
                 (self.header_phys, REQBUF_HEADER_LEN as u32, false),
@@ -418,6 +429,10 @@ impl BlkDevice {
         }
         virtio::notify(self.io_base, REQUEST_QUEUE_INDEX);
         let completed = poll_for_completion(&mut self.queue);
+        // SAFETY: `status_ptr` is `base + REQBUF_STATUS_OFFSET` (528) in the
+        // 4096-byte request-buffer page set up in `_start`: in bounds, a
+        // `u8` so always aligned, mapped and readable. Volatile because
+        // the device DMA-writes this byte.
         let status = unsafe { core::ptr::read_volatile(self.status_ptr) };
         (completed, status)
     }
@@ -428,6 +443,12 @@ impl BlkDevice {
     /// Phase 2's FAT32 walk touches) treats "couldn't read this sector"
     /// as a reason to stop, not to guess.
     fn read_sector(&mut self, sector: u64) -> Option<[u8; SECTOR_SIZE]> {
+        // SAFETY: `data_ptr` (offset 16) is valid for `SECTOR_SIZE` (512)
+        // bytes and `status_ptr` (offset 528) for 1 byte, all inside the
+        // one mapped, writable 4096-byte request-buffer page; `u8` writes
+        // need no alignment. No request is in flight to race with the
+        // device here (`&mut self`; previous `request` polled to
+        // completion, barring the timeout case, see `poll_for_completion`).
         unsafe {
             core::ptr::write_bytes(self.data_ptr, 0, SECTOR_SIZE);
             core::ptr::write_volatile(self.status_ptr, 0xFFu8);
@@ -437,6 +458,12 @@ impl BlkDevice {
             return None;
         }
         let mut buf = [0u8; SECTOR_SIZE];
+        // SAFETY: source is the 512-byte data region of the request page
+        // (in bounds, see above), destination is a fresh local array of
+        // exactly `SECTOR_SIZE` bytes, so the ranges cannot overlap. The
+        // request completed (`completed` checked above), so the device is
+        // no longer writing this region (assuming a device that reports
+        // used-ring completion has finished its DMA).
         unsafe {
             core::ptr::copy_nonoverlapping(self.data_ptr, buf.as_mut_ptr(), SECTOR_SIZE);
         }
@@ -444,6 +471,12 @@ impl BlkDevice {
     }
 
     fn write_sector(&mut self, sector: u64, data: &[u8; SECTOR_SIZE]) -> (bool, u8) {
+        // SAFETY: destination is the 512-byte data region at offset 16 of
+        // the mapped request page (in bounds), source is the caller's
+        // `&[u8; SECTOR_SIZE]` (exactly 512 bytes); they cannot overlap
+        // because the request page is never exposed to callers as a slice.
+        // `status_ptr` is in bounds as above. No request in flight (see
+        // `read_sector`), so the device is not reading this region.
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), self.data_ptr, SECTOR_SIZE);
             core::ptr::write_volatile(self.status_ptr, 0xFFu8);
@@ -457,6 +490,11 @@ impl BlkDevice {
 /// guarantee beyond "4 KiB page start", and 16 bytes doesn't force 8-byte
 /// alignment for the `sector` field on its own.
 fn write_header(base: *mut u8, req_type: u32, sector: u64) {
+    // SAFETY: `base` is `BLK_REQBUF_VA` (the only caller passes
+    // `BlkDevice::base`), the start of the kernel-mapped writable
+    // request-buffer page; writes cover bytes 0..16 of it, in bounds.
+    // `write_unaligned` means no alignment requirement on the `u32`/`u64`
+    // destinations.
     unsafe {
         core::ptr::write_unaligned(base.add(REQBUF_HEADER_OFFSET) as *mut u32, req_type.to_le());
         core::ptr::write_unaligned(base.add(REQBUF_HEADER_OFFSET + 4) as *mut u32, 0u32);
@@ -469,10 +507,28 @@ fn write_header(base: *mut u8, req_type: u32, sector: u64) {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    // SAFETY: `LockedHeap::init` requires a valid, writable, otherwise
+    // unused region and a single call. The kernel maps and zeroes
+    // `[HEAP_START, HEAP_START + HEAP_SIZE)` (`BLK_HEAP_START`/`SIZE`, same
+    // constants, in `load_and_run_blk_driver_host`) before spawning, nothing
+    // else in this binary uses that range, and this is the first statement
+    // of the process entry point, run once by the only thread, before any
+    // allocation. (`HEAP_SIZE`'s doc claims no allocation happens, but
+    // `alloc::{format, Vec}` are imported and used in this file, so the
+    // heap is live; the 256 KiB size is not verified against peak use.)
     unsafe {
         ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
     }
 
+    // SAFETY: `BLK_INFO_VA` is the page the kernel mapped (user, writable,
+    // page-aligned so aligned for `BlkBootInfo`'s align of 8) and filled
+    // with a `BlkBootInfo` before spawn, in the layout the `repr(C)` mirror
+    // in the kernel defines (that agreement is only by hand-kept
+    // convention, not type-checked). All fields are plain integers, so any
+    // bit pattern is valid. The reference is never invalidated: the page
+    // stays mapped for the process's life, and the only other writes to it
+    // are this process's result bytes at offsets 128/129, outside the
+    // struct's 32 bytes. The `'static`-like lifetime is unchecked.
     let info = unsafe { &*(BLK_INFO_VA as *const BlkBootInfo) };
     let blk = VirtioBlk::probe(info.io_base);
 
@@ -482,6 +538,14 @@ pub extern "C" fn _start() -> ! {
 
     let qsize = blk.queue_size(REQUEST_QUEUE_INDEX);
     blk.set_queue_address(REQUEST_QUEUE_INDEX, info.queue_phys);
+    // SAFETY: `Virtqueue::new`'s contract: `BLK_QUEUE_VA` (64 KiB aligned)
+    // is the 3 contiguous pages the kernel maps writable, zeroed and
+    // exclusively to this process (`map_zeroed_contiguous_region(.., 3, ..)`),
+    // never unmapped; `info.queue_phys` programmed just above is their
+    // physical base. `qsize` came from the device and `queue_size` asserts
+    // `qsize <= MAX_SUPPORTED_QUEUE_SIZE`, but NOT `qsize != 0` or
+    // `qsize >= 3` (see report): a zero-size queue would panic (abort) in
+    // `post_chain`/`poll_used`'s `%`, not cause UB.
     let mut queue = unsafe { Virtqueue::new(BLK_QUEUE_VA, qsize) };
     queue.init_avail_flags();
     blk.mark_ready();
@@ -494,7 +558,11 @@ pub extern "C" fn _start() -> ! {
         header_phys: info.reqbuf_phys + REQBUF_HEADER_OFFSET as u64,
         data_phys: info.reqbuf_phys + REQBUF_DATA_OFFSET as u64,
         status_phys: info.reqbuf_phys + REQBUF_STATUS_OFFSET as u64,
+        // SAFETY: `base` points to the start of the 4096-byte
+        // request-buffer page and `REQBUF_DATA_OFFSET` (16) is well within
+        // it, so `add` stays inside one allocation without overflow.
         data_ptr: unsafe { base.add(REQBUF_DATA_OFFSET) },
+        // SAFETY: as above; `REQBUF_STATUS_OFFSET` is 528, still < 4096.
         status_ptr: unsafe { base.add(REQBUF_STATUS_OFFSET) },
     };
 
@@ -519,6 +587,11 @@ pub extern "C" fn _start() -> ! {
         }
     } else if info.attempt_fat32 != 0 {
         let phase2_pass = run_fat32_proof(&mut dev);
+        // SAFETY: `BLK_INFO_VA + 129` is a byte inside the mapped, writable
+        // boot-info page (u8: no alignment need), outside the
+        // `BlkBootInfo` struct's bytes so it does not alias `info`.
+        // Volatile because the kernel/test reads it from outside this
+        // process's view of the program.
         unsafe {
             core::ptr::write_volatile(
                 (BLK_INFO_VA + BLK_FAT32_RESULT_OFFSET) as *mut u8,
@@ -531,6 +604,7 @@ pub extern "C" fn _start() -> ! {
         }
     } else {
         let phase1_pass = run_sector_roundtrip_proof(&mut dev);
+        // SAFETY: same as the Phase 2 result write above, at offset 128.
         unsafe {
             core::ptr::write_volatile(
                 (BLK_INFO_VA + BLK_RESULT_OFFSET) as *mut u8,
@@ -2534,6 +2608,12 @@ fn next_cluster_in_chain(dev: &mut BlkDevice, info: &BootSectorInfo, cluster: u3
 /// phase passes once this budget is large enough that the loop never
 /// actually exhausts it (confirmed via a temporary instrumented build
 /// that logged every timeout; none fired at this bound).
+///
+/// Caveat relevant to the `unsafe` in `BlkDevice::request`: on a timeout
+/// (`false`) the device may still own the descriptors/buffer and may
+/// complete later; the next request would reuse them and could consume
+/// that stale completion. Callers treat `false` as fatal for that request
+/// but nothing quarantines the device.
 fn poll_for_completion(queue: &mut Virtqueue) -> bool {
     for i in 0..100_000_000u32 {
         if queue.poll_used().is_some() {

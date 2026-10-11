@@ -23,9 +23,30 @@ const SYS_IPC_SESSION_SEND_UNLOCK: u64 = 15;
 const SYS_CAP_IS_REVOKED: u64 = 16;
 
 /// # Safety
-/// Whatever `num`'s own contract requires.
+/// Must only run in this ring 3 process, where the kernel has installed a
+/// DPL 3 gate at vector 0x80 (otherwise `int 0x80` raises #GP). `num` must
+/// be one of the `SYS_*` numbers above and `arg1..arg3` must satisfy that
+/// syscall's own contract. Every wrapper in this file passes only plain
+/// integers, never a pointer or length describing process memory, so the
+/// kernel never dereferences anything of ours on the caller's behalf and an
+/// out-of-contract value is rejected with `u64::MAX` rather than being a
+/// memory-safety hazard for this process. The asm block's register contract
+/// is spelled out at its own `SAFETY` comment below.
 unsafe fn syscall(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     let ret: u64;
+    // SAFETY: `int 0x80` enters `kernel/src/syscall.rs`'s naked `entry`,
+    // which moves rax/rdi/rsi/rdx into the SysV argument registers and
+    // `call`s a normal Rust `dispatch`, then `iretq`s. So on return every
+    // callee-saved register (rbx, rbp, r12-r15) and rsp are preserved by
+    // `dispatch`'s ABI; rax carries the result; rdi, rsi, rdx, rcx, r8-r11
+    // are caller-saved/scratch under that ABI and are all declared
+    // clobbered here (rdi/rsi/rdx as `inout ... => _` so the compiler
+    // cannot reuse them as inputs, see the comment on those operands).
+    // `options(...)` is deliberately omitted, so the compiler assumes the
+    // asm reads and writes arbitrary memory, may push to the stack and
+    // alters flags, which is the conservative (sound) choice for a kernel
+    // call. The kernel does not touch this process's memory through the
+    // scalar arguments (see this fn's `# Safety`).
     unsafe {
         core::arch::asm!(
             "int 0x80",
@@ -52,6 +73,9 @@ unsafe fn syscall(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
 }
 
 pub fn write_byte(byte: u8) {
+    // SAFETY: `SYS_WRITE` passes only scalar arguments (no pointers into this
+    // process), and `syscall`'s other precondition (ring 3 with the 0x80
+    // gate installed) holds for the whole life of this process.
     unsafe {
         syscall(SYS_WRITE, byte as u64, 0, 0);
     }
@@ -64,6 +88,9 @@ pub fn write_all(bytes: &[u8]) {
 }
 
 pub fn yield_now() {
+    // SAFETY: `SYS_YIELD` passes only scalar arguments (no pointers into this
+    // process), and `syscall`'s other precondition (ring 3 with the 0x80
+    // gate installed) holds for the whole life of this process.
     unsafe {
         syscall(SYS_YIELD, 0, 0, 0);
     }
@@ -73,6 +100,9 @@ pub fn yield_now() {
 /// this process was spawned with (see `kernel/src/capabilities.rs`'s
 /// `authorized_for_ioport`). Returns `None` if denied.
 pub fn port_in(port: u16, width: u8) -> Option<u32> {
+    // SAFETY: `SYS_PORT_IN` passes only scalar arguments (no pointers into this
+    // process), and `syscall`'s other precondition (ring 3 with the 0x80
+    // gate installed) holds for the whole life of this process.
     let ret = unsafe { syscall(SYS_PORT_IN, port as u64, width as u64, 0) };
     if ret == u64::MAX {
         None
@@ -84,6 +114,9 @@ pub fn port_in(port: u16, width: u8) -> Option<u32> {
 /// Writes `value`'s low `width` bytes to I/O `port`. Returns `false` if
 /// denied, same conditions as [`port_in`].
 pub fn port_out(port: u16, width: u8, value: u32) -> bool {
+    // SAFETY: `SYS_PORT_OUT` passes only scalar arguments (no pointers into this
+    // process), and `syscall`'s other precondition (ring 3 with the 0x80
+    // gate installed) holds for the whole life of this process.
     let ret = unsafe { syscall(SYS_PORT_OUT, port as u64, width as u64, value as u64) };
     ret != u64::MAX
 }
@@ -93,6 +126,9 @@ pub fn port_out(port: u16, width: u8, value: u32) -> bool {
 /// `revocation:query` capability). The caller must accept only exactly `0`
 /// as "not revoked" (fail closed); see `verify_file_token_with`.
 pub fn cap_is_revoked(fingerprint: u64) -> u64 {
+    // SAFETY: `SYS_CAP_IS_REVOKED` passes only scalar arguments (no pointers into this
+    // process), and `syscall`'s other precondition (ring 3 with the 0x80
+    // gate installed) holds for the whole life of this process.
     unsafe { syscall(SYS_CAP_IS_REVOKED, fingerprint, 0, 0) }
 }
 
@@ -100,6 +136,9 @@ pub fn cap_is_revoked(fingerprint: u64) -> u64 {
 /// comment for why this driver needs it (per-request capability-token
 /// expiry checking, `main.rs`'s `verify_file_token`).
 pub fn ticks() -> u64 {
+    // SAFETY: `SYS_TICKS` passes only scalar arguments (no pointers into this
+    // process), and `syscall`'s other precondition (ring 3 with the 0x80
+    // gate installed) holds for the whole life of this process.
     unsafe { syscall(SYS_TICKS, 0, 0, 0) }
 }
 
@@ -113,6 +152,9 @@ pub fn ticks() -> u64 {
 /// polls this once per loop iteration against `FS_SERVER_PORT` to pick up
 /// newly opened client sessions.
 pub fn session_try_accept(server_port: usize) -> Option<u64> {
+    // SAFETY: `SYS_IPC_SESSION_ACCEPT` passes only scalar arguments (no pointers into this
+    // process), and `syscall`'s other precondition (ring 3 with the 0x80
+    // gate installed) holds for the whole life of this process.
     let ret = unsafe { syscall(SYS_IPC_SESSION_ACCEPT, server_port as u64, 0, 0) };
     if ret == u64::MAX {
         None
@@ -128,6 +170,9 @@ pub fn session_try_accept(server_port: usize) -> Option<u64> {
 /// O(1) identity check rather than a re-verified capability token on every
 /// call.
 pub fn session_try_recv(session_id: u64) -> Option<u8> {
+    // SAFETY: `SYS_IPC_SESSION_RECV` passes only scalar arguments (no pointers into this
+    // process), and `syscall`'s other precondition (ring 3 with the 0x80
+    // gate installed) holds for the whole life of this process.
     let ret = unsafe { syscall(SYS_IPC_SESSION_RECV, session_id, 0, 0) };
     if ret == u64::MAX {
         None
@@ -140,6 +185,9 @@ pub fn session_try_recv(session_id: u64) -> Option<u8> {
 /// (spin-yielding) if its queue is momentarily full. Returns `false` if
 /// the session doesn't exist or this process isn't a participant.
 pub fn session_send(session_id: u64, byte: u8) -> bool {
+    // SAFETY: `SYS_IPC_SESSION_SEND` passes only scalar arguments (no pointers into this
+    // process), and `syscall`'s other precondition (ring 3 with the 0x80
+    // gate installed) holds for the whole life of this process.
     let ret = unsafe { syscall(SYS_IPC_SESSION_SEND, session_id, byte as u64, 0) };
     ret != u64::MAX
 }
@@ -152,6 +200,9 @@ pub fn session_send(session_id: u64, byte: u8) -> bool {
 /// concurrently without this. Returns `false` if this process isn't a
 /// participant.
 pub fn session_send_lock(session_id: u64) -> bool {
+    // SAFETY: `SYS_IPC_SESSION_SEND_LOCK` passes only scalar arguments (no pointers into this
+    // process), and `syscall`'s other precondition (ring 3 with the 0x80
+    // gate installed) holds for the whole life of this process.
     let ret = unsafe { syscall(SYS_IPC_SESSION_SEND_LOCK, session_id, 0, 0) };
     ret != u64::MAX
 }
@@ -159,6 +210,9 @@ pub fn session_send_lock(session_id: u64) -> bool {
 /// `SYS_IPC_SESSION_SEND_UNLOCK` — releases a lock claimed by
 /// [`session_send_lock`] on the same session from the same thread.
 pub fn session_send_unlock(session_id: u64) -> bool {
+    // SAFETY: `SYS_IPC_SESSION_SEND_UNLOCK` passes only scalar arguments (no pointers into this
+    // process), and `syscall`'s other precondition (ring 3 with the 0x80
+    // gate installed) holds for the whole life of this process.
     let ret = unsafe { syscall(SYS_IPC_SESSION_SEND_UNLOCK, session_id, 0, 0) };
     ret != u64::MAX
 }
