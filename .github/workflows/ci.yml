@@ -844,9 +844,10 @@ jobs:
           # Not MARSHAL-gated: of the data actions, ONLY the usage-period reset
           # (data.reset_usage, below) is ever sent for evaluation. Any other
           # "MARSHAL evaluation for data..." line is a regression, and so is
-          # more than one (the walk performs exactly one reset).
+          # any count but two (the walk performs exactly two gated resets: account 0's normal reset and
+          # account 1's early reset; the period-refused normal reset on account 1 is never sent).
           if grep "MARSHAL evaluation for data" /tmp/arm-boot.log | grep -qvF "data.reset_usage"; then exit 1; fi
-          test "$(grep -c "MARSHAL evaluation for data" /tmp/arm-boot.log)" -eq 1
+          test "$(grep -c "MARSHAL evaluation for data" /tmp/arm-boot.log)" -eq 2
           # Governed usage-period reset (SYS_DATA_RESET): it lifts a cap, so it is
           # capability-gated (data:reset:0, its own scope) AND MARSHAL-gated, and its
           # unreachable policy is FAIL-CLOSED (MarshalAction::unreachable_policy): a reset
@@ -884,6 +885,27 @@ jobs:
           grep -qF "SVC: SYS_SIM_DELETE slot 0 profile 0 authorized [MARSHAL verdict: Unreachable (fail-open: not governed)]" /tmp/arm-boot.log
           # No capability for data:reset:99: denied before MARSHAL or any state.
           grep -q "SVC: SYS_DATA_RESET account 99 DENIED" /tmp/arm-boot.log
+          # Billing-period gate on the reset (account 1 is DEMO DATA with a one-day period, so
+          # it is Active for the whole boot: no wall-clock race). A NORMAL reset needs an
+          # elapsed period: account 1 holds data:reset:1 but its period is active, so the
+          # reset is REFUSED before MARSHAL (no evaluation) and the refusal is WORM-audited.
+          grep -q "Runix ARM kernel: demo billing period installed (account 1, start tick 0, length " /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: data early-reset capability issued (account 1" /tmp/arm-boot.log
+          grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (billing period still active ([0-9]* ticks remaining); a normal reset is only allowed once it has elapsed)" /tmp/arm-boot.log
+          grep -q "SVC: SYS_DATA_RESET account 1 period refusal audited to WORM (authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot.log
+          # An unknown mode argument is refused before any capability is chosen.
+          grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (unknown mode 7; 0 = normal, 1 = early)" /tmp/arm-boot.log
+          # The EARLY reset is its own capability scope: account 0 holds data:reset:0 only, so
+          # an early reset on it is DENIED on the capability alone.
+          grep -q "SVC: SYS_DATA_RESET(early) account 0 DENIED (capability token is not authorized" /tmp/arm-boot.log
+          # With data:reset-early:1 the active period no longer blocks it; it is MARSHAL-gated
+          # with the SAME action and, with no proxy here, fails CLOSED like the normal reset.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=1: Unreachable" /tmp/arm-boot.log
+          grep -qF "SVC: SYS_DATA_RESET(early) account 1 DENIED (MARSHAL unreachable: fail-closed for this action)" /tmp/arm-boot.log
+          grep -qF "denial audited to WORM (usage period in force -> new usage period (counter reset; EARLY override), authorized=false;" /tmp/arm-boot.log
+          if grep -q "SVC: SYS_DATA_RESET(early) account 1 authorized" /tmp/arm-boot.log; then exit 1; fi
+          # The refused normal reset cost no MARSHAL round trip: account 1 was evaluated once.
+          test "$(grep -c "MARSHAL evaluation for data.reset_usage account=1" /tmp/arm-boot.log)" -eq 1
           # Billing periods (kernel-arm/src/data_state.rs, runix_mobile::period). A period
           # is DATA and nothing resets on a schedule: SYS_DATA_PERIOD is read-only ADVICE
           # computed from the generic timer when a CALLER asks. Account 0's DEMO period
@@ -1136,9 +1158,10 @@ jobs:
           # Not MARSHAL-gated: of the data actions, ONLY the usage-period reset
           # (data.reset_usage, below) is ever sent for evaluation. Any other
           # "MARSHAL evaluation for data..." line is a regression, and so is
-          # more than one (the walk performs exactly one reset).
+          # any count but two (the walk performs exactly two gated resets: account 0's normal reset and
+          # account 1's early reset; the period-refused normal reset on account 1 is never sent).
           if grep "MARSHAL evaluation for data" /tmp/arm-boot-nosecure.log | grep -qvF "data.reset_usage"; then exit 1; fi
-          test "$(grep -c "MARSHAL evaluation for data" /tmp/arm-boot-nosecure.log)" -eq 1
+          test "$(grep -c "MARSHAL evaluation for data" /tmp/arm-boot-nosecure.log)" -eq 2
           # Governed usage-period reset (SYS_DATA_RESET): it lifts a cap, so it is
           # capability-gated (data:reset:0, its own scope) AND MARSHAL-gated, and its
           # unreachable policy is FAIL-CLOSED (MarshalAction::unreachable_policy): a reset
@@ -1176,6 +1199,21 @@ jobs:
           grep -qF "SVC: SYS_SIM_DELETE slot 0 profile 0 authorized [MARSHAL verdict: Unreachable (fail-open: not governed)]" /tmp/arm-boot-nosecure.log
           # No capability for data:reset:99: denied before MARSHAL or any state.
           grep -q "SVC: SYS_DATA_RESET account 99 DENIED" /tmp/arm-boot-nosecure.log
+          # Billing-period gate on the reset (account 1: DEMO DATA, one-day period, so Active
+          # for the whole boot: no wall-clock race). Normal reset REFUSED before MARSHAL; an
+          # unknown mode refused; early reset needs its own capability and, with it, fails
+          # CLOSED here (no MARSHAL proxy). Same assertions as the secure=on boot above.
+          grep -q "Runix ARM kernel: demo billing period installed (account 1, start tick 0, length " /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: data early-reset capability issued (account 1" /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (billing period still active ([0-9]* ticks remaining); a normal reset is only allowed once it has elapsed)" /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_DATA_RESET account 1 period refusal audited to WORM (authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (unknown mode 7; 0 = normal, 1 = early)" /tmp/arm-boot-nosecure.log
+          grep -q "SVC: SYS_DATA_RESET(early) account 0 DENIED (capability token is not authorized" /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=1: Unreachable" /tmp/arm-boot-nosecure.log
+          grep -qF "SVC: SYS_DATA_RESET(early) account 1 DENIED (MARSHAL unreachable: fail-closed for this action)" /tmp/arm-boot-nosecure.log
+          grep -qF "denial audited to WORM (usage period in force -> new usage period (counter reset; EARLY override), authorized=false;" /tmp/arm-boot-nosecure.log
+          if grep -q "SVC: SYS_DATA_RESET(early) account 1 authorized" /tmp/arm-boot-nosecure.log; then exit 1; fi
+          test "$(grep -c "MARSHAL evaluation for data.reset_usage account=1" /tmp/arm-boot-nosecure.log)" -eq 1
           # Billing periods (kernel-arm/src/data_state.rs, runix_mobile::period). A period
           # is DATA and nothing resets on a schedule: SYS_DATA_PERIOD is read-only ADVICE
           # computed from the generic timer when a CALLER asks. Account 0's DEMO period
@@ -1315,6 +1353,19 @@ jobs:
           # calls (~15 ms measured), which a stalled runner could break; the plain boots
           # above assert the opposite, race-free case (a denied reset starts no period).
           grep -q "SVC: SYS_DATA_RESET account 0 billing period: next billing period started at tick [0-9]* (length [0-9]* ticks); reset request cleared" /tmp/arm-boot-marshal-refuse.log
+          # Billing-period gate on the reset (account 1: DEMO DATA, one-day period, Active for
+          # the whole boot). Normal reset REFUSED before MARSHAL (WORM-audited); unknown mode
+          # refused; early reset DENIED on account 0 (no data:reset-early:0) and, on account 1
+          # with its capability, follows the MARSHAL verdict -- here Execute (only esim.* is
+          # refused), so it is authorized and records the real verdict and the override.
+          grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (billing period still active ([0-9]* ticks remaining); a normal reset is only allowed once it has elapsed)" /tmp/arm-boot-marshal-refuse.log
+          grep -q "SVC: SYS_DATA_RESET account 1 period refusal audited to WORM (authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot-marshal-refuse.log
+          grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (unknown mode 7; 0 = normal, 1 = early)" /tmp/arm-boot-marshal-refuse.log
+          grep -q "SVC: SYS_DATA_RESET(early) account 0 DENIED (capability token is not authorized" /tmp/arm-boot-marshal-refuse.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=1: Execute" /tmp/arm-boot-marshal-refuse.log
+          grep -qF "SVC: SYS_DATA_RESET(early) account 1 authorized (EARLY override reset; usage 0 -> 0; new period; MARSHAL verdict: Execute; " /tmp/arm-boot-marshal-refuse.log
+          grep -q "SVC: SYS_DATA_RESET(early) account 1 billing period: next billing period started at tick [0-9]* (length [0-9]* ticks); reset request cleared" /tmp/arm-boot-marshal-refuse.log
+          test "$(grep -c "MARSHAL evaluation for data.reset_usage account=1" /tmp/arm-boot-marshal-refuse.log)" -eq 1
 
       # Beta item 3.4: the MVNO MARSHAL gate itself. Same bridge as above, but
       # the selective listener Refuses only `mvno.suspend_account`: the walk's
@@ -1382,6 +1433,19 @@ jobs:
           test "$(grep -c "SVC: SYS_DATA_PERIOD account 0 authorized (.*returns code 1)" /tmp/arm-boot-marshal-refuse-mvno.log)" -eq 2
           if grep -q "SVC: SYS_DATA_PERIOD account 0 authorized (.*returns code 0)" /tmp/arm-boot-marshal-refuse-mvno.log; then exit 1; fi
           if grep -q "next billing period started" /tmp/arm-boot-marshal-refuse-mvno.log; then exit 1; fi
+          # Billing-period gate on the reset (account 1: DEMO DATA, one-day period, Active for
+          # the whole boot). Normal reset REFUSED before MARSHAL; early reset DENIED on account
+          # 0 (no data:reset-early:0); early reset on account 1 (capability held) reaches
+          # MARSHAL -- the SAME data.reset_usage action, Refused here -- and is DENIED with
+          # the counter and period untouched (no "started" line, checked above).
+          grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (billing period still active ([0-9]* ticks remaining); a normal reset is only allowed once it has elapsed)" /tmp/arm-boot-marshal-refuse-mvno.log
+          grep -q "SVC: SYS_DATA_RESET account 1 period refusal audited to WORM (authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot-marshal-refuse-mvno.log
+          grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (unknown mode 7; 0 = normal, 1 = early)" /tmp/arm-boot-marshal-refuse-mvno.log
+          grep -q "SVC: SYS_DATA_RESET(early) account 0 DENIED (capability token is not authorized" /tmp/arm-boot-marshal-refuse-mvno.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=1: Refuse" /tmp/arm-boot-marshal-refuse-mvno.log
+          grep -qF "SVC: SYS_DATA_RESET(early) account 1 DENIED (MARSHAL Refuse)" /tmp/arm-boot-marshal-refuse-mvno.log
+          if grep -q "SVC: SYS_DATA_RESET(early) account 1 authorized" /tmp/arm-boot-marshal-refuse-mvno.log; then exit 1; fi
+          test "$(grep -c "MARSHAL evaluation for data.reset_usage account=1" /tmp/arm-boot-marshal-refuse-mvno.log)" -eq 1
       # Full real chain, the third case the REFUSE/Unreachable configs above
       # can't distinguish on their own (a Refuse from a canned stand-in
       # listener proves the transport, not that the real proxy's policy
@@ -1472,6 +1536,19 @@ jobs:
           # calls (~15 ms measured), which a stalled runner could break; the plain boots
           # above assert the opposite, race-free case (a denied reset starts no period).
           grep -q "SVC: SYS_DATA_RESET account 0 billing period: next billing period started at tick [0-9]* (length [0-9]* ticks); reset request cleared" /tmp/arm-boot-marshal-execute.log
+          # Billing-period gate on the reset (account 1: DEMO DATA, one-day period, Active for
+          # the whole boot). Normal reset REFUSED before MARSHAL; unknown mode refused; early
+          # reset DENIED on account 0 (no data:reset-early:0); early reset on account 1
+          # (capability held) passes the real proxy's data.reset_usage policy (same action
+          # type, no new one) and is authorized, recording the real verdict and the override.
+          grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (billing period still active ([0-9]* ticks remaining); a normal reset is only allowed once it has elapsed)" /tmp/arm-boot-marshal-execute.log
+          grep -q "SVC: SYS_DATA_RESET account 1 period refusal audited to WORM (authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot-marshal-execute.log
+          grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (unknown mode 7; 0 = normal, 1 = early)" /tmp/arm-boot-marshal-execute.log
+          grep -q "SVC: SYS_DATA_RESET(early) account 0 DENIED (capability token is not authorized" /tmp/arm-boot-marshal-execute.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=1: Execute" /tmp/arm-boot-marshal-execute.log
+          grep -qF "SVC: SYS_DATA_RESET(early) account 1 authorized (EARLY override reset; usage 0 -> 0; new period; MARSHAL verdict: Execute; " /tmp/arm-boot-marshal-execute.log
+          grep -q "SVC: SYS_DATA_RESET(early) account 1 billing period: next billing period started at tick [0-9]* (length [0-9]* ticks); reset request cleared" /tmp/arm-boot-marshal-execute.log
+          test "$(grep -c "MARSHAL evaluation for data.reset_usage account=1" /tmp/arm-boot-marshal-execute.log)" -eq 1
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke
