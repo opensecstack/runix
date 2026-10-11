@@ -56,6 +56,14 @@ pub const MAX_PERIODS: usize = 64;
 /// Length of the DEMO period, in ticks. DEMO DATA ONLY.
 pub const DEMO_PERIOD_TICKS: u64 = 1_000;
 
+/// Cooldown between an applied reset and the next EARLY reset, in milliseconds
+/// of the caller's timer (the kernel converts with the counter's actual
+/// frequency, never a hardcoded tick count). One hour. DEMO DATA ONLY: a real
+/// deployment's value is a plan/operator policy decision, not this number. It is
+/// sized to be far longer than any boot walk so a CI proof ("an immediate second
+/// early reset is refused") is deterministic rather than a race.
+pub const DEMO_EARLY_RESET_COOLDOWN_MILLIS: u64 = 3_600_000;
+
 /// Why a period could not be built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeriodError {
@@ -223,6 +231,14 @@ pub enum ResetRefusal {
     /// a coherent next period (`next_period` rejects a reset before the old
     /// start) and a rewound counter must not be a way to reset on demand.
     ClockBeforeStart { start_tick: u64, now_tick: u64 },
+    /// An EARLY reset was asked for less than the cooldown after the account's
+    /// last applied reset (normal or early). Only the early reset is subject to
+    /// it: it bounds how often the override can lift a cap.
+    EarlyCooldown {
+        /// Ticks until the cooldown is over (at least 1). A counter that reads
+        /// before the last reset (rewound) reports the full cooldown.
+        remaining: u64,
+    },
 }
 
 impl fmt::Display for ResetRefusal {
@@ -239,6 +255,10 @@ impl fmt::Display for ResetRefusal {
                 f,
                 "clock before period start (now {now_tick} < start {start_tick}); reset refused"
             ),
+            ResetRefusal::EarlyCooldown { remaining } => write!(
+                f,
+                "early-reset cooldown: a reset was applied recently ({remaining} ticks remaining before another early reset is allowed)"
+            ),
         }
     }
 }
@@ -252,14 +272,15 @@ impl fmt::Display for ResetRefusal {
 /// * `Elapsed` -> allowed, normal or early.
 /// * `Active` -> allowed only if `early`; otherwise [`ResetRefusal::PeriodActive`].
 /// * `ClockBeforeStart` -> always refused (see [`ResetRefusal::ClockBeforeStart`]).
-/// * `None` (no period) -> allowed, normal or early. This is the pre-period
-///   behaviour kept on purpose: with no period there is nothing to gate a reset
-///   against, and refusing would strand an account that has no billing cycle. It
-///   is a documented gap, not an endorsement: such an account can be reset
-///   repeatedly (still capability- and MARSHAL-gated and WORM-audited).
+/// * `None` (no period) -> allowed, normal or early, for the FIRST reset only:
+///   refusing would strand an account that has no billing cycle. That reset
+///   installs a period ([`install_period`]), so every later reset on the account
+///   is gated like any other account's (this function then sees `Some(..)`).
 ///
-/// A successful reset installs a new `Active` period (`next_period`), which is
-/// what makes a normal reset happen at most once per period.
+/// A successful reset installs a new `Active` period (`next_period` /
+/// [`install_period`]), which is what makes a normal reset happen at most once
+/// per period. The early-reset cooldown is a separate input: see
+/// [`reset_permitted_at`], which is what the kernel calls.
 pub fn reset_permitted(
     assessment: Option<PeriodAssessment>,
     early: bool,
@@ -281,6 +302,55 @@ pub fn reset_permitted(
             now_tick,
         }),
     }
+}
+
+/// The full pure decision of the governed reset: the period gate
+/// ([`reset_permitted`]) and then, for an EARLY reset only, the cooldown.
+///
+/// * `last_reset_tick` is the tick of the most recent reset APPLIED to this
+///   account (normal or early), `None` if none this boot.
+/// * `cooldown_ticks` is how long after an applied reset an early reset stays
+///   refused.
+///
+/// Period refusals come first (so `ClockBeforeStart` is refused for both modes
+/// and is reported as such). Then, if `early`: `now - last_reset_tick <
+/// cooldown_ticks` is [`ResetRefusal::EarlyCooldown`]; exactly at the boundary
+/// (`elapsed == cooldown_ticks`) it is allowed. A `now` BEFORE `last_reset_tick`
+/// (a rewound counter) never underflows and never allows: it is refused with the
+/// full cooldown remaining. A normal reset ignores the cooldown entirely.
+pub fn reset_permitted_at(
+    assessment: Option<PeriodAssessment>,
+    early: bool,
+    last_reset_tick: Option<u64>,
+    now_tick: u64,
+    cooldown_ticks: u64,
+) -> Result<(), ResetRefusal> {
+    reset_permitted(assessment, early)?;
+    if !early {
+        return Ok(());
+    }
+    let Some(last) = last_reset_tick else {
+        return Ok(());
+    };
+    match now_tick.checked_sub(last) {
+        Some(elapsed) if elapsed >= cooldown_ticks => Ok(()),
+        Some(elapsed) => Err(ResetRefusal::EarlyCooldown {
+            remaining: cooldown_ticks.saturating_sub(elapsed),
+        }),
+        None => Err(ResetRefusal::EarlyCooldown {
+            remaining: cooldown_ticks,
+        }),
+    }
+}
+
+/// The period a reset INSTALLS on an account that had none: `length_ticks` long,
+/// starting at `reset_at_tick` (the tick the reset took effect). Pure arithmetic
+/// on data, the no-period counterpart of [`next_period`]; the caller supplies the
+/// length (the kernel's DEMO constant). Rejects a zero length
+/// ([`PeriodError::ZeroLength`]). This is what turns "reset repeatedly on an
+/// account with no billing cycle" into "reset once, then period-gated".
+pub fn install_period(reset_at_tick: u64, length_ticks: u64) -> Result<BillingPeriod, PeriodError> {
+    BillingPeriod::new(reset_at_tick, length_ticks)
 }
 
 /// One account's period as observed, for [`check_periods`].
@@ -670,7 +740,8 @@ mod tests {
         };
         assert_eq!(reset_permitted(at(99), false), Err(cbs));
         assert_eq!(reset_permitted(at(99), true), Err(cbs));
-        // No billing period: the pre-period behaviour (allowed), both modes.
+        // No billing period: the FIRST reset is allowed, both modes (it then
+        // installs a period, see `install_period`).
         assert_eq!(reset_permitted(None, false), Ok(()));
         assert_eq!(reset_permitted(None, true), Ok(()));
     }
@@ -699,6 +770,116 @@ mod tests {
             }
         );
         assert!(c.contains("before period start"));
+    }
+
+    // ---- reset_permitted_at (cooldown) / install_period ----
+
+    #[test]
+    fn early_cooldown_matrix() {
+        const CD: u64 = 1_000;
+        let b = p(0, 100_000); // Active for every `now` used below
+        let act = Some(assess_period(&b, 5_000));
+        let ok = |early, last, now| reset_permitted_at(act, early, last, now, CD);
+        // No prior reset: early allowed.
+        assert_eq!(ok(true, None, 5_000), Ok(()));
+        // Inside the cooldown (immediately after, and one tick short).
+        assert_eq!(
+            ok(true, Some(5_000), 5_000),
+            Err(ResetRefusal::EarlyCooldown { remaining: CD })
+        );
+        assert_eq!(
+            ok(true, Some(4_001), 5_000),
+            Err(ResetRefusal::EarlyCooldown { remaining: 1 })
+        );
+        // Exactly at the boundary, and after: allowed.
+        assert_eq!(ok(true, Some(4_000), 5_000), Ok(()));
+        assert_eq!(ok(true, Some(0), 5_000), Ok(()));
+        // The normal reset ignores the cooldown (here Active -> the PERIOD
+        // refuses it, not the cooldown; with an Elapsed period it is allowed).
+        assert_eq!(
+            ok(false, Some(5_000), 5_000),
+            Err(ResetRefusal::PeriodActive { remaining: 95_000 })
+        );
+        let el = Some(assess_period(&b, 100_000));
+        assert_eq!(
+            reset_permitted_at(el, false, Some(100_000), 100_000, CD),
+            Ok(())
+        );
+        // ...but the early reset on that same elapsed period is cooled down.
+        assert_eq!(
+            reset_permitted_at(el, true, Some(100_000), 100_000, CD),
+            Err(ResetRefusal::EarlyCooldown { remaining: CD })
+        );
+        // Rewound counter (now < last): never underflows, never allows.
+        assert_eq!(
+            ok(true, Some(9_000), 5_000),
+            Err(ResetRefusal::EarlyCooldown { remaining: CD })
+        );
+        assert_eq!(
+            ok(true, Some(u64::MAX), 0),
+            Err(ResetRefusal::EarlyCooldown { remaining: CD })
+        );
+        // A zero cooldown never refuses.
+        assert_eq!(reset_permitted_at(act, true, Some(5_000), 5_000, 0), Ok(()));
+    }
+
+    #[test]
+    fn cooldown_does_not_mask_the_period_gate_or_clock_anomaly() {
+        let b = p(100, 50);
+        let cbs = Some(assess_period(&b, 99));
+        // ClockBeforeStart is still refused, for both modes, with its own variant.
+        for early in [false, true] {
+            assert_eq!(
+                reset_permitted_at(cbs, early, None, 99, 10),
+                Err(ResetRefusal::ClockBeforeStart {
+                    start_tick: 100,
+                    now_tick: 99
+                })
+            );
+            assert_eq!(
+                reset_permitted_at(cbs, early, Some(99), 99, 10),
+                Err(ResetRefusal::ClockBeforeStart {
+                    start_tick: 100,
+                    now_tick: 99
+                })
+            );
+        }
+        // No period: first reset (no last tick) allowed both modes; an early
+        // reset right after a recorded reset is cooled down even with no period.
+        assert_eq!(reset_permitted_at(None, false, None, 5, 10), Ok(()));
+        assert_eq!(reset_permitted_at(None, true, None, 5, 10), Ok(()));
+        assert_eq!(
+            reset_permitted_at(None, true, Some(5), 5, 10),
+            Err(ResetRefusal::EarlyCooldown { remaining: 10 })
+        );
+        assert_eq!(reset_permitted_at(None, false, Some(5), 5, 10), Ok(()));
+    }
+
+    #[test]
+    fn install_period_starts_at_the_reset_tick_and_then_gates_normal_resets() {
+        // First reset on a no-period account is allowed...
+        assert_eq!(reset_permitted(None, false), Ok(()));
+        // ...and installs a period starting at the reset tick.
+        let ip = install_period(500, 1_000).unwrap();
+        assert_eq!((ip.start_tick(), ip.length_ticks()), (500, 1_000));
+        // Every later normal reset is gated like any other account's.
+        assert_eq!(
+            reset_permitted(Some(assess_period(&ip, 501)), false),
+            Err(ResetRefusal::PeriodActive { remaining: 999 })
+        );
+        assert_eq!(
+            reset_permitted(Some(assess_period(&ip, 1_500)), false),
+            Ok(())
+        );
+        // Zero length is rejected.
+        assert_eq!(install_period(500, 0), Err(PeriodError::ZeroLength));
+    }
+
+    #[test]
+    fn early_cooldown_display_and_demo_constant() {
+        let d = format!("{}", ResetRefusal::EarlyCooldown { remaining: 42 });
+        assert!(d.contains("early-reset cooldown") && d.contains("42"));
+        assert_eq!(DEMO_EARLY_RESET_COOLDOWN_MILLIS, 3_600_000);
     }
 
     // ---- check_periods ----
