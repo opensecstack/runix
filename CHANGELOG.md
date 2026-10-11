@@ -40,6 +40,12 @@ not claim.
   failed open. It now travels as its own `MarshalError::PolicyRefused` and
   blocks, in both `kernel-arm` and the x86 kernel (`0c87c3e`). A proxy built
   before this change still fails open; deploy kernel and proxy together.
+- Fix: a real CITADEL answers `REFUSE` and `HARD_STOP` as HTTP 403 with a
+  Decision body, and `citadel_proxy` discarded that body, so a real refusal
+  was classified unreachable and failed open on both kernels. The transport
+  now relays a 403 Decision, so the refusal blocks (CI proves this against a
+  mock CITADEL that reproduces the handler's 403 + Decision; no real CITADEL
+  is exercised).
 - Fix: `kernel-arm` SIM operations shared one legality table, so a
   never-installed profile could be disabled then enabled, and `install` could
   overwrite an Enabled profile. Each operation now has its own required source
@@ -82,7 +88,9 @@ not claim.
   (`1c49264`; no consumer yet).
 - Fuzz target and proptest fallback for the `blk-driver-host` FAT32 directory
   and chain-walk code (`1fe4203`).
-- Mobile eSIM profile lifecycle, capability-gated and governed by MARSHAL
+- Mobile eSIM profile lifecycle, capability-gated and gated by MARSHAL
+  (fail-open when MARSHAL is unreachable; `Refuse`/`HardStop` denials are not
+  WORM-audited)
   (`50bf624`, `d93e124`: initiating principal passed through `esim_marshal`).
 - Mobile MVNO account model and network selection, wired into `kernel-arm`,
   with the MVNO syscalls routed through MARSHAL (`6d4d8f6`, `fda8a47`,
@@ -96,9 +104,10 @@ not claim.
   (`aaeb5b0`, `f3e89e2`, `6f3d9c5`, `7a7319d`, `96700b5`, `1de4af1`).
 - Mobile MARSHAL gate on `kernel-arm`: `esim_marshal` wired to a real
   transport, a per-action unreachable policy (reset is fail-closed; eSIM
-  enable/delete and MVNO bind/suspend/reactivate stay fail-open), and recorded
-  verdicts in the WORM reason and serial line (`319d111`, `727fc01`,
-  `3da349f`). Each evaluation uses its own source port and closes its socket
+  enable/delete and MVNO bind/suspend/reactivate stay fail-open, that is they
+  proceed ungoverned when MARSHAL is unreachable), and recorded verdicts in the
+  WORM reason and serial line (`319d111`, `727fc01`, `3da349f`). Denials by
+  `Refuse`/`HardStop` are not WORM-audited on mobile (serial line only). Each evaluation uses its own source port and closes its socket
   (`0088a4e`).
 - `kernel-arm` EL0 process model: ARM ELF64 parser and loader, per-process
   address spaces, MMIO-window capability type, cooperative scheduler and

@@ -2445,7 +2445,10 @@ sends the encoded `runix-ipc` `MarshalRequest` to the configured proxy and
 copies the reply back via `SYS_MARSHAL_PROOF_DONE` (15). The kernel decodes
 the reply with `MarshalResponse::decode`. Every request sets `"dry_run": true`,
 which is hardcoded in `kerkese_json`, and `citadel_proxy` forwards that flag
-upstream. The principal is `el0:arm-demo`, role `operator`.
+upstream; dry-run is a simulation request, not a committed execution, so even a
+real `EXECUTE` would not be a live approval. The reply is unsigned JSON/`ipc`
+over plaintext TCP (unauthenticated), and the proxy handles one connection at a
+time with no read timeout, so the link can be starved into "unreachable". The principal is `el0:arm-demo`, role `operator`.
 
 How the result is classified (`marshal_transport.rs`, `esim_marshal::enforce`):
 
@@ -2454,6 +2457,13 @@ How the result is classified (`marshal_transport.rs`, `esim_marshal::enforce`):
 | `Remote(Unreachable)` | No proxy configured (no process spawned), no device, connect failure, no report within 64 boot-thread yields, empty or undecodable reply, **and every `MarshalResponse::Error` kind except `PolicyRefused`** | Fail-open for the five eSIM and MVNO actions. **Fail-closed for `data.reset_usage`** (ADR 0003, below) |
 | `Remote(Refuse)` / `Remote(HardStop)` | A decoded CITADEL decision, **or** `MarshalError::PolicyRefused` from `citadel_proxy`'s own policy layer | Blocked, registry and sim untouched, **not WORM-audited** |
 | `LocalFailure(SetupFailed / SpawnFailed / ExcursionFaulted)` | The kernel could not run the evaluation: out of memory, thread spawn, EL0 fault | Fail-closed, `DENIED (MARSHAL local failure: ...)`, WORM-audited with `authorized=false` |
+
+Only six mobile actions are MARSHAL-gated; the other syscalls in `svc.rs`
+(RIL, SIM create/install/disable, IPC, the five other data syscalls) are
+capability-checked only. A real CITADEL delivers `REFUSE`/`HARD_STOP` as HTTP
+403 with a Decision body; the proxy used to discard that body, which made a real
+refusal classify as unreachable (fail-open). The transport now relays a 403
+Decision, proven in CI only against a mock CITADEL that reproduces it.
 
 The fail-open row has a consequence that has to be stated plainly. While the
 MARSHAL proxy is unreachable, five consequential mobile operations (eSIM enable

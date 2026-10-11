@@ -2,10 +2,10 @@
 
 Runix (formerly "CitadelOS" in early planning) is a capability-secure,
 Linux-adjacent operating system for desktop and mobile, built around a Rust
-microkernel and a WebAssembly application layer, with
+microkernel and a WebAssembly application layer, designed around
 [CITADEL](https://github.com/opensecstack/opensecstack) governance
-(MARSHAL, WORM, VIGIL, AUGUR) integrated as infrastructure rather than
-bolted on.
+(MARSHAL, WORM, VIGIL, AUGUR). Today the integration is plumbing plus a
+mock-verified gate, not live governance.
 
 Alpha is complete (tagged `v0.1.0-alpha`, with a notes-only GitHub release) and
 Beta is in progress, pre-1.0; see [docs/BETA_CRITERIA.md](docs/BETA_CRITERIA.md)

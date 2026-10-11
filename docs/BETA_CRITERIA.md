@@ -35,8 +35,11 @@ be described as having any of the following.
 1. **No live governance.** No code path in this repo reaches a real CITADEL
    `EXECUTE`. CI reaches an `Execute` verdict only from canned mock servers
    (`kernel/tests/support/mock_citadel_server.py`,
-   `mock_citadel_server_multi.py`), which answer `EXECUTE` to any request. A
-   real `EXECUTE` is impossible today: nothing constructs the operator
+   `mock_citadel_server_multi.py`) and from the selective listener
+   (`kernel/tests/support/arm_marshal_selective_listener.py`, which returns
+   `Execute` unless told to refuse a named action); the mocks answer `EXECUTE`
+   to any request. No real CITADEL ever answers in CI. A real
+   `EXECUTE` is impossible today: nothing constructs the operator
    `actor_token` or `sig_operator` Gate 1 needs, and the MARSHAL principal on
    mobile is the placeholder `el0:arm-demo` ([ROADMAP.md](ROADMAP.md) open
    question "Operator identity", STATUS.md "MARSHAL gate for mobile").
@@ -45,7 +48,11 @@ be described as having any of the following.
    [0003](adrs/0003-unreachable-marshal-policy-is-per-action.md)). Only
    `data.reset_usage` fails closed. On x86, `grid_sandbox::spawn_instance`
    also fails open on an unreachable or unconfigured proxy
-   ([MARSHAL-ENFORCEMENT-POLICY.md](MARSHAL-ENFORCEMENT-POLICY.md)).
+   ([MARSHAL-ENFORCEMENT-POLICY.md](MARSHAL-ENFORCEMENT-POLICY.md)). A
+   malformed or undecodable reply counts as unreachable. The proxy serves one
+   connection at a time with no read timeout, so the link can be starved into
+   "unreachable". Fail-open success is logged as "not governed"; `Refuse`,
+   `HardStop` and local failure always block.
 3. **Nothing outside tests calls `grid_sandbox::spawn_instance`.** The
    boot-time Grid Sandbox path (`kernel/src/main.rs` Phase B7) authorizes and
    loads `grid-sandbox-host` directly; the MARSHAL-gated multi-instance entry
@@ -94,6 +101,14 @@ be described as having any of the following.
     not a signature. There is no update channel and no support policy. RC and
     v1.0 scope (desktop shell, WORM boot chain, attestation, secure dialer,
     VoIP, roaming governance) is not started.
+14. **MARSHAL verdicts are not authenticated, and only part of the privileged
+    surface is gated.** The kernel-to-proxy reply is unsigned JSON/`ipc` over
+    plaintext TCP. Every request is `dry_run: true` (a simulation request).
+    The link can be starved into "unreachable", which fails open for most
+    actions. Only the six mobile actions below and x86 `spawn_instance` ask
+    MARSHAL; every other privileged syscall in `kernel-arm/src/svc.rs` and
+    `kernel/src/syscall.rs` is capability-checked only. On mobile,
+    `Refuse`/`HardStop` denials are not written to WORM.
 
 ## Summary
 
@@ -209,17 +224,21 @@ device stops answering.
 
 **Done means (checkable):** (a) a privileged desktop action asks MARSHAL
 before it runs and a `REFUSE`/`HARD_STOP` blocks it; (b) the request path is
-the typed `ipc` wire format through a user-space proxy to CITADEL; (c) the
+the typed `ipc` wire format through a user-space proxy to CITADEL (in CI only
+a mock CITADEL is ever reached); (c) the
 action is audited to WORM; (d) a real CITADEL decision, obtained with a real
 operator identity, can allow an action.
 
-**Status by clause:** (a) MET for `grid_sandbox::spawn_instance`; (b) MET;
+**Status by clause:** (a) MET for `grid_sandbox::spawn_instance` (test-only call
+path; fails open on unreachable); (b) MET (to a mock CITADEL only);
 (c) PARTIAL; (d) **NOT MET**.
 
 **Evidence:**
 - (a) `kernel/tests/grid_sandbox_marshal_shadow.rs` (CI step
-  `cargo test grid_sandbox_marshal_shadow (shadow-mode MARSHAL evaluation, observe-only)`;
-  the step name is stale, the test now asserts a real block on `REFUSE`).
+  `cargo test grid_sandbox_marshal_shadow (real MARSHAL enforcement: blocks on a reachable Refuse, fail-open when unreachable)`).
+  `Refuse`/`HARD_STOP` block, proven in CI against stand-ins and against a mock
+  CITADEL that reproduces the real handler's HTTP 403 + Decision; no real
+  CITADEL is exercised.
 - (b) `kernel/tests/marshal_tcp_roundtrip.rs` (CI step
   `cargo test marshal_tcp_roundtrip ...`) and `marshal_proxy_e2e.rs` (CI step
   `cargo test marshal_proxy_e2e (real citadel_proxy + mock CITADEL via guestfwd)`:
@@ -238,7 +257,8 @@ operator identity, can allow an action.
 - `spawn_instance` is never called outside tests (Not claimed 3).
 - Unreachable or unconfigured proxy fails open (Not claimed 2).
 - The verdict is not authenticated end to end (unsigned JSON over plaintext
-  TCP between kernel and proxy).
+  TCP between kernel and proxy), and every request is `dry_run: true`
+  (Not claimed 14).
 - The boot-time module gate is a wiring proof (Not claimed 4).
 - WORM evidence is an in-memory log: lost on reboot, not a durable chain.
 
@@ -276,7 +296,7 @@ one compiled-in demo account, not for subscribers.
 `Enabled`, `Deleted`; every transition goes through one validating function
 with a per-operation required source state; at most one profile per slot is
 `Enabled`; each operation needs its own scoped capability (delete is a
-separate resource); and every transition is audited at the syscall boundary.
+separate resource); and every successful transition is audited at the syscall boundary.
 
 **Evidence:**
 - 13 host tests of the state machine, including an exhaustive
@@ -300,7 +320,8 @@ separate resource); and every transition is audited at the syscall boundary.
 escalation percentage) determines session and usage decisions; a reconciler
 reports drift between observed state and the plan; a billing-period model
 gates the usage reset; and the reset is capability- and MARSHAL-gated with
-its refusal and success audited. The partial point: the engine only advises,
+its period refusal, success, and local-failure or unreachable denial audited
+(a MARSHAL `Refuse`/`HardStop` denial is not WORM-audited). The partial point: the engine only advises,
 and the inputs are asserted rather than measured.
 
 **Evidence:**
@@ -331,18 +352,25 @@ and the inputs are asserted rather than measured.
 **Done means (checkable):** (a) each consequential mobile action asks
 MARSHAL through the proxy before it takes effect; (b) `Refuse`/`HardStop`
 blocks it and leaves state untouched; (c) the verdict that allowed an action
-is recorded; (d) unreachable-MARSHAL behavior is an explicit per-action
+is recorded (denials by `Refuse`/`HardStop` are not); (d) unreachable-MARSHAL behavior is an explicit per-action
 policy; (e) a real CITADEL `EXECUTE` with a real operator identity admits an
 action.
 
-**Status by clause:** (a) MET for six actions (`esim.enable`, `esim.delete`,
+**Status by clause:** (a) MET for six actions; other privileged syscalls are not
+MARSHAL-gated (`esim.enable`, `esim.delete`,
 `mvno.bind_profile`, `mvno.suspend_account`, `mvno.reactivate_account`,
-`data.reset_usage`); (b) MET; (c) MET; (d) MET; (e) **NOT MET**.
+`data.reset_usage`); (b) MET; (c) PARTIAL (successful verdicts only);
+(d) MET as a policy, exercised in CI only against absent routes, never a real
+outage; (e) **NOT MET**.
 
 **Evidence:**
 - (b): CI steps `boot in QEMU and check MARSHAL REFUSE denies eSIM enable (Beta item 2.6)`
   and `boot in QEMU and check MARSHAL REFUSE denies MVNO suspend (Beta item 3.4)`
-  (selective listener refuses named actions).
+  (selective listener refuses named actions; the `Refuse` is canned, no real
+  CITADEL answers). Through the real `citadel_proxy`, `Refuse`/`HARD_STOP`
+  block, proven in CI against stand-ins and against a mock CITADEL that
+  reproduces the real handler's HTTP 403 + Decision; no real CITADEL is
+  exercised.
 - (a), (c): CI step `boot in QEMU and check a real citadel_proxy EXECUTE admits eSIM enable (Beta item 2.6 follow-up)`
   (real `citadel_proxy`, mock CITADEL; asserts `MARSHAL verdict: Execute` and
   exactly three data evaluations). This step proves the chain, not live
@@ -358,8 +386,8 @@ action.
 - (e): no operator identity (Not claimed 1); signing key is the demo key.
 - Five of six actions fail open (Not claimed 2). Whether any should fail
   closed is an open decision in ADR 0003.
-- A `Refuse`/`HardStop` block is not WORM-audited (STATUS.md table); local
-  failures are.
+- A `Refuse`/`HardStop` block is not WORM-audited (STATUS.md table, serial
+  line only); local failures and fail-closed-unreachable denials are.
 - Link is plaintext TCP and the verdict is unsigned.
 - A proxy built before `MarshalError::PolicyRefused` still fails open on its
   own policy rejections; kernel and proxy must be deployed together.
