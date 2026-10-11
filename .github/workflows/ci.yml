@@ -1709,6 +1709,72 @@ jobs:
           test "$(grep -c "SVC: SYS_DATA_RESET account 2 authorized" /tmp/arm-boot-marshal-execute.log)" -eq 1
           test "$(grep -c "MARSHAL evaluation for data" /tmp/arm-boot-marshal-execute.log)" -eq 3
 
+      # The real CITADEL handler (opensecstack citadel/internal/api/handlers/
+      # marshal.go) answers REFUSE and HARD_STOP with HTTP 403 plus the full
+      # Decision body (200 only for EXECUTE). Every other Refuse test in CI
+      # uses a Python stand-in speaking the ipc wire directly, and the mock
+      # CITADEL in the step above only returns 200, so nothing else exercised
+      # the real proxy's HTTP transport on a blocked verdict. Before the
+      # transport read the 403 body it surfaced "HTTP 403" as BadResponse,
+      # which the kernel classifies as Unreachable (fail-open for esim.*,
+      # mvno.* and spawn_instance): a real CITADEL REFUSE/HARD_STOP was
+      # ADMITTED. Same real citadel_proxy build and bridge as the step above;
+      # the mock is told (per action.type prefix) to answer 403 + REFUSE for
+      # esim.* and 403 + HARD_STOP for mvno.suspend_account, 200 + EXECUTE for
+      # the rest. This is also the first CI case that reaches HardStop.
+      - name: boot in QEMU and check a real citadel_proxy relaying a 403 REFUSE / HARD_STOP from a mock CITADEL denies eSIM enable and MVNO suspend
+        run: |
+          trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
+          python3 ../kernel/tests/support/tcp_proof_listener.py &
+          sleep 0.3
+          python3 ../kernel/tests/support/mock_citadel_server_multi.py \
+            --status403-refuse esim. --status403-hardstop mvno.suspend_account &
+          sleep 0.3
+          CITADEL_PROXY_LISTEN_ADDR=127.0.0.1:9104 \
+            RUNIX_CITADEL_URL=http://127.0.0.1:9105/marshal/kerkese \
+            ../target/release/citadel_proxy &
+          sleep 0.3
+          # 25 s: same measured budget as the Execute boot above (same walk).
+          timeout 25 qemu-system-aarch64 \
+            -M virt,secure=on,gic-version=2 -cpu cortex-a53 -nographic \
+            -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
+            -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001,guestfwd=tcp:10.0.2.100:9100-cmd:nc 127.0.0.1 9104" \
+            -device virtio-net-device,netdev=net0 \
+            -global virtio-mmio.force-legacy=false \
+            | tee /tmp/arm-boot-marshal-403.log || true
+          # 403 + REFUSE (esim.*): enable (three attempts in the walk) and delete (two) are DENIED.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for enable slot=0 profile=0: Refuse" /tmp/arm-boot-marshal-403.log
+          grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 0 DENIED (MARSHAL Refuse)" /tmp/arm-boot-marshal-403.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for delete slot=0 profile=0: Refuse" /tmp/arm-boot-marshal-403.log
+          grep -q "SVC: SYS_SIM_DELETE slot 0 profile 0 DENIED (MARSHAL Refuse)" /tmp/arm-boot-marshal-403.log
+          test "$(grep -c "SVC: SYS_SIM_ENABLE slot 0 profile 0 DENIED (MARSHAL Refuse)" /tmp/arm-boot-marshal-403.log)" -eq 3
+          test "$(grep -c "SVC: SYS_SIM_DELETE slot 0 profile 0 DENIED (MARSHAL Refuse)" /tmp/arm-boot-marshal-403.log)" -eq 2
+          if grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 0 authorized" /tmp/arm-boot-marshal-403.log; then exit 1; fi
+          if grep -q "SVC: SYS_SIM_DELETE slot 0 profile 0 authorized" /tmp/arm-boot-marshal-403.log; then exit 1; fi
+          # 403 + HARD_STOP (mvno.suspend_account): DENIED with the HardStop text, registry untouched.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.suspend_account account=0: HardStop" /tmp/arm-boot-marshal-403.log
+          grep -q "SVC: SYS_MVNO_SUSPEND account 0 DENIED (MARSHAL HardStop)" /tmp/arm-boot-marshal-403.log
+          if grep -q "SVC: SYS_MVNO_SUSPEND account 0 authorized" /tmp/arm-boot-marshal-403.log; then exit 1; fi
+          if grep -q "SVC: SYS_MVNO_SUSPEND account 0 forced disable" /tmp/arm-boot-marshal-403.log; then exit 1; fi
+          # The blocked verdicts were read from the 403 body, not mistaken for an
+          # unreachable CITADEL: no fail-open line anywhere in this boot.
+          if grep -q "fail-open" /tmp/arm-boot-marshal-403.log; then exit 1; fi
+          if grep -q "MARSHAL unreachable" /tmp/arm-boot-marshal-403.log; then exit 1; fi
+          # Negative control: actions the mock answers 200 + EXECUTE are still admitted.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.bind_profile account=0 slot=0 profile=0: Execute" /tmp/arm-boot-marshal-403.log
+          grep -qF "SVC: SYS_MVNO_BIND account 0 slot 0 profile 0 authorized [MARSHAL verdict: Execute]" /tmp/arm-boot-marshal-403.log
+          # Reactivate reaches and passes MARSHAL (Execute); the syscall itself then
+          # fails only because the suspend was denied and the account is still Active.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.reactivate_account account=0: Execute" /tmp/arm-boot-marshal-403.log
+          # data.reset_usage still behaves as in the Execute boot (three evaluations, all Execute).
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=0: Execute" /tmp/arm-boot-marshal-403.log
+          grep -qF "SVC: SYS_DATA_RESET account 0 authorized (usage 1600 -> 0; new period; MARSHAL verdict: Execute; " /tmp/arm-boot-marshal-403.log
+          grep -qF "SVC: SYS_DATA_RESET(early) account 1 authorized (EARLY override reset; usage 0 -> 0; new period; MARSHAL verdict: Execute; " /tmp/arm-boot-marshal-403.log
+          grep -qF "SVC: SYS_DATA_RESET account 2 authorized (usage 0 -> 0; new period; MARSHAL verdict: Execute; " /tmp/arm-boot-marshal-403.log
+          test "$(grep -c "MARSHAL evaluation for data" /tmp/arm-boot-marshal-403.log)" -eq 3
+          # Eleven evaluations in all: bind 1, enable 3, suspend 1, reactivate 1, data 3, delete 2.
+          test "$(grep -c "Runix ARM kernel: MARSHAL evaluation for" /tmp/arm-boot-marshal-403.log)" -eq 11
+
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke
   # test) and greps its serial output. Coarser and more brittle than a real

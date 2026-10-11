@@ -9,13 +9,25 @@ since Beta item 3.4 the EL0 walk performs seven MARSHAL evaluations per boot
 guestfwd connection to a fresh citadel_proxy request, so a one-shot mock would
 leave every evaluation after the first `Unreachable`.
 
-Not CITADEL, MARSHAL or any stand-in for governance logic: it never inspects
-the Kerkese envelope beyond logging its `action.type` to stderr for
-debugging. Runs until killed (CI backgrounds it; the runner tears it down).
+Not CITADEL, MARSHAL or any stand-in for governance logic. By default it
+answers 200 + EXECUTE to everything. Optionally it can mimic the one HTTP
+quirk of the real CITADEL handler (handlers/marshal.go) that a 200-only mock
+can never exercise: REFUSE and HARD_STOP are answered with HTTP 403 and the
+full Decision JSON body. Per-action behaviour is chosen by action.type prefix
+(repeatable flags):
 
-Usage: mock_citadel_server_multi.py [port]   (default: mock_citadel_server.PORT)
+  --status403-refuse PREFIX     403 + REFUSE Decision for matching action types
+  --status403-hardstop PREFIX   403 + HARD_STOP Decision for matching types
+
+Everything else gets 200 + EXECUTE. HARD_STOP flags win over REFUSE flags.
+
+Runs until killed (CI backgrounds it; the runner tears it down).
+
+Usage: mock_citadel_server_multi.py [port] [--status403-refuse P]... [--status403-hardstop P]...
+(port default: mock_citadel_server.PORT)
 """
 
+import argparse
 import json
 import socket
 import sys
@@ -23,7 +35,21 @@ import sys
 import mock_citadel_server as single
 
 
-def serve_one(conn: socket.socket) -> None:
+def decision_body(outcome: str) -> bytes:
+    """The canned EXECUTE body with only `outcome` swapped (same shape)."""
+    return single.DECISION_JSON.replace(b'"EXECUTE"', b'"' + outcome.encode("ascii") + b'"')
+
+
+def choose(action_type: str, refuse: list, hardstop: list):
+    """Returns (status line, outcome) for an action type."""
+    if any(action_type.startswith(p) for p in hardstop):
+        return b"403 Forbidden", "HARD_STOP"
+    if any(action_type.startswith(p) for p in refuse):
+        return b"403 Forbidden", "REFUSE"
+    return b"200 OK", "EXECUTE"
+
+
+def serve_one(conn: socket.socket, refuse: list, hardstop: list) -> None:
     body = single.read_http_request(conn)
     if not body:
         # Connection opened and closed (or a bare probe) with no request.
@@ -32,32 +58,38 @@ def serve_one(conn: socket.socket) -> None:
         action_type = json.loads(body)["action"]["type"]
     except (ValueError, KeyError, TypeError):
         action_type = "<unparseable>"
+    status, outcome = choose(action_type, refuse, hardstop)
+    payload = decision_body(outcome)
     response = (
-        b"HTTP/1.1 200 OK\r\n"
+        b"HTTP/1.1 " + status + b"\r\n"
         b"Content-Type: application/json\r\n"
-        b"Content-Length: " + str(len(single.DECISION_JSON)).encode("ascii") + b"\r\n"
+        b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n"
         b"Connection: close\r\n"
-        b"\r\n" + single.DECISION_JSON
+        b"\r\n" + payload
     )
     conn.sendall(response)
     print(
-        f"mock_citadel_server_multi: served canned EXECUTE for action.type={action_type}",
+        f"mock_citadel_server_multi: served {status.decode()} {outcome} for action.type={action_type}",
         file=sys.stderr,
         flush=True,
     )
 
 
 def main() -> int:
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else single.PORT
+    ap = argparse.ArgumentParser()
+    ap.add_argument("port", nargs="?", type=int, default=single.PORT)
+    ap.add_argument("--status403-refuse", action="append", default=[], metavar="PREFIX")
+    ap.add_argument("--status403-hardstop", action="append", default=[], metavar="PREFIX")
+    args = ap.parse_args()
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((single.HOST, port))
+    server.bind((single.HOST, args.port))
     server.listen(8)
-    print(f"mock_citadel_server_multi: listening on {single.HOST}:{port}", file=sys.stderr, flush=True)
+    print(f"mock_citadel_server_multi: listening on {single.HOST}:{args.port}", file=sys.stderr, flush=True)
     while True:
         conn, _addr = server.accept()
         try:
-            serve_one(conn)
+            serve_one(conn, args.status403_refuse, args.status403_hardstop)
         except OSError as err:
             print(f"mock_citadel_server_multi: connection error: {err}", file=sys.stderr, flush=True)
         finally:
