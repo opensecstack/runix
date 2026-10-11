@@ -1,7 +1,7 @@
 [package]
 name = "net-driver-host"
 description = "Network driver host: a freestanding ring 3 binary running the legacy virtio-net driver plus smoltcp (ICMP + TCP client) — Beta's 'user-space network stack' roadmap item. Loaded via kernel/src/elf.rs and scheduler::spawn_ring3_process_with_capability, capability-gated port I/O only, never linked into the kernel itself."
-version = "0.0.1"
+version = "0.1.0-beta.1"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"
