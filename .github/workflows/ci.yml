@@ -55,6 +55,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace
+      # kernel/ and the ring-3 hosts duplicate heap/boot-info VAs, result
+      # offsets, BootInfo layouts and syscall numbers by hand; fail if any
+      # pair drifts (std-only source parse, no QEMU). See abi-consistency/.
+      - name: kernel <-> host ABI constant consistency
+        run: cargo run -p abi-consistency
       # net-driver-host isn't a workspace member (own [workspace], targets
       # x86_64-unknown-none — see its Cargo.toml), so `cargo test --workspace`
       # above never touches it. `--lib` only, not a bare `cargo test`: the

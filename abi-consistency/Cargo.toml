@@ -1,0 +1,11 @@
+[package]
+name = "abi-consistency"
+description = "Host-side check that constants duplicated by hand between kernel/ and the standalone ring-3 hosts (grid/net/blk-driver-host) have not drifted. Std only, no dependencies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]

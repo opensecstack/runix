@@ -25,6 +25,7 @@ members = [
     "wasm-runtime",
     "citadel-integration",
     "tls-client",
+    "abi-consistency",
     "desktop",
     "mobile",
 ]
