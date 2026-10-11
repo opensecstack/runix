@@ -1977,9 +1977,14 @@ fn data_period(account: u64) -> u64 {
 ///    the billing-period gate ([`runix_mobile::period::reset_permitted`]: a
 ///    normal reset needs an `Elapsed` period, an early one also passes an
 ///    `Active` one, `ClockBeforeStart` is refused for both; an account with NO
-///    period is not period-gated, as before periods existed). A refusal here
-///    is WORM-audited `authorized=false`, starts no period and leaves the
-///    request marker alone. (No point spending a MARSHAL round trip on a reset
+///    period gets its FIRST reset allowed, which installs one -- DEMO DATA,
+///    start = the reset tick, `DEMO_INSTALL_PERIOD_MILLIS` long -- so its later
+///    resets are gated like any other account's) and, for an EARLY reset only,
+///    the cooldown: refused if ANY reset was applied to the account less than
+///    `DEMO_EARLY_RESET_COOLDOWN_MILLIS` ago (the last applied tick is in-memory
+///    kernel state, lost on reboot; a MARSHAL-denied reset records nothing). A
+///    refusal here is WORM-audited `authorized=false`, starts no period and
+///    leaves the request marker alone. (No point spending a MARSHAL round trip on a reset
 ///    that cannot happen, the same reasoning as `mvno::gate_enable` ahead of
 ///    `SYS_SIM_ENABLE`'s gate.) A successful reset installs a new `Active`
 ///    period, which is what limits a normal reset to once per period;
@@ -1997,9 +2002,10 @@ fn data_period(account: u64) -> u64 {
 /// opening a session afterwards is a separate decision by the policy engine.
 fn data_reset(account: u64, mode_arg: u64) -> u64 {
     use runix_kernel_arm::data_codes::{
-        demo_entitlement, describe_period_started, describe_reset_mode, reset_blocked_code,
-        reset_refusal_code, ResetMode, RESET_BAD_MODE, RESET_DENIED_CAPABILITY,
-        RESET_NO_ENTITLEMENT, RESET_NO_SUCH_ACCOUNT, RESET_OK,
+        demo_early_reset_cooldown_ticks, demo_entitlement, demo_install_period_ticks,
+        describe_period_started, describe_reset_mode, reset_blocked_code, reset_refusal_code,
+        ResetMode, RESET_BAD_MODE, RESET_DENIED_CAPABILITY, RESET_NO_ENTITLEMENT,
+        RESET_NO_SUCH_ACCOUNT, RESET_OK,
     };
     let Some(mode) = ResetMode::from_arg(mode_arg) else {
         // Serial-only: no capability can be named for a mode that does not
@@ -2067,9 +2073,17 @@ fn data_reset(account: u64, mode_arg: u64) -> u64 {
     // read here; the tick the next period starts at is re-read after the gate.
     // (Check and apply are separate critical sections, which is sound with the
     // one EL0 context and IRQs masked in the SVC handler, as noted in `data.rs`.)
-    let assessment = crate::data::assess_period_of(account, now_ticks());
+    let gate_now = now_ticks();
+    let freq = frequency_hz();
+    let assessment = crate::data::assess_period_of(account, gate_now);
     let mode_text = describe_reset_mode(mode, &assessment);
-    if let Err(refusal) = runix_mobile::period::reset_permitted(assessment, early) {
+    if let Err(refusal) = runix_mobile::period::reset_permitted_at(
+        assessment,
+        early,
+        crate::data::last_reset_tick(account),
+        gate_now,
+        demo_early_reset_cooldown_ticks(freq),
+    ) {
         audit_event(
             &resource,
             "usage period in force",
@@ -2117,8 +2131,19 @@ fn data_reset(account: u64, mode_arg: u64) -> u64 {
     // without reaching this, so it starts no period and leaves the request
     // marker (and an elapsed period) exactly as they were.
     let now = now_ticks();
-    let (before, after, started) = crate::data::reset_usage(account, now);
+    let (before, after, started, recorded) = crate::data::reset_usage(
+        account,
+        now,
+        Some(demo_install_period_ticks(frequency_hz())),
+    );
     let period_text = describe_period_started(&started);
+    if recorded.is_err() {
+        serial_println!(
+            "SVC: {} account {} last-reset record FAILED (table full): the early-reset cooldown will not see this reset",
+            label,
+            account
+        );
+    }
     audit_event(
         &resource,
         &format!("used {}", before.used_bytes),

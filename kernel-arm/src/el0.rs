@@ -624,6 +624,31 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x1, #1",
         "mov x2, #1",
         "svc #0",
+        // SYS_DATA_RESET(1, early) AGAIN, immediately -- where the first early reset
+        // was APPLIED, the early-reset cooldown (one hour, DEMO) refuses this one
+        // (code 10) before MARSHAL: no evaluation, WORM-audited authorized=false.
+        // Where the first was DENIED nothing was applied, so no cooldown exists and
+        // MARSHAL denies this one exactly like the first.
+        "mov x0, {sys_data_reset}",
+        "mov x1, #1",
+        "mov x2, #1",
+        "svc #0",
+        // --- Account 2: entitled, Active, NO billing period. SYS_DATA_RESET(2,
+        // normal) -- the FIRST reset on such an account is not period-gated: where
+        // MARSHAL allows it, it is applied and INSTALLS a (one-day, DEMO) period.
+        // Where MARSHAL denies it nothing is installed.
+        "mov x0, {sys_data_reset}",
+        "mov x1, #2",
+        "mov x2, #0",
+        "svc #0",
+        // SYS_DATA_RESET(2, normal) again, immediately -- where the first was
+        // applied the installed period is Active, so this is REFUSED (code 7)
+        // before MARSHAL like any other account's; elsewhere MARSHAL denies it
+        // again (no period was installed).
+        "mov x0, {sys_data_reset}",
+        "mov x1, #2",
+        "mov x2, #0",
+        "svc #0",
         // SYS_SIM_INSTALL(0, 0, 0x6666) -- expected to FAIL: re-installing
         // over the live Enabled profile would swap its identity (and, with
         // the old shared transition table, demote it). sim.rs now allows

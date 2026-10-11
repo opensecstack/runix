@@ -127,8 +127,24 @@ pub fn feed_usage(account: u64, bytes: u64) -> Result<(DataUsage, DataUsage), Ta
 /// reset-request marker cleared, all in one critical section. `now` is the
 /// generic-timer tick the caller read after the gate passed. Returns `(before,
 /// after, period outcome)`. Sessions, standing and profiles are not touched.
-pub fn reset_usage(account: u64, now: u64) -> (DataUsage, DataUsage, PeriodStarted) {
-    DATA.lock().reset_usage_and_period(account, now)
+///
+/// `install_len`: for an account with NO period, the length (ticks) of the period
+/// this reset installs (`None` = start none). Also records `now` as the account's
+/// last applied reset (the early-reset cooldown input; in memory, lost on
+/// reboot); the last tuple element is that record's outcome.
+pub fn reset_usage(
+    account: u64,
+    now: u64,
+    install_len: Option<u64>,
+) -> (DataUsage, DataUsage, PeriodStarted, Result<(), TableFull>) {
+    DATA.lock()
+        .reset_usage_and_period(account, now, install_len)
+}
+
+/// Tick of the most recent reset APPLIED to `account` (normal or early), if any
+/// since boot. Read-only; the cooldown check's input.
+pub fn last_reset_tick(account: u64) -> Option<u64> {
+    DATA.lock().last_reset_tick(account)
 }
 
 /// Install `period` as `account`'s billing period (boot-time DEMO DATA only;

@@ -453,6 +453,19 @@ fn el1_setup() -> ! {
             e
         ),
     }
+    // A third demo account (account 2) for the no-period proof: entitled, Active,
+    // but with NO billing period (see `data_codes::demo_period`); its first reset
+    // installs one. Owns no profile, never fed usage.
+    match crate::mvno::open_third_demo_account() {
+        Ok(id) => serial_println!(
+            "Runix ARM kernel: MVNO third demo account opened (account {}, no billing period, DEMO DATA ONLY)",
+            id.0
+        ),
+        Err(e) => serial_println!(
+            "Runix ARM kernel: MVNO third demo account open FAILED ({:?})",
+            e
+        ),
+    }
     // Data policy layer (Beta item 4.3). Three SEPARATELY scoped grants, all
     // for account 0 only: session access (open/close), the usage FEED, and
     // the reconciler. The feed is its own resource because it is privileged --
@@ -487,6 +500,10 @@ fn el1_setup() -> ! {
     serial_println!(
         "Runix ARM kernel: data early-reset capability issued (account 1, demo trust root)"
     );
+    // Account 2 (no billing period): the normal reset only. Its first reset
+    // installs a period; the second normal reset is then refused as period-active.
+    crate::capabilities::issue_and_hold(crate::capabilities::data_reset_resource(2), now);
+    serial_println!("Runix ARM kernel: data reset capability issued (account 2, demo trust root)");
     // Billing period for account 0 (DEMO DATA ONLY, like the entitlement table
     // and the demo account): a period is plain DATA -- start tick and length --
     // and this is the only place one is created; afterwards only a governed

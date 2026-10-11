@@ -176,6 +176,12 @@ pub const RESET_CLOCK_BEFORE_START: u64 = 8;
 /// [`RESET_MODE_EARLY`]. Refused first of all (no capability can be chosen
 /// from a mode that does not exist); serial-only, nothing changed.
 pub const RESET_BAD_MODE: u64 = 9;
+/// An EARLY reset was refused because a reset (normal or early) was applied to
+/// this account less than the early-reset cooldown ago. Refused before MARSHAL
+/// (no evaluation); WORM-audited `authorized=false`; nothing changed, no period
+/// started. Only observable after a reset was actually APPLIED (a MARSHAL-denied
+/// reset records nothing).
+pub const RESET_EARLY_COOLDOWN: u64 = 10;
 
 /// `SYS_DATA_RESET`'s second argument (`x2`): the normal reset, under
 /// `data:reset:{account}`, allowed once the billing period has elapsed.
@@ -215,6 +221,7 @@ pub const fn reset_refusal_code(r: &ResetRefusal) -> u64 {
     match r {
         ResetRefusal::PeriodActive { .. } => RESET_PERIOD_ACTIVE,
         ResetRefusal::ClockBeforeStart { .. } => RESET_CLOCK_BEFORE_START,
+        ResetRefusal::EarlyCooldown { .. } => RESET_EARLY_COOLDOWN,
     }
 }
 
@@ -355,13 +362,17 @@ pub const fn lifecycle_for_reconcile(state: ProfileState) -> ReconcileProfile {
 ///   whose billing period is ACTIVE for the whole boot (see [`demo_period`]); the
 ///   walk never feeds it usage.
 ///
+/// - account 2: the same plan. It exists so the boot proof has an entitled, standing-ok
+///   account with NO billing period ([`demo_period`] gives it none): its first reset
+///   installs one ([`demo_install_period_ticks`]).
+///
 /// Every other account has NO entitlement and gets `None`: the syscalls refuse
 /// it (fail closed) rather than substituting a default plan. Built through
 /// the validating constructor; a (never expected) validation failure also
 /// yields `None`, i.e. also fails closed.
 pub fn demo_entitlement(account: u64) -> Option<DataEntitlement> {
     match account {
-        0 | 1 => DataEntitlement::new(Some(1000), 80, false, 150).ok(),
+        0..=2 => DataEntitlement::new(Some(1000), 80, false, 150).ok(),
         _ => None,
     }
 }
@@ -402,6 +413,29 @@ pub const DEMO_LONG_PERIOD_MILLIS: u64 = 86_400_000;
 /// boot. The path that DOES fire is exercised by `period_proof.rs` on
 /// synthetic ticks.
 pub const DEMO_GRACE_MILLIS: u64 = 20_000;
+
+/// DEMO DATA ONLY: length of the billing period a first reset INSTALLS on an
+/// account that had none. Deliberately the same one-day constant account 1 uses
+/// ([`DEMO_LONG_PERIOD_MILLIS`]), so the installed period is Active for the whole
+/// boot and the follow-up "normal reset refused: period active" is deterministic.
+pub const DEMO_INSTALL_PERIOD_MILLIS: u64 = DEMO_LONG_PERIOD_MILLIS;
+
+/// Ticks of the period a first reset installs, at `freq_hz` (see
+/// [`DEMO_INSTALL_PERIOD_MILLIS`]).
+pub const fn demo_install_period_ticks(freq_hz: u64) -> u64 {
+    millis_to_ticks(freq_hz, DEMO_INSTALL_PERIOD_MILLIS)
+}
+
+/// Ticks of the early-reset cooldown at `freq_hz`
+/// (`runix_mobile::period::DEMO_EARLY_RESET_COOLDOWN_MILLIS`, one hour; DEMO
+/// DATA). Derived from the counter's actual frequency like every other demo
+/// duration here.
+pub const fn demo_early_reset_cooldown_ticks(freq_hz: u64) -> u64 {
+    millis_to_ticks(
+        freq_hz,
+        runix_mobile::period::DEMO_EARLY_RESET_COOLDOWN_MILLIS,
+    )
+}
 
 /// `millis` of a counter running at `freq_hz`, in ticks: `freq_hz * millis /
 /// 1000`, saturating (never wraps, never panics). A zero result for a nonzero
@@ -463,7 +497,9 @@ pub fn describe_period_assessment(a: &PeriodAssessment) -> String {
 /// account with no billing period.
 pub fn describe_reset_assessment(a: &Option<PeriodAssessment>) -> String {
     match a {
-        None => String::from("no billing period for this account (reset not period-gated)"),
+        None => String::from(
+            "no billing period for this account (this first reset is not period-gated and installs one)",
+        ),
         Some(PeriodAssessment::Active { elapsed, remaining }) => {
             format!("period active: {elapsed} ticks in, {remaining} remaining")
         }
@@ -497,6 +533,11 @@ pub fn describe_reset_mode(mode: ResetMode, a: &Option<PeriodAssessment>) -> Str
 pub fn describe_period_started(s: &PeriodStarted) -> String {
     match s {
         PeriodStarted::NoPeriod => String::from("no billing period for this account; none started"),
+        PeriodStarted::Installed(p) => format!(
+            "billing period INSTALLED at tick {} (length {} ticks) because the account had none; DEMO DATA; later resets are period-gated",
+            p.start_tick(),
+            p.length_ticks()
+        ),
         PeriodStarted::Started(p) => format!(
             "next billing period started at tick {} (length {} ticks); reset request cleared",
             p.start_tick(),
@@ -791,6 +832,12 @@ mod tests {
         // Valid even for a degenerate frequency (never a ZeroLength None).
         assert_eq!(demo_period(0, 0).unwrap().length_ticks(), 1);
         // Account 1: a one-day period from tick 0 (Active for the whole boot).
+        assert_eq!(demo_period(2, 62_500_000), None, "account 2 has NO period");
+        assert_eq!(demo_install_period_ticks(62_500_000), 62_500_000 * 86_400);
+        assert_eq!(
+            demo_early_reset_cooldown_ticks(62_500_000),
+            62_500_000 * 3_600
+        );
         let long = demo_period(1, 62_500_000).expect("account 1 has a long demo period");
         assert_eq!(long.start_tick(), 0);
         assert_eq!(long.length_ticks(), 62_500_000 * 86_400);
@@ -806,6 +853,11 @@ mod tests {
         assert_eq!(RESET_PERIOD_ACTIVE, 7);
         assert_eq!(RESET_CLOCK_BEFORE_START, 8);
         assert_eq!(RESET_BAD_MODE, 9);
+        assert_eq!(RESET_EARLY_COOLDOWN, 10);
+        assert_eq!(
+            reset_refusal_code(&ResetRefusal::EarlyCooldown { remaining: 1 }),
+            RESET_EARLY_COOLDOWN
+        );
         assert_eq!(ResetMode::from_arg(0), Some(ResetMode::Normal));
         assert_eq!(ResetMode::from_arg(1), Some(ResetMode::Early));
         for bad in [2u64, 3, 255, u64::MAX] {
@@ -879,6 +931,11 @@ mod tests {
             "next billing period started at tick 900 (length 500 ticks); reset request cleared"
         );
         assert!(describe_period_started(&PeriodStarted::NoPeriod).contains("none started"));
+        let ip = describe_period_started(&PeriodStarted::Installed(p));
+        assert!(
+            ip.contains("INSTALLED at tick 900") && ip.contains("because the account had none")
+        );
+        assert!(!ip.contains("next billing period started"));
         let e = runix_mobile::period::PeriodError::ResetBeforeStart {
             start_tick: 9,
             reset_at_tick: 1,
@@ -1016,7 +1073,8 @@ mod tests {
         assert!(!e.roaming_data_allowed());
         assert_eq!(e.escalate_at_percent(), 150);
         assert_eq!(demo_entitlement(1), Some(e));
-        for a in [2u64, 15, 99, u64::MAX] {
+        assert_eq!(demo_entitlement(2), Some(e));
+        for a in [3u64, 15, 99, u64::MAX] {
             assert_eq!(demo_entitlement(a), None, "account {a} must fail closed");
         }
     }

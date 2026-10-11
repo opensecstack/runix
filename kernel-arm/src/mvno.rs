@@ -130,6 +130,17 @@ pub fn open_second_demo_account() -> Result<AccountId, AccountError> {
         .open_account(SubscriberId(0xD0_0002), PlanId(1))
 }
 
+/// Opens the THIRD compiled-in demo account (**DEMO DATA ONLY**), account 2 on a
+/// fresh boot, after [`open_second_demo_account`]. It owns no profile and is never
+/// fed usage; it is entitled (`data_codes::demo_entitlement`) but has NO billing
+/// period (`data_codes::demo_period`), for the boot proof that a first reset on
+/// such an account installs one.
+pub fn open_third_demo_account() -> Result<AccountId, AccountError> {
+    REGISTRY
+        .lock()
+        .open_account(SubscriberId(0xD0_0003), PlanId(1))
+}
+
 /// Binds `(slot, profile)` to `account`, subject to the registry's own rules
 /// (not already bound, not Deleted, account not Closed, ...).
 pub fn bind(account: u64, slot: usize, profile: u8) -> Result<(), AccountError> {

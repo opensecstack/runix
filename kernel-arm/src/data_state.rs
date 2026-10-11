@@ -43,8 +43,8 @@
 use alloc::vec::Vec;
 
 use runix_mobile::period::{
-    assess_period, next_period, period_request, BillingPeriod, ObservedPeriod, PeriodAssessment,
-    PeriodError, PeriodRequest,
+    assess_period, install_period, next_period, period_request, BillingPeriod, ObservedPeriod,
+    PeriodAssessment, PeriodError, PeriodRequest,
 };
 use runix_mobile::policy::{
     apply_usage, evaluate_usage, reset_usage, AccountStandingForData, DataEntitlement, DataUsage,
@@ -94,6 +94,15 @@ pub struct PeriodEntry {
     pub reset_requested_since: Option<u64>,
 }
 
+/// The tick of the most recent reset APPLIED to one account (normal or early).
+/// In memory like the rest of this state: LOST ON REBOOT, so the early-reset
+/// cooldown it feeds restarts empty after a reboot (a documented gap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResetEntry {
+    pub account: u64,
+    pub last_reset_tick: u64,
+}
+
 /// What [`DataState::advise_period`] found. ADVICE ONLY: `request` is the
 /// pure model's statement that a reset is due, not a reset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +125,9 @@ pub enum PeriodStarted {
     NoPeriod,
     /// The next period is installed and the request marker cleared.
     Started(BillingPeriod),
+    /// The account had NO period, so this (first) reset INSTALLED one: start =
+    /// the reset tick, length = the caller's install length (DEMO DATA).
+    Installed(BillingPeriod),
     /// `next_period` refused (the reset tick is before the old period's start:
     /// a rewound clock). The OLD period and marker are left exactly as they
     /// were, so the anomaly stays visible to the reconciler
@@ -150,6 +162,7 @@ pub struct DataState {
     usage: Vec<UsageEntry>,
     sessions: Vec<DataSession>,
     periods: Vec<PeriodEntry>,
+    last_resets: Vec<ResetEntry>,
 }
 
 impl DataState {
@@ -158,7 +171,35 @@ impl DataState {
             usage: Vec::new(),
             sessions: Vec::new(),
             periods: Vec::new(),
+            last_resets: Vec::new(),
         }
+    }
+
+    /// Tick of the most recent reset applied to `account`, if any this boot.
+    pub fn last_reset_tick(&self, account: u64) -> Option<u64> {
+        self.last_resets
+            .iter()
+            .find(|e| e.account == account)
+            .map(|e| e.last_reset_tick)
+    }
+
+    /// Record that a reset was applied to `account` at `now` (overwrites the
+    /// previous tick). A first record for a new account needs a free row (same
+    /// bound as the other tables); a full table refuses rather than evicting,
+    /// and the caller must report it: an unrecorded reset would mean no cooldown.
+    pub fn record_reset(&mut self, account: u64, now: u64) -> Result<(), TableFull> {
+        if let Some(e) = self.last_resets.iter_mut().find(|e| e.account == account) {
+            e.last_reset_tick = now;
+            return Ok(());
+        }
+        if self.last_resets.len() >= MAX_DATA_ACCOUNTS {
+            return Err(TableFull);
+        }
+        self.last_resets.push(ResetEntry {
+            account,
+            last_reset_tick: now,
+        });
+        Ok(())
     }
 
     /// The counter for `account`; an account never fed has used nothing.
@@ -275,9 +316,28 @@ impl DataState {
     /// request marker. Called ONLY from the reset's success path, after its
     /// capability check and MARSHAL gate; a denied reset never reaches it, so a
     /// denied reset starts no period and leaves the request outstanding.
-    pub fn start_next_period(&mut self, account: u64, now: u64) -> PeriodStarted {
+    ///
+    /// An account with NO period: `install_len == None` leaves it without one
+    /// ([`PeriodStarted::NoPeriod`]); `Some(len)` INSTALLS a period of `len`
+    /// ticks starting at `now` ([`install_period`]), so the account's later
+    /// resets are period-gated like any other account's.
+    pub fn start_next_period(
+        &mut self,
+        account: u64,
+        now: u64,
+        install_len: Option<u64>,
+    ) -> PeriodStarted {
         let Some(e) = self.periods.iter_mut().find(|e| e.account == account) else {
-            return PeriodStarted::NoPeriod;
+            let Some(len) = install_len else {
+                return PeriodStarted::NoPeriod;
+            };
+            return match install_period(now, len) {
+                Ok(p) => match self.set_period(account, p) {
+                    Ok(()) => PeriodStarted::Installed(p),
+                    Err(TableFull) => PeriodStarted::NoPeriod,
+                },
+                Err(err) => PeriodStarted::Rejected(err),
+            };
         };
         match next_period(&e.period, now) {
             Ok(next) => {
@@ -293,14 +353,20 @@ impl DataState {
     /// ([`Self::reset_usage`]) and the next period started at `now`
     /// ([`Self::start_next_period`]). One section, so no reader sees a zeroed
     /// counter inside an old, elapsed period (or the reverse).
+    ///
+    /// Also records `now` as the account's last applied reset (the early-reset
+    /// cooldown's input). The 4th element is that record's outcome: `Err` only
+    /// if the table is full, which the caller must surface.
     pub fn reset_usage_and_period(
         &mut self,
         account: u64,
         now: u64,
-    ) -> (DataUsage, DataUsage, PeriodStarted) {
+        install_len: Option<u64>,
+    ) -> (DataUsage, DataUsage, PeriodStarted, Result<(), TableFull>) {
         let (before, after) = self.reset_usage(account);
-        let started = self.start_next_period(account, now);
-        (before, after, started)
+        let started = self.start_next_period(account, now, install_len);
+        let recorded = self.record_reset(account, now);
+        (before, after, started, recorded)
     }
 
     /// The reconciler's view of every period: copies, in table order
@@ -653,7 +719,10 @@ mod tests {
         let mut s = DataState::new();
         assert_eq!(s.period_of(0), None);
         assert_eq!(s.advise_period(0, 10_000), None);
-        assert_eq!(s.start_next_period(0, 10_000), PeriodStarted::NoPeriod);
+        assert_eq!(
+            s.start_next_period(0, 10_000, None),
+            PeriodStarted::NoPeriod
+        );
         assert!(s.period_snapshot().is_empty());
     }
 
@@ -715,7 +784,7 @@ mod tests {
         s.set_period(0, bp(0, 500)).unwrap();
         s.feed_usage(0, 1600).unwrap();
         s.advise_period(0, 800).unwrap();
-        let (b, a, started) = s.reset_usage_and_period(0, 900);
+        let (b, a, started, _) = s.reset_usage_and_period(0, 900, None);
         assert_eq!((b.used_bytes, a.used_bytes), (1600, 0));
         assert_eq!(started, PeriodStarted::Started(bp(900, 500)));
         assert_eq!(s.period_of(0), Some(bp(900, 500)));
@@ -733,10 +802,49 @@ mod tests {
     fn a_reset_for_an_account_without_a_period_behaves_as_before() {
         let mut s = DataState::new();
         s.feed_usage(0, 1600).unwrap();
-        let (b, a, started) = s.reset_usage_and_period(0, 900);
+        let (b, a, started, _) = s.reset_usage_and_period(0, 900, None);
         assert_eq!((b.used_bytes, a.used_bytes), (1600, 0));
         assert_eq!(started, PeriodStarted::NoPeriod);
         assert!(s.period_snapshot().is_empty());
+    }
+
+    #[test]
+    fn first_reset_on_a_no_period_account_installs_a_period_then_it_is_gated() {
+        let mut s = DataState::new();
+        s.feed_usage(2, 700).unwrap();
+        assert_eq!(s.last_reset_tick(2), None);
+        let (b, a, started, rec) = s.reset_usage_and_period(2, 900, Some(5_000));
+        assert_eq!((b.used_bytes, a.used_bytes), (700, 0));
+        assert_eq!(started, PeriodStarted::Installed(bp(900, 5_000)));
+        assert_eq!(rec, Ok(()));
+        assert_eq!(s.period_of(2), Some(bp(900, 5_000)));
+        assert_eq!(s.last_reset_tick(2), Some(900));
+        // The second reset advances the (now existing) period, not Installed.
+        let (_, _, again, _) = s.reset_usage_and_period(2, 1_200, Some(5_000));
+        assert_eq!(again, PeriodStarted::Started(bp(1_200, 5_000)));
+        assert_eq!(s.last_reset_tick(2), Some(1_200));
+        // A zero install length is rejected and installs nothing.
+        let (_, _, rej, _) = s.reset_usage_and_period(3, 10, Some(0));
+        assert!(matches!(
+            rej,
+            PeriodStarted::Rejected(PeriodError::ZeroLength)
+        ));
+        assert_eq!(s.period_of(3), None);
+    }
+
+    #[test]
+    fn every_applied_reset_records_its_tick_per_account_and_the_table_is_bounded() {
+        let mut s = DataState::new();
+        let _ = s.reset_usage_and_period(0, 10, None);
+        let _ = s.reset_usage_and_period(1, 20, None);
+        assert_eq!(s.last_reset_tick(0), Some(10));
+        assert_eq!(s.last_reset_tick(1), Some(20));
+        assert_eq!(s.last_reset_tick(2), None);
+        for a in 2..MAX_DATA_ACCOUNTS as u64 {
+            assert_eq!(s.record_reset(a, 1), Ok(()));
+        }
+        assert_eq!(s.record_reset(99, 1), Err(TableFull));
+        assert_eq!(s.record_reset(0, 11), Ok(())); // existing row still updates
     }
 
     #[test]
@@ -744,7 +852,7 @@ mod tests {
         let mut s = DataState::new();
         s.set_period(0, bp(1_000, 500)).unwrap();
         s.advise_period(0, 2_000).unwrap(); // elapsed: marker = 2000
-        let (_, _, started) = s.reset_usage_and_period(0, 5);
+        let (_, _, started, _) = s.reset_usage_and_period(0, 5, None);
         assert!(matches!(
             started,
             PeriodStarted::Rejected(PeriodError::ResetBeforeStart { .. })
