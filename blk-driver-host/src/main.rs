@@ -107,6 +107,10 @@ fn file_resource(name: &str) -> String {
 /// which holds the testable logic). Fails closed: a revoked token, a denied
 /// syscall (this process lacking the `revocation:query` capability), or any
 /// result other than exactly `0` rejects the request.
+///
+/// Spawners must grant `revocation:query`; use the kernel's
+/// `capabilities::blk_driver_extra_capabilities` rather than issuing the
+/// driver's tokens by hand.
 fn verify_file_token(token: &CapabilityToken, name: &str) -> bool {
     let now = syscall::ticks();
     blk_driver_host::verify_file_token_with(

@@ -125,6 +125,10 @@ impl CapabilityToken {
 #[derive(Debug, Default)]
 pub struct RevocationList {
     revoked_signatures: BTreeSet<String>,
+    /// Index of [`signature_fingerprint`]s of `revoked_signatures`, for
+    /// O(log n) [`RevocationList::is_fingerprint_revoked`]. Signatures with
+    /// no fingerprint (malformed) appear only in the full set.
+    revoked_fingerprints: BTreeSet<u64>,
 }
 
 impl RevocationList {
@@ -133,6 +137,9 @@ impl RevocationList {
     }
 
     pub fn revoke(&mut self, token: &CapabilityToken) {
+        if let Some(fp) = signature_fingerprint(&token.signature) {
+            self.revoked_fingerprints.insert(fp);
+        }
         self.revoked_signatures.insert(token.signature.clone());
     }
 
@@ -150,9 +157,7 @@ impl RevocationList {
     /// fingerprint, since a token with a forged signature fails Ed25519
     /// verification regardless of what this returns.
     pub fn is_fingerprint_revoked(&self, fingerprint: u64) -> bool {
-        self.revoked_signatures
-            .iter()
-            .any(|sig| signature_fingerprint(sig) == Some(fingerprint))
+        self.revoked_fingerprints.contains(&fingerprint)
     }
 }
 
@@ -289,6 +294,47 @@ mod tests {
         assert_eq!(signature_fingerprint(""), None);
         // Multi-byte char straddling byte 16 must not panic.
         assert_eq!(signature_fingerprint("0102030405060\u{e9}\u{e9}"), None);
+    }
+
+    #[test]
+    fn fingerprint_index_scales_and_preserves_exact_signature_semantics() {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut revocations = RevocationList::new();
+        let tokens: alloc::vec::Vec<_> = (0..200u64)
+            .map(|i| CapabilityToken::issue("s", format!("r{i}"), i, i + 10, "k", &key))
+            .collect();
+        for t in &tokens[..100] {
+            revocations.revoke(t);
+        }
+        for (i, t) in tokens.iter().enumerate() {
+            let fp = signature_fingerprint(&t.signature).unwrap();
+            assert_eq!(revocations.is_fingerprint_revoked(fp), i < 100);
+            assert_eq!(revocations.is_revoked(t), i < 100);
+        }
+        // Same fingerprint, different full signature: the fingerprint query
+        // fails closed, but is_revoked stays exact.
+        let mut twin = tokens[150].clone();
+        let mut sig = tokens[0].signature.clone();
+        sig.replace_range(16.., &"0".repeat(sig.len() - 16));
+        twin.signature = sig;
+        let mut r2 = RevocationList::new();
+        let mut revoked = tokens[0].clone();
+        revoked.signature = twin.signature.clone();
+        r2.revoke(&revoked);
+        let mut colliding = tokens[1].clone();
+        colliding.signature = format!(
+            "{}{}",
+            &twin.signature[..16],
+            "1".repeat(twin.signature.len() - 16)
+        );
+        assert!(!r2.is_revoked(&colliding));
+        assert!(r2.is_revoked(&revoked));
+        assert!(r2.is_fingerprint_revoked(signature_fingerprint(&colliding.signature).unwrap()));
+        // Malformed signature: exact-set only, never reachable by fingerprint.
+        let mut bad = tokens[0].clone();
+        bad.signature = "zz".into();
+        r2.revoke(&bad);
+        assert!(r2.is_revoked(&bad));
     }
 
     #[test]

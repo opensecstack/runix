@@ -99,8 +99,35 @@ pub fn random_resource() -> String {
 /// `SYS_CAP_IS_REVOKED`. Held (as an extra capability) only by
 /// `blk-driver-host`, so arbitrary ring-3 code cannot probe the revocation
 /// list.
+///
+/// Requirement for spawners of `blk-driver-host` in serve mode: it MUST
+/// hold this capability or every request is denied (fails closed). Do not
+/// issue the driver's extra tokens by hand; use
+/// [`blk_driver_extra_capabilities`], which includes it.
 pub fn revocation_query_resource() -> String {
     "revocation:query".into()
+}
+
+/// The complete set of extra capabilities a serve-mode `blk-driver-host`
+/// needs beyond its block-device token: the file-server token it was given
+/// plus the `revocation:query` token. Single source of truth so spawners
+/// cannot forget the second one.
+pub fn blk_driver_extra_capabilities(
+    fs_server_token: CapabilityToken,
+    now: u64,
+    signing_key: &SigningKey,
+) -> alloc::vec::Vec<CapabilityToken> {
+    alloc::vec![
+        fs_server_token,
+        CapabilityToken::issue(
+            "blk-driver-host",
+            revocation_query_resource(),
+            now,
+            now + 1_000_000,
+            "demo-key",
+            signing_key,
+        ),
+    ]
 }
 
 /// The resource-string convention for port-I/O access: one capability
