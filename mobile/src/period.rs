@@ -208,6 +208,81 @@ pub fn next_period(old: &BillingPeriod, reset_at_tick: u64) -> Result<BillingPer
     BillingPeriod::new(reset_at_tick, old.length_ticks)
 }
 
+/// Why a governed reset was refused on period grounds. Carries the facts the
+/// caller needs for its audit line; it is a verdict, not an action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetRefusal {
+    /// A normal reset was asked for while the period is still in progress. Only
+    /// the separately scoped early (override) reset may end a period early.
+    PeriodActive {
+        /// Ticks left until the period ends (at least 1).
+        remaining: u64,
+    },
+    /// `now < start`: the clock is untrustworthy relative to this period. Refused
+    /// for BOTH the normal and the early reset, because the reset could not start
+    /// a coherent next period (`next_period` rejects a reset before the old
+    /// start) and a rewound counter must not be a way to reset on demand.
+    ClockBeforeStart { start_tick: u64, now_tick: u64 },
+}
+
+impl fmt::Display for ResetRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResetRefusal::PeriodActive { remaining } => write!(
+                f,
+                "billing period still active ({remaining} ticks remaining); a normal reset is only allowed once it has elapsed"
+            ),
+            ResetRefusal::ClockBeforeStart {
+                start_tick,
+                now_tick,
+            } => write!(
+                f,
+                "clock before period start (now {now_tick} < start {start_tick}); reset refused"
+            ),
+        }
+    }
+}
+
+/// The period half of the governed reset's decision. Pure.
+///
+/// `assessment` is `assess_period` of the account's period at the caller's
+/// `now`, or `None` when the account has NO billing period. `early` is true for
+/// the override reset (its own capability, checked by the caller before this).
+///
+/// * `Elapsed` -> allowed, normal or early.
+/// * `Active` -> allowed only if `early`; otherwise [`ResetRefusal::PeriodActive`].
+/// * `ClockBeforeStart` -> always refused (see [`ResetRefusal::ClockBeforeStart`]).
+/// * `None` (no period) -> allowed, normal or early. This is the pre-period
+///   behaviour kept on purpose: with no period there is nothing to gate a reset
+///   against, and refusing would strand an account that has no billing cycle. It
+///   is a documented gap, not an endorsement: such an account can be reset
+///   repeatedly (still capability- and MARSHAL-gated and WORM-audited).
+///
+/// A successful reset installs a new `Active` period (`next_period`), which is
+/// what makes a normal reset happen at most once per period.
+pub fn reset_permitted(
+    assessment: Option<PeriodAssessment>,
+    early: bool,
+) -> Result<(), ResetRefusal> {
+    match assessment {
+        None | Some(PeriodAssessment::Elapsed { .. }) => Ok(()),
+        Some(PeriodAssessment::Active { remaining, .. }) => {
+            if early {
+                Ok(())
+            } else {
+                Err(ResetRefusal::PeriodActive { remaining })
+            }
+        }
+        Some(PeriodAssessment::ClockBeforeStart {
+            start_tick,
+            now_tick,
+        }) => Err(ResetRefusal::ClockBeforeStart {
+            start_tick,
+            now_tick,
+        }),
+    }
+}
+
 /// One account's period as observed, for [`check_periods`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedPeriod {
@@ -567,6 +642,63 @@ mod tests {
         assert_eq!(d.start_tick(), 42);
         assert_eq!(d.length_ticks(), DEMO_PERIOD_TICKS);
         const _: () = assert!(DEMO_PERIOD_TICKS > 0);
+    }
+
+    // ---- reset_permitted ----
+
+    #[test]
+    fn reset_permitted_matrix() {
+        let b = p(100, 50); // end = 150
+        let at = |now| Some(assess_period(&b, now));
+        // Elapsed (boundary and later): allowed, normal and early.
+        for now in [150, 151, 10_000] {
+            assert_eq!(reset_permitted(at(now), false), Ok(()));
+            assert_eq!(reset_permitted(at(now), true), Ok(()));
+        }
+        // Active (first and last tick): normal refused, early allowed.
+        for (now, remaining) in [(100, 50), (149, 1)] {
+            assert_eq!(
+                reset_permitted(at(now), false),
+                Err(ResetRefusal::PeriodActive { remaining })
+            );
+            assert_eq!(reset_permitted(at(now), true), Ok(()));
+        }
+        // Clock before start: refused for both, early included.
+        let cbs = ResetRefusal::ClockBeforeStart {
+            start_tick: 100,
+            now_tick: 99,
+        };
+        assert_eq!(reset_permitted(at(99), false), Err(cbs));
+        assert_eq!(reset_permitted(at(99), true), Err(cbs));
+        // No billing period: the pre-period behaviour (allowed), both modes.
+        assert_eq!(reset_permitted(None, false), Ok(()));
+        assert_eq!(reset_permitted(None, true), Ok(()));
+    }
+
+    #[test]
+    fn a_successful_reset_makes_the_next_normal_reset_refused() {
+        // "Once per period": the reset installs an Active period.
+        let b = p(0, 100);
+        assert_eq!(reset_permitted(Some(assess_period(&b, 100)), false), Ok(()));
+        let n = next_period(&b, 100).unwrap();
+        assert!(matches!(
+            reset_permitted(Some(assess_period(&n, 101)), false),
+            Err(ResetRefusal::PeriodActive { remaining: 99 })
+        ));
+    }
+
+    #[test]
+    fn reset_refusal_display_is_descriptive() {
+        let a = format!("{}", ResetRefusal::PeriodActive { remaining: 7 });
+        assert!(a.contains("still active") && a.contains('7'));
+        let c = format!(
+            "{}",
+            ResetRefusal::ClockBeforeStart {
+                start_tick: 9,
+                now_tick: 3
+            }
+        );
+        assert!(c.contains("before period start"));
     }
 
     // ---- check_periods ----
