@@ -50,6 +50,7 @@
 
 #![no_std]
 #![no_main]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 extern crate alloc;
 
@@ -119,10 +120,25 @@ const SYS_WRITE: u64 = 1;
 /// linking against the kernel it calls into.
 ///
 /// # Safety
-/// Whatever `num`'s own contract requires — `SYS_WRITE` needs `arg1` to be
-/// a byte value, `SYS_YIELD` ignores its arguments entirely.
+/// Must only be called from ring 3 in a process whose IDT vector 0x80 is
+/// the kernel's `syscall::entry` (the only thing this crate runs under);
+/// elsewhere `int 0x80` would invoke an unrelated handler or fault. `num`
+/// must be a syscall number the kernel defines, and the arguments must meet
+/// that syscall's own contract — `SYS_WRITE` needs `arg1` to be a byte
+/// value, `SYS_YIELD` ignores its arguments entirely. Neither syscall used
+/// here takes a pointer, so no memory-validity requirement is passed through.
 unsafe fn syscall(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     let ret: u64;
+    // SAFETY: `int 0x80` enters `kernel::syscall::entry`, which remaps
+    // registers, calls the SysV `dispatch` (so callee-saved registers
+    // rbx/rbp/r12-r15 and rsp are preserved) and returns via `iretq` with
+    // the result in RAX. Every register that path may change is declared:
+    // RAX as the in/out result, RDI/RSI/RDX overwritten by the remap shim
+    // (`inout(..) => _`), and RCX/R8-R11 as caller-saved scratch
+    // (`lateout`). The default asm options are kept (not `nomem`/
+    // `nostack`/`preserves_flags`), so the compiler assumes memory and flags
+    // may change across the call. The caller contract is the `# Safety`
+    // section above.
     unsafe {
         core::arch::asm!(
             "int 0x80",
@@ -168,12 +184,19 @@ unsafe fn syscall(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
 }
 
 fn write_byte(byte: u8) {
+    // SAFETY: `SYS_WRITE` takes a plain byte value in `arg1` (any `u8`
+    // widened to `u64` is valid) and ignores the other arguments; no
+    // pointers are passed. This crate only ever runs as the kernel's ring 3
+    // process, so vector 0x80 is `syscall::entry`.
     unsafe {
         syscall(SYS_WRITE, byte as u64, 0, 0);
     }
 }
 
 fn yield_now() {
+    // SAFETY: `SYS_YIELD` ignores all its arguments (zeros here) and takes
+    // no pointers; this crate only runs as the kernel's ring 3 process, so
+    // vector 0x80 is `syscall::entry`.
     unsafe {
         syscall(SYS_YIELD, 0, 0, 0);
     }
@@ -203,6 +226,16 @@ const GROW_PROBE_DELTA_PAGES: i32 = 69;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    // SAFETY: the loader (`load_and_run_grid_sandbox_host` in
+    // kernel/src/main.rs, and the kernel/tests/grid_sandbox_*.rs tests)
+    // maps `HEAP_START..HEAP_START + HEAP_SIZE` (8 MiB, page-aligned start)
+    // PRESENT | WRITABLE | USER_ACCESSIBLE, zero-filled, in this process's
+    // private address space, and nothing else in this binary uses that
+    // range. `_start` is the process entry point and runs once, so `init` is
+    // called exactly once, before any allocation (the global allocator is
+    // `LockedHeap::empty()` until now). If a loader failed to map the
+    // region, `init` would page-fault (process killed) rather than corrupt
+    // memory — that mapping is a loader obligation not checked here.
     unsafe {
         ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
     }
@@ -214,6 +247,13 @@ pub extern "C" fn _start() -> ! {
     // intended. This mirrors the fail-closed stance
     // `BootAllowlist::authorize_module_load` already takes for an
     // unrecognized module.
+    // SAFETY: `GRID_INFO_VA` is a fixed, 1-byte-aligned address in the
+    // `GridBootInfo` page the loader maps PRESENT | USER_ACCESSIBLE and
+    // fills before spawning this process (kernel/src/main.rs
+    // `info_page`/`GRID_INFO_VA`, same constant). Volatile because the
+    // kernel, not this program, wrote the byte. Mapping is a loader
+    // obligation not checked here; an unmapped page would fault, not read
+    // stale memory.
     let tier_byte = unsafe { core::ptr::read_volatile(GRID_INFO_VA as *const u8) };
     let limits = match tier_byte {
         0 => SandboxLimits::t1_critical(),
@@ -245,6 +285,12 @@ pub extern "C" fn _start() -> ! {
             Ok(_) => GRID_GROW_RESULT_FAILED,
             Err(_) => GRID_GROW_RESULT_ERROR,
         };
+    // SAFETY: `GRID_INFO_VA + GRID_GROW_RESULT_OFFSET` (offset 128) lies in
+    // the same page as the tier byte read above, which the loader maps
+    // PRESENT | WRITABLE | USER_ACCESSIBLE (kernel/src/main.rs `info_flags`),
+    // and a `u8` write needs no alignment. Nothing else in this process
+    // touches that byte; volatile because the kernel/tests read it from
+    // outside this program.
     unsafe {
         core::ptr::write_volatile(
             (GRID_INFO_VA + GRID_GROW_RESULT_OFFSET) as *mut u8,
