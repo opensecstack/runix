@@ -120,6 +120,33 @@ per this crate's own channel):
 rustup run stable-x86_64-pc-windows-gnu cargo build --target aarch64-unknown-none --release
 ```
 
+### Two proof lines that cannot pass on a plain local boot
+
+CI's two QEMU boot steps that assert the net TCP proof (the secure boot and the
+no-EL3 boot; `.github/workflows/ci.yml`) grep for these two lines:
+
+```
+Runix ARM kernel: net TCP proof observed SPSR_EL1=.* result=0 (Pass)
+Runix ARM kernel: net TCP proof PASS
+```
+
+They only appear when the guest's outbound TCP connection to `10.0.2.100:9000`
+actually reaches a listener. CI provides one: it starts
+`kernel/tests/support/tcp_proof_listener.py` on the host and boots QEMU with
+`-netdev user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001`. A bare
+local boot has no listener, so the proof cannot complete and **those two greps
+fail locally even though the kernel is fine**. Every other assertion in those steps
+is unaffected.
+
+- On Linux (or WSL, or CI), reproduce CI exactly: start the listener, then boot
+  with the same `-netdev` value.
+- On native Windows, QEMU cannot run the `cmd:` helper that `guestfwd` uses (the
+  Slirp `fork_exec` fails), so the exact CI setup is not available. Either run the
+  boot under Linux, or accept that those two lines will not match and check the
+  rest of the step's assertions.
+- A failure of only these two lines on a local boot, with no listener, is expected.
+  A failure of them on CI is a real regression.
+
 ## Kernel build stages (Alpha)
 
 1. Toolchain & target bring-up — `x86_64-unknown-none`, `no_std`/`no_main`,
