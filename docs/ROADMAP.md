@@ -100,6 +100,19 @@ of Alpha's scope (and beyond it) is done, in progress, or not started.
     in `kernel/Cargo.toml`'s `panic = "abort"` comment); treat kernel-direct
     as a deliberate future project specifically because it could give
     `tls-client` its first real consumer, not as a default migration target.
+- **Boot-time module authorization is a wiring proof, not an enforcing gate —
+  open, RC-scope (decision 2026-10-11).** `kernel/src/citadel.rs` builds its
+  allowlist from the very bytes it then checks, so it cannot reject a real
+  module, and each call's evidence log is dropped. Making it enforce is not a
+  build-script change: every authorized module is embedded with
+  `include_bytes!`, so a manifest produced by the same build, and verified by a
+  key embedded in the same image, adds no security. The design that does:
+  load a module from outside the image (the FAT32 filesystem driver already
+  exists) and authorize it against a manifest signed by a separate release
+  process, with the verifying key provisioned outside the image (firmware or
+  the future WORM boot chain). Retain the allowlist's evidence log in a
+  kernel-owned `WormLog` at the same time. Until then, do not describe the gate
+  as fail-closed. Tracked in [STATUS.md](STATUS.md) and `THREAT_MODEL.md`.
 - **Operator identity for a real MARSHAL round trip — open, RC-scope, not
   started (2026-10-02).** A real CITADEL/MARSHAL deployment is reachable
   (independently verified: `/api/v1/health` returns `200` on both CITADEL

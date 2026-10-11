@@ -3129,7 +3129,11 @@ Still open, verified in the code:
 - The boot allowlist cannot reject a real module as wired:
   `citadel::demo_authorize` builds the allowlist from the bytes it checks.
   Its evidence log is also dropped after each call, so boot authorization
-  decisions are not retained.
+  decisions are not retained. **Accepted limitation (2026-10-11):** every
+  authorized module is embedded with `include_bytes!`, so a manifest made by
+  the same build would add no security. Read the gate as a wiring proof. It
+  becomes enforcing when a module is loaded from outside the image against a
+  manifest signed by a separate release process (ROADMAP open questions).
 - (Corrected 2026-10-11) The kernel's CITADEL demo seed was reported as having no
   `insecure-demo-keys` barrier. That was overstated: a build without the feature
   already failed for the whole crate through `capabilities.rs`'s `compile_error!`.
