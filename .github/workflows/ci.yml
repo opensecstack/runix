@@ -893,6 +893,8 @@ jobs:
           grep -q "Runix ARM kernel: data early-reset capability issued (account 1" /tmp/arm-boot.log
           grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (billing period still active ([0-9]* ticks remaining); a normal reset is only allowed once it has elapsed)" /tmp/arm-boot.log
           grep -q "SVC: SYS_DATA_RESET account 1 period refusal audited to WORM (authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot.log
+          # The entry READ BACK from the WORM chain (not re-derived): refused, with the period text.
+          grep -q "SVC: SYS_DATA_RESET account 1 WORM entry: authorized=false reason=.*billing period still active.*NORMAL reset" /tmp/arm-boot.log
           # An unknown mode argument is refused before any capability is chosen.
           grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (unknown mode 7; 0 = normal, 1 = early)" /tmp/arm-boot.log
           # The EARLY reset is its own capability scope: account 0 holds data:reset:0 only, so
@@ -1207,6 +1209,8 @@ jobs:
           grep -q "Runix ARM kernel: data early-reset capability issued (account 1" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (billing period still active ([0-9]* ticks remaining); a normal reset is only allowed once it has elapsed)" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_DATA_RESET account 1 period refusal audited to WORM (authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot-nosecure.log
+          # The entry READ BACK from the WORM chain (not re-derived): refused, with the period text.
+          grep -q "SVC: SYS_DATA_RESET account 1 WORM entry: authorized=false reason=.*billing period still active.*NORMAL reset" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (unknown mode 7; 0 = normal, 1 = early)" /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_DATA_RESET(early) account 0 DENIED (capability token is not authorized" /tmp/arm-boot-nosecure.log
           grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=1: Unreachable" /tmp/arm-boot-nosecure.log
@@ -1338,6 +1342,7 @@ jobs:
           # ...and the success records the REAL verdict (a reachable MARSHAL
           # answered), not the ungoverned fail-open text.
           grep -qF "SVC: SYS_DATA_RESET account 0 authorized (usage 1600 -> 0; new period; MARSHAL verdict: Execute; " /tmp/arm-boot-marshal-refuse.log
+          grep -q "SVC: SYS_DATA_RESET account 0 WORM entry: authorized=true reason=.*NORMAL reset.*MARSHAL verdict: Execute" /tmp/arm-boot-marshal-refuse.log
           grep -qF "SVC: SYS_MVNO_BIND account 0 slot 0 profile 0 authorized [MARSHAL verdict: Execute]" /tmp/arm-boot-marshal-refuse.log
           # Billing period (SYS_DATA_PERIOD), race-free assertions only: the first call
           # runs >= ~2.3 s into the counter against a 500 ms demo period that started
@@ -1360,10 +1365,13 @@ jobs:
           # refused), so it is authorized and records the real verdict and the override.
           grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (billing period still active ([0-9]* ticks remaining); a normal reset is only allowed once it has elapsed)" /tmp/arm-boot-marshal-refuse.log
           grep -q "SVC: SYS_DATA_RESET account 1 period refusal audited to WORM (authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot-marshal-refuse.log
+          # The entry READ BACK from the WORM chain (not re-derived): refused, with the period text.
+          grep -q "SVC: SYS_DATA_RESET account 1 WORM entry: authorized=false reason=.*billing period still active.*NORMAL reset" /tmp/arm-boot-marshal-refuse.log
           grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (unknown mode 7; 0 = normal, 1 = early)" /tmp/arm-boot-marshal-refuse.log
           grep -q "SVC: SYS_DATA_RESET(early) account 0 DENIED (capability token is not authorized" /tmp/arm-boot-marshal-refuse.log
           grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=1: Execute" /tmp/arm-boot-marshal-refuse.log
           grep -qF "SVC: SYS_DATA_RESET(early) account 1 authorized (EARLY override reset; usage 0 -> 0; new period; MARSHAL verdict: Execute; " /tmp/arm-boot-marshal-refuse.log
+          grep -q "SVC: SYS_DATA_RESET(early) account 1 WORM entry: authorized=true reason=.*EARLY (override) reset under data:reset-early.*Execute" /tmp/arm-boot-marshal-refuse.log
           grep -q "SVC: SYS_DATA_RESET(early) account 1 billing period: next billing period started at tick [0-9]* (length [0-9]* ticks); reset request cleared" /tmp/arm-boot-marshal-refuse.log
           test "$(grep -c "MARSHAL evaluation for data.reset_usage account=1" /tmp/arm-boot-marshal-refuse.log)" -eq 1
 
@@ -1440,6 +1448,8 @@ jobs:
           # the counter and period untouched (no "started" line, checked above).
           grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (billing period still active ([0-9]* ticks remaining); a normal reset is only allowed once it has elapsed)" /tmp/arm-boot-marshal-refuse-mvno.log
           grep -q "SVC: SYS_DATA_RESET account 1 period refusal audited to WORM (authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot-marshal-refuse-mvno.log
+          # The entry READ BACK from the WORM chain (not re-derived): refused, with the period text.
+          grep -q "SVC: SYS_DATA_RESET account 1 WORM entry: authorized=false reason=.*billing period still active.*NORMAL reset" /tmp/arm-boot-marshal-refuse-mvno.log
           grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (unknown mode 7; 0 = normal, 1 = early)" /tmp/arm-boot-marshal-refuse-mvno.log
           grep -q "SVC: SYS_DATA_RESET(early) account 0 DENIED (capability token is not authorized" /tmp/arm-boot-marshal-refuse-mvno.log
           grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=1: Refuse" /tmp/arm-boot-marshal-refuse-mvno.log
@@ -1521,6 +1531,7 @@ jobs:
           # The success lines record the real verdict (every evaluation above
           # was a reachable Execute), not the ungoverned fail-open text.
           grep -qF "SVC: SYS_DATA_RESET account 0 authorized (usage 1600 -> 0; new period; MARSHAL verdict: Execute; " /tmp/arm-boot-marshal-execute.log
+          grep -q "SVC: SYS_DATA_RESET account 0 WORM entry: authorized=true reason=.*NORMAL reset.*MARSHAL verdict: Execute" /tmp/arm-boot-marshal-execute.log
           grep -qF "SVC: SYS_SIM_ENABLE slot 0 profile 0 authorized [MARSHAL verdict: Execute]" /tmp/arm-boot-marshal-execute.log
           # Billing period (SYS_DATA_PERIOD), race-free assertions only: the first call
           # runs >= ~2.3 s into the counter against a 500 ms demo period that started
@@ -1543,10 +1554,13 @@ jobs:
           # type, no new one) and is authorized, recording the real verdict and the override.
           grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (billing period still active ([0-9]* ticks remaining); a normal reset is only allowed once it has elapsed)" /tmp/arm-boot-marshal-execute.log
           grep -q "SVC: SYS_DATA_RESET account 1 period refusal audited to WORM (authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot-marshal-execute.log
+          # The entry READ BACK from the WORM chain (not re-derived): refused, with the period text.
+          grep -q "SVC: SYS_DATA_RESET account 1 WORM entry: authorized=false reason=.*billing period still active.*NORMAL reset" /tmp/arm-boot-marshal-execute.log
           grep -q "SVC: SYS_DATA_RESET account 1 REFUSED (unknown mode 7; 0 = normal, 1 = early)" /tmp/arm-boot-marshal-execute.log
           grep -q "SVC: SYS_DATA_RESET(early) account 0 DENIED (capability token is not authorized" /tmp/arm-boot-marshal-execute.log
           grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=1: Execute" /tmp/arm-boot-marshal-execute.log
           grep -qF "SVC: SYS_DATA_RESET(early) account 1 authorized (EARLY override reset; usage 0 -> 0; new period; MARSHAL verdict: Execute; " /tmp/arm-boot-marshal-execute.log
+          grep -q "SVC: SYS_DATA_RESET(early) account 1 WORM entry: authorized=true reason=.*EARLY (override) reset under data:reset-early.*Execute" /tmp/arm-boot-marshal-execute.log
           grep -q "SVC: SYS_DATA_RESET(early) account 1 billing period: next billing period started at tick [0-9]* (length [0-9]* ticks); reset request cleared" /tmp/arm-boot-marshal-execute.log
           test "$(grep -c "MARSHAL evaluation for data.reset_usage account=1" /tmp/arm-boot-marshal-execute.log)" -eq 1
 

@@ -521,6 +521,33 @@ fn audit_chain_summary() -> (usize, bool) {
     }
 }
 
+/// `(authorized, reason)` of the LAST entry in [`ESIM_WORM_LOG`], read back
+/// from the chain itself (not re-derived from the strings that were recorded),
+/// so the serial log shows what the audit trail really holds.
+fn audit_last_entry() -> Option<(bool, Option<String>)> {
+    let guard = ESIM_WORM_LOG.lock();
+    let entry = guard.as_ref()?.entries().last()?;
+    Some((entry.authorized, entry.reason.clone()))
+}
+
+/// Prints the last WORM entry's flag and reason for a `SYS_DATA_RESET` line.
+fn print_reset_readback(label: &str, account: u64) {
+    match audit_last_entry() {
+        Some((authorized, reason)) => serial_println!(
+            "SVC: {} account {} WORM entry: authorized={} reason={}",
+            label,
+            account,
+            authorized,
+            reason.as_deref().unwrap_or("<none>")
+        ),
+        None => serial_println!(
+            "SVC: {} account {} WORM entry: <chain empty>",
+            label,
+            account
+        ),
+    }
+}
+
 /// Maps a registry result to [`audit_event`]'s `(authorized, reason)`.
 fn audit_outcome<T>(r: &Result<T, runix_mobile::account::AccountError>) -> (bool, Option<String>) {
     match r {
@@ -2059,6 +2086,7 @@ fn data_reset(account: u64, mode_arg: u64) -> u64 {
             entries,
             chain_ok
         );
+        print_reset_readback(label, account);
         return reset_refusal_code(&refusal);
     }
     // No lock held across this call. A block leaves usage and `last_used` alone.
@@ -2122,6 +2150,7 @@ fn data_reset(account: u64, mode_arg: u64) -> u64 {
         account,
         period_text
     );
+    print_reset_readback(label, account);
     RESET_OK
 }
 
