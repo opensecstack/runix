@@ -844,10 +844,10 @@ jobs:
           # Not MARSHAL-gated: of the data actions, ONLY the usage-period reset
           # (data.reset_usage, below) is ever sent for evaluation. Any other
           # "MARSHAL evaluation for data..." line is a regression, and so is
-          # any count but two (the walk performs exactly two gated resets: account 0's normal reset and
-          # account 1's early reset; the period-refused normal reset on account 1 is never sent).
+          # any unexpected count (the period- and cooldown-refused resets are never sent; the exact
+          # per-boot totals are asserted with the account 1 / account 2 checks below).
           if grep "MARSHAL evaluation for data" /tmp/arm-boot.log | grep -qvF "data.reset_usage"; then exit 1; fi
-          test "$(grep -c "MARSHAL evaluation for data" /tmp/arm-boot.log)" -eq 2
+          # (the exact total is asserted below, once every gated reset of the walk is listed)
           # Governed usage-period reset (SYS_DATA_RESET): it lifts a cap, so it is
           # capability-gated (data:reset:0, its own scope) AND MARSHAL-gated, and its
           # unreachable policy is FAIL-CLOSED (MarshalAction::unreachable_policy): a reset
@@ -906,8 +906,26 @@ jobs:
           grep -qF "SVC: SYS_DATA_RESET(early) account 1 DENIED (MARSHAL unreachable: fail-closed for this action)" /tmp/arm-boot.log
           grep -qF "denial audited to WORM (usage period in force -> new usage period (counter reset; EARLY override), authorized=false;" /tmp/arm-boot.log
           if grep -q "SVC: SYS_DATA_RESET(early) account 1 authorized" /tmp/arm-boot.log; then exit 1; fi
-          # The refused normal reset cost no MARSHAL round trip: account 1 was evaluated once.
-          test "$(grep -c "MARSHAL evaluation for data.reset_usage account=1" /tmp/arm-boot.log)" -eq 1
+          # The refused normal reset cost no MARSHAL round trip. Account 1's early reset is evaluated
+          # twice here: the first was denied (nothing applied), so the second is denied the same way.
+          test "$(grep -c "MARSHAL evaluation for data.reset_usage account=1" /tmp/arm-boot.log)" -eq 2
+          # Early-reset cooldown (any applied reset blocks an EARLY reset for an hour, DEMO) and the
+          # no-period account (account 2: entitled, Active, NO billing period). Both are decided BEFORE
+          # MARSHAL (no evaluation), WORM-audited authorized=false, and start no period.
+          # No reset is APPLIED in this boot, so there is no cooldown to observe: the second early
+          # reset on account 1 is evaluated and DENIED by MARSHAL exactly like the first (two
+          # evaluations; the cooldown refusal never appears).
+          test "$(grep -c "SVC: SYS_DATA_RESET(early) account 1 DENIED (MARSHAL unreachable: fail-closed for this action)" /tmp/arm-boot.log)" -eq 2
+          if grep -q "early-reset cooldown" /tmp/arm-boot.log; then exit 1; fi
+          # Account 2 (no billing period): both normal resets reach MARSHAL and are denied, so no
+          # period is installed and the second is NOT period-refused.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=2: Unreachable" /tmp/arm-boot.log
+          test "$(grep -c "MARSHAL evaluation for data.reset_usage account=2" /tmp/arm-boot.log)" -eq 2
+          test "$(grep -c "SVC: SYS_DATA_RESET account 2 DENIED (MARSHAL unreachable: fail-closed for this action)" /tmp/arm-boot.log)" -eq 2
+          if grep -q "SVC: SYS_DATA_RESET account 2 authorized" /tmp/arm-boot.log; then exit 1; fi
+          if grep -q "billing period INSTALLED" /tmp/arm-boot.log; then exit 1; fi
+          if grep -q "SVC: SYS_DATA_RESET account 2 REFUSED" /tmp/arm-boot.log; then exit 1; fi
+          test "$(grep -c "MARSHAL evaluation for data" /tmp/arm-boot.log)" -eq 5
           # Billing periods (kernel-arm/src/data_state.rs, runix_mobile::period). A period
           # is DATA and nothing resets on a schedule: SYS_DATA_PERIOD is read-only ADVICE
           # computed from the generic timer when a CALLER asks. Account 0's DEMO period
@@ -1160,10 +1178,10 @@ jobs:
           # Not MARSHAL-gated: of the data actions, ONLY the usage-period reset
           # (data.reset_usage, below) is ever sent for evaluation. Any other
           # "MARSHAL evaluation for data..." line is a regression, and so is
-          # any count but two (the walk performs exactly two gated resets: account 0's normal reset and
-          # account 1's early reset; the period-refused normal reset on account 1 is never sent).
+          # any unexpected count (the period- and cooldown-refused resets are never sent; the exact
+          # per-boot totals are asserted with the account 1 / account 2 checks below).
           if grep "MARSHAL evaluation for data" /tmp/arm-boot-nosecure.log | grep -qvF "data.reset_usage"; then exit 1; fi
-          test "$(grep -c "MARSHAL evaluation for data" /tmp/arm-boot-nosecure.log)" -eq 2
+          # (the exact total is asserted below, once every gated reset of the walk is listed)
           # Governed usage-period reset (SYS_DATA_RESET): it lifts a cap, so it is
           # capability-gated (data:reset:0, its own scope) AND MARSHAL-gated, and its
           # unreachable policy is FAIL-CLOSED (MarshalAction::unreachable_policy): a reset
@@ -1217,7 +1235,24 @@ jobs:
           grep -qF "SVC: SYS_DATA_RESET(early) account 1 DENIED (MARSHAL unreachable: fail-closed for this action)" /tmp/arm-boot-nosecure.log
           grep -qF "denial audited to WORM (usage period in force -> new usage period (counter reset; EARLY override), authorized=false;" /tmp/arm-boot-nosecure.log
           if grep -q "SVC: SYS_DATA_RESET(early) account 1 authorized" /tmp/arm-boot-nosecure.log; then exit 1; fi
-          test "$(grep -c "MARSHAL evaluation for data.reset_usage account=1" /tmp/arm-boot-nosecure.log)" -eq 1
+          test "$(grep -c "MARSHAL evaluation for data.reset_usage account=1" /tmp/arm-boot-nosecure.log)" -eq 2
+          # Early-reset cooldown (any applied reset blocks an EARLY reset for an hour, DEMO) and the
+          # no-period account (account 2: entitled, Active, NO billing period). Both are decided BEFORE
+          # MARSHAL (no evaluation), WORM-audited authorized=false, and start no period.
+          # No reset is APPLIED in this boot, so there is no cooldown to observe: the second early
+          # reset on account 1 is evaluated and DENIED by MARSHAL exactly like the first (two
+          # evaluations; the cooldown refusal never appears).
+          test "$(grep -c "SVC: SYS_DATA_RESET(early) account 1 DENIED (MARSHAL unreachable: fail-closed for this action)" /tmp/arm-boot-nosecure.log)" -eq 2
+          if grep -q "early-reset cooldown" /tmp/arm-boot-nosecure.log; then exit 1; fi
+          # Account 2 (no billing period): both normal resets reach MARSHAL and are denied, so no
+          # period is installed and the second is NOT period-refused.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=2: Unreachable" /tmp/arm-boot-nosecure.log
+          test "$(grep -c "MARSHAL evaluation for data.reset_usage account=2" /tmp/arm-boot-nosecure.log)" -eq 2
+          test "$(grep -c "SVC: SYS_DATA_RESET account 2 DENIED (MARSHAL unreachable: fail-closed for this action)" /tmp/arm-boot-nosecure.log)" -eq 2
+          if grep -q "SVC: SYS_DATA_RESET account 2 authorized" /tmp/arm-boot-nosecure.log; then exit 1; fi
+          if grep -q "billing period INSTALLED" /tmp/arm-boot-nosecure.log; then exit 1; fi
+          if grep -q "SVC: SYS_DATA_RESET account 2 REFUSED" /tmp/arm-boot-nosecure.log; then exit 1; fi
+          test "$(grep -c "MARSHAL evaluation for data" /tmp/arm-boot-nosecure.log)" -eq 5
           # Billing periods (kernel-arm/src/data_state.rs, runix_mobile::period). A period
           # is DATA and nothing resets on a schedule: SYS_DATA_PERIOD is read-only ADVICE
           # computed from the generic timer when a CALLER asks. Account 0's DEMO period
@@ -1374,6 +1409,29 @@ jobs:
           grep -q "SVC: SYS_DATA_RESET(early) account 1 WORM entry: authorized=true reason=.*EARLY (override) reset under data:reset-early.*Execute" /tmp/arm-boot-marshal-refuse.log
           grep -q "SVC: SYS_DATA_RESET(early) account 1 billing period: next billing period started at tick [0-9]* (length [0-9]* ticks); reset request cleared" /tmp/arm-boot-marshal-refuse.log
           test "$(grep -c "MARSHAL evaluation for data.reset_usage account=1" /tmp/arm-boot-marshal-refuse.log)" -eq 1
+          # Early-reset cooldown (any applied reset blocks an EARLY reset for an hour, DEMO) and the
+          # no-period account (account 2: entitled, Active, NO billing period). Both are decided BEFORE
+          # MARSHAL (no evaluation), WORM-audited authorized=false, and start no period.
+          # Resets are APPLIED in this boot, so the immediate SECOND early reset on account 1 is
+          # REFUSED by the cooldown (code 10) with no MARSHAL round trip: account 1 was evaluated once.
+          grep -q "SVC: SYS_DATA_RESET(early) account 1 REFUSED (early-reset cooldown: a reset was applied recently ([0-9]* ticks remaining before another early reset is allowed))" /tmp/arm-boot-marshal-refuse.log
+          grep -q "SVC: SYS_DATA_RESET(early) account 1 period refusal audited to WORM (authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot-marshal-refuse.log
+          grep -q "SVC: SYS_DATA_RESET(early) account 1 WORM entry: authorized=false reason=refused: early-reset cooldown.*EARLY (override) reset" /tmp/arm-boot-marshal-refuse.log
+          test "$(grep -c "SVC: SYS_DATA_RESET(early) account 1 authorized" /tmp/arm-boot-marshal-refuse.log)" -eq 1
+          # Account 2: the FIRST reset is not period-gated, is applied and INSTALLS a (one-day, DEMO)
+          # period; the immediate second NORMAL reset then finds it Active and is REFUSED before MARSHAL
+          # (period-active, code 7) like any other account's. One evaluation in all (the first).
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=2: Execute" /tmp/arm-boot-marshal-refuse.log
+          test "$(grep -c "MARSHAL evaluation for data.reset_usage account=2" /tmp/arm-boot-marshal-refuse.log)" -eq 1
+          grep -qF "SVC: SYS_DATA_RESET account 2 authorized (usage 0 -> 0; new period; MARSHAL verdict: Execute; " /tmp/arm-boot-marshal-refuse.log
+          grep -q "SVC: SYS_DATA_RESET account 2 billing period: billing period INSTALLED at tick [0-9]* (length [0-9]* ticks) because the account had none; DEMO DATA; later resets are period-gated" /tmp/arm-boot-marshal-refuse.log
+          # The entry READ BACK from the WORM chain: it states the period was installed because none existed.
+          grep -q "SVC: SYS_DATA_RESET account 2 WORM entry: authorized=true reason=.*NORMAL reset; no billing period for this account (this first reset is not period-gated and installs one); billing period INSTALLED at tick [0-9]* (length [0-9]* ticks) because the account had none" /tmp/arm-boot-marshal-refuse.log
+          grep -q "SVC: SYS_DATA_RESET account 2 REFUSED (billing period still active ([0-9]* ticks remaining); a normal reset is only allowed once it has elapsed)" /tmp/arm-boot-marshal-refuse.log
+          grep -q "SVC: SYS_DATA_RESET account 2 period refusal audited to WORM (authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot-marshal-refuse.log
+          grep -q "SVC: SYS_DATA_RESET account 2 WORM entry: authorized=false reason=.*billing period still active.*NORMAL reset" /tmp/arm-boot-marshal-refuse.log
+          test "$(grep -c "SVC: SYS_DATA_RESET account 2 authorized" /tmp/arm-boot-marshal-refuse.log)" -eq 1
+          test "$(grep -c "MARSHAL evaluation for data" /tmp/arm-boot-marshal-refuse.log)" -eq 3
 
       # Beta item 3.4: the MVNO MARSHAL gate itself. Same bridge as above, but
       # the selective listener Refuses only `mvno.suspend_account`: the walk's
@@ -1455,7 +1513,24 @@ jobs:
           grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=1: Refuse" /tmp/arm-boot-marshal-refuse-mvno.log
           grep -qF "SVC: SYS_DATA_RESET(early) account 1 DENIED (MARSHAL Refuse)" /tmp/arm-boot-marshal-refuse-mvno.log
           if grep -q "SVC: SYS_DATA_RESET(early) account 1 authorized" /tmp/arm-boot-marshal-refuse-mvno.log; then exit 1; fi
-          test "$(grep -c "MARSHAL evaluation for data.reset_usage account=1" /tmp/arm-boot-marshal-refuse-mvno.log)" -eq 1
+          test "$(grep -c "MARSHAL evaluation for data.reset_usage account=1" /tmp/arm-boot-marshal-refuse-mvno.log)" -eq 2
+          # Early-reset cooldown (any applied reset blocks an EARLY reset for an hour, DEMO) and the
+          # no-period account (account 2: entitled, Active, NO billing period). Both are decided BEFORE
+          # MARSHAL (no evaluation), WORM-audited authorized=false, and start no period.
+          # No reset is APPLIED in this boot, so there is no cooldown to observe: the second early
+          # reset on account 1 is evaluated and DENIED by MARSHAL exactly like the first (two
+          # evaluations; the cooldown refusal never appears).
+          test "$(grep -c "SVC: SYS_DATA_RESET(early) account 1 DENIED (MARSHAL Refuse)" /tmp/arm-boot-marshal-refuse-mvno.log)" -eq 2
+          if grep -q "early-reset cooldown" /tmp/arm-boot-marshal-refuse-mvno.log; then exit 1; fi
+          # Account 2 (no billing period): both normal resets reach MARSHAL and are denied, so no
+          # period is installed and the second is NOT period-refused.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=2: Refuse" /tmp/arm-boot-marshal-refuse-mvno.log
+          test "$(grep -c "MARSHAL evaluation for data.reset_usage account=2" /tmp/arm-boot-marshal-refuse-mvno.log)" -eq 2
+          test "$(grep -c "SVC: SYS_DATA_RESET account 2 DENIED (MARSHAL Refuse)" /tmp/arm-boot-marshal-refuse-mvno.log)" -eq 2
+          if grep -q "SVC: SYS_DATA_RESET account 2 authorized" /tmp/arm-boot-marshal-refuse-mvno.log; then exit 1; fi
+          if grep -q "billing period INSTALLED" /tmp/arm-boot-marshal-refuse-mvno.log; then exit 1; fi
+          if grep -q "SVC: SYS_DATA_RESET account 2 REFUSED" /tmp/arm-boot-marshal-refuse-mvno.log; then exit 1; fi
+          test "$(grep -c "MARSHAL evaluation for data" /tmp/arm-boot-marshal-refuse-mvno.log)" -eq 5
       # Full real chain, the third case the REFUSE/Unreachable configs above
       # can't distinguish on their own (a Refuse from a canned stand-in
       # listener proves the transport, not that the real proxy's policy
@@ -1563,6 +1638,29 @@ jobs:
           grep -q "SVC: SYS_DATA_RESET(early) account 1 WORM entry: authorized=true reason=.*EARLY (override) reset under data:reset-early.*Execute" /tmp/arm-boot-marshal-execute.log
           grep -q "SVC: SYS_DATA_RESET(early) account 1 billing period: next billing period started at tick [0-9]* (length [0-9]* ticks); reset request cleared" /tmp/arm-boot-marshal-execute.log
           test "$(grep -c "MARSHAL evaluation for data.reset_usage account=1" /tmp/arm-boot-marshal-execute.log)" -eq 1
+          # Early-reset cooldown (any applied reset blocks an EARLY reset for an hour, DEMO) and the
+          # no-period account (account 2: entitled, Active, NO billing period). Both are decided BEFORE
+          # MARSHAL (no evaluation), WORM-audited authorized=false, and start no period.
+          # Resets are APPLIED in this boot, so the immediate SECOND early reset on account 1 is
+          # REFUSED by the cooldown (code 10) with no MARSHAL round trip: account 1 was evaluated once.
+          grep -q "SVC: SYS_DATA_RESET(early) account 1 REFUSED (early-reset cooldown: a reset was applied recently ([0-9]* ticks remaining before another early reset is allowed))" /tmp/arm-boot-marshal-execute.log
+          grep -q "SVC: SYS_DATA_RESET(early) account 1 period refusal audited to WORM (authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot-marshal-execute.log
+          grep -q "SVC: SYS_DATA_RESET(early) account 1 WORM entry: authorized=false reason=refused: early-reset cooldown.*EARLY (override) reset" /tmp/arm-boot-marshal-execute.log
+          test "$(grep -c "SVC: SYS_DATA_RESET(early) account 1 authorized" /tmp/arm-boot-marshal-execute.log)" -eq 1
+          # Account 2: the FIRST reset is not period-gated, is applied and INSTALLS a (one-day, DEMO)
+          # period; the immediate second NORMAL reset then finds it Active and is REFUSED before MARSHAL
+          # (period-active, code 7) like any other account's. One evaluation in all (the first).
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=2: Execute" /tmp/arm-boot-marshal-execute.log
+          test "$(grep -c "MARSHAL evaluation for data.reset_usage account=2" /tmp/arm-boot-marshal-execute.log)" -eq 1
+          grep -qF "SVC: SYS_DATA_RESET account 2 authorized (usage 0 -> 0; new period; MARSHAL verdict: Execute; " /tmp/arm-boot-marshal-execute.log
+          grep -q "SVC: SYS_DATA_RESET account 2 billing period: billing period INSTALLED at tick [0-9]* (length [0-9]* ticks) because the account had none; DEMO DATA; later resets are period-gated" /tmp/arm-boot-marshal-execute.log
+          # The entry READ BACK from the WORM chain: it states the period was installed because none existed.
+          grep -q "SVC: SYS_DATA_RESET account 2 WORM entry: authorized=true reason=.*NORMAL reset; no billing period for this account (this first reset is not period-gated and installs one); billing period INSTALLED at tick [0-9]* (length [0-9]* ticks) because the account had none" /tmp/arm-boot-marshal-execute.log
+          grep -q "SVC: SYS_DATA_RESET account 2 REFUSED (billing period still active ([0-9]* ticks remaining); a normal reset is only allowed once it has elapsed)" /tmp/arm-boot-marshal-execute.log
+          grep -q "SVC: SYS_DATA_RESET account 2 period refusal audited to WORM (authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot-marshal-execute.log
+          grep -q "SVC: SYS_DATA_RESET account 2 WORM entry: authorized=false reason=.*billing period still active.*NORMAL reset" /tmp/arm-boot-marshal-execute.log
+          test "$(grep -c "SVC: SYS_DATA_RESET account 2 authorized" /tmp/arm-boot-marshal-execute.log)" -eq 1
+          test "$(grep -c "MARSHAL evaluation for data" /tmp/arm-boot-marshal-execute.log)" -eq 3
 
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke
