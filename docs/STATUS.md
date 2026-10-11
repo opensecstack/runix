@@ -2792,11 +2792,26 @@ cap, but session open still reports `Suspended` first, so service is not restore
 until `SYS_MVNO_REACTIVATE`. A reset of an account that has no usage row succeeds and
 creates no row; its WORM entry reads `used 0 -> used 0`. The reset does not check the
 counter before zeroing it, so it zeroes an account under its cap as readily as one
-over it. Its WORM entry does record the counter's value before the reset. It does not check
-the billing period either: an early reset is accepted, and so is a second reset in
-the same period. A reset whose tick is before the old period's start (a rewound
-counter) still zeroes the counter, but keeps the old period and its request marker,
-and its entry says the next period was not started (gap 26 in THREAT_MODEL.md).
+over it. Its WORM entry does record the counter's value before the reset.
+
+**The period gate (gap 26, closed 2026-10-11).** `SYS_DATA_RESET(account, mode)` takes
+`mode` in the second argument: `0` normal, `1` early (any other value is refused with
+code `9`, serial-only, because no capability can be chosen). A normal reset checks
+`data:reset:{account}` and is allowed only when the account's billing period has
+elapsed (`mobile::period::reset_permitted`, a pure function with host tests). A
+successful reset installs a new active period, so a normal reset happens at most once
+per period. An early reset checks a separate capability, `data:reset-early:{account}`,
+and is allowed in an active period too, for cases such as a mid-period top-up. It uses
+the same MARSHAL action (`data.reset_usage`), is fail-closed on `Unreachable`, and its
+WORM entry says it was an early override. The period check runs before the MARSHAL
+gate, so a refusal costs no round trip; it is WORM-audited with `authorized=false` and
+starts no period. New return codes: `7` period still active, `8` clock before the
+period start (refused for both modes, because a rewound counter must not allow
+resets on demand), `9` unknown mode. An account with no billing period keeps the old
+behaviour (reset allowed, repeatedly); that remains a gap. The boot walk uses a
+DEMO-only account 1 with a one-day period so "period active" is deterministic; account
+0 holds no early capability, which proves the capability split. See
+[adrs/0004-early-usage-reset-has-its-own-capability.md](adrs/0004-early-usage-reset-has-its-own-capability.md).
 
 Its return codes are in the table above. In the boot walk the reset's verdict
 depends on the boot's configuration. The two plain boots have no proxy, so the
