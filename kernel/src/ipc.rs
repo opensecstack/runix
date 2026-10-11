@@ -65,13 +65,17 @@ lazy_static! {
 /// protected against interleaving with a concurrent sender on the same
 /// port. See this module's own doc comment for the exact hazard this
 /// closes.
-pub fn begin_send(port: usize) {
+#[must_use]
+pub fn begin_send(port: usize) -> bool {
+    let Some(lock) = SEND_LOCKS.get(port) else {
+        return false;
+    };
     loop {
         {
-            let mut locked = SEND_LOCKS[port].lock();
+            let mut locked = lock.lock();
             if !*locked {
                 *locked = true;
-                return;
+                return true;
             }
         }
         crate::scheduler::yield_now();
@@ -84,27 +88,45 @@ pub fn begin_send(port: usize) {
 /// syscall in this kernel already places on its caller; a caller that never
 /// calls this permanently starves every other sender on that port, a
 /// liveness bug for that caller to avoid, not a memory-safety one).
-pub fn end_send(port: usize) {
-    *SEND_LOCKS[port].lock() = false;
+#[must_use]
+pub fn end_send(port: usize) -> bool {
+    let Some(lock) = SEND_LOCKS.get(port) else {
+        return false;
+    };
+    *lock.lock() = false;
+    true
 }
 
 /// Blocks (spin-yielding) until there's room, then enqueues `byte` on `port`.
-pub fn send(port: usize, byte: u8) {
+/// `false` (nothing enqueued) if `port` is out of range.
+#[must_use]
+pub fn send(port: usize, byte: u8) -> bool {
+    let Some(channel) = CHANNELS.get(port) else {
+        return false;
+    };
     loop {
         {
-            let mut channel = CHANNELS[port].lock();
+            let mut channel = channel.lock();
             if channel.queue.len() < CHANNEL_CAPACITY {
                 channel.queue.push_back(byte);
-                return;
+                return true;
             }
         }
         crate::scheduler::yield_now();
     }
 }
 
-/// Non-blocking: `None` if `port` currently has nothing queued.
+/// Whether `port` names a real channel. Every port-indexed function in this
+/// module is itself bounds-checked (`port` ultimately comes from a ring-3
+/// syscall argument); this is for callers that want to reject early.
+pub fn is_valid_port(port: usize) -> bool {
+    port < PORT_COUNT
+}
+
+/// Non-blocking: `None` if `port` currently has nothing queued (or is out of
+/// range).
 pub fn try_recv(port: usize) -> Option<u8> {
-    CHANNELS[port].lock().queue.pop_front()
+    CHANNELS.get(port)?.lock().queue.pop_front()
 }
 
 /// Peeks whether `port` currently has anything queued, without popping —
@@ -119,15 +141,23 @@ pub fn try_recv(port: usize) -> Option<u8> {
 /// `net_driver_sockets.rs` run took long enough under QEMU/TCG that it
 /// looked indistinguishable from a hang (minutes to cross a few tens of
 /// thousands of otherwise-empty polls) before this fix.
+///
+/// An out-of-range `port` reports empty (nothing can ever be queued there).
 pub fn is_empty(port: usize) -> bool {
-    CHANNELS[port].lock().queue.is_empty()
+    CHANNELS
+        .get(port)
+        .is_none_or(|channel| channel.lock().queue.is_empty())
 }
 
-/// Blocks (spin-yielding) until a byte is available on `port`.
-pub fn recv(port: usize) -> u8 {
+/// Blocks (spin-yielding) until a byte is available on `port`; `None`
+/// immediately if `port` is out of range (it would never fill).
+pub fn recv(port: usize) -> Option<u8> {
+    if !is_valid_port(port) {
+        return None;
+    }
     loop {
         if let Some(byte) = try_recv(port) {
-            return byte;
+            return Some(byte);
         }
         crate::scheduler::yield_now();
     }

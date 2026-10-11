@@ -202,6 +202,13 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         }
         SYS_IPC_SEND => {
             let port = arg1 as usize;
+            // Out-of-range ports are rejected inside `ipc` itself (every
+            // port-indexed function there is bounds-checked); `is_valid_port`
+            // here just skips the Ed25519 check for a port nobody can hold a
+            // token for.
+            if !ipc::is_valid_port(port) {
+                return u64::MAX;
+            }
             // Once a real `runix_citadel_integration::KerkeseTransport`
             // implementation exists, a Gate-evaluation call would be
             // inserted here, gated on the existing capability check
@@ -215,7 +222,9 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                 // caller could use to probe why it failed.
                 return u64::MAX;
             }
-            ipc::send(port, arg2 as u8);
+            if !ipc::send(port, arg2 as u8) {
+                return u64::MAX;
+            }
             0
         }
         SYS_IPC_SEND_LOCK => {
@@ -223,7 +232,9 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             if !authorized_for_port(port) {
                 return u64::MAX;
             }
-            ipc::begin_send(port);
+            if !ipc::begin_send(port) {
+                return u64::MAX;
+            }
             0
         }
         SYS_IPC_SEND_UNLOCK => {
@@ -239,7 +250,9 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             if !authorized_for_port(port) {
                 return u64::MAX;
             }
-            ipc::end_send(port);
+            if !ipc::end_send(port) {
+                return u64::MAX;
+            }
             0
         }
         SYS_IPC_RECV => {
@@ -326,7 +339,7 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         }
         SYS_IPC_SESSION_OPEN => {
             let server_port = arg1 as usize;
-            if !authorized_for_port(server_port) {
+            if !ipc::is_valid_port(server_port) || !authorized_for_port(server_port) {
                 return u64::MAX;
             }
             let Some(caller) = crate::scheduler::current_thread_id() else {
