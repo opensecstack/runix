@@ -38,7 +38,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use blk_driver_host::{
     encode_short_name, fat_entry_at, is_end_of_chain, parse_lfn_fragment, parse_short_dir_entry,
-    short_name_checksum, BootSectorInfo, FsInfoSector, FSINFO_UNKNOWN,
+    short_name_checksum, validate_queue_size, BootSectorInfo, FsInfoSector, QueueHealth,
+    FSINFO_UNKNOWN,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use linked_list_allocator::LockedHeap;
@@ -409,22 +410,37 @@ struct BlkDevice {
     status_phys: u64,
     data_ptr: *mut u8,
     status_ptr: *mut u8,
+    /// Fail-closed quarantine: after a poll timeout the device may still own
+    /// the chain and buffer, so nothing is ever posted or written again.
+    health: QueueHealth,
 }
 
 impl BlkDevice {
+    /// True once a poll timeout quarantined the device.
+    fn is_faulted(&self) -> bool {
+        !self.health.may_submit()
+    }
+
     fn request(&mut self, req_type: u32, sector: u64, data_writable: bool) -> (bool, u8) {
+        if !self.health.may_submit() {
+            // Quarantined: do not touch the header, queue, descriptors or
+            // status byte (the device may still be using them). 0xFF is the
+            // same "no status" sentinel callers pre-load.
+            return (false, 0xFF);
+        }
         write_header(self.base, req_type, sector);
         // SAFETY: `post_chain`'s contract: the three `*_phys` addresses are
         // the header/data/status parts of the one request-buffer page the
         // kernel mapped and handed over via `BlkBootInfo::reqbuf_phys`
         // (offsets 0, 16, 528; lengths 16, 512, 1; all inside 4096 B); the
         // process owns that page for its whole life so it outlives the
-        // device's use. The chain has 3 entries, which must be <= the
-        // device's `qsize` (not checked anywhere: `queue_size` only checks
-        // the upper bound; a known hardening gap, tracked in docs/STATUS.md).
-        // Only one request is ever in flight:
-        // `&mut self` plus `poll_for_completion` before returning, except
-        // after a poll timeout (see `poll_for_completion`).
+        // device's use. The chain has 3 entries, which is <= the device's
+        // `qsize` because `validate_queue_size` (in `_start`) rejected any
+        // queue smaller than 3. Only one request is ever in flight:
+        // `&mut self` plus `poll_for_completion` before returning, and after
+        // a poll timeout `self.health` is `Faulted` so this point is never
+        // reached again (checked above): the possibly-still-in-flight chain
+        // is never reused.
         unsafe {
             self.queue.post_chain(&[
                 (self.header_phys, REQBUF_HEADER_LEN as u32, false),
@@ -434,6 +450,16 @@ impl BlkDevice {
         }
         virtio::notify(self.io_base, REQUEST_QUEUE_INDEX);
         let completed = poll_for_completion(&mut self.queue);
+        if !completed {
+            if self.health.on_timeout() {
+                write_all(
+                    b"blk-driver-host: request timed out - device QUARANTINED, no further I/O will be submitted\n",
+                );
+            }
+            // The device may still DMA into the status byte, so do not read
+            // it as a result.
+            return (false, 0xFF);
+        }
         // SAFETY: `status_ptr` is `base + REQBUF_STATUS_OFFSET` (528) in the
         // 4096-byte request-buffer page set up in `_start`: in bounds, a
         // `u8` so always aligned, mapped and readable. Volatile because
@@ -448,12 +474,17 @@ impl BlkDevice {
     /// Phase 2's FAT32 walk touches) treats "couldn't read this sector"
     /// as a reason to stop, not to guess.
     fn read_sector(&mut self, sector: u64) -> Option<[u8; SECTOR_SIZE]> {
+        if self.is_faulted() {
+            // Quarantined: the device may still own the request buffer.
+            return None;
+        }
         // SAFETY: `data_ptr` (offset 16) is valid for `SECTOR_SIZE` (512)
         // bytes and `status_ptr` (offset 528) for 1 byte, all inside the
         // one mapped, writable 4096-byte request-buffer page; `u8` writes
         // need no alignment. No request is in flight to race with the
         // device here (`&mut self`; previous `request` polled to
-        // completion, barring the timeout case, see `poll_for_completion`).
+        // completion, and after a poll timeout the device is quarantined
+        // and the faulted check above returns before this write).
         unsafe {
             core::ptr::write_bytes(self.data_ptr, 0, SECTOR_SIZE);
             core::ptr::write_volatile(self.status_ptr, 0xFFu8);
@@ -476,6 +507,10 @@ impl BlkDevice {
     }
 
     fn write_sector(&mut self, sector: u64, data: &[u8; SECTOR_SIZE]) -> (bool, u8) {
+        if self.is_faulted() {
+            // Quarantined: do not touch the buffer the device may still own.
+            return (false, 0xFF);
+        }
         // SAFETY: destination is the 512-byte data region at offset 16 of
         // the mapped request page (in bounds), source is the caller's
         // `&[u8; SECTOR_SIZE]` (exactly 512 bytes); they cannot overlap
@@ -541,16 +576,35 @@ pub extern "C" fn _start() -> ! {
     write_decimal(blk.capacity_sectors);
     write_all(b" sectors\n");
 
-    let qsize = blk.queue_size(REQUEST_QUEUE_INDEX);
+    let Some(qsize) = validate_queue_size(blk.queue_size(REQUEST_QUEUE_INDEX)) else {
+        // Fail the probe cleanly (no abort): the device is never made
+        // ready, no queue is programmed, and both result bytes report FAIL.
+        write_all(b"blk-driver-host: FAIL - device queue size is not a power of two in [3, 256]\n");
+        // SAFETY: offsets 128/129 are bytes inside the mapped, writable
+        // boot-info page, outside the `BlkBootInfo` struct (see below).
+        unsafe {
+            core::ptr::write_volatile(
+                (BLK_INFO_VA + BLK_RESULT_OFFSET) as *mut u8,
+                BLK_RESULT_FAIL,
+            );
+            core::ptr::write_volatile(
+                (BLK_INFO_VA + BLK_FAT32_RESULT_OFFSET) as *mut u8,
+                BLK_RESULT_FAIL,
+            );
+        }
+        loop {
+            yield_now();
+        }
+    };
     blk.set_queue_address(REQUEST_QUEUE_INDEX, info.queue_phys);
     // SAFETY: `Virtqueue::new`'s contract: `BLK_QUEUE_VA` (64 KiB aligned)
     // is the 3 contiguous pages the kernel maps writable, zeroed and
     // exclusively to this process (`map_zeroed_contiguous_region(.., 3, ..)`),
     // never unmapped; `info.queue_phys` programmed just above is their
-    // physical base. `qsize` came from the device and `queue_size` asserts
-    // `qsize <= MAX_SUPPORTED_QUEUE_SIZE`, but NOT `qsize != 0` or
-    // `qsize >= 3` (a known hardening gap): a zero-size queue would panic (abort) in
-    // `post_chain`/`poll_used`'s `%`, not cause UB.
+    // physical base. `qsize` came from the device and passed
+    // `validate_queue_size`: a power of two, `3 <= qsize <= 256`, so it is
+    // nonzero (no `%` abort in `post_chain`/`poll_used`), fits the fixed
+    // one-page descriptor table, and holds the 3-descriptor request chain.
     let mut queue = unsafe { Virtqueue::new(BLK_QUEUE_VA, qsize) };
     queue.init_avail_flags();
     blk.mark_ready();
@@ -569,6 +623,7 @@ pub extern "C" fn _start() -> ! {
         data_ptr: unsafe { base.add(REQBUF_DATA_OFFSET) },
         // SAFETY: as above; `REQBUF_STATUS_OFFSET` is 528, still < 4096.
         status_ptr: unsafe { base.add(REQBUF_STATUS_OFFSET) },
+        health: QueueHealth::new(),
     };
 
     // Phase 1's own proof writes a test pattern to sector 0 -- fine on the
@@ -2212,14 +2267,26 @@ fn handle_read_ipc_request(
     if !verify_file_token(token, name) {
         return FsResponse::Error(FsError::Unauthorized);
     }
+    // A quarantined device (poll timeout) fails every request with the
+    // existing `DeviceFailed`, never a misleading `NotFound` or short data.
+    if dev.is_faulted() {
+        return FsResponse::Error(FsError::DeviceFailed);
+    }
     let Some(entry) = find_entry_by_display_name(dev, info, info.root_cluster, name) else {
-        return FsResponse::Error(FsError::NotFound);
+        return if dev.is_faulted() {
+            FsResponse::Error(FsError::DeviceFailed)
+        } else {
+            FsResponse::Error(FsError::NotFound)
+        };
     };
     if entry.is_dir {
         return FsResponse::Error(FsError::NotFound);
     }
     let mut buf = [0u8; MAX_FILE_BYTES];
     let written = read_file_contents(dev, info, &entry, &mut buf);
+    if dev.is_faulted() {
+        return FsResponse::Error(FsError::DeviceFailed);
+    }
     FsResponse::Data(Vec::from(&buf[..written]))
 }
 
@@ -2243,8 +2310,15 @@ fn handle_write_ipc_request(
     if data.len() != SECTOR_SIZE {
         return FsResponse::Error(FsError::BadRequest);
     }
+    if dev.is_faulted() {
+        return FsResponse::Error(FsError::DeviceFailed);
+    }
     let Some(sector) = resolve_single_sector_file_by_name(dev, info, name) else {
-        return FsResponse::Error(FsError::NotFound);
+        return if dev.is_faulted() {
+            FsResponse::Error(FsError::DeviceFailed)
+        } else {
+            FsResponse::Error(FsError::NotFound)
+        };
     };
     let mut payload = [0u8; SECTOR_SIZE];
     payload.copy_from_slice(data);
@@ -2616,9 +2690,11 @@ fn next_cluster_in_chain(dev: &mut BlkDevice, info: &BootSectorInfo, cluster: u3
 ///
 /// Caveat relevant to the `unsafe` in `BlkDevice::request`: on a timeout
 /// (`false`) the device may still own the descriptors/buffer and may
-/// complete later; the next request would reuse them and could consume
-/// that stale completion. Callers treat `false` as fatal for that request
-/// but nothing quarantines the device.
+/// complete later; reusing them could consume that stale completion. So
+/// `BlkDevice::request` treats a `false` return as a permanent, fail-closed
+/// quarantine (`QueueHealth::on_timeout`): every later request returns
+/// failure without touching the queue, buffer or descriptors, and the FS IPC
+/// handlers answer `FsError::DeviceFailed`. There is no reset/recovery.
 fn poll_for_completion(queue: &mut Virtqueue) -> bool {
     for i in 0..100_000_000u32 {
         if queue.poll_used().is_some() {

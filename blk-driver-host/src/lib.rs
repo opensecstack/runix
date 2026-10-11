@@ -565,10 +565,101 @@ pub fn verify_file_token_with(
     }
 }
 
+/// Health of the request queue, as a pure state machine (no I/O).
+///
+/// A poll timeout does NOT mean the device dropped the request: it may still
+/// own the descriptor chain and the request buffer and complete later. The
+/// next request would reuse that same chain and buffer and could consume the
+/// stale completion (wrong status/data attributed to the wrong request). So a
+/// timeout is fail-closed and permanent: once `Faulted`, nothing may be
+/// submitted again and the queue/buffer/descriptors are never touched. There
+/// is deliberately no way back to `Healthy` (device reset is out of scope).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueHealth {
+    Healthy,
+    Faulted,
+}
+
+impl QueueHealth {
+    /// A fresh, healthy queue.
+    pub const fn new() -> Self {
+        QueueHealth::Healthy
+    }
+
+    /// Records a poll timeout. Returns `true` only on the transition from
+    /// `Healthy` (so the caller logs the quarantine exactly once).
+    pub fn on_timeout(&mut self) -> bool {
+        let first = *self == QueueHealth::Healthy;
+        *self = QueueHealth::Faulted;
+        first
+    }
+
+    /// Whether a new request may be posted to the queue.
+    pub const fn may_submit(&self) -> bool {
+        matches!(self, QueueHealth::Healthy)
+    }
+}
+
+impl Default for QueueHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Descriptors per request chain (header, data, status) -- the minimum
+/// queue size this driver's `post_chain` call needs.
+pub const MIN_QUEUE_SIZE: u16 = 3;
+
+/// The largest queue this driver's fixed descriptor/avail/used layout holds.
+pub const MAX_QUEUE_SIZE: u16 = 256;
+
+/// Validates a device-reported virtio queue size: it must be a power of two
+/// (the virtio split-ring rule), at least [`MIN_QUEUE_SIZE`] and at most
+/// [`MAX_QUEUE_SIZE`]. Since 3 is not a power of two, the effective minimum
+/// is 4. Returns `None` for anything else (including 0, which would abort on
+/// `% qsize`).
+pub fn validate_queue_size(qsize: u16) -> Option<u16> {
+    if qsize.is_power_of_two() && (MIN_QUEUE_SIZE..=MAX_QUEUE_SIZE).contains(&qsize) {
+        Some(qsize)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn healthy_queue_submits() {
+        assert!(QueueHealth::new().may_submit());
+    }
+
+    #[test]
+    fn timeout_quarantines_and_stays_faulted() {
+        let mut h = QueueHealth::new();
+        assert!(h.on_timeout(), "first timeout reports the transition");
+        assert!(!h.may_submit());
+        assert!(!h.on_timeout(), "later timeouts are not a new transition");
+        assert!(!h.may_submit());
+        assert_eq!(h, QueueHealth::Faulted);
+    }
+
+    #[test]
+    fn queue_size_validation() {
+        assert_eq!(validate_queue_size(0), None);
+        assert_eq!(validate_queue_size(1), None);
+        assert_eq!(validate_queue_size(2), None);
+        assert_eq!(validate_queue_size(3), None);
+        assert_eq!(validate_queue_size(4), Some(4));
+        assert_eq!(validate_queue_size(5), None);
+        assert_eq!(validate_queue_size(100), None);
+        assert_eq!(validate_queue_size(128), Some(128));
+        assert_eq!(validate_queue_size(256), Some(256));
+        assert_eq!(validate_queue_size(512), None);
+        assert_eq!(validate_queue_size(u16::MAX), None);
+    }
 
     fn test_key() -> ed25519_dalek::SigningKey {
         ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])

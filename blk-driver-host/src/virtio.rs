@@ -44,9 +44,6 @@ const STATUS_DRIVER_OK: u8 = 4;
 /// already uses (descriptor table, avail ring, used ring, each rounded up
 /// to this).
 pub const QUEUE_ALIGN: usize = 4096;
-/// Same reasoning as `net-driver-host`'s own constant of this name — one
-/// page of 16-byte descriptors is exactly 256, QEMU's legacy default.
-pub const MAX_SUPPORTED_QUEUE_SIZE: u16 = 256;
 
 fn read_reg(io_base: u16, offset: u16, width: u8) -> u32 {
     port_in(io_base + offset, width).expect("port I/O denied reading a virtio-blk register")
@@ -101,17 +98,13 @@ impl VirtioBlk {
         }
     }
 
-    /// Reads the (one, for virtio-blk) request queue's `QueueSize` and
-    /// asserts it fits this driver's fixed one-page descriptor table —
-    /// same contract as `net-driver-host`'s `VirtioNet::queue_size`.
+    /// Reads the (one, for virtio-blk) request queue's raw `QueueSize`.
+    /// Not validated here: the caller must run it through
+    /// `blk_driver_host::validate_queue_size` (power of two, >= 3, <=
+    /// `blk_driver_host::MAX_QUEUE_SIZE` (256, one page of descriptors)) before constructing a [`Virtqueue`].
     pub fn queue_size(&self, queue_index: u16) -> u16 {
         write_reg(self.io_base, REG_QUEUE_SELECT, 2, u32::from(queue_index));
-        let size = read_reg(self.io_base, REG_QUEUE_SIZE, 2) as u16;
-        assert!(
-            size <= MAX_SUPPORTED_QUEUE_SIZE,
-            "virtio-blk queue {queue_index} reports size {size}, past this driver's fixed one-page descriptor table"
-        );
-        size
+        read_reg(self.io_base, REG_QUEUE_SIZE, 2) as u16
     }
 
     pub fn set_queue_address(&self, queue_index: u16, region_phys: u64) {
@@ -179,8 +172,9 @@ impl Virtqueue {
     /// the sole caller passes `BLK_QUEUE_VA`, page-aligned), stay mapped and
     /// physically contiguous for this `Virtqueue`'s lifetime (the device
     /// DMAs into it via the physical address given to `set_queue_address`),
-    /// and `qsize` must be the nonzero queue size the device reported and
-    /// at most [`MAX_SUPPORTED_QUEUE_SIZE`], so the descriptor table
+    /// and `qsize` must be a device-reported queue size that passed
+    /// `blk_driver_host::validate_queue_size` (power of two, at least 3,
+    /// at most `blk_driver_host::MAX_QUEUE_SIZE` (256, one page of descriptors); the sole caller enforces it), so the descriptor table
     /// (`16 * qsize` bytes), avail ring and used ring each stay within
     /// their own page. `new` itself only does pointer arithmetic; the
     /// guarantees are relied upon by every later method's `unsafe` block.
@@ -234,8 +228,11 @@ impl Virtqueue {
     /// this process actually owns and that outlives the device's use of it.
     /// Additionally `descriptors.len()` must be at most the `qsize` given to
     /// `new` (descriptor `i` is written at `desc.add(i)` with no bounds
-    /// check; only the nonempty check is asserted) and no earlier chain may
-    /// still be in flight on the device (indices `0..len` are reused).
+    /// check; only the nonempty check is asserted; the 3-descriptor caller
+    /// is covered because `validate_queue_size` guarantees `qsize >= 3`) and
+    /// no earlier chain may still be in flight on the device (indices
+    /// `0..len` are reused; the caller guarantees this by never posting
+    /// again after a poll timeout, see `blk_driver_host::QueueHealth`).
     pub unsafe fn post_chain(&mut self, descriptors: &[(u64, u32, bool)]) {
         assert!(
             !descriptors.is_empty(),
@@ -250,8 +247,9 @@ impl Virtqueue {
         // device reads these structures; the compiler fences order the
         // descriptor writes before the avail-slot write before the
         // `avail_idx` publish (sufficient on x86's TSO, which is the only
-        // target). `self.qsize` being nonzero is also required by `new`'s
-        // contract (`idx % self.qsize` would otherwise panic).
+        // target). `self.qsize` being nonzero (indeed a power of two >= 3) is
+        // also guaranteed by `new`'s contract (`validate_queue_size`), so
+        // `idx % self.qsize` cannot panic.
         unsafe {
             for (i, &(phys, len, writable)) in descriptors.iter().enumerate() {
                 let is_last = i + 1 == descriptors.len();
