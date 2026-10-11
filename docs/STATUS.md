@@ -3087,6 +3087,33 @@ Not present, stated so none of it is assumed:
 - **Persistent storage, the real RIL/SIM/eUICC protocol, and real hardware.**
   Everything runs under QEMU (`virt`, `cortex-a53`).
 
+## Beta review findings (2026-10-11), x86 kernel
+
+Two bugs found by a read-only review are fixed (`98bf422`, `a8bd3f3`,
+`a67dde2`), each with a regression test confirmed to fail on the old code:
+
+- **`SYS_IPC_RECV` halted the kernel for any ring-3 caller.** An unchecked
+  `CHANNELS[port]` index ran before the capability check, and `panic =
+  "abort"` made the out-of-bounds panic a full halt. All port-indexed
+  accesses in `ipc.rs` are now bounds-checked (`kernel/tests/ipc_bad_port.rs`).
+- **A port-I/O token covered more than its range.** `check_ioport_range`
+  ignored access width, so a 4-byte access at the last granted port reached
+  up to 3 ports past it. The whole access must now fit
+  (`kernel/tests/ioport_range.rs`).
+
+Still open, verified in the code:
+
+- The boot allowlist cannot reject a real module as wired:
+  `citadel::demo_authorize` builds the allowlist from the bytes it checks.
+  Its evidence log is also dropped after each call, so boot authorization
+  decisions are not retained.
+- The kernel's CITADEL demo seed has no `insecure-demo-keys` compile-time
+  barrier (`capabilities.rs` does).
+- `blk-driver-host` does not check revocation on file tokens.
+
+The `unsafe` blocks in the three ring-3 hosts carry few `// SAFETY:`
+comments; that is a documentation gap, not a confirmed bug.
+
 ## Real bugs worth knowing before touching the relevant code again
 
 A real bug caught along the way, worth knowing before touching `gdt.rs`
