@@ -29,9 +29,29 @@ const SYS_IPC_SESSION_SEND_LOCK: u64 = 14;
 const SYS_IPC_SESSION_SEND_UNLOCK: u64 = 15;
 
 /// # Safety
-/// Whatever `num`'s own contract requires.
+/// `int 0x80` traps into the kernel's `syscall::entry`, which hands
+/// (`num`, `arg1`..`arg3`) to its `dispatch`. The caller must pass a `num`
+/// the kernel's ABI defines, with arguments meaning what that syscall
+/// expects. Every wrapper in this file passes only scalar values (ports,
+/// widths, session ids, bytes) -- never a pointer into this process's
+/// memory -- so the kernel cannot be induced to read or write memory
+/// through anything this function hands it; an unauthorized or malformed
+/// request fails closed with `u64::MAX` (checked by each wrapper).
 unsafe fn syscall(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     let ret: u64;
+    // SAFETY: `int 0x80` is the kernel's syscall gate (IDT vector 0x80,
+    // `kernel/src/syscall.rs::entry`: remaps rax/rdi/rsi/rdx onto the SysV
+    // argument registers, `call`s the SysV `dispatch`, then `iretq`s back).
+    // Everything that path may overwrite is declared: rax is the output;
+    // rdi/rsi/rdx are SysV caller-saved and rewritten by the shim, so they
+    // are discarded outputs (`=> _`); rcx and r8-r11 are the remaining
+    // SysV caller-saved GPRs `dispatch` may clobber (`lateout`). Callee-saved
+    // registers and rsp are restored by `dispatch`'s SysV epilogue and
+    // `iretq`. No `nomem`/`nostack`/`preserves_flags` options are given, so
+    // the compiler conservatively assumes the call reads/writes memory and
+    // clobbers flags. Not verified here: the SIMD registers (xmm) are not
+    // declared clobbered; this relies on the kernel (target
+    // x86_64-unknown-none, soft-float) not touching them.
     unsafe {
         core::arch::asm!(
             "int 0x80",
@@ -72,6 +92,7 @@ unsafe fn syscall(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
 }
 
 pub fn write_byte(byte: u8) {
+    // SAFETY: SYS_WRITE takes a scalar byte and no pointer; see `syscall`.
     unsafe {
         syscall(SYS_WRITE, byte as u64, 0, 0);
     }
@@ -84,6 +105,7 @@ pub fn write_all(bytes: &[u8]) {
 }
 
 pub fn yield_now() {
+    // SAFETY: SYS_YIELD takes no arguments; see `syscall`.
     unsafe {
         syscall(SYS_YIELD, 0, 0, 0);
     }
@@ -96,6 +118,7 @@ pub fn yield_now() {
 /// same `u64::MAX` signal at the syscall boundary, same fail-closed
 /// convention as every other capability-gated syscall in this kernel.
 pub fn port_in(port: u16, width: u8) -> Option<u32> {
+    // SAFETY: scalar port/width only; the kernel checks the ioport capability and returns u64::MAX on denial (handled below). See `syscall`.
     let ret = unsafe { syscall(SYS_PORT_IN, port as u64, width as u64, 0) };
     if ret == u64::MAX {
         None
@@ -107,6 +130,7 @@ pub fn port_in(port: u16, width: u8) -> Option<u32> {
 /// Writes `value`'s low `width` bytes to I/O `port`. Returns `false` if
 /// denied, same conditions as [`port_in`].
 pub fn port_out(port: u16, width: u8, value: u32) -> bool {
+    // SAFETY: scalar port/width/value only; the kernel checks the ioport capability and returns u64::MAX on denial (handled below). See `syscall`.
     let ret = unsafe { syscall(SYS_PORT_OUT, port as u64, width as u64, value as u64) };
     ret != u64::MAX
 }
@@ -127,6 +151,7 @@ pub fn port_out(port: u16, width: u8, value: u32) -> bool {
 /// hot path. See [`session_try_recv`]/[`session_send`] below.
 #[allow(dead_code)]
 pub fn session_open(server_port: usize) -> Option<u64> {
+    // SAFETY: scalar port argument only; the kernel checks the port capability and returns u64::MAX on denial (handled below). See `syscall`.
     let ret = unsafe { syscall(SYS_IPC_SESSION_OPEN, server_port as u64, 0, 0) };
     if ret == u64::MAX {
         None
@@ -140,6 +165,7 @@ pub fn session_open(server_port: usize) -> Option<u64> {
 /// this process was spawned with for that port. `None` if denied or
 /// nothing is currently pending.
 pub fn session_accept(server_port: usize) -> Option<u64> {
+    // SAFETY: scalar port argument only; the kernel checks the port capability and returns u64::MAX on denial/empty (handled below). See `syscall`.
     let ret = unsafe { syscall(SYS_IPC_SESSION_ACCEPT, server_port as u64, 0, 0) };
     if ret == u64::MAX {
         None
@@ -155,6 +181,7 @@ pub fn session_accept(server_port: usize) -> Option<u64> {
 /// by design — same fail-closed "denied and empty look the same" convention
 /// every other gated receive syscall in this codebase has.
 pub fn session_try_recv(session_id: u64) -> Option<u8> {
+    // SAFETY: scalar session id only; the kernel checks participation and returns u64::MAX if denied/empty (handled below). See `syscall`.
     let ret = unsafe { syscall(SYS_IPC_SESSION_RECV, session_id, 0, 0) };
     if ret == u64::MAX {
         None
@@ -166,6 +193,7 @@ pub fn session_try_recv(session_id: u64) -> Option<u8> {
 /// Sends one byte on `session_id`. Returns `false` if `session_id` doesn't
 /// exist or this thread isn't a participant.
 pub fn session_send(session_id: u64, byte: u8) -> bool {
+    // SAFETY: scalar session id and byte only; the kernel checks participation and returns u64::MAX on failure (handled below). See `syscall`.
     let ret = unsafe { syscall(SYS_IPC_SESSION_SEND, session_id, byte as u64, 0) };
     ret != u64::MAX
 }
@@ -176,12 +204,14 @@ pub fn session_send(session_id: u64, byte: u8) -> bool {
 /// `false` if `session_id` doesn't exist or this thread isn't a
 /// participant.
 pub fn session_send_lock(session_id: u64) -> bool {
+    // SAFETY: scalar session id only; the kernel checks participation and returns u64::MAX on failure (handled below). See `syscall`.
     let ret = unsafe { syscall(SYS_IPC_SESSION_SEND_LOCK, session_id, 0, 0) };
     ret != u64::MAX
 }
 
 /// Releases `session_id`'s send lock acquired by [`session_send_lock`].
 pub fn session_send_unlock(session_id: u64) -> bool {
+    // SAFETY: scalar session id only; the kernel checks participation and returns u64::MAX on failure (handled below). See `syscall`.
     let ret = unsafe { syscall(SYS_IPC_SESSION_SEND_UNLOCK, session_id, 0, 0) };
     ret != u64::MAX
 }
@@ -192,6 +222,7 @@ pub fn session_send_unlock(session_id: u64) -> bool {
 /// collapse to `u64::MAX` at the syscall boundary, same fail-closed
 /// convention as every other gated syscall this process calls.
 pub fn random_u64() -> Option<u64> {
+    // SAFETY: no arguments; the kernel checks the `random` capability and returns u64::MAX on denial/RDRAND failure (handled below). See `syscall`.
     let ret = unsafe { syscall(SYS_RANDOM, 0, 0, 0) };
     if ret == u64::MAX {
         None

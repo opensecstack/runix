@@ -47,7 +47,12 @@ impl RunixNetDevice {
     /// zeroed bytes this process exclusively owns. `rx_buffer_va`/
     /// `tx_buffer_va` must each point to `RX_BUFFER_COUNT`/`TX_BUFFER_COUNT`
     /// individually page-mapped, physically-backed buffers matching
-    /// `rx_buffer_phys`/`tx_buffer_phys`.
+    /// `rx_buffer_phys`/`tx_buffer_phys`: buffer `i` occupies the 4096 bytes
+    /// at `*_buffer_va + i * 4096` (the `RxToken`/`TxToken` `consume` bodies
+    /// compute that address unchecked, with `i` bounded by the
+    /// `*_BUFFER_COUNT` consts) and is exclusively owned, RW, and mapped for
+    /// the process's lifetime. `rx_queue_size`/`tx_queue_size` must be in
+    /// `1..=virtio::MAX_SUPPORTED_QUEUE_SIZE` (see `Virtqueue::new`).
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
         net_io_base: u16,
@@ -60,7 +65,12 @@ impl RunixNetDevice {
         tx_buffer_va: usize,
         tx_buffer_phys: [u64; TX_BUFFER_COUNT],
     ) -> Self {
+        // SAFETY: forwarded from this fn's own `# Safety` contract
+        // (`rx_queue_va` region, zeroed, exclusively owned, page-aligned,
+        // size in range).
         let mut rx_queue = unsafe { Virtqueue::new(rx_queue_va, rx_queue_size) };
+        // SAFETY: as above, for `tx_queue_va`/`tx_queue_size`; the TX region
+        // is distinct from the RX region, so the two queues never alias.
         let mut tx_queue = unsafe { Virtqueue::new(tx_queue_va, tx_queue_size) };
         rx_queue.init_avail_flags();
         tx_queue.init_avail_flags();
@@ -70,6 +80,12 @@ impl RunixNetDevice {
         // write an incoming frame, same requirement Phase 1's `_start`
         // already documents.
         for (i, &phys) in rx_buffer_phys.iter().enumerate() {
+            // SAFETY: `i < RX_BUFFER_COUNT` (8) satisfies `post`'s `index <
+            // 256`; `phys` is the physical address of RX buffer `i`, a
+            // `RX_BUFFER_SIZE`-byte (one-page) buffer this process owns for
+            // its whole lifetime (this fn's contract), so it outlives the
+            // device's use of it. The device is not yet marked ready, so
+            // nothing is consuming the ring concurrently.
             unsafe {
                 rx_queue.post(i as u16, phys, RX_BUFFER_SIZE, true);
             }
@@ -228,6 +244,23 @@ impl smoltcp::phy::RxToken for RunixRxToken<'_> {
     where
         F: FnOnce(&[u8]) -> R,
     {
+        // SAFETY: `index < RX_BUFFER_COUNT` and `len <= RX_BUFFER_SIZE`
+        // (4096) were enforced by `validate_rx_completion` in `receive()`,
+        // so the range `rx_buffer_va + index * 4096 + 10 ..` of length `len
+        // - 10` lies inside RX buffer `index`'s page (`RunixNetDevice::new`'s
+        // contract). `u8` has alignment 1 and any byte is valid. The
+        // device handed this buffer back through the used ring, so the
+        // driver owns it until the `post` below; the slice is dead before
+        // then (`f` has returned, and `R` cannot borrow from the
+        // higher-ranked `&[u8]`). ASSUMPTION NOT ESTABLISHED BY THE CODE:
+        // `len >= VIRTIO_NET_HDR_LEN` -- `validate_rx_completion` only
+        // checks the upper bound, and `len - VIRTIO_NET_HDR_LEN` is plain
+        // `usize` subtraction (overflow checks are off in release), so a
+        // device-reported `len < 10` would wrap to a huge slice length (UB).
+        // A well-behaved virtio-net device always writes at least the
+        // header. Also assumes the device does not write this buffer
+        // while the slice is live (it only does so for descriptors in the
+        // avail ring, and this one is re-posted only after `f`).
         let buf = unsafe {
             core::slice::from_raw_parts(
                 (self.rx_buffer_va + self.index * 4096 + VIRTIO_NET_HDR_LEN) as *const u8,
@@ -238,6 +271,13 @@ impl smoltcp::phy::RxToken for RunixRxToken<'_> {
         // Re-post this descriptor as RX before returning -- the buffer's
         // content has already been consumed by `f` above, so it's safe to
         // hand back to the device immediately.
+        //
+        // SAFETY: `self.index < RX_BUFFER_COUNT` (validated in `receive()`)
+        // satisfies `post`'s `index < 256`; `rx_buffer_phys[index]` is that
+        // same RX buffer's physical address, a one-page buffer owned for the
+        // process's lifetime, and nothing borrows its contents any more
+        // (`buf` is out of use). `self.rx_queue` is the unique `&mut` to the
+        // queue held by this token.
         unsafe {
             self.rx_queue.post(
                 self.index as u16,
@@ -256,11 +296,28 @@ impl smoltcp::phy::TxToken for RunixTxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
+        // SAFETY: `slot < TX_BUFFER_COUNT` (4) because it came from
+        // `free_tx_slot`'s position in the `tx_in_use` array, so `tx_buffer_va
+        // + slot * 4096` .. `+ 4096` is exactly TX buffer `slot`'s own page
+        // (`RunixNetDevice::new`'s contract), valid RW for the process's
+        // lifetime; `u8` alignment 1. Exclusivity: `free_tx_slot` only
+        // returns a slot after `reap_tx_completions` saw the device return
+        // it (or it was never posted), and this token holds the device's only
+        // `&mut` TX queue borrow, so there is at most one live `TxToken`
+        // and no other slice over this page. ASSUMPTION: the device does not
+        // read a slot it has already returned through the used ring.
         let buf = unsafe {
             core::slice::from_raw_parts_mut((self.tx_buffer_va + self.slot * 4096) as *mut u8, 4096)
         };
         buf[..VIRTIO_NET_HDR_LEN].fill(0);
         let result = f(&mut buf[VIRTIO_NET_HDR_LEN..VIRTIO_NET_HDR_LEN + len]);
+        // SAFETY: `slot < 4` satisfies `post`'s `index < 256`. The
+        // `buf[..VIRTIO_NET_HDR_LEN + len]` slicing above already panicked
+        // (not UB) if `len` exceeded the page, so `10 + len <= 4096` bytes at
+        // `tx_buffer_phys[slot]` are inside that slot's page. The buffer is
+        // not touched again, and the slot is not handed out again until the
+        // device returns it (`tx_in_use` is set right after this post, with no
+        // other access to the token's queue in between).
         unsafe {
             self.tx_queue.post(
                 self.slot as u16,

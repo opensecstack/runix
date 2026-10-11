@@ -181,7 +181,14 @@ impl Virtqueue {
     /// writable memory this process exclusively owns, zeroed before this is
     /// called (a stale used/avail index from whatever previously occupied
     /// this memory would desynchronize the ring from the device's own idea
-    /// of it).
+    /// of it). `region_va` must be `QUEUE_ALIGN`-aligned (every field
+    /// pointer derived here relies on it for its own alignment: 16 for
+    /// descriptors, 4 for used elements, 2 for the ring indices) and
+    /// `qsize` must be in `1..=MAX_SUPPORTED_QUEUE_SIZE`: every later ring
+    /// access in `post`/`poll_used` stays inside the owning page only
+    /// because 256 descriptors/avail entries/used elements fit one page
+    /// each, and `% qsize` panics (not UB) on 0. The region must stay mapped
+    /// for the life of the returned `Virtqueue`.
     pub unsafe fn new(region_va: usize, qsize: u16) -> Self {
         let desc = region_va as *mut VirtqDesc;
         let avail_base = region_va + QUEUE_ALIGN;
@@ -210,8 +217,25 @@ impl Virtqueue {
     /// `buf_phys`/`buf_len` must describe memory this process actually owns
     /// and that outlives the device's use of it (until the corresponding
     /// used-ring entry appears) — same contract as handing a raw pointer to
-    /// any DMA-capable device.
+    /// any DMA-capable device. `index` must be `< MAX_SUPPORTED_QUEUE_SIZE`
+    /// (it is used unchecked as a descriptor-table offset; the table is one
+    /// page of 256 entries). It is NOT checked against `qsize`: a caller
+    /// passing `index >= qsize` stays memory-safe but posts a descriptor the
+    /// device will never look at.
     pub unsafe fn post(&mut self, index: u16, buf_phys: u64, buf_len: u32, writable: bool) {
+        // SAFETY: `self`'s pointers were derived by `Virtqueue::new` from a
+        // `QUEUE_ALIGN`-aligned, exclusively owned, kernel-mapped RW region
+        // that outlives `self` (new's contract), so they are aligned and
+        // valid for volatile access. `desc.add(index)` is in the descriptor
+        // page by this fn's `index < 256` contract; `avail_ring.add(idx %
+        // qsize)` is in the avail page since `qsize <= 256` (new's
+        // contract) and `4 + 2 * 255 < QUEUE_ALIGN`. `&mut self` gives
+        // exclusivity against this process's own accesses (the binary is
+        // single-threaded: no thread-creating syscall is wrapped); the
+        // device is the only concurrent party, which is why every access is
+        // `write_volatile`/`read_volatile` and the descriptor write is
+        // ordered before the avail publish by a compiler fence (x86 TSO
+        // needs no hardware fence for store-store ordering).
         unsafe {
             let desc_ptr = self.desc.add(index as usize);
             core::ptr::write_volatile(
@@ -234,6 +258,11 @@ impl Virtqueue {
     }
 
     pub fn init_avail_flags(&mut self) {
+        // SAFETY: `avail_flags`/`avail_idx` are the first two u16s of the
+        // avail page, aligned and valid for writes per `Virtqueue::new`'s
+        // contract; `&mut self` excludes concurrent access from this
+        // process, and the device has not yet been told the queue is ready
+        // (callers run this before `mark_ready`).
         unsafe {
             core::ptr::write_volatile(self.avail_flags, 0);
             core::ptr::write_volatile(self.avail_idx, 0);
@@ -246,10 +275,21 @@ impl Virtqueue {
     /// prefix); for TX, it's conventionally 0 and only the fact that a
     /// completion appeared at all matters.
     pub fn poll_used(&mut self) -> Option<(u32, u32)> {
+        // SAFETY: `used_idx` points at the u16 at `used_base + 2`, aligned
+        // and inside the used page per `Virtqueue::new`'s contract; volatile
+        // because the device writes it concurrently. Any u16 is a valid
+        // value, so a misbehaving device cannot make this read invalid.
         let idx = unsafe { core::ptr::read_volatile(self.used_idx) };
         if idx == self.last_used_seen {
             return None;
         }
+        // SAFETY: `used_ring.add(n % qsize)` is in the used page (`qsize <=
+        // 256` and `4 + 8 * 255 < QUEUE_ALIGN`, per `Virtqueue::new`'s
+        // contract), 4-aligned (`used_base + 4`, 8-byte elements). The reduction is
+        // by `qsize`, not by anything the device supplies, so a lying device
+        // cannot steer this read out of bounds; every bit pattern is a valid
+        // `UsedElem` (two u32s). The returned `id`/`len` are untrusted and
+        // are validated by the callers.
         let elem = unsafe {
             core::ptr::read_volatile(
                 self.used_ring

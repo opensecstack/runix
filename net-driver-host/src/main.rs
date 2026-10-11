@@ -43,6 +43,7 @@
 
 #![no_std]
 #![no_main]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 extern crate alloc;
 
@@ -218,10 +219,32 @@ const MAX_SOCKETS: usize = runix_ipc::sockets::MAX_SOCKETS as usize;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    // SAFETY: `LockedHeap::init` requires that the region is valid,
+    // writable, unused by anything else, and that `init` is called at most
+    // once, before any allocation. `_start` is the process entry point
+    // (runs once) and this is its first statement, so nothing has allocated
+    // yet; the kernel maps `NET_HEAP_START..+NET_HEAP_SIZE` (256 KiB, RW
+    // user pages, zeroed) with the same values as `HEAP_START`/`HEAP_SIZE`
+    // here (`kernel/src/main.rs::load_and_run_net_driver_host`), and no
+    // other use of that range exists in this binary. Mismatch between the
+    // two copies of the constants is not checked at build time.
     unsafe {
         ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
     }
 
+    // SAFETY: the kernel maps the page at `NET_INFO_VA` (page-aligned, so
+    // aligned for `NetBootInfo`) RW and writes a `NetBootInfo` into it
+    // before this process is spawned, and never unmaps it, so the
+    // reference is valid for the process's lifetime. Every field is an
+    // integer or integer array, so any bit pattern is valid. The shared
+    // reference covers only the first `size_of::<NetBootInfo>() == 128`
+    // bytes; this process's own later writes to that page are at offsets
+    // `NET_*_RESULT_OFFSET >= 128`, outside it, so no write overlaps the
+    // reference. Relies on the `repr(C)` layout matching the kernel's
+    // `NetBootInfo` definition, which is only checked by hand (no shared
+    // type) -- and on every spawner (the kernel boot path and the
+    // `kernel/tests/net_driver_*` tests) writing that page, which was
+    // verified only for the boot path.
     let info = unsafe { &*(NET_INFO_VA as *const NetBootInfo) };
     let net = virtio::VirtioNet::probe(info.io_base);
     let mac = net.mac;
@@ -240,6 +263,18 @@ pub extern "C" fn _start() -> ! {
     let tx_size = net.queue_size(1);
     net.set_queue_address(1, info.tx_queue_phys);
 
+    // SAFETY: meets `RunixNetDevice::new`'s contract as set up by the
+    // kernel loader (`load_and_run_net_driver_host`): `NET_RXQ_VA`/
+    // `NET_TXQ_VA` are each 3 zeroed, physically contiguous RW user pages
+    // (`map_zeroed_contiguous_region`) at page-aligned addresses;
+    // `NET_RXBUF_VA`/`NET_TXBUF_VA` are 8/4 individually mapped, zeroed RW
+    // pages one page apart, whose physical addresses the kernel wrote into
+    // `info.rx_buffer_phys`/`tx_buffer_phys`; none of these ranges is used
+    // elsewhere in this binary, so ownership is exclusive, and this is the
+    // only `RunixNetDevice`. `rx_size`/`tx_size` come from
+    // `VirtioNet::queue_size`, which asserts `<= 256` but does NOT reject 0
+    // (a device reporting size 0 would make `% qsize` panic later, an abort,
+    // not UB). `info`'s physical addresses are trusted from the kernel.
     let mut device = unsafe {
         RunixNetDevice::new(
             info.io_base,
@@ -369,6 +404,13 @@ pub extern "C" fn _start() -> ! {
     // convention Phase 1 established: write a real result code into the
     // shared `NetBootInfo` page at a fixed offset well past that struct's
     // own fields.
+    // SAFETY: `NET_INFO_VA` is the kernel-mapped, RW user page holding
+    // `NetBootInfo`; `NET_RESULT_OFFSET` is a small constant (< 4096, past the
+    // 128-byte struct), so the one-byte write is in-bounds of that page,
+    // needs no alignment, and overlaps no live reference (the `&NetBootInfo`
+    // covers only the first 128 bytes). Volatile so the write is not elided
+    // or reordered away: the kernel test harness reads this byte from
+    // outside the process.
     unsafe {
         core::ptr::write_volatile(
             (NET_INFO_VA + NET_RESULT_OFFSET) as *mut u8,
@@ -496,6 +538,14 @@ fn run_dhcp(iface: &mut Interface, device: &mut RunixNetDevice) -> u32 {
         write_all(b"net-driver-host: no DHCP lease acquired within poll bound (DHCP FAILED)\n");
     }
 
+    // SAFETY: `NET_INFO_VA` is the kernel-mapped, RW user page holding
+    // `NetBootInfo`. Every write here is one byte at `NET_INFO_VA + off`
+    // with `off` = `NET_DHCP_RESULT_OFFSET` or `NET_DHCP_ADDR_OFFSET + i` for `i < 4` (offsets 131..=134),
+    // all < 4096 and past the 128-byte struct, so each is in-bounds of that
+    // page, needs no alignment, and overlaps no live reference (the
+    // `&NetBootInfo` covers only the first 128 bytes). Volatile so the
+    // writes are not elided or reordered away: the kernel test harness reads
+    // these bytes from outside the process.
     unsafe {
         core::ptr::write_volatile(
             (NET_INFO_VA + NET_DHCP_RESULT_OFFSET) as *mut u8,
@@ -600,6 +650,13 @@ fn run_tcp_proof(iface: &mut Interface, device: &mut RunixNetDevice, start_itera
         );
     }
 
+    // SAFETY: `NET_INFO_VA` is the kernel-mapped, RW user page holding
+    // `NetBootInfo`; `NET_TCP_RESULT_OFFSET` is a small constant (< 4096, past the
+    // 128-byte struct), so the one-byte write is in-bounds of that page,
+    // needs no alignment, and overlaps no live reference (the `&NetBootInfo`
+    // covers only the first 128 bytes). Volatile so the write is not elided
+    // or reordered away: the kernel test harness reads this byte from
+    // outside the process.
     unsafe {
         core::ptr::write_volatile(
             (NET_INFO_VA + NET_TCP_RESULT_OFFSET) as *mut u8,
@@ -684,6 +741,14 @@ fn run_dns_lookup(iface: &mut Interface, device: &mut RunixNetDevice, start_iter
         write_all(b"net-driver-host: no DNS answer within poll bound (DNS FAILED)\n");
     }
 
+    // SAFETY: `NET_INFO_VA` is the kernel-mapped, RW user page holding
+    // `NetBootInfo`. Every write here is one byte at `NET_INFO_VA + off`
+    // with `off` = `NET_DNS_RESULT_OFFSET` or `NET_DNS_ADDR_OFFSET + i` for `i < 4` (offsets 136..=139),
+    // all < 4096 and past the 128-byte struct, so each is in-bounds of that
+    // page, needs no alignment, and overlaps no live reference (the
+    // `&NetBootInfo` covers only the first 128 bytes). Volatile so the
+    // writes are not elided or reordered away: the kernel test harness reads
+    // these bytes from outside the process.
     unsafe {
         core::ptr::write_volatile(
             (NET_INFO_VA + NET_DNS_RESULT_OFFSET) as *mut u8,
