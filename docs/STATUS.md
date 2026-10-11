@@ -2807,11 +2807,19 @@ WORM entry says it was an early override. The period check runs before the MARSH
 gate, so a refusal costs no round trip; it is WORM-audited with `authorized=false` and
 starts no period. New return codes: `7` period still active, `8` clock before the
 period start (refused for both modes, because a rewound counter must not allow
-resets on demand), `9` unknown mode. An account with no billing period keeps the old
-behaviour (reset allowed, repeatedly); that remains a gap. The boot walk uses a
-DEMO-only account 1 with a one-day period so "period active" is deterministic; account
-0 holds no early capability, which proves the capability split. See
-[adrs/0004-early-usage-reset-has-its-own-capability.md](adrs/0004-early-usage-reset-has-its-own-capability.md).
+resets on demand), `9` unknown mode, `10` early-reset cooldown. The first reset on an
+account with no billing period is allowed and installs one (DEMO length, one day), so
+every later reset of that account is gated. An early reset is also refused if any reset
+was applied to that account within the cooldown (DEMO, one hour; measured from the last
+applied reset, kept in memory and lost on reboot). The boot walk uses a DEMO-only
+account 1 with a one-day period so "period active" is deterministic, and a DEMO-only
+account 2 with no period to prove the install; account 0 holds no early capability,
+which proves the capability split. **Still open:** the flat capability set (gap 5)
+means every EL0 context holds the early capability, so the cooldown limits how fast it
+is used, not who holds it. See
+[adrs/0004-early-usage-reset-has-its-own-capability.md](adrs/0004-early-usage-reset-has-its-own-capability.md)
+and
+[adrs/0005-no-period-reset-installs-a-period-and-early-resets-have-a-cooldown.md](adrs/0005-no-period-reset-installs-a-period-and-early-resets-have-a-cooldown.md).
 
 Its return codes are in the table above. In the boot walk the reset's verdict
 depends on the boot's configuration. The two plain boots have no proxy, so the
