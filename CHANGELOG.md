@@ -1,13 +1,17 @@
 # Changelog
 
-Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). No
-version numbers or dates are assigned yet. This section covers everything
-committed after the `alpha-complete` tag. Each line was derived from the commit
-history (`git log alpha-complete..HEAD`); see [docs/STATUS.md](docs/STATUS.md)
-for what is verified and [docs/BETA_CRITERIA.md](docs/BETA_CRITERIA.md) for what
-Beta claims and does not claim.
+Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
+file covers the changes since the published Alpha release, the tag
+`v0.1.0-alpha`, up to version `0.1.0-beta.1`. Every entry was derived from the
+commit history (`git log v0.1.0-alpha..HEAD`, 84 commits, 2026-10-01 to
+2026-10-11); work that already shipped in `v0.1.0-alpha` is not repeated here.
+See [docs/STATUS.md](docs/STATUS.md) for what is verified and
+[docs/BETA_CRITERIA.md](docs/BETA_CRITERIA.md) for what Beta claims and does
+not claim.
 
 ## [Unreleased]
+
+## [0.1.0-beta.1] - 2026-10-11
 
 ### Security
 
@@ -22,99 +26,145 @@ Beta claims and does not claim.
   header size, which could wrap a slice length. It is now rejected and the
   consume path uses saturating arithmetic (`51c606f`).
 - Fix: `blk-driver-host` did not check revocation on file tokens. It now asks
-  the kernel through the new `SYS_CAP_IS_REVOKED` (16) and fails closed on any
-  answer other than "not revoked" (`482ac57`, `b541ac0`, test `blk_fs_revoked`).
-- Fix: virtio queue sizes are validated (power of two within the driver's real
-  minimum and 256) in both drivers; a bad size now fails the probe instead of
-  aborting (`d057c7b`, `51c606f`).
+  the kernel through the new `SYS_CAP_IS_REVOKED` (16, gated on
+  `revocation:query`) and fails closed on any answer other than "not revoked"
+  (`482ac57`, `b541ac0`, tests `cap_is_revoked`, `blk_fs_revoked`). A shared
+  `blk_driver_extra_capabilities` helper keeps spawners from omitting the
+  capability (`a4e6a39`).
+- Fix: virtio queue sizes are validated in both drivers (power of two; at least
+  the driver's real minimum; at most 256). A bad size now fails the probe
+  instead of aborting (`d057c7b`, `51c606f`).
 - Fix: `blk-driver-host` quarantines the device after a poll timeout instead of
   reading a stale completion later (`d057c7b`; QEMU regression test `c998f40`).
-- Fix: concurrent senders on one IPC port could interleave messages (`51c0c4c`).
 - Fix: a `citadel_proxy` policy refusal was classified as unreachable and so
-  fail-open; it now travels as its own `MarshalError::PolicyRefused` and blocks.
-  Also closes an SIM source-state hole where a never-installed profile could be
-  disabled then enabled (`0c87c3e`). A proxy built before this change still
-  fails open; deploy kernel and proxy together.
-- Fix: `SYS_IPC_RECV` is now capability-gated and the shared FS response port
-  is retired (`cc51dd5`).
-- Fix: syscall wrappers declare RCX/R8-R11 clobbers on `int 0x80` (`c3f911e`).
-- Remove RSA certificate verification from `tls-client` to resolve
-  RUSTSEC-2023-0071 (`4d3d993`).
-- `cargo-deny` supply-chain checks in CI, with `allow-git` empty so a git
-  dependency fails closed until reviewed (`a415ff9`, `deny.toml` fixes after).
+  failed open. It now travels as its own `MarshalError::PolicyRefused` and
+  blocks, in both `kernel-arm` and the x86 kernel (`0c87c3e`). A proxy built
+  before this change still fails open; deploy kernel and proxy together.
+- Fix: `kernel-arm` SIM operations shared one legality table, so a
+  never-installed profile could be disabled then enabled, and `install` could
+  overwrite an Enabled profile. Each operation now has its own required source
+  state (`0c87c3e`).
+- Fix: on `kernel-arm`, a MARSHAL evaluation that failed locally (for example
+  out of memory) fell back to "unreachable" and so proceeded ungoverned. Local
+  failures now fail closed, and evaluation address spaces and stacks are
+  reclaimed so the heap no longer drains after about 8 evaluations (`0de97f8`).
 - Every `unsafe` site in `grid-sandbox-host`, `net-driver-host` and
   `blk-driver-host` carries a `// SAFETY:` comment; each crate warns on
-  `clippy::undocumented_unsafe_blocks`.
-- `abi-consistency` CI check fails if kernel and ring-3 host duplicated
-  constants (210 today) drift (`4b19652`).
+  `clippy::undocumented_unsafe_blocks` (`28e3a91`, `b9ebe03`, `1e4a4b4`).
+  Hardening gaps found while doing this are recorded in `docs/STATUS.md`
+  (`f8a101a`, `efffb46`).
+- `abi-consistency` CI check fails if constants duplicated between the kernel
+  and the ring-3 hosts (heap and boot-info addresses, result offsets,
+  `BootInfo` layout, syscall numbers) drift (`4b19652`).
 - `kernel/src/citadel.rs` states the `insecure-demo-keys` barrier itself
   (`c5bafd6`). Docs now record the boot allowlist as a wiring proof, not an
   enforcing gate (`de59268`).
 
 ### Added
 
-- ARM/TrustZone bring-up in new `kernel-arm`: EL3 boot, exception vectors,
-  GICv2, EL3 to EL1 Non-secure drop, EL1 MMU, EL0 RIL isolation boundary with
-  SVC gate and capability checks, and basic SIM provisioning. A no-EL3 boot path
-  is also supported.
-- Mobile Beta work in `kernel-arm` and `mobile/`: eSIM profile lifecycle
-  (state machine, per-operation capabilities, audit); MVNO account registry and
-  network selection; data policy engine, reconciler and billing-period model;
-  governed usage reset (`SYS_DATA_RESET`) with period gate, early-override
-  capability, cooldown and no-period install (ADRs 0001 to 0005).
-- Mobile EL0 process model: ELF64 loader, per-process address spaces,
-  cooperative scheduler and IPC, virtio-mmio net discovery, virtqueue bring-up,
-  real outbound TCP at EL0 (`net-driver-host-arm`).
-- MARSHAL gate for mobile: six governed actions, an EL0 transport process per
-  evaluation, per-action unreachable policy (`FailOpen`/`FailClosed`), verdicts
-  recorded in WORM text, `citadel_proxy` recognizes `esim.*`, `mvno.*` and
-  `data.reset_usage`.
-- Desktop network stack in `net-driver-host`: virtio-net, smoltcp, ARP/ICMP,
-  TCP, DHCP, concurrent sockets, DNS, and a typed sockets IPC surface.
-- Desktop filesystem driver in `blk-driver-host`: virtio-blk, FAT32 read, long
-  filenames, subdirectories, partial write, cluster allocation, directory
-  growth, create/delete/grow (driver-internal), and a typed filesystem IPC
-  surface with per-request capability tokens.
-- Grid Sandbox tiers T1/T2/T3 with tier-driven memory and table caps, boot
-  verified for all three, plus multi-instance `spawn_instance`.
-- `spawn_instance` MARSHAL evaluation, first observe-only, then real
-  enforcement (`Refuse`/`HardStop` block; unreachable or unconfigured fails open).
-- Kernel to proxy MARSHAL wire contract in `ipc`, a real `HttpKerkeseTransport`
-  and `citadel_proxy` binary in `desktop`, a boot-time proxy address hook, and
-  an end-to-end QEMU test through a real proxy and a mock CITADEL.
-- Kernel syscalls and IPC: RDRAND entropy (`sys_random`), session/handle IPC
-  primitive with both drivers migrated onto it, `SYS_CAP_IS_REVOKED`.
-- `capability-manager`: signature fingerprints and an O(log n) revocation index.
-- `citadel-integration`: boot-time module allowlist (replacing the stub),
-  per-instance authorization with a local WORM evidence log, and a dependency on
-  `citadel-kerkese-core` 1.0.0.
+- Kernel: `SYS_RANDOM` (RDRAND-backed, capability-gated entropy) and a
+  session/handle IPC primitive (`SYS_IPC_SESSION_OPEN/ACCEPT/SEND/RECV/
+  SEND_LOCK/SEND_UNLOCK`) with per-caller isolation. `blk-driver-host`,
+  `net-driver-host` and the kernel's MARSHAL client were migrated onto it. A
+  measured round trip is about 228 times cheaper than the fixed-port transport
+  (`4fbb5e2`, tests `sys_random`, `ipc_session`, `syscall_cost`).
+- Kernel: `SYS_CAP_IS_REVOKED` (`482ac57`); `capability-manager`
+  `signature_fingerprint`, `RevocationList::is_fingerprint_revoked` and an
+  O(log n) fingerprint revocation index (`327906b`, `a4e6a39`).
+- Kernel: build-time `RUNIX_MARSHAL_PROXY_ADDR` hook so a real boot can point
+  `spawn_instance`'s MARSHAL evaluation at a proxy; unset by default
+  (`8b7a5a0`).
+- `citadel-integration`: depends on `citadel-kerkese-core` 1.0.0; the local
+  `KerkeseTransport` duplicate is dropped (`a3cbe2a`).
+- `citadel_proxy` recognizes `esim.enable` and `esim.delete` (`e5166a8`) and
+  records its own Verifier-identity decision in WORM (`8d0fabd`).
 - `tls-client`: pure-Rust TLS 1.3 client crate for `x86_64-unknown-none`
-  (no consumer yet).
-- Fuzz harnesses for `capability-manager`, `net-driver-host`, and the
-  `blk-driver-host` FAT32 and allocator code, with proptest fallbacks.
-- `docs/`: ARCHITECTURE, STATUS, ROADMAP, BUILDING split from the README;
-  MARSHAL enforcement policy and Verifier-identity RFCs; TLS and IPC-response
-  capability RFCs; `docs/adrs/`; `docs/BETA_CRITERIA.md`.
+  (`1c49264`; no consumer yet).
+- Fuzz target and proptest fallback for the `blk-driver-host` FAT32 directory
+  and chain-walk code (`1fe4203`).
+- Mobile eSIM profile lifecycle, capability-gated and governed by MARSHAL
+  (`50bf624`, `d93e124`: initiating principal passed through `esim_marshal`).
+- Mobile MVNO account model and network selection, wired into `kernel-arm`,
+  with the MVNO syscalls routed through MARSHAL (`6d4d8f6`, `fda8a47`,
+  `727fc01`).
+- Mobile data policy engine and read-only reconciler, wired into `kernel-arm`
+  (`1660232`, `aef10bd`); billing-period model and `SYS_DATA_PERIOD` (24)
+  (`3da349f`).
+- Governed usage reset `SYS_DATA_RESET`: period gate, early-override
+  capability, early-reset cooldown, demo-period install on a no-period
+  account, and the last WORM entry read back onto the serial log
+  (`aaeb5b0`, `f3e89e2`, `6f3d9c5`, `7a7319d`, `96700b5`, `1de4af1`).
+- Mobile MARSHAL gate on `kernel-arm`: `esim_marshal` wired to a real
+  transport, a per-action unreachable policy (reset is fail-closed; eSIM
+  enable/delete and MVNO bind/suspend/reactivate stay fail-open), and recorded
+  verdicts in the WORM reason and serial line (`319d111`, `727fc01`,
+  `3da349f`). Each evaluation uses its own source port and closes its socket
+  (`0088a4e`).
+- `kernel-arm` EL0 process model: ARM ELF64 parser and loader, per-process
+  address spaces, MMIO-window capability type, cooperative scheduler and
+  general-purpose IPC, and the first real EL0 process (`6cf1a58`, `58b202f`,
+  `7806bec`, `33725c0`, `0d99bc1`).
+- `kernel-arm` networking: virtio-mmio net device discovery, virtqueue
+  bring-up with a real ARP round trip, `smoltcp` confirmed to build for
+  `aarch64-unknown-none`, and real outbound TCP at EL0 through
+  `net-driver-host-arm` (`447e531`, `1d65b9b`, `4a24f80`, `fa46ef7`).
+- `docs/`: `docs/adrs/` (ADRs 0002 to 0005), `docs/BETA_CRITERIA.md`,
+  `docs/RELEASE_NOTES_BETA_DRAFT.md` (`6a04eee`, `aaeb5b0`, `3da349f`,
+  `0e488dc`, `803ee7c`, `2bc7d50`). Docs also now describe the data policy
+  engine, the IPC migration, the MARSHAL identity gap and the driver hardening
+  gaps.
+- Release tooling: tag-triggered `.github/workflows/release.yml` (draft
+  release, `SHA256SUMS`, dry run via `workflow_dispatch`) and `ci.yml` made
+  callable (`7daf8c7`).
+- CI additions: host unit tests for `kernel-arm` and `net-driver-host-arm`
+  (`e4845f9`); QEMU tests `ipc_session` and `sys_random` (`755ba5d`),
+  `blk_fs_concurrent_write` (`aa52f29`), `blk_fs_revoked`, `cap_is_revoked`
+  (`b541ac0`, `482ac57`), `blk_fs_quarantine` (`c998f40`); assertions for the
+  reset period gate, early override, cooldown and no-period install in the five
+  ARM boot steps (`9fdefda`, `c7e34d4`); the `abi-consistency` check
+  (`4b19652`).
 
 ### Changed
 
-- `citadel-integration` license re-confirmed as Apache-2.0 with a written
-  argument (`af789e9`).
-- `citadel_proxy` records its own Verifier-identity decision in WORM (`8d0fabd`).
-- Project renamed from CitadelOS to Runix in the tree (`0e490a9`).
-- CI: `kernel-arm` and `net-driver-host-arm` host unit tests, a QEMU test per
-  new driver and MARSHAL path, `net_driver_dns` run then removed again because
-  the runner gets no DNS answer.
+- All `blk-driver-host` and `net-driver-host` IPC now goes over sessions; each
+  server has one session-accept port instead of separate request and response
+  ports (`4fbb5e2`).
+- `net-driver-host` sockets IPC server pre-checks `SESSION_ACCEPT` cheaply
+  instead of throttling itself (`47a14cc`).
+- Version bumped to `0.1.0-beta.1` across the workspace and the standalone
+  crates (`f45e0fa`).
+- Docs corrected for two stale MARSHAL-identity claims and a re-confirmed
+  operator-identity gap; `kernel-arm` build-directory requirement documented;
+  proof greps that fail on a plain local boot explained (`b11d739`, `3743409`,
+  `ae8565b`, `97f3d68`, `c1b3efb`).
+- CI: `net_driver_dns` was added to the QEMU test list (`755ba5d`), a
+  throwaway diagnosis workflow was run (`7c4ff71`, merged in `b40844b`), and the
+  test was removed again because the runner gets no DNS answer from 8.8.8.8
+  (`ce9a203`). DNS is therefore not CI-verified.
+
+### Removed
+
+- RSA certificate verification from `tls-client`, to resolve RUSTSEC-2023-0071
+  (`4d3d993`).
 
 ### Fixed
 
-- Ring 3 stack under-mapping in the `grid_sandbox_wasm` test (`47bd3ef`).
-- `kernel-arm` silent boot failure without `secure=on` (`1643323`) and the
-  AP[2:1]=0b01 QEMU hang in EL0/EL1 page isolation (`c9ba1c7`).
-- `blk-driver-host` poll timeout under TCG without KVM (`cdb789b`).
-- `net-driver-host` sockets IPC server exhausting its budget before a client
-  connected (`72b0bb2`).
-- A stale `marshal_proxy_e2e` request fixture, and a MARSHAL test budget that
-  needed a test-only override (`cc66be5`, `47a14cc`).
-- Several rustfmt and clippy drift fixes and CI ordering fixes (payload
-  binaries built before the crates that embed them).
+- A stale `marshal_proxy_e2e` request fixture (missing `dry_run`) and the
+  `grid_sandbox_marshal_shadow` test (`cc66be5`, `47a14cc`).
+- A session queue shared by both peers let a caller read back its own bytes
+  before the peer did; each session now has two directional queues with
+  independent send locks (`4fbb5e2`).
+- `kernel-arm` MARSHAL evaluations after the first failed to connect because
+  they reused a fixed source port and initial sequence number and never sent a
+  FIN (`0088a4e`).
+- `kernel-arm` heap exhaustion from unreclaimed evaluation processes
+  (`0de97f8`).
+- `SYS_DATA_PERIOD`'s "no billing period" refusal was WORM-audited on every
+  call, so polling could grow the audit chain; it is serial-only now
+  (`3da349f`).
+- rustfmt and clippy drift, a clippy MSRV lint, and CI ordering (payload
+  binaries such as `net-driver-host-arm` built before the crates that embed
+  them) (`5c31c15`, `22bc3b2`, `468a85f`, `6e98f4e`, `200cfd8`, `a67dde2`).
+
+[Unreleased]: https://github.com/opensecstack/runix/compare/v0.1.0-beta.1...HEAD
+[0.1.0-beta.1]: https://github.com/opensecstack/runix/compare/v0.1.0-alpha...v0.1.0-beta.1

@@ -46,6 +46,10 @@ Read this first. This list mirrors "Not claimed" in BETA_CRITERIA.md.
 
 ## What is in it
 
+This is the implemented state of the tree. The Grid Sandbox, network stack and
+filesystem driver were implemented before the `v0.1.0-alpha` tag (first
+shipped in it); the changes since that tag are listed in the CHANGELOG.
+
 Desktop (x86_64 microkernel plus ring-3 hosts):
 
 - Grid Sandbox: `wasmi` inside a ring-3 process with its own address space,
