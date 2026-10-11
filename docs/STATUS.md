@@ -3139,7 +3139,17 @@ Still open, verified in the code:
   already failed for the whole crate through `capabilities.rs`'s `compile_error!`.
   `citadel.rs` now states the same barrier itself, so it no longer depends on a
   sibling module.
-- `blk-driver-host` does not check revocation on file tokens.
+- (Closed 2026-10-11) `blk-driver-host` did not check revocation on file tokens.
+  It now asks the kernel through `SYS_CAP_IS_REVOKED` (16): the argument is a
+  64-bit fingerprint (the first 8 decoded bytes) of the token signature, so the
+  syscall stays scalar-only. The query is gated on a `revocation:query`
+  capability held only by the driver. The driver accepts a token only when the
+  kernel answers exactly `0`; a revoked token, a denied call, an unexpected
+  value or a malformed signature all deny. Proven on a CI runner by
+  `kernel/tests/blk_fs_revoked.rs` (a revoked-but-unexpired token is refused
+  while a fresh token for the same file still reads) and `cap_is_revoked.rs`.
+  Any new spawner of `blk-driver-host` in serve mode must grant
+  `revocation:query`, or every request is denied.
 
 The `unsafe` blocks in the three ring-3 hosts carry few `// SAFETY:`
 comments; that is a documentation gap, not a confirmed bug.
