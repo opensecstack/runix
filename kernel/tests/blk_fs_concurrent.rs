@@ -258,7 +258,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         kernel_trampoline,
         space,
         Some(blk_token),
-        alloc::vec![fs_server_token],
+        alloc::vec![
+            fs_server_token,
+            // SYS_CAP_IS_REVOKED gate: without this the driver fails closed on every request.
+            CapabilityToken::issue(
+                "blk-driver-host",
+                runix_kernel::capabilities::revocation_query_resource(),
+                now,
+                now + 1_000_000,
+                "demo-key",
+                &signing_key,
+            ),
+        ],
     );
 
     // Give it time to probe the device and reach its receive loop before

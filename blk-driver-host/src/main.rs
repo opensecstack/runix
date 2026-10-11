@@ -101,19 +101,20 @@ fn file_resource(name: &str) -> String {
 /// rather than relying solely on the coarser port-level capability the
 /// kernel's `SYS_IPC_SEND` gate already checks.
 ///
-/// Deliberately does **not** consult a revocation list: this driver has
-/// no access to the kernel's own `capabilities::REVOCATIONS` state (it's
-/// kernel-internal, not exposed over any syscall) -- a revoked-but-not-yet-
-/// expired file token would still verify here. Named explicitly as a known
-/// limitation, not silently assumed solved: closing it needs either a new
-/// syscall exposing revocation status or routing file-capability
-/// revocation through the kernel's existing `SYS_IPC_SEND` gate instead
-/// (e.g. a dedicated revocation-check port), neither of which exists yet.
+/// Also consults the kernel's revocation list via `SYS_CAP_IS_REVOKED`
+/// (by signature fingerprint -- see [`blk_driver_host::verify_file_token_with`],
+/// which holds the testable logic). Fails closed: a revoked token, a denied
+/// syscall (this process lacking the `revocation:query` capability), or any
+/// result other than exactly `0` rejects the request.
 fn verify_file_token(token: &CapabilityToken, name: &str) -> bool {
     let now = syscall::ticks();
-    token
-        .verify(&demo_verifying_key(), &file_resource(name), now)
-        .is_ok()
+    blk_driver_host::verify_file_token_with(
+        token,
+        &demo_verifying_key(),
+        &file_resource(name),
+        now,
+        syscall::cap_is_revoked,
+    )
 }
 
 /// Small — this driver does no dynamic allocation at all (no `alloc`

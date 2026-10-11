@@ -23,6 +23,9 @@
 
 #![cfg_attr(not(test), no_std)]
 
+use ed25519_dalek::VerifyingKey;
+use runix_capability_manager::{signature_fingerprint, CapabilityToken};
+
 /// A parsed BIOS Parameter Block (BPB) — the FAT32 boot sector, always
 /// sector 0. Only the fields this driver actually needs are kept; the BPB
 /// has many more (media descriptor, geometry, volume label, ...) that are
@@ -537,10 +540,112 @@ pub fn first_free_cluster_in_fat_sector(
     None
 }
 
+/// Pure per-request file-token check: signature, expiry, and exact
+/// `expected_resource` scope (via [`CapabilityToken::verify`]), then
+/// revocation. `revocation_query` receives the token's
+/// [`signature_fingerprint`] and returns the raw `SYS_CAP_IS_REVOKED`
+/// result: only exactly `0` means "not revoked". `1` (revoked),
+/// `u64::MAX` (syscall denied/failed) and any other value all deny, i.e.
+/// FAIL CLOSED. A signature with no computable fingerprint is denied
+/// without querying. Signature/expiry are checked first so a forged or
+/// expired token never reaches the syscall.
+pub fn verify_file_token_with(
+    token: &CapabilityToken,
+    verifying_key: &VerifyingKey,
+    expected_resource: &str,
+    now: u64,
+    revocation_query: impl FnOnce(u64) -> u64,
+) -> bool {
+    if token.verify(verifying_key, expected_resource, now).is_err() {
+        return false;
+    }
+    match signature_fingerprint(&token.signature) {
+        Some(fingerprint) => revocation_query(fingerprint) == 0,
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn test_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    fn file_token(expires_at: u64) -> CapabilityToken {
+        CapabilityToken::issue("t", "file:A.TXT", 0, expires_at, "k", &test_key())
+    }
+
+    #[test]
+    fn file_token_valid_and_not_revoked_is_accepted() {
+        let token = file_token(100);
+        let fp = signature_fingerprint(&token.signature).unwrap();
+        let key = test_key().verifying_key();
+        let ok = verify_file_token_with(&token, &key, "file:A.TXT", 50, |q| {
+            assert_eq!(q, fp);
+            0
+        });
+        assert!(ok);
+    }
+
+    #[test]
+    fn file_token_revoked_is_denied() {
+        let token = file_token(100);
+        let key = test_key().verifying_key();
+        assert!(!verify_file_token_with(
+            &token,
+            &key,
+            "file:A.TXT",
+            50,
+            |_| 1
+        ));
+    }
+
+    #[test]
+    fn file_token_denied_or_unexpected_syscall_result_fails_closed() {
+        let token = file_token(100);
+        let key = test_key().verifying_key();
+        for ret in [u64::MAX, 2, 0xdead_beef] {
+            assert!(!verify_file_token_with(
+                &token,
+                &key,
+                "file:A.TXT",
+                50,
+                |_| ret
+            ));
+        }
+    }
+
+    #[test]
+    fn file_token_expired_wrong_resource_or_forged_is_denied_without_query() {
+        let token = file_token(100);
+        let key = test_key().verifying_key();
+        let never = |_| panic!("must not query revocation");
+        assert!(!verify_file_token_with(
+            &token,
+            &key,
+            "file:A.TXT",
+            101,
+            never
+        ));
+        assert!(!verify_file_token_with(
+            &token,
+            &key,
+            "file:B.TXT",
+            50,
+            never
+        ));
+        let other = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        assert!(!verify_file_token_with(
+            &token,
+            &other,
+            "file:A.TXT",
+            50,
+            never
+        ));
+    }
 
     /// A minimal, valid FAT32 BPB — every field this parser reads set to
     /// a plausible, self-consistent value, everything else left zeroed.
@@ -828,10 +933,7 @@ mod tests {
         // free -- must return 3, not 2.
         let mut sector = [0u8; 16];
         sector[8..12].copy_from_slice(&0x0000_0005u32.to_le_bytes()); // cluster 2: in use
-        assert_eq!(
-            first_free_cluster_in_fat_sector(&sector, 0, 4),
-            Some(3)
-        );
+        assert_eq!(first_free_cluster_in_fat_sector(&sector, 0, 4), Some(3));
     }
 
     #[test]

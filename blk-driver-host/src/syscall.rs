@@ -20,6 +20,7 @@ const SYS_IPC_SESSION_SEND: u64 = 12;
 const SYS_IPC_SESSION_RECV: u64 = 13;
 const SYS_IPC_SESSION_SEND_LOCK: u64 = 14;
 const SYS_IPC_SESSION_SEND_UNLOCK: u64 = 15;
+const SYS_CAP_IS_REVOKED: u64 = 16;
 
 /// # Safety
 /// Whatever `num`'s own contract requires.
@@ -85,6 +86,14 @@ pub fn port_in(port: u16, width: u8) -> Option<u32> {
 pub fn port_out(port: u16, width: u8, value: u32) -> bool {
     let ret = unsafe { syscall(SYS_PORT_OUT, port as u64, width as u64, value as u64) };
     ret != u64::MAX
+}
+
+/// `SYS_CAP_IS_REVOKED`: raw result for a token-signature fingerprint --
+/// `0` not revoked, `1` revoked, `u64::MAX` denied (this process lacks the
+/// `revocation:query` capability). The caller must accept only exactly `0`
+/// as "not revoked" (fail closed); see `verify_file_token_with`.
+pub fn cap_is_revoked(fingerprint: u64) -> u64 {
+    unsafe { syscall(SYS_CAP_IS_REVOKED, fingerprint, 0, 0) }
 }
 
 /// PIT ticks since boot -- see `kernel/src/syscall.rs`'s `SYS_TICKS` doc
