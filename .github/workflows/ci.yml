@@ -78,6 +78,13 @@ jobs:
       - name: test blk-driver-host (host-side property tests)
         working-directory: blk-driver-host
         run: cargo test --lib
+      # Same reasoning again for net-driver-host-arm (not a workspace member;
+      # its bin target is `#![no_std] #![no_main]`, so `--lib` only). Runs the
+      # lib.rs property tests on the host triple; no --target needed since its
+      # .cargo/config.toml sets no default target.
+      - name: test net-driver-host-arm (host-side property tests)
+        working-directory: net-driver-host-arm
+        run: cargo test --lib
 
   # Freestanding x86_64-unknown-none build. Needs nightly from Phase 2
   # onward: exception handlers use `extern "x86-interrupt"`, which is still
@@ -497,6 +504,12 @@ jobs:
             net-driver-host-arm
       - name: fmt check
         run: cargo fmt --check
+      # kernel-arm isn't a workspace member, so `cargo test --workspace` never
+      # runs its host-side unit tests. The lib is `cfg_attr(not(test), no_std)`
+      # and its .cargo/config.toml sets no default target, so `--lib` on the
+      # host triple runs them (bin target is no_std/no_main, hence `--lib`).
+      - name: test (host-side unit tests)
+        run: cargo test --lib
       # tcp_proof.rs's `include_bytes!` embeds this binary at kernel-arm
       # compile time (Beta mobile item 2.5, "Stage 3: real outbound TCP at
       # EL0") — same "build the payload before the thing that embeds it"
