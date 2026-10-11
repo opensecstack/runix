@@ -231,6 +231,9 @@ struct BlkBootInfo {
     /// every other boot/test. `1` only in `kernel/tests/blk_fs_ipc.rs`,
     /// which alone spawns a second process to actually send a request.
     serve_fs_requests: u8,
+    /// Test-only fault injection (see `blk-driver-host`'s field of the same
+    /// name). Always `0` on the real boot path.
+    inject_stall_after_first_request: u8,
 }
 
 /// Filesystem driver's one fixed IPC port -- a client opens a session
@@ -1193,6 +1196,7 @@ fn load_and_run_blk_driver_host(
         reqbuf_phys,
         attempt_fat32: attempt_fat32 as u8,
         serve_fs_requests: serve_fs_requests as u8,
+        inject_stall_after_first_request: 0,
     };
     unsafe {
         (info_content.as_mut_ptr() as *mut BlkBootInfo).write(info);

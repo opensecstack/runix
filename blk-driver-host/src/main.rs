@@ -169,6 +169,14 @@ struct BlkBootInfo {
     /// to actually open a session against [`FS_SERVER_PORT`] and send a
     /// request.
     serve_fs_requests: u8,
+    /// TEST-ONLY fault injection: when non-zero (and only in FS-server
+    /// mode), the driver serves the first FS request normally, then skips
+    /// the queue-notify write for exactly the first device request of the
+    /// second one, so the device never completes it and the poll times out
+    /// (exercising the quarantine path end to end). `0` on the real boot
+    /// path and every other test; only `kernel/tests/blk_fs_quarantine.rs`
+    /// sets it, and the page is written solely by the kernel before spawn.
+    inject_stall_after_first_request: u8,
 }
 
 /// Filesystem driver's one fixed IPC port — must match
@@ -413,6 +421,12 @@ struct BlkDevice {
     /// Fail-closed quarantine: after a poll timeout the device may still own
     /// the chain and buffer, so nothing is ever posted or written again.
     health: QueueHealth,
+    /// Armed from `stall_after_first_served`; consumed by the
+    /// next `request` (skips its notify once). Always `false` in production.
+    stall_next_notify: bool,
+    /// Armed from `BlkBootInfo::inject_stall_after_first_request`; turns
+    /// `stall_next_notify` on once the first FS request has been answered.
+    stall_after_first_served: bool,
 }
 
 impl BlkDevice {
@@ -448,7 +462,14 @@ impl BlkDevice {
                 (self.status_phys, 1, true),
             ]);
         }
-        virtio::notify(self.io_base, REQUEST_QUEUE_INDEX);
+        if core::mem::take(&mut self.stall_next_notify) {
+            write_all(
+                b"blk-driver-host: TEST fault injection - skipping queue notify once
+",
+            );
+        } else {
+            virtio::notify(self.io_base, REQUEST_QUEUE_INDEX);
+        }
         let completed = poll_for_completion(&mut self.queue);
         if !completed {
             if self.health.on_timeout() {
@@ -624,6 +645,8 @@ pub extern "C" fn _start() -> ! {
         // SAFETY: as above; `REQBUF_STATUS_OFFSET` is 528, still < 4096.
         status_ptr: unsafe { base.add(REQBUF_STATUS_OFFSET) },
         health: QueueHealth::new(),
+        stall_next_notify: false,
+        stall_after_first_served: false,
     };
 
     // Phase 1's own proof writes a test pattern to sector 0 -- fine on the
@@ -642,7 +665,10 @@ pub extern "C" fn _start() -> ! {
         // documents: this mode reads (never writes) the boot sector, so it
         // shares that branch's exclusivity with Phase 1's write proof.
         match dev.read_sector(0).and_then(|s| BootSectorInfo::parse(&s)) {
-            Some(boot_info) => run_fs_ipc_server(&mut dev, &boot_info),
+            Some(boot_info) => {
+                dev.stall_after_first_served = info.inject_stall_after_first_request != 0;
+                run_fs_ipc_server(&mut dev, &boot_info)
+            }
             None => write_all(b"blk-driver-host: FS server FAIL - boot sector did not parse\n"),
         }
     } else if info.attempt_fat32 != 0 {
@@ -2552,6 +2578,9 @@ fn run_fs_ipc_server(dev: &mut BlkDevice, info: &BootSectorInfo) {
             };
             send_fs_response(session.session_id, &response);
             requests_served += 1;
+            if requests_served == 1 && core::mem::take(&mut dev.stall_after_first_served) {
+                dev.stall_next_notify = true;
+            }
             served_indices.push(idx);
         }
         for idx in served_indices.into_iter().rev() {

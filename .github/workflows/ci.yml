@@ -366,6 +366,17 @@ jobs:
         run: |
           RUNIX_BLK_IMG="$(pwd)/target/runix-fat32-test.img" \
             cargo test --target x86_64-unknown-none --test blk_fs_revoked
+      # Quarantine regression: a test-only boot-info flag makes blk-driver-host
+      # skip one queue notify so a real request times out. Serial must show
+      # the healthy step1 BEFORE the (single) QUARANTINED line.
+      - name: cargo test blk_fs_quarantine (poll timeout quarantines the device)
+        working-directory: kernel
+        run: |
+          RUNIX_BLK_IMG="$(pwd)/target/runix-fat32-test.img" \
+            cargo test --target x86_64-unknown-none --test blk_fs_quarantine 2>&1 | tee /tmp/blk_fs_quarantine.log
+          test "${PIPESTATUS[0]}" -eq 0
+          test "$(grep -c 'device QUARANTINED' /tmp/blk_fs_quarantine.log)" -eq 1
+          awk '/step1 OK/{ok=1} /device QUARANTINED/{exit !ok}' /tmp/blk_fs_quarantine.log
       # Two concurrent writers to the same FS_REQUEST_PORT. Mutates
       # WRITE.TXT and PARTIAL.TXT, so it runs AFTER every step above that
       # checks those files' earlier contents (blk_fat32_read's and
