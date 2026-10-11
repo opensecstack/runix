@@ -3,15 +3,15 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 file covers the changes since the published Alpha release, the tag
 `v0.1.0-alpha`, up to version `0.1.0-beta.1`. Every entry was derived from the
-commit history (`git log v0.1.0-alpha..HEAD`, 84 commits, 2026-10-01 to
-2026-10-11); work that already shipped in `v0.1.0-alpha` is not repeated here.
+commit history (`git log v0.1.0-alpha..HEAD`, 91 commits, 2026-10-01 to
+2026-10-12); work that already shipped in `v0.1.0-alpha` is not repeated here.
 See [docs/STATUS.md](docs/STATUS.md) for what is verified and
 [docs/BETA_CRITERIA.md](docs/BETA_CRITERIA.md) for what Beta claims and does
 not claim.
 
 ## [Unreleased]
 
-## [0.1.0-beta.1] - 2026-10-11
+## [0.1.0-beta.1] - 2026-10-12
 
 ### Security
 
