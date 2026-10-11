@@ -1,0 +1,67 @@
+name: dns-diagnose
+
+on:
+  push:
+    branches: [ci-dns-diagnose]
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+          targets: x86_64-unknown-none
+          components: llvm-tools, rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            kernel
+            xtask
+            grid-sandbox-host
+            net-driver-host
+            blk-driver-host
+      - name: install QEMU and tools
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 dnsutils tcpdump
+      - name: build grid-sandbox-host
+        working-directory: grid-sandbox-host
+        run: cargo build --target x86_64-unknown-none --release
+      - name: build net-driver-host
+        working-directory: net-driver-host
+        run: cargo build --target x86_64-unknown-none --release
+      - name: build blk-driver-host
+        working-directory: blk-driver-host
+        run: cargo build --target x86_64-unknown-none --release
+      - name: environment info
+        run: |
+          qemu-system-x86_64 --version
+          dpkg -l | grep -i slirp || true
+          cat /etc/resolv.conf
+          resolvectl status | head -30 || true
+      - name: runner network checks
+        continue-on-error: true
+        run: |
+          dig +time=3 +tries=1 @8.8.8.8 example.com || true
+          ping -c2 8.8.8.8 || true
+          NS=$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf)
+          echo "resolv.conf nameserver: $NS"
+          dig +time=3 +tries=1 @"$NS" example.com || true
+          resolvectl query example.com || true
+      - name: net_driver_dns x3 with tcpdump
+        working-directory: kernel
+        continue-on-error: true
+        run: |
+          sudo tcpdump -i any -n 'udp port 53' -l > /tmp/dns.pcap.txt 2>&1 &
+          sleep 2
+          for i in 1 2 3; do
+            echo "=== RUN $i ==="
+            echo "--- tcpdump line count before: $(wc -l < /tmp/dns.pcap.txt)"
+            cargo test --target x86_64-unknown-none --test net_driver_dns && echo "RESULT $i: PASS" || echo "RESULT $i: FAIL"
+          done
+          sleep 2
+          sudo pkill tcpdump || true
+          sleep 1
+          echo "=== tcpdump output ==="
+          cat /tmp/dns.pcap.txt
