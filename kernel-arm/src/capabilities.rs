@@ -168,6 +168,19 @@ pub fn data_reset_resource(account: u64) -> String {
     alloc::format!("data:reset:{account}")
 }
 
+/// The resource string a capability must match to authorize the EARLY
+/// (override) form of `SYS_DATA_RESET` on `account` (`x2 == 1`): a reset that
+/// does not wait for the billing period to elapse. Deliberately a separate scope
+/// from [`data_reset_resource`], which only allows the reset once the period is
+/// over: holding the ordinary reset right must not let a caller zero the counter
+/// (and lift the cap) mid-period, and `data:reset:{id}` is not a prefix match of
+/// this string, so the two cannot be confused. It is MARSHAL-gated with the SAME
+/// action as the normal reset (`data.reset_usage`) and WORM-audited as an early
+/// override.
+pub fn data_reset_early_resource(account: u64) -> String {
+    alloc::format!("data:reset-early:{account}")
+}
+
 /// The resource string a capability must match to authorize
 /// `SYS_DATA_RECONCILE`. Not account-scoped: the reconciler reads every
 /// account's state in one pass (and writes only incident evidence to the
@@ -536,6 +549,38 @@ mod tests {
         for a in [0u64, 1, 99, u64::MAX] {
             assert_ne!(data_reset_resource(a), data_usage_resource(a));
             assert_ne!(data_reset_resource(a), data_session_resource(a));
+        }
+    }
+
+    #[test]
+    fn early_reset_is_a_separate_scope_from_the_normal_reset() {
+        assert_eq!(data_reset_early_resource(1), "data:reset-early:1");
+        let now = 0u64;
+        let issue = |resource: String| {
+            CapabilityToken::issue(
+                "el0:arm-demo",
+                resource,
+                now,
+                now + 100,
+                "demo-key",
+                &demo_signing_key(),
+            )
+        };
+        let vk = demo_verifying_key();
+        let early = issue(data_reset_early_resource(1));
+        let normal = issue(data_reset_resource(1));
+        assert!(early
+            .verify(&vk, &data_reset_early_resource(1), now)
+            .is_ok());
+        assert!(early.verify(&vk, &data_reset_resource(1), now).is_err());
+        assert!(early
+            .verify(&vk, &data_reset_early_resource(0), now)
+            .is_err());
+        assert!(normal
+            .verify(&vk, &data_reset_early_resource(1), now)
+            .is_err());
+        for a in [0u64, 1, 99, u64::MAX] {
+            assert_ne!(data_reset_early_resource(a), data_reset_resource(a));
         }
     }
 

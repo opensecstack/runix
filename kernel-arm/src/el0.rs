@@ -269,7 +269,8 @@ const SYS_DATA_ACCOUNT: u64 = 19;
 const SYS_DATA_SESSION_OPEN: u64 = 20;
 const SYS_DATA_SESSION_CLOSE: u64 = 21;
 const SYS_DATA_RECONCILE: u64 = 22;
-// 23 is the governed usage-period reset (MARSHAL-gated).
+// 23 is the governed usage-period reset (MARSHAL-gated). x1 = account, x2 =
+// mode (0 normal, 1 early override); x2 must always be set explicitly.
 const SYS_DATA_RESET: u64 = 23;
 // 24 is the read-only billing-period advice (capability-checked, not gated).
 const SYS_DATA_PERIOD: u64 = 24;
@@ -546,8 +547,13 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         // SYS_DATA_RESET(0) -- capability data:reset:0, then MARSHAL
         // (data.reset_usage, the walk's eighth evaluation), then usage
         // 1600 -> 0 with the reconciler's memory cleared. Closes no session.
+        // x2 = mode 0 (normal): the billing-period gate needs account 0's
+        // period ELAPSED, which it is by now (500 ms demo period, walk is
+        // seconds in). x2 MUST be set: it is the mode argument and would
+        // otherwise be whatever the previous syscall left there.
         "mov x0, {sys_data_reset}",
         "mov x1, #0",
+        "mov x2, #0",
         "svc #0",
         // SYS_DATA_SESSION_OPEN(0, 0, 0) -- now Allow: service restored.
         "mov x0, {sys_data_session_open}",
@@ -580,11 +586,43 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         // state is read, MARSHAL consulted or counter touched.
         "mov x0, {sys_data_reset}",
         "mov x1, #99",
+        "mov x2, #0",
         "svc #0",
         // SYS_DATA_PERIOD(99) -- no data:session:99 capability: DENIED before
         // any period is read or any marker written.
         "mov x0, {sys_data_period}",
         "mov x1, #99",
+        "svc #0",
+        // --- Billing-period gate on the reset. Account 1 is DEMO DATA with a
+        // one-day period, so it is ACTIVE for the whole boot (no timing race).
+        // SYS_DATA_RESET(1, normal) -- capability data:reset:1 is held, but
+        // the period is still active: REFUSED (code 7) before MARSHAL; no
+        // evaluation, no period started.
+        "mov x0, {sys_data_reset}",
+        "mov x1, #1",
+        "mov x2, #0",
+        "svc #0",
+        // SYS_DATA_RESET(0, early) -- account 0 holds data:reset:0 but NOT
+        // data:reset-early:0: DENIED (code 1) before anything else, so the
+        // ordinary reset right does not buy an early reset.
+        "mov x0, {sys_data_reset}",
+        "mov x1, #0",
+        "mov x2, #1",
+        "svc #0",
+        // SYS_DATA_RESET(1, mode 7) -- no such mode: refused (code 9) before any
+        // capability is chosen.
+        "mov x0, {sys_data_reset}",
+        "mov x1, #1",
+        "mov x2, #7",
+        "svc #0",
+        // SYS_DATA_RESET(1, early) -- data:reset-early:1 is held, so the active
+        // period no longer blocks it: MARSHAL (data.reset_usage, the walk's
+        // ninth evaluation) decides. Fail-closed on unreachable (code 6), code 2
+        // on Refuse, authorized (code 0) where the proxy executes. WORM-audited
+        // as an EARLY override.
+        "mov x0, {sys_data_reset}",
+        "mov x1, #1",
+        "mov x2, #1",
         "svc #0",
         // SYS_SIM_INSTALL(0, 0, 0x6666) -- expected to FAIL: re-installing
         // over the live Enabled profile would swap its identity (and, with

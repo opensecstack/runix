@@ -119,6 +119,17 @@ pub fn open_demo_account() -> Result<AccountId, AccountError> {
         .open_account(SubscriberId(0xD0_0001), PlanId(1))
 }
 
+/// Opens the SECOND compiled-in demo account (**DEMO DATA ONLY**), account 1 on a
+/// fresh boot, after [`open_demo_account`]. It owns no profile and is never fed
+/// usage; it exists so the boot proof of the data reset's billing-period gate has
+/// an account whose (long) period is Active throughout (see
+/// `data_codes::demo_period`).
+pub fn open_second_demo_account() -> Result<AccountId, AccountError> {
+    REGISTRY
+        .lock()
+        .open_account(SubscriberId(0xD0_0002), PlanId(1))
+}
+
 /// Binds `(slot, profile)` to `account`, subject to the registry's own rules
 /// (not already bound, not Deleted, account not Closed, ...).
 pub fn bind(account: u64, slot: usize, profile: u8) -> Result<(), AccountError> {

@@ -439,6 +439,20 @@ fn el1_setup() -> ! {
         ),
         Err(e) => serial_println!("Runix ARM kernel: MVNO demo account open FAILED ({:?})", e),
     }
+    // A second demo account (account 1) for the reset's billing-period proof: its
+    // demo period is a day long, so it is Active for the whole boot (account 0's
+    // 500 ms period is long over by the time the walk resets it). It owns no
+    // profile and is never fed usage.
+    match crate::mvno::open_second_demo_account() {
+        Ok(id) => serial_println!(
+            "Runix ARM kernel: MVNO second demo account opened (account {}, DEMO DATA ONLY)",
+            id.0
+        ),
+        Err(e) => serial_println!(
+            "Runix ARM kernel: MVNO second demo account open FAILED ({:?})",
+            e
+        ),
+    }
     // Data policy layer (Beta item 4.3). Three SEPARATELY scoped grants, all
     // for account 0 only: session access (open/close), the usage FEED, and
     // the reconciler. The feed is its own resource because it is privileged --
@@ -462,6 +476,17 @@ fn el1_setup() -> ! {
     // el0_demo's SYS_DATA_RESET(99) is the denial proof.
     crate::capabilities::issue_and_hold(crate::capabilities::data_reset_resource(0), now);
     serial_println!("Runix ARM kernel: data reset capability issued (account 0, demo trust root)");
+    // Billing-period gate proof (accounts 0 and 1): a NORMAL reset needs an
+    // elapsed period; the EARLY override reset is its own scope
+    // (`data:reset-early:{account}`). Account 0 deliberately gets NO early grant
+    // (el0_demo's early reset on it is the denial proof); account 1 gets both
+    // (normal -> refused, period active; early -> follows the MARSHAL verdict).
+    crate::capabilities::issue_and_hold(crate::capabilities::data_reset_resource(1), now);
+    serial_println!("Runix ARM kernel: data reset capability issued (account 1, demo trust root)");
+    crate::capabilities::issue_and_hold(crate::capabilities::data_reset_early_resource(1), now);
+    serial_println!(
+        "Runix ARM kernel: data early-reset capability issued (account 1, demo trust root)"
+    );
     // Billing period for account 0 (DEMO DATA ONLY, like the entitlement table
     // and the demo account): a period is plain DATA -- start tick and length --
     // and this is the only place one is created; afterwards only a governed
@@ -487,6 +512,25 @@ fn el1_setup() -> ! {
         },
         None => serial_println!(
             "Runix ARM kernel: demo billing period install FAILED (no valid period for account 0)"
+        ),
+    }
+    // Account 1's long (one day) period: Active for the whole boot, so the
+    // period-gate proof on it does not depend on wall-clock timing.
+    match runix_kernel_arm::data_codes::demo_period(1, freq) {
+        Some(p) => match crate::data::set_period(1, p) {
+            Ok(()) => serial_println!(
+                "Runix ARM kernel: demo billing period installed (account 1, start tick {}, length {} ticks = {} ms at {} Hz, DEMO DATA ONLY)",
+                p.start_tick(),
+                p.length_ticks(),
+                runix_kernel_arm::data_codes::DEMO_LONG_PERIOD_MILLIS,
+                freq
+            ),
+            Err(_) => {
+                serial_println!("Runix ARM kernel: demo billing period install FAILED (table full)")
+            }
+        },
+        None => serial_println!(
+            "Runix ARM kernel: demo billing period install FAILED (no valid period for account 1)"
         ),
     }
     // Network-selection proof (`mvno_proof.rs`) on its own local registry;

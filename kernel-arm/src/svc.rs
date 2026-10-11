@@ -95,7 +95,9 @@
 //!   20   SYS_DATA_SESSION_OPEN        account, slot, profile|roam<<8   data:session:{account}
 //!   21   SYS_DATA_SESSION_CLOSE       account, slot, profile           data:session:{account}
 //!   22   SYS_DATA_RECONCILE           (none)                           data:reconcile
-//!   23   SYS_DATA_RESET               account                          data:reset:{account} + MARSHAL
+//!   23   SYS_DATA_RESET               account, mode (0 normal/1 early) data:reset:{account} (normal, once the
+//!                                                                      period elapsed) or data:reset-early:{account}
+//!                                                                      (early override), + MARSHAL
 //!   24   SYS_DATA_PERIOD              account                          data:session:{account}
 //!   ```
 //!
@@ -110,7 +112,9 @@
 //!   argument; `RECONCILE` -> the incident count (`u64::MAX` = denied);
 //!   `RESET` -> `0` reset / `1` no capability / `2` MARSHAL Refuse or HardStop
 //!   / `3` MARSHAL local failure (fail closed) / `4` no entitlement / `5` no
-//!   such account / `6` MARSHAL unreachable (fail closed); `PERIOD` -> `0`
+//!   such account / `6` MARSHAL unreachable (fail closed) / `7` normal reset
+//!   refused, billing period still active / `8` clock before the period start
+//!   / `9` unknown mode argument; `PERIOD` -> `0`
 //!   active / `1` elapsed: reset REQUESTED / `2` clock before the period start /
 //!   `3` no billing period / `4` denied. The
 //!   third `SESSION_OPEN` argument packs `profile` in bits 0..=7 and the
@@ -362,9 +366,12 @@ pub const SYS_DATA_SESSION_CLOSE: u64 = 21;
 /// policy; incidents are printed and WORM-recorded, nothing is corrected.
 /// Capability: `data_reconcile_resource()`.
 pub const SYS_DATA_RECONCILE: u64 = 22;
-/// `SYS_DATA_RESET(account)`: start a new usage period -- zero the account's
+/// `SYS_DATA_RESET(account, mode)`: start a new usage period -- zero the account's
 /// counter (lifting any cap it had hit) and clear the reconciler's memory of it.
-/// Capability `data_reset_resource(account)`, then the MARSHAL gate
+/// `mode` (`x2`) 0 = normal, allowed once the billing period has elapsed,
+/// capability `data_reset_resource(account)`; 1 = early override, capability
+/// `data_reset_early_resource(account)`; other values are refused. After the
+/// capability and the billing-period gate comes the MARSHAL gate
 /// (`data.reset_usage`), then the mutation, then a WORM entry. The ONE
 /// MARSHAL-gated data syscall (see this module's doc comment). Closes no
 /// session and changes no standing or profile.
@@ -1254,7 +1261,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         SYS_DATA_SESSION_OPEN => data_session_open(arg1, arg2 as usize, arg3),
         SYS_DATA_SESSION_CLOSE => data_session_close(arg1, arg2 as usize, arg3),
         SYS_DATA_RECONCILE => data_reconcile(),
-        SYS_DATA_RESET => data_reset(arg1),
+        SYS_DATA_RESET => data_reset(arg1, arg2),
         SYS_DATA_PERIOD => data_period(arg1),
         // The one arm that may not return to EL0 (see this constant's doc
         // comment and `el0_proof::finish`): on the proof path it resumes an
@@ -1928,14 +1935,27 @@ fn data_period(account: u64) -> u64 {
     code
 }
 
-/// `SYS_DATA_RESET(account)`: the governed usage-period reset.
+/// `SYS_DATA_RESET(account, mode)`: the governed usage-period reset.
+///
+/// `mode` (`x2`): `0` = normal reset, allowed only once the account's billing
+/// period has elapsed; `1` = EARLY (override) reset, which may also end a period
+/// that is still active. Anything else is refused ([`RESET_BAD_MODE`]) before
+/// any capability is chosen. The two modes are different capability scopes
+/// (`data:reset:{account}` / `data:reset-early:{account}`) but the SAME MARSHAL
+/// action (`data.reset_usage`); the early reset is not a new action type.
 ///
 /// Order, each step before the next and none skippable:
-/// 1. capability `data:reset:{account}` (re-run every call);
-/// 2. the cheap local checks -- an entitlement exists and the account exists
-///    (no point spending a MARSHAL round trip on a reset that cannot happen,
-///    the same reasoning as `mvno::gate_enable` ahead of `SYS_SIM_ENABLE`'s
-///    gate);
+/// 1. the chosen capability (re-run every call);
+/// 2. the cheap local checks -- an entitlement exists, the account exists, and
+///    the billing-period gate ([`runix_mobile::period::reset_permitted`]: a
+///    normal reset needs an `Elapsed` period, an early one also passes an
+///    `Active` one, `ClockBeforeStart` is refused for both; an account with NO
+///    period is not period-gated, as before periods existed). A refusal here
+///    is WORM-audited `authorized=false`, starts no period and leaves the
+///    request marker alone. (No point spending a MARSHAL round trip on a reset
+///    that cannot happen, the same reasoning as `mvno::gate_enable` ahead of
+///    `SYS_SIM_ENABLE`'s gate.) A successful reset installs a new `Active`
+///    period, which is what limits a normal reset to once per period;
 /// 3. MARSHAL evaluate + enforce ([`marshal_gate`], `data.reset_usage`). NO
 ///    lock is held here: the evaluation can drive a nested EL0 excursion, which
 ///    must never run under a spin lock. A block returns with state untouched;
@@ -1948,14 +1968,39 @@ fn data_period(account: u64) -> u64 {
 /// This lifts a cap, so it is the consequential data action. It does NOT close
 /// sessions, change standing or touch profiles: the caller lifted the cap, and
 /// opening a session afterwards is a separate decision by the policy engine.
-fn data_reset(account: u64) -> u64 {
+fn data_reset(account: u64, mode_arg: u64) -> u64 {
     use runix_kernel_arm::data_codes::{
-        demo_entitlement, describe_period_started, reset_blocked_code, RESET_DENIED_CAPABILITY,
+        demo_entitlement, describe_period_started, describe_reset_mode, reset_blocked_code,
+        reset_refusal_code, ResetMode, RESET_BAD_MODE, RESET_DENIED_CAPABILITY,
         RESET_NO_ENTITLEMENT, RESET_NO_SUCH_ACCOUNT, RESET_OK,
     };
-    let resource = crate::capabilities::data_reset_resource(account);
+    let Some(mode) = ResetMode::from_arg(mode_arg) else {
+        // Serial-only: no capability can be named for a mode that does not
+        // exist, and a WORM entry here would let a caller grow the chain by
+        // spamming bad arguments (the same rule as a malformed SESSION_CLOSE).
+        serial_println!(
+            "\nSVC: SYS_DATA_RESET account {} REFUSED (unknown mode {}; 0 = normal, 1 = early)",
+            account,
+            mode_arg
+        );
+        return RESET_BAD_MODE;
+    };
+    let early = mode.is_early();
+    // The early reset has its own serial label so the normal path's lines (which
+    // CI greps) keep their exact text and an early line can never be mistaken
+    // for one.
+    let label = if early {
+        "SYS_DATA_RESET(early)"
+    } else {
+        "SYS_DATA_RESET"
+    };
+    let resource = if early {
+        crate::capabilities::data_reset_early_resource(account)
+    } else {
+        crate::capabilities::data_reset_resource(account)
+    };
     if let Err(e) = check(&resource) {
-        serial_println!("\nSVC: SYS_DATA_RESET account {} DENIED ({})", account, e);
+        serial_println!("\nSVC: {} account {} DENIED ({})", label, account, e);
         return RESET_DENIED_CAPABILITY;
     }
     if demo_entitlement(account).is_none() {
@@ -1969,7 +2014,8 @@ fn data_reset(account: u64) -> u64 {
             )),
         );
         serial_println!(
-            "\nSVC: SYS_DATA_RESET account {} FAILED (no data entitlement for this account)",
+            "\nSVC: {} account {} FAILED (no data entitlement for this account)",
+            label,
             account
         );
         return RESET_NO_ENTITLEMENT;
@@ -1983,28 +2029,56 @@ fn data_reset(account: u64) -> u64 {
             Some(String::from("refused: no such account in the registry")),
         );
         serial_println!(
-            "\nSVC: SYS_DATA_RESET account {} FAILED (no such account)",
+            "\nSVC: {} account {} FAILED (no such account)",
+            label,
             account
         );
         return RESET_NO_SUCH_ACCOUNT;
     }
+    // The billing-period gate, before MARSHAL (a refusal costs no round trip).
+    // Read-only: `assess_period_of` does not touch the request marker. `now` is
+    // read here; the tick the next period starts at is re-read after the gate.
+    // (Check and apply are separate critical sections, which is sound with the
+    // one EL0 context and IRQs masked in the SVC handler, as noted in `data.rs`.)
+    let assessment = crate::data::assess_period_of(account, now_ticks());
+    let mode_text = describe_reset_mode(mode, &assessment);
+    if let Err(refusal) = runix_mobile::period::reset_permitted(assessment, early) {
+        audit_event(
+            &resource,
+            "usage period in force",
+            "usage period in force",
+            false,
+            Some(format!("refused: {refusal}; {mode_text}")),
+        );
+        serial_println!("\nSVC: {} account {} REFUSED ({})", label, account, refusal);
+        let (entries, chain_ok) = audit_chain_summary();
+        serial_println!(
+            "SVC: {} account {} period refusal audited to WORM (authorized=false; entries {}, chain verified {})",
+            label,
+            account,
+            entries,
+            chain_ok
+        );
+        return reset_refusal_code(&refusal);
+    }
     // No lock held across this call. A block leaves usage and `last_used` alone.
     // Fail-CLOSED on an unreachable MARSHAL (`unreachable_policy`): a reset
     // restores service, so no verdict means no reset; that denial is audited
-    // inside `enforce_gate`.
+    // inside `enforce_gate`. The early reset passes the SAME action and so the
+    // same policy; only the audited `to` text names it as an override.
     let verdict = match marshal_gate(
         &MarshalAction::DataResetUsage { account },
         &resource,
         "usage period in force",
-        "new usage period (counter reset)",
+        if early {
+            "new usage period (counter reset; EARLY override)"
+        } else {
+            "new usage period (counter reset)"
+        },
     ) {
         Ok(allowed) => verdict_text(allowed),
         Err(blocked) => {
-            serial_println!(
-                "\nSVC: SYS_DATA_RESET account {} DENIED ({})",
-                account,
-                blocked
-            );
+            serial_println!("\nSVC: {} account {} DENIED ({})", label, account, blocked);
             return reset_blocked_code(&blocked);
         }
     };
@@ -2024,15 +2098,18 @@ fn data_reset(account: u64) -> u64 {
         true,
         Some(reason_with_verdict(
             Some(format!(
-                "usage period reset (new period); reconciler memory cleared; no session, standing or profile changed; {period_text}"
+                "usage period reset (new period); reconciler memory cleared; no session, standing or profile changed; {mode_text}; {period_text}"
             )),
             &verdict,
         )),
     );
     let (entries, chain_ok) = audit_chain_summary();
+    let early_tag = if early { "EARLY override reset; " } else { "" };
     serial_println!(
-        "\nSVC: SYS_DATA_RESET account {} authorized (usage {} -> {}; new period; {}; WORM entries {}, chain verified {})",
+        "\nSVC: {} account {} authorized ({}usage {} -> {}; new period; {}; WORM entries {}, chain verified {})",
+        label,
         account,
+        early_tag,
         before.used_bytes,
         after.used_bytes,
         verdict,
@@ -2040,7 +2117,8 @@ fn data_reset(account: u64) -> u64 {
         chain_ok
     );
     serial_println!(
-        "SVC: SYS_DATA_RESET account {} billing period: {}",
+        "SVC: {} account {} billing period: {}",
+        label,
         account,
         period_text
     );

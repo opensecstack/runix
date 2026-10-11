@@ -89,8 +89,9 @@
 //! # DEMO DATA ONLY
 //!
 //! Entitlements come from `data_codes::demo_entitlement` and billing periods
-//! from `data_codes::demo_period` (account 0 only, installed at boot by
-//! `nonsecure.rs`); there is no provisioning path.
+//! from `data_codes::demo_period` (accounts 0 and 1, installed at boot by
+//! `nonsecure.rs`; account 1's period is a day long, for the boot proof of the
+//! reset's period gate); there is no provisioning path.
 
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -99,7 +100,7 @@ use runix_kernel_arm::data_codes::{build_observed, ProfileRow};
 use runix_kernel_arm::data_state::{
     DataSession, DataState, OpenOutcome, PeriodAdvice, PeriodStarted, TableFull, UsageEntry,
 };
-use runix_mobile::period::{BillingPeriod, ObservedPeriod};
+use runix_mobile::period::{assess_period, BillingPeriod, ObservedPeriod, PeriodAssessment};
 use runix_mobile::policy::{
     AccountStandingForData, DataEntitlement, DataUsage, ProfileLifecycleForData,
 };
@@ -142,6 +143,15 @@ pub fn set_period(account: u64, period: BillingPeriod) -> Result<(), TableFull> 
 /// period. Advice only -- nothing is reset or restricted.
 pub fn advise_period(account: u64, now: u64) -> Option<PeriodAdvice> {
     DATA.lock().advise_period(account, now)
+}
+
+/// Assess `account`'s period at `now` WITHOUT touching the request marker (unlike
+/// [`advise_period`]): the read the governed reset's period gate makes before
+/// MARSHAL. `None`: the account has no billing period. Read-only.
+pub fn assess_period_of(account: u64, now: u64) -> Option<PeriodAssessment> {
+    DATA.lock()
+        .period_of(account)
+        .map(|p| assess_period(&p, now))
 }
 
 /// Copies of every billing period (with its request marker) for the reconciler.
