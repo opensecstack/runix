@@ -146,7 +146,7 @@ pub fn try_recv(port: usize) -> Option<u8> {
 pub fn is_empty(port: usize) -> bool {
     CHANNELS
         .get(port)
-        .is_none_or(|channel| channel.lock().queue.is_empty())
+        .map_or(true, |channel| channel.lock().queue.is_empty())
 }
 
 /// Blocks (spin-yielding) until a byte is available on `port`; `None`

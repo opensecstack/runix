@@ -63,7 +63,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ] {
             let r = unsafe { syscall(num, bad, 0, 0) };
             if r != u64::MAX {
-                serial_println!("ipc_bad_port: FAIL syscall {} port {:#x} -> {:#x}", num, bad, r);
+                serial_println!(
+                    "ipc_bad_port: FAIL syscall {} port {:#x} -> {:#x}",
+                    num,
+                    bad,
+                    r
+                );
                 exit_qemu(QemuExitCode::Failed);
             }
         }

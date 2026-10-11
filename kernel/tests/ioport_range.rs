@@ -68,18 +68,46 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     let top = "ioport:65520-65535"; // 0xFFF0-0xFFFF
     check("0xFFFF w1", ioport_access_within(top, 0xFFFF, 1), true);
-    check("0xFFFF w2 overflow", ioport_access_within(top, 0xFFFF, 2), false);
-    check("0xFFFF w4 overflow", ioport_access_within(top, 0xFFFF, 4), false);
-    check("0xFFFE w4 overflow", ioport_access_within(top, 0xFFFE, 4), false);
-    check("0xFFFC w4 fills", ioport_access_within(top, 0xFFFC, 4), true);
+    check(
+        "0xFFFF w2 overflow",
+        ioport_access_within(top, 0xFFFF, 2),
+        false,
+    );
+    check(
+        "0xFFFF w4 overflow",
+        ioport_access_within(top, 0xFFFF, 4),
+        false,
+    );
+    check(
+        "0xFFFE w4 overflow",
+        ioport_access_within(top, 0xFFFE, 4),
+        false,
+    );
+    check(
+        "0xFFFC w4 fills",
+        ioport_access_within(top, 0xFFFC, 4),
+        true,
+    );
 
     // Issuer overflow / empty range must not panic and must grant nothing.
     let over = ioport_range_resource(0xFFF0, 0x20);
-    check("issuer overflow grants nothing", ioport_access_within(&over, 0xFFF0, 1), false);
+    check(
+        "issuer overflow grants nothing",
+        ioport_access_within(&over, 0xFFF0, 1),
+        false,
+    );
     let empty = ioport_range_resource(0x100, 0);
-    check("issuer len 0 grants nothing", ioport_access_within(&empty, 0x100, 1), false);
+    check(
+        "issuer len 0 grants nothing",
+        ioport_access_within(&empty, 0x100, 1),
+        false,
+    );
 
-    check("inverted range", ioport_access_within("ioport:100-50", 75, 1), false);
+    check(
+        "inverted range",
+        ioport_access_within("ioport:100-50", 75, 1),
+        false,
+    );
     check("not ioport", ioport_access_within("port:5", 5, 1), false);
 
     serial_println!("ioport_range: PASS");
