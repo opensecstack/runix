@@ -61,8 +61,9 @@ relationship or the business.
    `account`; rejects `slot`, `profile`, `module_id`, `instance_id`) and
    attributes its WORM entry to module `data`. The upstream CITADEL `rbacMap`
    needs a `data.reset_usage` entry in both the admin and operator lists; that
-   entry was prepared as a separate change and, at the time of writing, had not
-   been merged upstream.
+   entry was added as opensecstack PR #84 and merged into
+   `release/ecosystem-v1.2.0-rc` on 2026-10-10 (a CITADEL built from an older
+   tree would still refuse the action).
 
 ## Consequences
 
@@ -92,9 +93,10 @@ Worse, or left open:
   still a governed caller action.)
 - **One more MARSHAL evaluation per boot** (eight, up from seven), a measured
   cost of roughly half a second of host CPU.
-- **Upstream dependency.** Until the `rbacMap` entry is merged, a live CITADEL
-  hard-REFUSEs `data.reset_usage` at Gate 2. CI's mock CITADEL always answers
-  `EXECUTE`, so CI cannot see this.
+- **Upstream dependency.** The `rbacMap` entry is merged (PR #84), but a
+  CITADEL deployment built from an older tree hard-REFUSEs `data.reset_usage` at
+  Gate 2. CI's mock CITADEL always answers `EXECUTE`, so CI cannot see which
+  tree a deployment runs.
 
 ## Alternatives considered
 

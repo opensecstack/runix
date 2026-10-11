@@ -2501,13 +2501,13 @@ own Verifier identity (`sig_verifier`) and records its own WORM verification
 entry, attributed to module `esim`, `mvno` or `data` (the reset's instance is
 `account-N`). CITADEL's server-side `rbacMap` carries entries for the eSIM and
 MVNO actions (`esim.*` merged from `opensecstack` `b575903`; `mvno.*` via
-opensecstack PR #83). As of 2026-10-11 the `data.reset_usage` entry is a local,
-unpushed change in an opensecstack checkout and is not merged upstream. This
-repository cannot show that checkout's state, so the claim is as reported. Until
-the entry is merged, a live CITADEL is expected to hard-REFUSE the action at
-Gate 2, and the kernel would print `DENIED (MARSHAL Refuse)` and leave the
-counter alone. CI's mock CITADEL answers EXECUTE for any request, so CI cannot
-show this.
+opensecstack PR #83) and, since opensecstack PR #84 (merged into
+`release/ecosystem-v1.2.0-rc` on 2026-10-10), for `data.reset_usage`. A CITADEL
+built from a tree older than that merge would hard-REFUSE the action at Gate 2,
+and the kernel would then print `DENIED (MARSHAL Refuse)` and leave the counter
+alone. CI's mock CITADEL answers EXECUTE for any request, so CI cannot show
+whether a given deployment has the entry; that is a deployment question this
+repository cannot answer.
 
 Not closed:
 
