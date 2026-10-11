@@ -146,6 +146,10 @@ name = "blk_fs_ipc"
 harness = false
 
 [[test]]
+name = "blk_fs_revoked"
+harness = false
+
+[[test]]
 name = "blk_fs_concurrent"
 harness = false
 
@@ -179,6 +183,10 @@ harness = false
 
 [[test]]
 name = "ipc_bad_port"
+harness = false
+
+[[test]]
+name = "cap_is_revoked"
 harness = false
 
 [[test]]

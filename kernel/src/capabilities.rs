@@ -95,6 +95,14 @@ pub fn random_resource() -> String {
     "random".into()
 }
 
+/// The resource string a capability must match to authorize
+/// `SYS_CAP_IS_REVOKED`. Held (as an extra capability) only by
+/// `blk-driver-host`, so arbitrary ring-3 code cannot probe the revocation
+/// list.
+pub fn revocation_query_resource() -> String {
+    "revocation:query".into()
+}
+
 /// The resource-string convention for port-I/O access: one capability
 /// covers a whole inclusive port range, not one token per port — matching
 /// the granularity `port_resource` already uses for IPC (one token per
@@ -189,6 +197,14 @@ pub fn revoke(token: &CapabilityToken) {
 
 pub fn is_revoked(token: &CapabilityToken) -> bool {
     REVOCATIONS.lock().is_revoked(token)
+}
+
+/// Whether any revoked token's signature has `fingerprint`
+/// ([`runix_capability_manager::signature_fingerprint`]). Backs
+/// `SYS_CAP_IS_REVOKED`; see `RevocationList::is_fingerprint_revoked` for
+/// the fail-closed collision reasoning.
+pub fn is_fingerprint_revoked(fingerprint: u64) -> bool {
+    REVOCATIONS.lock().is_fingerprint_revoked(fingerprint)
 }
 
 /// The "look up caller's token, check not revoked, check the resource"

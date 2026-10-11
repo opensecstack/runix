@@ -1241,7 +1241,19 @@ fn load_and_run_blk_driver_host(
             blk_driver_host_trampoline,
             space,
             Some(blk_token),
-            alloc::vec![fs_server_token],
+            alloc::vec![
+                fs_server_token,
+                // Gates SYS_CAP_IS_REVOKED, which the driver consults on
+                // every file-token check (fails closed without it).
+                runix_capability_manager::CapabilityToken::issue(
+                    "blk-driver-host",
+                    runix_kernel::capabilities::revocation_query_resource(),
+                    now,
+                    now + 1_000_000,
+                    "demo-key",
+                    signing_key,
+                ),
+            ],
         );
     } else {
         runix_kernel::scheduler::spawn_ring3_process_with_capability(

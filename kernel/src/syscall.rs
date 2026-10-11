@@ -109,6 +109,21 @@ pub const SYS_IPC_SESSION_SEND_LOCK: u64 = 14;
 /// rdi = session id -> 0 ok, `u64::MAX` if the caller isn't a participant.
 /// Session-scoped equivalent of [`SYS_IPC_SEND_UNLOCK`].
 pub const SYS_IPC_SESSION_SEND_UNLOCK: u64 = 15;
+/// rdi = 64-bit fingerprint of a capability token's signature
+/// (`runix_capability_manager::signature_fingerprint`: first 8 bytes of the
+/// decoded Ed25519 signature, little-endian) -> 1 if some revoked token has
+/// that fingerprint, 0 if none does, `u64::MAX` if the caller is denied.
+/// Callers MUST treat `u64::MAX` (and any value other than 0) as "revoked":
+/// fail closed. Scalar-only like every other syscall here: a 64-byte
+/// signature cannot travel in three registers and this ABI deliberately
+/// takes no user pointers, so the query is by fingerprint. A prefix match
+/// can only yield a false "revoked" (a ~2^-64 collision), never a false
+/// "not revoked"; and a forged signature cannot benefit, since it fails
+/// Ed25519 verification on its own. Gated on the `"revocation:query"`
+/// resource (`capabilities::revocation_query_resource`), held as an extra
+/// capability by `blk-driver-host` only; the query leaks nothing beyond
+/// whether a given fingerprint is revoked.
+pub const SYS_CAP_IS_REVOKED: u64 = 16;
 
 pub const VECTOR: u8 = 0x80;
 
@@ -178,11 +193,16 @@ fn authorized_for_port(port: usize) -> bool {
 /// token as an extra one via `spawn_ring3_process_with_capabilities`), not
 /// as the sole capability a process is spawned with.
 fn authorized_for_random() -> bool {
-    let resource = crate::capabilities::random_resource();
+    authorized_for_resource(&crate::capabilities::random_resource())
+}
+
+/// [`authorized_for_random`]'s check for an arbitrary process-wide
+/// `resource` (main capability first, then extras).
+fn authorized_for_resource(resource: &str) -> bool {
     let now = crate::interrupts::ticks();
     let token_authorizes = |token: &runix_capability_manager::CapabilityToken| {
         !crate::capabilities::is_revoked(token)
-            && crate::capabilities::check(token, &resource, now).is_ok()
+            && crate::capabilities::check(token, resource, now).is_ok()
     };
     crate::scheduler::current_capability().is_some_and(|token| token_authorizes(&token))
         || crate::scheduler::current_extra_capabilities()
@@ -406,6 +426,12 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             } else {
                 u64::MAX
             }
+        }
+        SYS_CAP_IS_REVOKED => {
+            if !authorized_for_resource(&crate::capabilities::revocation_query_resource()) {
+                return u64::MAX;
+            }
+            u64::from(crate::capabilities::is_fingerprint_revoked(arg1))
         }
         _ => u64::MAX,
     }
