@@ -1072,4 +1072,106 @@ mod tests {
         // `serve_one` only returns after `submit`/refusal completes
         // synchronously on the same thread that would have connected.
     }
+
+    // --- Real CITADEL answers REFUSE / HARD_STOP with HTTP 403 + the full
+    // Decision body (handlers/marshal.go); 200 only for EXECUTE. ---
+
+    fn decision_body(outcome: &str) -> String {
+        format!(
+            "{{\"execution_id\":\"00000000-0000-0000-0000-000000000000\",\"outcome\":\"{outcome}\",\"gates\":[],\"reasons\":[],\"ts_utc\":\"2026-07-26T12:00:01Z\"}}"
+        )
+    }
+
+    fn http_response(status_line: &str, body: &str) -> &'static str {
+        let s = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        Box::leak(s.into_boxed_str())
+    }
+
+    /// Runs one minimal envelope through the proxy against a mock CITADEL
+    /// that replies with `response`.
+    fn proxy_against(response: &'static str) -> MarshalResponse {
+        let transport = HttpKerkeseTransport::new(Some(spawn_mock_server(response)));
+        let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+        let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
+        let signing_key = test_signing_key();
+        let worm_log = Mutex::new(WormLog::default());
+        let handle = std::thread::spawn(move || {
+            serve_one(&proxy_listener, &transport, &signing_key, &worm_log)
+        });
+        let req = MarshalRequest {
+            kerkese_json: minimal_envelope_json(),
+        };
+        let response = round_trip(proxy_addr, &req);
+        handle
+            .join()
+            .expect("proxy thread panicked")
+            .expect("serve_one");
+        response
+    }
+
+    #[test]
+    fn http_403_refuse_decision_becomes_refuse() {
+        let r = proxy_against(http_response("403 Forbidden", &decision_body("REFUSE")));
+        match r {
+            MarshalResponse::Decision { outcome, .. } => {
+                assert_eq!(outcome, MarshalOutcome::Refuse)
+            }
+            other => panic!("expected Decision Refuse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_403_hard_stop_decision_becomes_hard_stop() {
+        let r = proxy_against(http_response("403 Forbidden", &decision_body("HARD_STOP")));
+        match r {
+            MarshalResponse::Decision { outcome, .. } => {
+                assert_eq!(outcome, MarshalOutcome::HardStop)
+            }
+            other => panic!("expected Decision HardStop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_403_garbage_body_stays_bad_response() {
+        let r = proxy_against(http_response("403 Forbidden", "not json"));
+        assert!(matches!(
+            r,
+            MarshalResponse::Error(MarshalError::BadResponse(_))
+        ));
+    }
+
+    #[test]
+    fn http_403_with_execute_decision_never_becomes_execute() {
+        let r = proxy_against(http_response("403 Forbidden", &decision_body("EXECUTE")));
+        assert!(matches!(
+            r,
+            MarshalResponse::Error(MarshalError::BadResponse(_))
+        ));
+    }
+
+    #[test]
+    fn http_200_execute_decision_unchanged() {
+        let r = proxy_against(http_response("200 OK", &decision_body("EXECUTE")));
+        match r {
+            MarshalResponse::Decision { outcome, .. } => {
+                assert_eq!(outcome, MarshalOutcome::Execute)
+            }
+            other => panic!("expected Decision Execute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_500_and_400_stay_bad_response() {
+        for status in ["500 Internal Server Error", "400 Bad Request"] {
+            // Even with a blocked-Decision-shaped body, only 403 is trusted.
+            let r = proxy_against(http_response(status, &decision_body("REFUSE")));
+            assert!(
+                matches!(r, MarshalResponse::Error(MarshalError::BadResponse(_))),
+                "{status}: {r:?}"
+            );
+        }
+    }
 }

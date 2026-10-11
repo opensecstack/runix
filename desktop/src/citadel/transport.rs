@@ -22,6 +22,7 @@
 //! back to a guessed production URL — an unconfigured transport must never
 //! look like a working one.
 
+use citadel_kerkese_core::decision::{Decision, Outcome};
 use citadel_kerkese_core::{KerkeseTransport, TransportError};
 use tokio::runtime::Runtime;
 
@@ -92,11 +93,28 @@ impl HttpKerkeseTransport {
             .await
             .map_err(|e| TransportError::Unreachable(e.to_string()))?;
 
-        if !response.status().is_success() {
-            return Err(TransportError::BadResponse(format!(
-                "HTTP {}",
-                response.status()
-            )));
+        let status = response.status();
+        if status == reqwest::StatusCode::FORBIDDEN {
+            // CITADEL's MARSHAL handler answers REFUSE and HARD_STOP with
+            // HTTP 403 *and the full Decision body*. Discarding that body
+            // would turn a real denial into `BadResponse`, which callers
+            // classify as Unreachable (fail-open for some actions). Hand the
+            // body back only if it is a genuine blocked Decision; anything
+            // else (garbage, or an inconsistent 403 + EXECUTE) stays a
+            // `BadResponse`, never an allow.
+            let body = response
+                .bytes()
+                .await
+                .map_err(|e| TransportError::BadResponse(e.to_string()))?;
+            return match serde_json::from_slice::<Decision>(&body) {
+                Ok(d) if matches!(d.outcome, Outcome::Refuse | Outcome::HardStop) => {
+                    Ok(body.to_vec())
+                }
+                _ => Err(TransportError::BadResponse(format!("HTTP {status}"))),
+            };
+        }
+        if !status.is_success() {
+            return Err(TransportError::BadResponse(format!("HTTP {status}")));
         }
 
         response
