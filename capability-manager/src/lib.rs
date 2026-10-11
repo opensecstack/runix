@@ -139,6 +139,34 @@ impl RevocationList {
     pub fn is_revoked(&self, token: &CapabilityToken) -> bool {
         self.revoked_signatures.contains(&token.signature)
     }
+
+    /// Whether any revoked signature has the given [`signature_fingerprint`].
+    /// Backs the kernel's `SYS_CAP_IS_REVOKED`, whose scalar-only ABI can
+    /// carry a 64-bit fingerprint but not a 64-byte signature.
+    ///
+    /// Fails closed: a fingerprint collision (probability about 2^-64 per
+    /// pair for an honest signature) can only report a never-revoked token
+    /// as revoked, never the reverse. A forger cannot exploit the
+    /// fingerprint, since a token with a forged signature fails Ed25519
+    /// verification regardless of what this returns.
+    pub fn is_fingerprint_revoked(&self, fingerprint: u64) -> bool {
+        self.revoked_signatures
+            .iter()
+            .any(|sig| signature_fingerprint(sig) == Some(fingerprint))
+    }
+}
+
+/// 64-bit fingerprint of a token's hex-encoded signature: the first 8
+/// bytes of the decoded signature, little-endian. The single definition
+/// shared by the kernel (revocation lookup) and ring-3 drivers (revocation
+/// query), so the two cannot drift. Returns `None` if the first 16 hex
+/// characters are missing or not valid hex (such a token cannot verify
+/// anyway; callers must treat `None` as revoked/denied).
+pub fn signature_fingerprint(signature_hex: &str) -> Option<u64> {
+    let head = signature_hex.get(..16)?;
+    let mut bytes = [0u8; 8];
+    hex::decode_to_slice(head, &mut bytes).ok()?;
+    Some(u64::from_le_bytes(bytes))
 }
 
 #[derive(Debug)]
@@ -248,6 +276,35 @@ mod tests {
         // caller has to check both. Confirms that split actually holds,
         // not just that `is_revoked` flips a bool.
         assert!(token.verify(&verifying_key, "res:disk0", 1500).is_ok());
+    }
+
+    #[test]
+    fn fingerprint_is_first_eight_signature_bytes_little_endian() {
+        assert_eq!(
+            signature_fingerprint("0102030405060708ffff"),
+            Some(0x0807_0605_0403_0201)
+        );
+        assert_eq!(signature_fingerprint("0102030405060"), None);
+        assert_eq!(signature_fingerprint("zz02030405060708"), None);
+        assert_eq!(signature_fingerprint(""), None);
+        // Multi-byte char straddling byte 16 must not panic.
+        assert_eq!(signature_fingerprint("0102030405060\u{e9}\u{e9}"), None);
+    }
+
+    #[test]
+    fn fingerprint_revocation_matches_only_revoked_tokens() {
+        let (signing_key, _) = keypair();
+        let revoked =
+            CapabilityToken::issue("user:alice", "file:A", 1000, 2000, "key:1", &signing_key);
+        let other =
+            CapabilityToken::issue("user:alice", "file:B", 1000, 2000, "key:1", &signing_key);
+        let mut revocations = RevocationList::new();
+        let fp_revoked = signature_fingerprint(&revoked.signature).unwrap();
+        let fp_other = signature_fingerprint(&other.signature).unwrap();
+        assert!(!revocations.is_fingerprint_revoked(fp_revoked));
+        revocations.revoke(&revoked);
+        assert!(revocations.is_fingerprint_revoked(fp_revoked));
+        assert!(!revocations.is_fingerprint_revoked(fp_other));
     }
 
     #[test]
