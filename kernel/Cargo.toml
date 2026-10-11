@@ -170,6 +170,10 @@ name = "sys_random"
 harness = false
 
 [[test]]
+name = "ioport_range"
+harness = false
+
+[[test]]
 name = "ipc_session"
 harness = false
 

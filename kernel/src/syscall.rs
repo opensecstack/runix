@@ -294,7 +294,8 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             // implementation exists, a Gate-evaluation call would be
             // inserted here, gated on the existing capability check
             // (`authorized_for_ioport`) succeeding first.
-            if !crate::capabilities::authorized_for_ioport(port, crate::interrupts::ticks()) {
+            if !crate::capabilities::authorized_for_ioport(port, width, crate::interrupts::ticks())
+            {
                 return u64::MAX;
             }
             // Same fail-closed convention as an unauthorized caller: a bad
@@ -318,7 +319,8 @@ extern "C" fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             // implementation exists, a Gate-evaluation call would be
             // inserted here, gated on the existing capability check
             // (`authorized_for_ioport`) succeeding first.
-            if !crate::capabilities::authorized_for_ioport(port, crate::interrupts::ticks()) {
+            if !crate::capabilities::authorized_for_ioport(port, width, crate::interrupts::ticks())
+            {
                 return u64::MAX;
             }
             unsafe {

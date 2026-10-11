@@ -104,7 +104,13 @@ pub fn random_resource() -> String {
 /// (wildcard/prefix matching) required — see docs/STATUS.md's network-stack
 /// section for the reasoning.
 pub fn ioport_range_resource(base: u16, len: u16) -> String {
-    format!("ioport:{base}-{}", base + len - 1)
+    // u32 math so a range running past 0xFFFF (or len == 0) can't overflow-
+    // panic here; such a resource string fails `parse_ioport_range` and so
+    // grants nothing (fail closed).
+    if len == 0 {
+        return "ioport:empty".into();
+    }
+    format!("ioport:{base}-{}", u32::from(base) + u32::from(len) - 1)
 }
 
 /// Parses a resource string produced by [`ioport_range_resource`] back into
@@ -115,7 +121,31 @@ pub fn ioport_range_resource(base: u16, len: u16) -> String {
 fn parse_ioport_range(resource: &str) -> Option<(u16, u16)> {
     let rest = resource.strip_prefix("ioport:")?;
     let (base, end) = rest.split_once('-')?;
-    Some((base.parse().ok()?, end.parse().ok()?))
+    let (base, end): (u16, u16) = (base.parse().ok()?, end.parse().ok()?);
+    // An inverted range (base > end) grants nothing and is never issued by
+    // `ioport_range_resource`; treat it as malformed rather than relying on
+    // the containment check to happen to reject everything.
+    if base > end {
+        return None;
+    }
+    Some((base, end))
+}
+
+/// Pure range check: does an access of `width` bytes at `port` (covering
+/// `port..=port+width-1`) lie entirely inside the range `resource` names?
+/// Checked arithmetic throughout so an access at the top of the port space
+/// (e.g. 0xFFFF, width 2) cannot wrap around into "allowed".
+pub fn ioport_access_within(resource: &str, port: u16, width: u8) -> bool {
+    let Some((base, end)) = parse_ioport_range(resource) else {
+        return false;
+    };
+    let Some(last_offset) = u16::from(width).checked_sub(1) else {
+        return false; // width 0
+    };
+    let Some(last) = port.checked_add(last_offset) else {
+        return false;
+    };
+    base <= port && last <= end
 }
 
 /// Checks whether `token` is valid (signature, expiry — same checks
@@ -125,16 +155,19 @@ fn parse_ioport_range(resource: &str) -> Option<(u16, u16)> {
 /// the token claims until the token itself is parsed. Instead this verifies
 /// the signature against the token's *own* `resource` field (confirming the
 /// token really was signed for whatever range it claims to cover, not a
-/// forged claim), then checks that range contains `port`.
+/// forged claim), then checks that range contains the *whole* access
+/// `port..=port+width-1`, not just its first port.
 pub fn check_ioport_range(
     token: &CapabilityToken,
     port: u16,
+    width: u8,
     now: u64,
 ) -> Result<(), CapabilityError> {
     token.verify(&demo_verifying_key(), &token.resource, now)?;
-    match parse_ioport_range(&token.resource) {
-        Some((base, end)) if base <= port && port <= end => Ok(()),
-        _ => Err(CapabilityError::WrongResource),
+    if ioport_access_within(&token.resource, port, width) {
+        Ok(())
+    } else {
+        Err(CapabilityError::WrongResource)
     }
 }
 
@@ -163,7 +196,8 @@ pub fn is_revoked(token: &CapabilityToken) -> bool {
 /// its own copy of this shape (see `syscall.rs::dispatch`); `SYS_PORT_IN`/
 /// `SYS_PORT_OUT` are the second and third callers, past the point where
 /// duplicating it a third time stopped being worth it.
-pub fn authorized_for_ioport(port: u16, now: u64) -> bool {
-    crate::scheduler::current_capability()
-        .is_some_and(|token| !is_revoked(&token) && check_ioport_range(&token, port, now).is_ok())
+pub fn authorized_for_ioport(port: u16, width: u8, now: u64) -> bool {
+    crate::scheduler::current_capability().is_some_and(|token| {
+        !is_revoked(&token) && check_ioport_range(&token, port, width, now).is_ok()
+    })
 }
