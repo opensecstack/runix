@@ -3151,8 +3151,30 @@ Still open, verified in the code:
   Any new spawner of `blk-driver-host` in serve mode must grant
   `revocation:query`, or every request is denied.
 
-The `unsafe` blocks in the three ring-3 hosts carry few `// SAFETY:`
-comments; that is a documentation gap, not a confirmed bug.
+Every `unsafe` site in the three ring-3 hosts (`grid-sandbox-host` 7,
+`net-driver-host` 34, `blk-driver-host` 32) now carries a `// SAFETY:` comment or
+`# Safety` section stating its real invariant, and each crate warns on
+`clippy::undocumented_unsafe_blocks`. The comment-only change was checked: the
+`.text` section is byte-identical to the previous build at the same build path.
+Documenting them surfaced these open hardening gaps (none is a regression):
+
+- **`net-driver-host` RX length (real, device-controlled input).**
+  `validate_rx_completion` bounds the device-reported length above but not below,
+  and `RxToken::consume` computes `len - VIRTIO_NET_HDR_LEN` with overflow checks
+  off in release. A reported length under 10 wraps to a huge `from_raw_parts`
+  length, which is undefined behaviour. A well-behaved virtio-net device always
+  writes at least the header, so this needs a hostile or buggy device.
+- **Virtio queue size not fully validated** in `blk-driver-host` and
+  `net-driver-host`: only `<= 256` is checked. A size of 0 aborts on `% qsize`
+  (not UB), and `blk-driver-host`'s `post_chain` writes 3 descriptors without
+  checking the size is at least 3.
+- **`blk-driver-host` after a poll timeout** the device may still own the request
+  buffer and descriptors, and the next request reuses them and can consume the
+  stale completion. Nothing quarantines the device.
+- The `syscall` asm in the hosts does not declare xmm registers as clobbered and
+  relies on the kernel not touching them. Kernel/driver constants (`HEAP_START`,
+  `HEAP_SIZE`, the boot-info layouts) match by hand-kept convention only; they
+  match today.
 
 ## Real bugs worth knowing before touching the relevant code again
 

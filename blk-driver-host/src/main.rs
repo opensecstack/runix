@@ -421,7 +421,8 @@ impl BlkDevice {
         // process owns that page for its whole life so it outlives the
         // device's use. The chain has 3 entries, which must be <= the
         // device's `qsize` (not checked anywhere: `queue_size` only checks
-        // the upper bound; see report). Only one request is ever in flight:
+        // the upper bound; a known hardening gap, tracked in docs/STATUS.md).
+        // Only one request is ever in flight:
         // `&mut self` plus `poll_for_completion` before returning, except
         // after a poll timeout (see `poll_for_completion`).
         unsafe {
@@ -548,7 +549,7 @@ pub extern "C" fn _start() -> ! {
     // never unmapped; `info.queue_phys` programmed just above is their
     // physical base. `qsize` came from the device and `queue_size` asserts
     // `qsize <= MAX_SUPPORTED_QUEUE_SIZE`, but NOT `qsize != 0` or
-    // `qsize >= 3` (see report): a zero-size queue would panic (abort) in
+    // `qsize >= 3` (a known hardening gap): a zero-size queue would panic (abort) in
     // `post_chain`/`poll_used`'s `%`, not cause UB.
     let mut queue = unsafe { Virtqueue::new(BLK_QUEUE_VA, qsize) };
     queue.init_avail_flags();
