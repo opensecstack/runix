@@ -15,6 +15,21 @@
 //! the first real module load in this kernel's boot path that depends on
 //! this gate, not just a demo call proving the gate itself works.
 
+// Same compile-time barrier as `capabilities.rs`: the hardcoded `DEMO_SEED`
+// below must never end up in a build that did not explicitly ask for demo
+// keys. `capabilities.rs`'s own `compile_error!` already breaks every build
+// without this feature, but that protection is indirect (it depends on a
+// sibling module staying compiled unconditionally), so this module states
+// its own requirement instead of borrowing that one.
+#[cfg(not(feature = "insecure-demo-keys"))]
+compile_error!(
+    "citadel.rs's hardcoded Ed25519 demo trust root (the boot-time allowlist \
+     signing key) requires the `insecure-demo-keys` feature. There is no real \
+     key provisioning yet -- if you're building something meant to ship, that \
+     has to exist first. If this is still an alpha/dev build, re-enable \
+     default features."
+);
+
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use runix_citadel_integration::{
     BootAllowlist, CitadelError, InstanceAllowlist, InstanceManifestEntry, ModuleManifestEntry,

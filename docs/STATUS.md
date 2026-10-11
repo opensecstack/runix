@@ -3130,8 +3130,11 @@ Still open, verified in the code:
   `citadel::demo_authorize` builds the allowlist from the bytes it checks.
   Its evidence log is also dropped after each call, so boot authorization
   decisions are not retained.
-- The kernel's CITADEL demo seed has no `insecure-demo-keys` compile-time
-  barrier (`capabilities.rs` does).
+- (Corrected 2026-10-11) The kernel's CITADEL demo seed was reported as having no
+  `insecure-demo-keys` barrier. That was overstated: a build without the feature
+  already failed for the whole crate through `capabilities.rs`'s `compile_error!`.
+  `citadel.rs` now states the same barrier itself, so it no longer depends on a
+  sibling module.
 - `blk-driver-host` does not check revocation on file tokens.
 
 The `unsafe` blocks in the three ring-3 hosts carry few `// SAFETY:`
