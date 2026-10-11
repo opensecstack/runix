@@ -11,8 +11,10 @@ layer/crate split these phases build on, see [ARCHITECTURE.md](ARCHITECTURE.md).
 | RC    | 2028 Q1 / Q2 | Desktop shell, app framework, WORM boot chain, hardware attestation | Secure dialer, VoIP trunk, roaming governance, VIGIL health monitoring |
 | v1.0  | 2028 Q3 / Q4 | NIS2/GDPR suite, secure update channel, full MARSHAL governance, EU CRA alignment | Full MVNO operations, NIS2 suite, network slicing, EU regulatory alignment |
 
-We are currently in **Alpha** — see [STATUS.md](STATUS.md) for exactly what
-of Alpha's scope (and beyond it) is done, in progress, or not started.
+**Alpha is complete and Beta is in progress.** What counts as "done" for each
+Beta item, the evidence for it today, and what remains are in
+[BETA_CRITERIA.md](BETA_CRITERIA.md). See [STATUS.md](STATUS.md) for exactly
+what is implemented and verified.
 
 ## Open questions
 
