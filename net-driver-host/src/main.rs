@@ -54,6 +54,7 @@ mod virtio;
 use alloc::vec;
 use alloc::vec::Vec;
 use linked_list_allocator::LockedHeap;
+use net_driver_host::queue_size_is_valid;
 use runix_ipc::sockets::{SocketError, SocketRequest, SocketResponse};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{dhcpv4, dns, icmp, tcp};
@@ -258,9 +259,37 @@ pub extern "C" fn _start() -> ! {
     }
     write_byte(b'\n');
 
+    // Minimum valid sizes: the driver posts descriptors 0..RX_BUFFER_COUNT on
+    // the RX queue and 0..TX_BUFFER_COUNT on TX, so the highest index posted
+    // plus one is the buffer count (8 and 4). The device-reported size must
+    // also be a power of two and <= 256; otherwise fail the probe cleanly
+    // (no panic) before handing the queue to the device.
     let rx_size = net.queue_size(0);
-    net.set_queue_address(0, info.rx_queue_phys);
     let tx_size = net.queue_size(1);
+    if !queue_size_is_valid(rx_size, RX_BUFFER_COUNT as u16)
+        || !queue_size_is_valid(tx_size, TX_BUFFER_COUNT as u16)
+    {
+        write_all(b"net-driver-host: unsupported virtio queue size (probe FAILED)\n");
+        for off in [
+            NET_RESULT_OFFSET,
+            NET_TCP_RESULT_OFFSET,
+            NET_DHCP_RESULT_OFFSET,
+            NET_DNS_RESULT_OFFSET,
+        ] {
+            // SAFETY: `NET_INFO_VA` is the kernel-mapped, RW user page
+            // holding `NetBootInfo`; every offset is a small constant (< 4096,
+            // past the 128-byte struct), so the one-byte write is in-bounds,
+            // needs no alignment, and overlaps no live reference. Volatile
+            // because the kernel test harness reads it from outside.
+            unsafe {
+                core::ptr::write_volatile((NET_INFO_VA + off) as *mut u8, NET_RESULT_FAIL);
+            }
+        }
+        loop {
+            yield_now();
+        }
+    }
+    net.set_queue_address(0, info.rx_queue_phys);
     net.set_queue_address(1, info.tx_queue_phys);
 
     // SAFETY: meets `RunixNetDevice::new`'s contract as set up by the
@@ -272,9 +301,9 @@ pub extern "C" fn _start() -> ! {
     // `info.rx_buffer_phys`/`tx_buffer_phys`; none of these ranges is used
     // elsewhere in this binary, so ownership is exclusive, and this is the
     // only `RunixNetDevice`. `rx_size`/`tx_size` come from
-    // `VirtioNet::queue_size`, which asserts `<= 256` but does NOT reject 0
-    // (a device reporting size 0 would make `% qsize` panic later, an abort,
-    // not UB). `info`'s physical addresses are trusted from the kernel.
+    // `VirtioNet::queue_size` and were checked above with
+    // `queue_size_is_valid`: a power of two in `[RX_BUFFER_COUNT or
+    // TX_BUFFER_COUNT, 256]`, so non-zero and covering every posted index. `info`'s physical addresses are trusted from the kernel.
     let mut device = unsafe {
         RunixNetDevice::new(
             info.io_base,

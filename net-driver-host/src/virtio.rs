@@ -36,14 +36,8 @@ const STATUS_DRIVER_OK: u8 = 4;
 /// exactly one page, which is why a fixed "3 pages per queue" allocation
 /// (desc, avail, used) works regardless of the device's actual `QueueSize`,
 /// as long as that size fits one page's worth of descriptors — see
-/// `MAX_SUPPORTED_QUEUE_SIZE` below.
+/// `net_driver_host::MAX_QUEUE_SIZE`.
 pub const QUEUE_ALIGN: usize = 4096;
-
-/// One page of 16-byte descriptors is exactly 256 — QEMU's virtio-net-pci
-/// legacy default. A `QueueSize` larger than this wouldn't fit the fixed
-/// one-page descriptor table this driver's fixed page layout assumes; fail
-/// loudly rather than silently truncate or corrupt adjacent memory.
-pub const MAX_SUPPORTED_QUEUE_SIZE: u16 = 256;
 
 fn read_reg(io_base: u16, offset: u16, width: u8) -> u32 {
     port_in(io_base + offset, width).expect("port I/O denied reading a virtio-net register")
@@ -93,16 +87,12 @@ impl VirtioNet {
         VirtioNet { io_base, mac }
     }
 
-    /// Reads `queue_index`'s `QueueSize` and asserts it fits this driver's
-    /// fixed one-page descriptor table — see `MAX_SUPPORTED_QUEUE_SIZE`.
+    /// Reads `queue_index`'s `QueueSize`. The value is device-controlled and
+    /// NOT validated here: the caller must check it with
+    /// `net_driver_host::queue_size_is_valid` before building a `Virtqueue`.
     pub fn queue_size(&self, queue_index: u16) -> u16 {
         write_reg(self.io_base, REG_QUEUE_SELECT, 2, u32::from(queue_index));
-        let size = read_reg(self.io_base, REG_QUEUE_SIZE, 2) as u16;
-        assert!(
-            size <= MAX_SUPPORTED_QUEUE_SIZE,
-            "virtio-net queue {queue_index} reports size {size}, past this driver's fixed one-page descriptor table"
-        );
-        size
+        read_reg(self.io_base, REG_QUEUE_SIZE, 2) as u16
     }
 
     /// Tells the device where `queue_index`'s ring memory lives — `region_phys`
@@ -184,10 +174,12 @@ impl Virtqueue {
     /// of it). `region_va` must be `QUEUE_ALIGN`-aligned (every field
     /// pointer derived here relies on it for its own alignment: 16 for
     /// descriptors, 4 for used elements, 2 for the ring indices) and
-    /// `qsize` must be in `1..=MAX_SUPPORTED_QUEUE_SIZE`: every later ring
-    /// access in `post`/`poll_used` stays inside the owning page only
-    /// because 256 descriptors/avail entries/used elements fit one page
-    /// each, and `% qsize` panics (not UB) on 0. The region must stay mapped
+    /// `qsize` must satisfy `net_driver_host::queue_size_is_valid` (power of
+    /// two, at least the highest descriptor index posted + 1, at most
+    /// `net_driver_host::MAX_QUEUE_SIZE`): every later ring access in
+    /// `post`/`poll_used` stays inside the owning page only because 256
+    /// descriptors/avail entries/used elements fit one page each, and
+    /// `% qsize` panics (not UB) on 0, which that check excludes. The region must stay mapped
     /// for the life of the returned `Virtqueue`.
     pub unsafe fn new(region_va: usize, qsize: u16) -> Self {
         let desc = region_va as *mut VirtqDesc;
@@ -217,7 +209,7 @@ impl Virtqueue {
     /// `buf_phys`/`buf_len` must describe memory this process actually owns
     /// and that outlives the device's use of it (until the corresponding
     /// used-ring entry appears) — same contract as handing a raw pointer to
-    /// any DMA-capable device. `index` must be `< MAX_SUPPORTED_QUEUE_SIZE`
+    /// any DMA-capable device. `index` must be `< net_driver_host::MAX_QUEUE_SIZE`
     /// (it is used unchecked as a descriptor-table offset; the table is one
     /// page of 256 entries). It is NOT checked against `qsize`: a caller
     /// passing `index >= qsize` stays memory-safe but posts a descriptor the

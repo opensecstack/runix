@@ -51,8 +51,8 @@ impl RunixNetDevice {
     /// at `*_buffer_va + i * 4096` (the `RxToken`/`TxToken` `consume` bodies
     /// compute that address unchecked, with `i` bounded by the
     /// `*_BUFFER_COUNT` consts) and is exclusively owned, RW, and mapped for
-    /// the process's lifetime. `rx_queue_size`/`tx_queue_size` must be in
-    /// `1..=virtio::MAX_SUPPORTED_QUEUE_SIZE` (see `Virtqueue::new`).
+    /// the process's lifetime. `rx_queue_size`/`tx_queue_size` must
+    /// satisfy `net_driver_host::queue_size_is_valid` (see `Virtqueue::new`).
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
         net_io_base: u16,
@@ -244,27 +244,24 @@ impl smoltcp::phy::RxToken for RunixRxToken<'_> {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        // SAFETY: `index < RX_BUFFER_COUNT` and `len <= RX_BUFFER_SIZE`
-        // (4096) were enforced by `validate_rx_completion` in `receive()`,
-        // so the range `rx_buffer_va + index * 4096 + 10 ..` of length `len
-        // - 10` lies inside RX buffer `index`'s page (`RunixNetDevice::new`'s
-        // contract). `u8` has alignment 1 and any byte is valid. The
-        // device handed this buffer back through the used ring, so the
-        // driver owns it until the `post` below; the slice is dead before
-        // then (`f` has returned, and `R` cannot borrow from the
-        // higher-ranked `&[u8]`). ASSUMPTION NOT ESTABLISHED BY THE CODE:
-        // `len >= VIRTIO_NET_HDR_LEN` -- `validate_rx_completion` only
-        // checks the upper bound, and `len - VIRTIO_NET_HDR_LEN` is plain
-        // `usize` subtraction (overflow checks are off in release), so a
-        // device-reported `len < 10` would wrap to a huge slice length (UB).
-        // A well-behaved virtio-net device always writes at least the
-        // header. Also assumes the device does not write this buffer
-        // while the slice is live (it only does so for descriptors in the
-        // avail ring, and this one is re-posted only after `f`).
+        // SAFETY: `index < RX_BUFFER_COUNT` and `VIRTIO_NET_HDR_LEN <= len <=
+        // RX_BUFFER_SIZE` (4096) were enforced by `validate_rx_completion` in
+        // `receive()`, so the range `rx_buffer_va + index * 4096 + 10 ..` of
+        // length `len - 10` lies inside RX buffer `index`'s page
+        // (`RunixNetDevice::new`'s contract). As defense in depth the length
+        // uses `saturating_sub`, so even a bypassed validator yields an
+        // empty slice rather than a wrapped, huge one. `u8` has alignment 1
+        // and any byte is valid. The device handed this buffer back through
+        // the used ring, so the driver owns it until the `post` below; the
+        // slice is dead before then (`f` has returned, and `R` cannot borrow
+        // from the higher-ranked `&[u8]`). Also assumes the device does not
+        // write this buffer while the slice is live (it only does so for
+        // descriptors in the avail ring, and this one is re-posted only
+        // after `f`).
         let buf = unsafe {
             core::slice::from_raw_parts(
                 (self.rx_buffer_va + self.index * 4096 + VIRTIO_NET_HDR_LEN) as *const u8,
-                self.len - VIRTIO_NET_HDR_LEN,
+                self.len.saturating_sub(VIRTIO_NET_HDR_LEN),
             )
         };
         let result = f(buf);

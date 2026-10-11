@@ -46,8 +46,14 @@ pub const RX_BUFFER_SIZE: u32 = 4096;
 /// existed to gate it. Returns the validated `(buffer_index, len)` pair, or
 /// `None` if either field is out of range — the caller's job is to drop
 /// the completion rather than trust it, not to guess a safe fallback.
+///
+/// `len` is accepted only in `VIRTIO_NET_HDR_LEN..=RX_BUFFER_SIZE`: the
+/// device always writes the full `virtio_net_hdr` before the frame, so a
+/// shorter `len` is malformed, and the caller computes `len -
+/// VIRTIO_NET_HDR_LEN` as the frame length (which would wrap for a shorter
+/// one). `len == VIRTIO_NET_HDR_LEN` is a valid zero-length frame.
 pub fn validate_rx_completion(desc_id: u32, len: u32, buffer_count: usize) -> Option<(usize, u32)> {
-    if len > RX_BUFFER_SIZE {
+    if len < VIRTIO_NET_HDR_LEN as u32 || len > RX_BUFFER_SIZE {
         return None;
     }
     let index = desc_id as usize;
@@ -57,9 +63,23 @@ pub fn validate_rx_completion(desc_id: u32, len: u32, buffer_count: usize) -> Op
     Some((index, len))
 }
 
+/// Largest virtqueue size this driver's fixed one-page-per-ring layout can
+/// hold (16-byte descriptors, 256 per 4096-byte page); also QEMU's legacy
+/// virtio-net default.
+pub const MAX_QUEUE_SIZE: u16 = 256;
+
+/// Whether a device-reported `QueueSize` is usable. `min_size` is the
+/// highest descriptor index the driver ever posts on that queue plus one
+/// (RX: `RX_BUFFER_COUNT`, TX: `TX_BUFFER_COUNT`); the size must also be a
+/// power of two (virtio split-ring rule) and at most [`MAX_QUEUE_SIZE`].
+/// Rejects 0 (which would make the ring's `% qsize` abort).
+pub fn queue_size_is_valid(qsize: u16, min_size: u16) -> bool {
+    qsize.is_power_of_two() && qsize >= min_size && qsize <= MAX_QUEUE_SIZE
+}
+
 /// `buf` is a full RX buffer (`virtio_net_hdr` prefix + Ethernet frame) —
-/// already validated by [`validate_rx_completion`] to be no longer than
-/// [`RX_BUFFER_SIZE`], but this function makes no assumption about that;
+/// already validated by [`validate_rx_completion`] to be at least
+/// [`VIRTIO_NET_HDR_LEN`] and no longer than [`RX_BUFFER_SIZE`], but this function makes no assumption about that;
 /// it only trusts its own length check below. Checks Ethertype == ARP and
 /// ARP opcode == reply — the specific, falsifiable proof Phase 1 exists to
 /// produce, not "some bytes arrived".
@@ -122,6 +142,36 @@ mod tests {
     }
 
     #[test]
+    fn validate_rx_completion_len_boundaries() {
+        let hdr = VIRTIO_NET_HDR_LEN as u32;
+        assert_eq!(validate_rx_completion(0, 0, 4), None);
+        assert_eq!(validate_rx_completion(0, 1, 4), None);
+        assert_eq!(validate_rx_completion(0, hdr - 1, 4), None);
+        assert_eq!(validate_rx_completion(0, hdr, 4), Some((0, hdr)));
+        assert_eq!(
+            validate_rx_completion(3, RX_BUFFER_SIZE, 4),
+            Some((3, RX_BUFFER_SIZE))
+        );
+        assert_eq!(validate_rx_completion(0, RX_BUFFER_SIZE + 1, 4), None);
+    }
+
+    #[test]
+    fn queue_size_validation() {
+        assert!(!queue_size_is_valid(0, 8));
+        assert!(!queue_size_is_valid(1, 8));
+        assert!(!queue_size_is_valid(3, 4));
+        assert!(!queue_size_is_valid(4, 8)); // power of two but below min
+        assert!(!queue_size_is_valid(12, 8)); // not a power of two
+        assert!(!queue_size_is_valid(255, 8));
+        assert!(queue_size_is_valid(8, 8));
+        assert!(queue_size_is_valid(4, 4));
+        assert!(queue_size_is_valid(128, 8));
+        assert!(queue_size_is_valid(256, 8));
+        assert!(!queue_size_is_valid(512, 8));
+        assert!(!queue_size_is_valid(u16::MAX, 8));
+    }
+
+    #[test]
     fn validate_rx_completion_rejects_out_of_range_desc_id() {
         assert_eq!(validate_rx_completion(4, 100, 4), None);
         assert!(validate_rx_completion(3, 100, 4).is_some());
@@ -147,6 +197,18 @@ mod tests {
             if let Some((index, validated_len)) = validate_rx_completion(desc_id, len, buffer_count) {
                 prop_assert!(index < buffer_count);
                 prop_assert!(validated_len <= RX_BUFFER_SIZE);
+                prop_assert!(validated_len >= VIRTIO_NET_HDR_LEN as u32);
+            }
+        }
+
+        #[test]
+        fn validate_rx_completion_result_always_in_range_for_all_inputs(
+            desc_id in any::<u32>(),
+            len in any::<u32>(),
+        ) {
+            if let Some((index, l)) = validate_rx_completion(desc_id, len, 8) {
+                prop_assert!(index < 8);
+                prop_assert!(l >= VIRTIO_NET_HDR_LEN as u32 && l <= RX_BUFFER_SIZE);
             }
         }
 
