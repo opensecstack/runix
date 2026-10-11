@@ -1,0 +1,202 @@
+# Release workflow for Runix.
+#
+# INERT until a version tag is pushed: it only triggers on `push` of a tag
+# matching `v*` (e.g. v0.1.0-beta.1) or on a manual `workflow_dispatch`.
+# Ordinary pushes and pull requests never start it (ci.yml handles those).
+#
+# Creating and pushing a version tag is a MAINTAINER action. Nothing in this
+# repository's automation creates tags.
+#
+# DRY RUN: Actions tab -> "Release" -> "Run workflow" (workflow_dispatch).
+# This re-runs the full CI gate, builds every release artifact, writes
+# SHA256SUMS and the dependency record, and uploads them as workflow
+# artifacts. It NEVER creates a GitHub release (the `release` job is gated
+# on a tag push).
+#
+# On a tag push the same pipeline runs, then the `release` job creates a
+# DRAFT GitHub release (never published automatically; a maintainer reviews
+# and publishes by hand). Tags containing '-' are marked prerelease.
+#
+# SBOM: intentionally SKIPPED. Producing a standard SBOM (SPDX/CycloneDX)
+# would need a new third-party Action or tool not already trusted in this
+# repo. Instead the bundle carries `cargo metadata` for the root workspace
+# plus every Cargo.lock (the root workspace and each standalone crate
+# resolve their own graph). cargo-deny already runs as part of the reused
+# ci.yml gate.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# Default for every job; only the `release` job raises it.
+permissions:
+  contents: read
+
+jobs:
+  # Full gate, reused from ci.yml (made callable via `workflow_call`):
+  # cargo-deny (all manifests), fmt/clippy/test, kernel build, QEMU kernel
+  # tests, kernel-arm, and the x86_64 boot smoke test, all from a clean
+  # checkout of the tag (or of the branch, for a dry run).
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  build-x86_64:
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+          targets: x86_64-unknown-none
+          components: llvm-tools, rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            kernel
+            xtask
+            grid-sandbox-host
+            net-driver-host
+            blk-driver-host
+      # The kernel `include_bytes!`s these three ring-3 payloads, so they
+      # must exist before xtask builds the kernel (same order as ci.yml's
+      # `boot` job).
+      - name: build grid-sandbox-host
+        working-directory: grid-sandbox-host
+        run: cargo build --target x86_64-unknown-none --release
+      - name: build net-driver-host
+        working-directory: net-driver-host
+        run: cargo build --target x86_64-unknown-none --release
+      - name: build blk-driver-host
+        working-directory: blk-driver-host
+        run: cargo build --target x86_64-unknown-none --release
+      # xtask is not a root-workspace member, so this runs from xtask/ (as
+      # ci.yml's `boot` job does). Output: <repo root>/target/runix-bios.img.
+      - name: build bootable image
+        working-directory: xtask
+        run: cargo run -- build --release
+      - name: collect artifacts
+        run: |
+          mkdir -p dist
+          cp target/runix-bios.img dist/runix-x86_64-bios.img
+          cp kernel/target/x86_64-unknown-none/release/runix-kernel dist/runix-kernel-x86_64.elf
+          cp grid-sandbox-host/target/x86_64-unknown-none/release/grid-sandbox-host dist/grid-sandbox-host-x86_64.elf
+          cp net-driver-host/target/x86_64-unknown-none/release/net-driver-host dist/net-driver-host-x86_64.elf
+          cp blk-driver-host/target/x86_64-unknown-none/release/blk-driver-host dist/blk-driver-host-x86_64.elf
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-x86_64
+          path: dist/
+          if-no-files-found: error
+
+  build-aarch64:
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-none
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            kernel-arm
+            net-driver-host-arm
+      # kernel-arm `include_bytes!`s this binary; build it first (same
+      # order as ci.yml's `kernel-arm` job).
+      - name: build net-driver-host-arm
+        working-directory: net-driver-host-arm
+        run: cargo build --target aarch64-unknown-none --release
+      - name: build kernel-arm
+        working-directory: kernel-arm
+        run: cargo build --target aarch64-unknown-none --release
+      - name: collect artifacts
+        run: |
+          mkdir -p dist
+          cp kernel-arm/target/aarch64-unknown-none/release/runix-kernel-arm dist/runix-kernel-arm-aarch64.elf
+          cp net-driver-host-arm/target/aarch64-unknown-none/release/net-driver-host-arm dist/net-driver-host-arm-aarch64.elf
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-aarch64
+          path: dist/
+          if-no-files-found: error
+
+  # Checksums over every artifact, plus the dependency record.
+  bundle:
+    needs: [build-x86_64, build-aarch64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: dist
+          merge-multiple: true
+      - name: dependency record (cargo metadata + Cargo.lock files)
+        run: |
+          cargo metadata --format-version 1 --locked > dist/cargo-metadata-workspace.json
+          cp Cargo.lock dist/Cargo.lock.workspace
+          for d in kernel xtask grid-sandbox-host net-driver-host blk-driver-host kernel-arm net-driver-host-arm; do
+            cp "$d/Cargo.lock" "dist/Cargo.lock.$d"
+          done
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          ls -1 | grep -v '^SHA256SUMS$' | LC_ALL=C sort | xargs sha256sum > SHA256SUMS
+          cat SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: dist/
+          if-no-files-found: error
+
+  # Tag pushes only. workflow_dispatch never reaches this job.
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
+    needs: bundle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: dist
+      # The tag name reaches the script only through env, always quoted.
+      - name: create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          args=(--draft --verify-tag --title "Runix $TAG")
+          case "$TAG" in
+            *-*) args+=(--prerelease) ;;
+          esac
+          if [ -f docs/RELEASE_NOTES_BETA_DRAFT.md ]; then
+            args+=(--notes-file docs/RELEASE_NOTES_BETA_DRAFT.md)
+          else
+            printf 'Runix %s (draft). See CHANGELOG.md and docs/STATUS.md for what changed and what is implemented. Verify downloads against SHA256SUMS.\n' "$TAG" > "$RUNNER_TEMP/release-notes.md"
+            args+=(--notes-file "$RUNNER_TEMP/release-notes.md")
+          fi
+          gh release create "$TAG" "${args[@]}" dist/*
