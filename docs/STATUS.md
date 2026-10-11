@@ -3173,8 +3173,12 @@ Documenting them surfaced hardening gaps; the first four are closed (2026-10-11)
 - **Closed: `blk-driver-host` stale completion after a poll timeout.** A timeout
   now quarantines the queue (`QueueHealth::Faulted`): later requests fail before
   touching the queue, and the filesystem IPC handlers answer `FsError::DeviceFailed`.
-  There is no device reset. **The quarantine path is covered by host tests of the
-  state machine only; no QEMU test forces a timeout.**
+  There is no device reset. The state machine has host tests, and
+  `kernel/tests/blk_fs_quarantine.rs` (a CI step, FAT32 fixture) forces a real poll
+  timeout through a test-only boot-info byte, `inject_stall_after_first_request`,
+  that the kernel's production loader hardcodes to `0`: it proves the driver prints
+  `device QUARANTINED` exactly once and answers later requests with `DeviceFailed`.
+  The stall code is not behind a build flag, so it ships (inert) in the driver.
 - **Closed: kernel/driver constants.** `cargo run -p abi-consistency` (a CI step in
   the host job, also run by `cargo test --workspace`) compares 210 duplicated
   constants (heap and boot-info addresses, result offsets, `NetBootInfo` and
