@@ -57,16 +57,25 @@
 //! actually being a well-formed Decision (translated to
 //! `MarshalError::BadResponse`, never silently defaulting to `Execute`).
 //!
-//! # One connection at a time
+//! # Bounded concurrency and per-connection deadlines
 //!
-//! [`serve`] is a sequential accept loop — not a production concurrent
-//! server, just a real, correctly-functioning one, matching this task's
-//! scope. A later concurrency upgrade (thread-per-connection or async) is
-//! separate work.
+//! The kernel reads "no answer from the proxy" as MARSHAL-unavailable, which
+//! is fail-open for some actions. So a client that can merely open a TCP
+//! connection must not be able to stall legitimate requests. [`serve`]
+//! therefore (a) handles each connection on its own thread, up to
+//! [`ProxyLimits::max_connections`] at once (excess connections are closed
+//! immediately, never queued behind a stuck one), and (b) bounds every
+//! connection's lifetime: the whole request must arrive within
+//! [`ProxyLimits::read_deadline`] (a total deadline, not a per-read one, so
+//! a slow-loris trickling one byte at a time is dropped too), and writing
+//! the response is bounded by [`ProxyLimits::write_timeout`]. The CITADEL
+//! leg is bounded by `HttpKerkeseTransport`'s own connect/total timeouts.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use citadel_kerkese_core::decision::{Decision, Outcome};
 use citadel_kerkese_core::{KerkeseTransport, TransportError};
@@ -104,17 +113,69 @@ pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9000";
 /// `decode` that can never succeed.
 const MAX_REQUEST_BYTES: usize = runix_ipc::marshal::MAX_JSON_LEN + 4;
 
+/// Timeouts and concurrency cap for [`serve`].
+///
+/// # Why these numbers
+///
+/// The kernel's own wait is a bounded *poll-iteration* budget, not a
+/// wall-clock one (`kernel/src/grid_sandbox.rs`'s `SHADOW_MARSHAL_MAX_ITERS`
+/// = 2000 recv polls; `kernel-arm/src/marshal_transport.rs`'s 64-yield
+/// budget), so there is no exact millisecond figure to stay under; the
+/// reproduced failure was an idle client stalling a legitimate request for
+/// more than ~5 s. The defaults keep the worst case for a legitimate request
+/// well below that: a normal request is one small loopback/guestfwd write
+/// (milliseconds), so `read_deadline` = 1 s is generous for it yet drops a
+/// stalled client fast; CITADEL gets connect 1 s / total 3 s (see
+/// `transport.rs`). Worst legitimate case: 1 s read + 3 s CITADEL = 4 s,
+/// and an idle/slow client costs a worker slot for at most 1 s.
+#[derive(Debug, Clone, Copy)]
+pub struct ProxyLimits {
+    /// Total time allowed for a connection to deliver one full request.
+    pub read_deadline: Duration,
+    /// Time allowed for any single write of the response.
+    pub write_timeout: Duration,
+    /// Max connections handled concurrently; extra ones are closed at once.
+    pub max_connections: usize,
+}
+
+impl Default for ProxyLimits {
+    fn default() -> Self {
+        Self {
+            read_deadline: Duration::from_millis(1000),
+            write_timeout: Duration::from_millis(2000),
+            max_connections: 8,
+        }
+    }
+}
+
 /// Reads bytes off `stream` until a full [`MarshalRequest`] can be decoded,
 /// handling partial reads correctly: a real TCP stream may deliver the
 /// request across multiple `read()` calls, so this keeps appending to a
 /// growing buffer and retrying [`MarshalRequest::decode`] rather than
 /// assuming one `read()` call is enough.
-fn read_marshal_request(stream: &mut impl Read) -> std::io::Result<MarshalRequest> {
+///
+/// The whole read must finish by `deadline` (each `read` gets only the
+/// remaining time as its timeout), and a declared length over
+/// `MAX_JSON_LEN` is rejected as soon as the 4-byte prefix is in, before
+/// any body is buffered.
+fn read_marshal_request(
+    stream: &mut TcpStream,
+    deadline: Instant,
+) -> std::io::Result<MarshalRequest> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
         if let Some((request, _consumed)) = MarshalRequest::decode(&buf) {
             return Ok(request);
+        }
+        if buf.len() >= 4 {
+            let declared = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            if declared > runix_ipc::marshal::MAX_JSON_LEN {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "MarshalRequest declared length exceeds MAX_JSON_LEN",
+                ));
+            }
         }
         if buf.len() > MAX_REQUEST_BYTES {
             return Err(std::io::Error::new(
@@ -122,6 +183,14 @@ fn read_marshal_request(stream: &mut impl Read) -> std::io::Result<MarshalReques
                 "MarshalRequest exceeds the maximum wire size without decoding",
             ));
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "deadline reached before a full MarshalRequest was received",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining))?;
         let n = stream.read(&mut chunk)?;
         if n == 0 {
             return Err(std::io::Error::new(
@@ -405,8 +474,27 @@ pub fn handle_connection(
     signing_key: &SigningKey,
     worm_log: &Mutex<WormLog>,
 ) -> std::io::Result<()> {
-    let request = read_marshal_request(stream)?;
+    handle_connection_with(
+        stream,
+        transport,
+        signing_key,
+        worm_log,
+        &ProxyLimits::default(),
+    )
+}
+
+/// [`handle_connection`] with explicit [`ProxyLimits`].
+pub fn handle_connection_with(
+    stream: &mut TcpStream,
+    transport: &HttpKerkeseTransport,
+    signing_key: &SigningKey,
+    worm_log: &Mutex<WormLog>,
+    limits: &ProxyLimits,
+) -> std::io::Result<()> {
+    let deadline = Instant::now() + limits.read_deadline;
+    let request = read_marshal_request(stream, deadline)?;
     let response = build_response(transport, signing_key, worm_log, &request.kerkese_json);
+    stream.set_write_timeout(Some(limits.write_timeout))?;
     stream.write_all(&response.encode())?;
     stream.flush()
 }
@@ -425,28 +513,66 @@ pub fn serve_one(
     handle_connection(&mut stream, transport, signing_key, worm_log)
 }
 
-/// Binds `listen_addr` and serves connections one at a time, forever, using
-/// this proxy's own demo Verifier signing key
-/// ([`super::identity::proxy_signing_key`]) and a fresh, process-lifetime
-/// [`WormLog`] recording every verification decision this proxy makes (see
-/// [`build_response`]). Never returns on success; returns `Err` only if
-/// binding the listener itself fails. A per-connection failure (bad
-/// request, policy refusal, transport error, I/O error mid-handling) is
-/// logged to stderr and the loop moves on to the next connection rather than
-/// tearing down the whole server.
+/// Binds `listen_addr` and serves connections forever with
+/// [`ProxyLimits::default`]; see [`serve_listener`].
 pub fn serve(listen_addr: &str, transport: HttpKerkeseTransport) -> std::io::Result<()> {
     let listener = TcpListener::bind(listen_addr)?;
-    let signing_key = identity::proxy_signing_key();
-    let worm_log = Mutex::new(WormLog::default());
+    serve_listener(listener, transport, ProxyLimits::default())
+}
+
+/// Serves connections off `listener` forever, using this proxy's own demo
+/// Verifier signing key ([`super::identity::proxy_signing_key`]) and a fresh,
+/// process-lifetime [`WormLog`] recording every verification decision this
+/// proxy makes (see [`build_response`]).
+///
+/// Each accepted connection runs on its own thread (per-request state is
+/// local to that thread; only the transport, key and WORM log are shared,
+/// the log behind its `Mutex`). At most `limits.max_connections` run at
+/// once: when that many are active, a new connection is closed immediately
+/// (the kernel sees an EOF with no response, i.e. the same "proxy
+/// unavailable" it would see from any dead proxy) rather than queued behind
+/// a stuck one. Never returns; per-connection failures are logged to
+/// stderr.
+pub fn serve_listener(
+    listener: TcpListener,
+    transport: HttpKerkeseTransport,
+    limits: ProxyLimits,
+) -> std::io::Result<()> {
+    let shared = Arc::new((
+        transport,
+        identity::proxy_signing_key(),
+        Mutex::new(WormLog::default()),
+    ));
+    let active = Arc::new(AtomicUsize::new(0));
     loop {
-        match listener.accept() {
-            Ok((mut stream, _addr)) => {
-                if let Err(e) = handle_connection(&mut stream, &transport, &signing_key, &worm_log)
+        let mut stream = match listener.accept() {
+            Ok((stream, _addr)) => stream,
+            Err(e) => {
+                eprintln!("citadel_proxy: accept error: {e}");
+                continue;
+            }
+        };
+        if active.fetch_add(1, Ordering::AcqRel) >= limits.max_connections {
+            active.fetch_sub(1, Ordering::AcqRel);
+            eprintln!("citadel_proxy: at connection cap, refusing a connection");
+            continue; // dropping `stream` closes it
+        }
+        let shared = Arc::clone(&shared);
+        let active_for_thread = Arc::clone(&active);
+        let spawned = std::thread::Builder::new()
+            .name("citadel_proxy-conn".to_string())
+            .spawn(move || {
+                let (transport, key, worm_log) = &*shared;
+                if let Err(e) =
+                    handle_connection_with(&mut stream, transport, key, worm_log, &limits)
                 {
                     eprintln!("citadel_proxy: connection error: {e}");
                 }
-            }
-            Err(e) => eprintln!("citadel_proxy: accept error: {e}"),
+                active_for_thread.fetch_sub(1, Ordering::AcqRel);
+            });
+        if let Err(e) = spawned {
+            active.fetch_sub(1, Ordering::AcqRel);
+            eprintln!("citadel_proxy: failed to spawn connection thread: {e}");
         }
     }
 }
@@ -616,8 +742,14 @@ mod tests {
         let dead_addr = listener.local_addr().expect("addr");
         drop(listener);
 
-        let transport =
-            HttpKerkeseTransport::new(Some(format!("http://{dead_addr}/marshal/kerkese")));
+        // Long connect timeout: Windows retries SYNs to a closed port for
+        // ~2 s before reporting refusal, which a short timeout would
+        // (correctly) report as Timeout instead.
+        let transport = HttpKerkeseTransport::with_timeouts(
+            Some(format!("http://{dead_addr}/marshal/kerkese")),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
 
         let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
         let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
@@ -1173,5 +1305,209 @@ mod tests {
                 "{status}: {r:?}"
             );
         }
+    }
+
+    // ---- Hardening: idle / slow / oversized clients, concurrency cap ----
+
+    /// Starts `serve_listener` on a background thread (it never returns; the
+    /// thread dies with the test process) and returns its address.
+    fn start_proxy(transport: HttpKerkeseTransport, limits: ProxyLimits) -> std::net::SocketAddr {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+        let addr = listener.local_addr().expect("proxy addr");
+        std::thread::spawn(move || {
+            let _ = serve_listener(listener, transport, limits);
+        });
+        addr
+    }
+
+    /// Asserts the peer closes `client` (EOF or reset) within `within`,
+    /// without sending any response bytes.
+    fn expect_closed(client: &mut TcpStream, within: Duration) {
+        client.set_read_timeout(Some(within)).expect("set timeout");
+        let mut b = [0u8; 16];
+        match client.read(&mut b) {
+            Ok(0) => {}
+            Ok(n) => panic!("expected a close, got {n} bytes"),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                ) => {}
+            Err(e) => panic!("connection not closed within {within:?}: {e}"),
+        }
+    }
+
+    fn assert_execute_response(r: MarshalResponse) {
+        match r {
+            MarshalResponse::Decision { outcome, .. } => {
+                assert_eq!(outcome, MarshalOutcome::Execute)
+            }
+            other => panic!("expected Decision Execute, got {other:?}"),
+        }
+    }
+
+    fn legit_request(addr: std::net::SocketAddr) -> MarshalResponse {
+        round_trip(
+            addr,
+            &MarshalRequest {
+                kerkese_json: minimal_envelope_json(),
+            },
+        )
+    }
+
+    #[test]
+    fn idle_client_does_not_block_a_legitimate_request() {
+        // A serial server would hold the legitimate request behind the idle
+        // client for the whole 5 s read deadline.
+        let limits = ProxyLimits {
+            read_deadline: Duration::from_secs(5),
+            ..ProxyLimits::default()
+        };
+        let transport = HttpKerkeseTransport::new(Some(spawn_mock_server(CANNED_EXECUTE_RESPONSE)));
+        let addr = start_proxy(transport, limits);
+
+        let _idle = TcpStream::connect(addr).expect("idle connect");
+        let start = Instant::now();
+        assert_execute_response(legit_request(addr));
+        assert!(
+            start.elapsed() < Duration::from_millis(3500),
+            "legitimate request was delayed by an idle client: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn slow_loris_client_is_dropped_within_the_deadline() {
+        let limits = ProxyLimits {
+            read_deadline: Duration::from_millis(500),
+            ..ProxyLimits::default()
+        };
+        let transport = HttpKerkeseTransport::new(None);
+        let addr = start_proxy(transport, limits);
+
+        let mut loris = TcpStream::connect(addr).expect("connect");
+        loris.write_all(&[0x10]).expect("one byte");
+        let start = Instant::now();
+        expect_closed(&mut loris, Duration::from_secs(8));
+        assert!(
+            start.elapsed() < Duration::from_secs(6),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn trickling_bytes_cannot_extend_the_total_deadline() {
+        // One byte every 200 ms would keep a per-read timeout alive forever;
+        // the total deadline (600 ms) must still cut it off.
+        let limits = ProxyLimits {
+            read_deadline: Duration::from_millis(600),
+            ..ProxyLimits::default()
+        };
+        let addr = start_proxy(HttpKerkeseTransport::new(None), limits);
+        let mut loris = TcpStream::connect(addr).expect("connect");
+        let start = Instant::now();
+        loris.write_all(&[0x40]).expect("first byte"); // declares 64 bytes (low byte)
+        let mut closed = false;
+        for _ in 0..25 {
+            std::thread::sleep(Duration::from_millis(200));
+            if loris.write_all(&[0x00]).is_err() {
+                closed = true;
+                break;
+            }
+        }
+        if !closed {
+            expect_closed(&mut loris, Duration::from_secs(5));
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn oversized_declared_length_is_rejected_without_waiting() {
+        // Long deadline: rejection must come from the length check, not the
+        // timeout.
+        let limits = ProxyLimits {
+            read_deadline: Duration::from_secs(30),
+            ..ProxyLimits::default()
+        };
+        let addr = start_proxy(HttpKerkeseTransport::new(None), limits);
+        let mut c = TcpStream::connect(addr).expect("connect");
+        let declared = (runix_ipc::marshal::MAX_JSON_LEN as u32 + 1).to_le_bytes();
+        c.write_all(&declared).expect("write prefix");
+        let start = Instant::now();
+        expect_closed(&mut c, Duration::from_secs(5));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn connections_beyond_the_cap_are_refused_not_queued() {
+        // Documented behaviour: with `max_connections` idle clients holding
+        // every slot, an extra connection is closed immediately (no
+        // response, no queueing); once the idle ones hit the read deadline
+        // and are dropped, legitimate traffic is served again.
+        let limits = ProxyLimits {
+            read_deadline: Duration::from_millis(1500),
+            max_connections: 2,
+            ..ProxyLimits::default()
+        };
+        let transport = HttpKerkeseTransport::new(Some(spawn_mock_server(CANNED_EXECUTE_RESPONSE)));
+        let addr = start_proxy(transport, limits);
+
+        let mut idle: Vec<TcpStream> = (0..2)
+            .map(|_| TcpStream::connect(addr).expect("idle connect"))
+            .collect();
+        // Let the acceptor register both idle connections.
+        std::thread::sleep(Duration::from_millis(300));
+
+        let mut extra = TcpStream::connect(addr).expect("extra connect");
+        let _ = extra.write_all(
+            &MarshalRequest {
+                kerkese_json: minimal_envelope_json(),
+            }
+            .encode(),
+        );
+        expect_closed(&mut extra, Duration::from_millis(1200));
+
+        // The idle clients are themselves dropped at the deadline...
+        for c in &mut idle {
+            expect_closed(c, Duration::from_secs(8));
+        }
+        // ...after which the slots are free and a legitimate request works.
+        assert_execute_response(legit_request(addr));
+    }
+
+    #[test]
+    fn never_answering_citadel_yields_marshal_timeout_within_bound() {
+        let silent = StdTcpListener::bind("127.0.0.1:0").expect("bind silent citadel");
+        let silent_addr = silent.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = silent.accept() {
+                read_http_request(&mut s);
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        });
+        let transport = HttpKerkeseTransport::with_timeouts(
+            Some(format!("http://{silent_addr}/marshal/kerkese")),
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+        );
+        let addr = start_proxy(transport, ProxyLimits::default());
+        let start = Instant::now();
+        let r = legit_request(addr);
+        assert!(
+            matches!(r, MarshalResponse::Error(MarshalError::Timeout)),
+            "{r:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
     }
 }
