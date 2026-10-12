@@ -48,11 +48,24 @@ be described as having any of the following.
    [0003](adrs/0003-unreachable-marshal-policy-is-per-action.md)). Only
    `data.reset_usage` fails closed. On x86, `grid_sandbox::spawn_instance`
    also fails open on an unreachable or unconfigured proxy
-   ([MARSHAL-ENFORCEMENT-POLICY.md](MARSHAL-ENFORCEMENT-POLICY.md)). A
-   malformed or undecodable reply counts as unreachable. The proxy serves one
-   connection at a time with no read timeout, so the link can be starved into
-   "unreachable". Fail-open success is logged as "not governed"; `Refuse`,
-   `HardStop` and local failure always block.
+   ([MARSHAL-ENFORCEMENT-POLICY.md](MARSHAL-ENFORCEMENT-POLICY.md)). A reply
+   that was reached but is faulty (malformed or empty body, bad content-length,
+   a non-403 HTTP error such as 400 or 500, a 403 that is not a
+   `REFUSE`/`HARD_STOP` Decision) is not unreachable: it blocks all six mobile
+   actions and x86 `spawn_instance` (ADR
+   [0006](adrs/0006-a-reachable-but-faulty-marshal-reply-fails-closed.md)). The
+   consequence is an availability hazard: a CITADEL that rejects dry-run
+   requests (every Runix request is `dry_run: true`) answers 400, and one that
+   fails with 5xx does the same, so every gated action is blocked, loudly. Still
+   fail-open: no proxy or device, connect failure, timeout, and an undecodable
+   kernel-to-proxy `ipc` reply. The proxy is bounded (1 s request-read
+   deadline, 2 s write timeout, at most 8 concurrent connections, CITADEL
+   connect 1 s / total 3 s), so an idle or slow client cannot stall it, but an
+   attacker who can reach its listener (a local process, or the guest through
+   QEMU guestfwd) can still hold the 8 slots and reopen them every second to
+   starve legitimate requests, which the kernel reads as unreachable. There is
+   no per-peer limit. Fail-open success is logged as "not governed"; `Refuse`,
+   `HardStop`, a faulty reply and local failure always block.
 3. **Nothing outside tests calls `grid_sandbox::spawn_instance`.** The
    boot-time Grid Sandbox path (`kernel/src/main.rs` Phase B7) authorizes and
    loads `grid-sandbox-host` directly; the MARSHAL-gated multi-instance entry
@@ -104,7 +117,8 @@ be described as having any of the following.
 14. **MARSHAL verdicts are not authenticated, and only part of the privileged
     surface is gated.** The kernel-to-proxy reply is unsigned JSON/`ipc` over
     plaintext TCP. Every request is `dry_run: true` (a simulation request).
-    The link can be starved into "unreachable", which fails open for most
+    An attacker who can reach the proxy listener can still starve the link
+    into "unreachable" (bounded, not prevented), which fails open for most
     actions. Only the six mobile actions below and x86 `spawn_instance` ask
     MARSHAL; every other privileged syscall in `kernel-arm/src/svc.rs` and
     `kernel/src/syscall.rs` is capability-checked only. On mobile,
@@ -238,7 +252,9 @@ path; fails open on unreachable); (b) MET (to a mock CITADEL only);
   `cargo test grid_sandbox_marshal_shadow (real MARSHAL enforcement - blocks on a reachable Refuse, fail-open when unreachable)`).
   `Refuse`/`HARD_STOP` block, proven in CI against stand-ins and against a mock
   CITADEL that reproduces the real handler's HTTP 403 + Decision; no real
-  CITADEL is exercised.
+  CITADEL is exercised. The same test's third case, `"shadow-faulty"`
+  (case 2b in the file), proves a reached-but-faulty reply blocks the spawn
+  with `MarshalEnforcementError::FaultyReply` and records `Faulty` in the WormLog.
 - (b) `kernel/tests/marshal_tcp_roundtrip.rs` (CI step
   `cargo test marshal_tcp_roundtrip ...`) and `marshal_proxy_e2e.rs` (CI step
   `cargo test marshal_proxy_e2e (real citadel_proxy + mock CITADEL via guestfwd)`:
@@ -379,8 +395,16 @@ outage; (e) **NOT MET**.
   not governed)` for eSIM/MVNO and `DENIED (MARSHAL unreachable: fail-closed
   for this action)` for the reset. Policy in ADR
   [0003](adrs/0003-unreachable-marshal-policy-is-per-action.md).
-- Proxy policy and wire tests (`desktop/src/citadel/policy.rs`, `proxy.rs`):
-  CI step `test`.
+- Faulty replies: CI step `boot in QEMU and check a real citadel_proxy relaying a garbage 200 / HTTP 500 from a mock CITADEL fails closed (faulty reply) for eSIM enable/delete and MVNO suspend`
+  (real `citadel_proxy`, mock CITADEL answering a non-JSON 200 for `esim.*` and
+  HTTP 500 for `mvno.suspend_account`; asserts `DENIED (MARSHAL faulty reply:
+  fail-closed)`, the `Faulty` evaluation lines, six WORM denials with
+  `authorized=false`, and that the actions answered `EXECUTE` are still admitted).
+  A genuinely unreachable MARSHAL still follows the per-action table, as in the
+  plain boot step above.
+- Proxy policy, wire and hardening tests (`desktop/src/citadel/policy.rs`,
+  `proxy.rs`, `transport.rs`: idle and slow clients, oversized length, the
+  connection cap, a never-answering CITADEL yielding `Timeout`): CI step `test`.
 
 **Remains:**
 - (e): no operator identity (Not claimed 1); signing key is the demo key.
@@ -389,8 +413,11 @@ outage; (e) **NOT MET**.
 - A `Refuse`/`HardStop` block is not WORM-audited (STATUS.md table, serial
   line only); local failures and fail-closed-unreachable denials are.
 - Link is plaintext TCP and the verdict is unsigned.
-- A proxy built before `MarshalError::PolicyRefused` still fails open on its
-  own policy rejections; kernel and proxy must be deployed together.
+- A proxy built before `MarshalError::PolicyRefused` reports its own policy
+  rejections as `MarshalError::Other`, which is now a faulty reply and blocks
+  (it used to fail open); kernel and proxy must still be deployed together.
+- The proxy's bounded concurrency does not stop an attacker who can reach the
+  listener from starving it (see Not claimed 2).
 - A live CITADEL must carry `rbacMap` entries for these actions; CI cannot
   show whether a given deployment does.
 

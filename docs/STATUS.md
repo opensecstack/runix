@@ -455,7 +455,10 @@ refusal):
   `ShadowMarshalOutcome` it computes, in addition to recording it in
   `WormLog` exactly as before — observability is unchanged, only now
   something also acts on the result.
-- A new `enforce_marshal_decision` gate: `Unreachable` (which
+- (Superseded in part by ADR 0006: a reached-but-faulty reply is now
+  `ShadowMarshalOutcome::Faulty` and also returns
+  `Err(MarshalEnforcementError::FaultyReply)`; only genuinely unreachable stays
+  fail-open.) A new `enforce_marshal_decision` gate: `Unreachable` (which
   `shadow_marshal_evaluate` already produces for both "no proxy
   configured" and "configured but couldn't be reached" — see that
   function's own `match`) and `Execute` both return `Ok(())`;
@@ -2447,14 +2450,16 @@ the reply with `MarshalResponse::decode`. Every request sets `"dry_run": true`,
 which is hardcoded in `kerkese_json`, and `citadel_proxy` forwards that flag
 upstream; dry-run is a simulation request, not a committed execution, so even a
 real `EXECUTE` would not be a live approval. The reply is unsigned JSON/`ipc`
-over plaintext TCP (unauthenticated), and the proxy handles one connection at a
-time with no read timeout, so the link can be starved into "unreachable". The principal is `el0:arm-demo`, role `operator`.
+over plaintext TCP (unauthenticated). The proxy is bounded (see "Proxy
+hardening" below): a slow or idle client cannot stall it, but an attacker who can
+reach its listener can still starve it, which the kernel reads as unreachable. The principal is `el0:arm-demo`, role `operator`.
 
 How the result is classified (`marshal_transport.rs`, `esim_marshal::enforce`):
 
 | Result | Covers | Policy |
 |---|---|---|
-| `Remote(Unreachable)` | No proxy configured (no process spawned), no device, connect failure, no report within 64 boot-thread yields, empty or undecodable reply, **and every `MarshalResponse::Error` kind except `PolicyRefused`** | Fail-open for the five eSIM and MVNO actions. **Fail-closed for `data.reset_usage`** (ADR 0003, below) |
+| `Remote(Unreachable)` | Nothing answered: no proxy configured (no process spawned), no device, connect failure (`MarshalError::Unreachable`), `MarshalError::Timeout`, no report within 64 boot-thread yields, or a kernel-to-proxy `ipc` reply that does not decode at all (response `None`) | Fail-open for the five eSIM and MVNO actions. **Fail-closed for `data.reset_usage`** (ADR 0003, below) |
+| `Remote(Faulty)` | MARSHAL was reached but its reply was faulty: `MarshalError::BadResponse` or `MarshalError::Other`, i.e. a malformed or empty body, a bad content-length, a non-403 HTTP error such as 400 or 500, or a 403 whose body is not a `REFUSE`/`HARD_STOP` Decision (including 403 with `EXECUTE`) | **Blocked for all six actions, regardless of the unreachable table** (ADR 0006): `DENIED (MARSHAL faulty reply: fail-closed)`, serial line `...: Faulty`, WORM-audited with `authorized=false`; `data.reset_usage` returns `11` |
 | `Remote(Refuse)` / `Remote(HardStop)` | A decoded CITADEL decision, **or** `MarshalError::PolicyRefused` from `citadel_proxy`'s own policy layer | Blocked, registry and sim untouched, **not WORM-audited** |
 | `LocalFailure(SetupFailed / SpawnFailed / ExcursionFaulted)` | The kernel could not run the evaluation: out of memory, thread spawn, EL0 fault | Fail-closed, `DENIED (MARSHAL local failure: ...)`, WORM-audited with `authorized=false` |
 
@@ -2465,7 +2470,7 @@ capability-checked only. A real CITADEL delivers `REFUSE`/`HARD_STOP` as HTTP
 refusal classify as unreachable (fail-open). The transport now relays a 403
 Decision, proven in CI only against a mock CITADEL that reproduces it.
 
-The fail-open row has a consequence that has to be stated plainly. While the
+The `Unreachable` fail-open row has a consequence that has to be stated plainly. While the
 MARSHAL proxy is unreachable, five consequential mobile operations (eSIM enable
 and delete, MVNO bind, suspend and reactivate) proceed without governance.
 Any failure of the link (proxy down, connection refused, no answer within the
@@ -2479,8 +2484,37 @@ tag 1, error-kind byte 4, same bounded string encoding as the other kinds),
 which both kernels classify as a refusal (`marshal_action::classify_response`
 on ARM, `grid_sandbox::shadow_marshal_evaluate` on x86). The kernel and the
 proxy must be deployed together: a proxy built before this change still sends
-`Other("POLICY_REFUSE...")`, which stays fail-open. A kernel envelope that
-fails to parse at all is still `BadResponse` and so still fail-open.
+`Other("POLICY_REFUSE...")`, which is now a faulty reply and so blocks (it used
+to be fail-open). Likewise `BadResponse` (for example a CITADEL body that fails to
+parse) no longer fails open: it is `Faulty` and blocks, per
+[adrs/0006-a-reachable-but-faulty-marshal-reply-fails-closed.md](adrs/0006-a-reachable-but-faulty-marshal-reply-fails-closed.md).
+
+**Faulty replies fail closed (ADR 0006).** `marshal_action::classify_response`
+maps `MarshalError::BadResponse` and `MarshalError::Other` to
+`ShadowMarshalOutcome::Faulty`, which `enforce` blocks under either policy (a host
+test, `faulty_blocks_all_six_actions_unreachable_follows_table`, pins this and
+that `Unreachable`/`Timeout`/`None` still follow the table). The x86
+`grid_sandbox::spawn_instance` does the same
+(`MarshalEnforcementError::FaultyReply`), proven in QEMU by case 2b
+(`"shadow-faulty"`) of `kernel/tests/grid_sandbox_marshal_shadow.rs` and, for ARM, by a CI boot
+of a real `citadel_proxy` against a mock CITADEL answering a garbage 200 and an HTTP 500.
+**Availability consequence:** every Runix request is `dry_run:true`; a CITADEL that
+rejects dry-run requests answers HTTP 400, which is a faulty reply, so every gated
+action is now blocked loudly instead of silently allowed, and a CITADEL outage that
+yields 5xx does the same. **Still open:** an undecodable kernel-to-proxy `ipc` reply
+(response `None`) is classified `Unreachable`, so it follows the per-action table
+(fail-open for five actions).
+
+**Proxy hardening.** `citadel_proxy` (`desktop/src/citadel/proxy.rs`,
+`ProxyLimits`) now allows a connection 1 s in total to deliver its request, 2 s per response
+write, and handles at most 8 connections at once (a thread per connection; excess
+connections are closed immediately, not queued). It rejects an oversized declared length
+from the 4-byte prefix. Its CITADEL HTTP leg (`desktop/src/citadel/transport.rs`) has a 1 s connect and
+3 s total timeout; a timeout is `MarshalError::Timeout`. Default listen address is
+`127.0.0.1:9000`. **Residual:** an attacker who can reach the listener (a local process,
+or the guest through QEMU guestfwd) can hold 8 connections open and reopen them every second
+to starve legitimate requests, which the kernel reads as unavailable. There is no per-peer limit;
+the real fix is controlling who can reach the listener or authenticating the link.
 
 **The per-action policy (ADR 0003).** `MarshalAction::unreachable_policy()`
 (`kernel-arm/src/marshal_action.rs`) is one exhaustive `match` that gives each
@@ -2491,7 +2525,7 @@ action)`, returns code `6`, leaves state untouched, and is WORM-audited with
 `authorized=false`. The other five stay `FailOpen`, and whether any of them should
 change is an open decision with its own table of candidates and the availability
 trade-off: [adrs/0003-unreachable-marshal-policy-is-per-action.md](adrs/0003-unreachable-marshal-policy-is-per-action.md).
-`Refuse`, `HardStop` and local failures block under either policy.
+`Refuse`, `HardStop`, `Faulty` and local failures block under either policy.
 
 **Verdicts are recorded.** Every gated success writes the verdict that let it
 through, `MARSHAL verdict: Execute` or `MARSHAL verdict: Unreachable (fail-open:
@@ -2685,7 +2719,7 @@ its own copies of the numbers, as the other mobile syscalls do.
 | 20 | `SYS_DATA_SESSION_OPEN` | account, slot, profile \| roaming<<8 | `data:session:{account}` | `0` allow, `1` allow throttled; `2`–`6` engine denial; `7`–`13` refused |
 | 21 | `SYS_DATA_SESSION_CLOSE` | account, slot, profile | `data:session:{account}` | `0` closed, `1` denied, `2` not open, `3` bad argument |
 | 22 | `SYS_DATA_RECONCILE` | none | `data:reconcile` | incident count; `u64::MAX` if denied |
-| 23 | `SYS_DATA_RESET` | account | `data:reset:{account}` + MARSHAL (`data.reset_usage`) | `0` counter reset (next period started, if the account has one); `1` no capability; `2` MARSHAL `Refuse`/`HardStop`; `3` MARSHAL local failure; `4` no entitlement; `5` no such account; `6` MARSHAL unreachable (fail-closed) |
+| 23 | `SYS_DATA_RESET` | account | `data:reset:{account}` + MARSHAL (`data.reset_usage`) | `0` counter reset (next period started, if the account has one); `1` no capability; `2` MARSHAL `Refuse`/`HardStop`; `3` MARSHAL local failure; `4` no entitlement; `5` no such account; `6` MARSHAL unreachable (fail-closed); `11` MARSHAL faulty reply (fail-closed) |
 | 24 | `SYS_DATA_PERIOD` | account | `data:session:{account}` (read-only advice) | `0` active; `1` elapsed, reset REQUESTED; `2` clock before the period start; `3` no billing period; `4` no capability |
 
 The refusal codes are named. For `SYS_DATA_ACCOUNT`: `4` no capability, `5` no

@@ -1,0 +1,113 @@
+# 0006: A reachable but faulty MARSHAL reply fails closed
+
+**Status**: Accepted 2026-10-12. Refines
+[0003](0003-unreachable-marshal-policy-is-per-action.md).
+
+## Context
+
+ADR 0003 made the "MARSHAL is unreachable" policy a per-action table
+(`MarshalAction::unreachable_policy()`): `data.reset_usage` fails closed, and
+`esim.enable`, `esim.delete`, `mvno.bind_profile`, `mvno.suspend_account` and
+`mvno.reactivate_account` fail open. Its fail-open reasoning is the bootstrap
+deadlock: enabling an eSIM profile can be what provides the connectivity needed to
+reach the gate, so a phone cannot ask first.
+
+That reasoning only covers being unable to reach the gate. Both kernels, however,
+classified every reply that was not a decoded Decision as `Unreachable`, including
+replies that prove the proxy and the network were reached: a `200` with a
+non-JSON or empty body, a bad content-length, a non-403 HTTP error such as 400 or
+500, or a `403` whose body is not a `REFUSE`/`HARD_STOP` Decision (including
+`403` with `EXECUTE`). On the wire these are `MarshalError::BadResponse` and
+`MarshalError::Other` (`ipc/src/marshal.rs`). Treating them as an outage meant a
+CITADEL, or anything able to make it answer badly, could turn the gate off for the
+fail-open actions (and for `grid_sandbox::spawn_instance` on x86) simply by
+answering with garbage. No bootstrap argument applies: the gate was reached and
+the connectivity exists.
+
+## Decision
+
+1. **A reached-but-faulty reply is its own outcome, `ShadowMarshalOutcome::Faulty`**
+   (`citadel-integration/src/lib.rs`). `MarshalError::BadResponse` and
+   `MarshalError::Other` classify to it, on ARM
+   (`marshal_action::classify_response`) and on x86
+   (`grid_sandbox::shadow_marshal_evaluate`).
+2. **`Faulty` blocks, under every policy.** All six mobile actions (`esim.enable`,
+   `esim.delete`, `mvno.bind_profile`, `mvno.suspend_account`,
+   `mvno.reactivate_account`, `data.reset_usage`) and x86
+   `grid_sandbox::spawn_instance` (`MarshalEnforcementError::FaultyReply`) are
+   denied regardless of the per-action unreachable table.
+3. **The denial is the kernel's own and is audited.** Text:
+   `DENIED (MARSHAL faulty reply: fail-closed)`; serial evaluation line
+   `...: Faulty`; WORM entry `authorized=false`, like the fail-closed-unreachable
+   denial (unlike `Refuse`/`HardStop` on mobile, which are not audited). The data
+   reset returns `RESET_DENIED_FAULTY = 11` (`kernel-arm/src/data_codes.rs`).
+4. **The unreachable table is unchanged.** Genuinely unreachable cases (no proxy,
+   no network device, connect failure `MarshalError::Unreachable`,
+   `MarshalError::Timeout`, and an undecodable kernel-to-proxy `ipc` reply, i.e.
+   response `None`) keep ADR 0003's per-action behaviour, pinned by the test
+   `unreachable_policy_table_is_pinned`. `Refuse`, `HardStop`, `PolicyRefused` and
+   local failures are unchanged.
+
+## Consequences
+
+Better:
+
+- A reachable CITADEL answering garbage can no longer admit an action. The class
+  of "answered, but not with a Decision" is no longer silently equal to "down".
+- The audit trail distinguishes `Faulty` from `Unreachable`.
+
+Worse, or left open:
+
+- **Availability hazard.** Every Runix request is `dry_run:true`. A CITADEL that
+  rejects dry-run requests answers HTTP 400, which is a faulty reply, so every
+  gated action is now blocked, loudly, where it used to be silently allowed. A
+  CITADEL outage that yields 5xx does the same. Deployments must confirm their
+  CITADEL accepts dry-run Kerkese requests before enabling the gate.
+- **The `None` case is still open.** A kernel-to-proxy `ipc` reply that does not
+  decode at all (response `None`) is still classified `Unreachable`, so for the
+  five fail-open actions it still admits the action. It cannot be told apart from
+  a dead link at that layer.
+- **Starvation residual.** `citadel_proxy` is now bounded (1 s total request-read
+  deadline, 2 s write timeout, at most 8 concurrent connections, excess closed
+  immediately, oversized declared length rejected on the 4-byte prefix; CITADEL
+  HTTP connect 1 s, total 3 s, a timeout being `MarshalError::Timeout`). Default
+  listen address is `127.0.0.1:9000`. An attacker who can reach the listener (a
+  local process, or the guest through QEMU guestfwd) can still hold 8
+  connections open and reopen them every second, starving legitimate requests,
+  which the kernel reads as unavailable and so fail-open for five actions. There
+  is no per-peer limit. The real fix is controlling who can reach the listener
+  or authenticating the link.
+- The verdict is still unauthenticated and `dry_run` is still `true`; this
+  change does not make an `Execute` a live approval.
+
+## Alternatives considered
+
+- **Fail-closed except `esim.enable`.** Keeps the bootstrap exception. Rejected: the
+  bootstrap argument is about reaching the gate, and a faulty reply shows the gate
+  was reached, so the exception has no basis here; it would also leave a
+  garbage-reply bypass for the action that switches the active subscription.
+- **Leave as is.** Rejected: any reply that is not a valid Decision, including
+  a CITADEL bug or a hostile in-path party, would disable the gate for five
+  actions, which is the bypass lever ADR 0003 set out to remove for the reset.
+
+## Revisit when
+
+- The kernel-to-proxy link is authenticated or the `None` case can be told apart
+  from a dead link; then reconsider its classification.
+- A CITADEL deployment is found that legitimately answers dry-run requests with
+  a non-403 error, which would make this blocking unusable there.
+- The maintainers decide any open row of ADR 0003's table, or a bootstrap exception
+  or offline grant is designed.
+- A per-peer limit or restriction on who may reach the proxy listener exists.
+
+## References
+
+- `kernel-arm/src/marshal_action.rs` (`classify_response`, `enforce`)
+- `kernel-arm/src/data_codes.rs` (`RESET_DENIED_FAULTY`)
+- `kernel/src/grid_sandbox.rs` (`MarshalEnforcementError::FaultyReply`)
+- `citadel-integration/src/lib.rs` (`ShadowMarshalOutcome::Faulty`)
+- `desktop/src/citadel/proxy.rs` (`ProxyLimits`), `desktop/src/citadel/transport.rs`
+- `kernel/tests/grid_sandbox_marshal_shadow.rs` (case 2b, `shadow-faulty`)
+- `.github/workflows/ci.yml` (the garbage 200 / HTTP 500 ARM boot step)
+- [0003](0003-unreachable-marshal-policy-is-per-action.md),
+  `docs/MARSHAL-ENFORCEMENT-POLICY.md`, `docs/STATUS.md` "MARSHAL gate for mobile"

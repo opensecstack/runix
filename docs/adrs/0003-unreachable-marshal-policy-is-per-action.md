@@ -3,7 +3,8 @@
 **Status**: Accepted for `data.reset_usage` (fail-closed). Open for the other
 gated mobile actions, which keep their existing fail-open behaviour until the
 maintainers decide otherwise. Accepted 2026-10-11. Refines
-[0002](0002-usage-reset-is-marshal-gated.md).
+[0002](0002-usage-reset-is-marshal-gated.md). Refined by
+[0006](0006-a-reachable-but-faulty-marshal-reply-fails-closed.md).
 
 ## Context
 

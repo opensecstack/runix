@@ -11,6 +11,46 @@ not claim.
 
 ## [Unreleased]
 
+### Security
+
+- Fix: a MARSHAL reply that was reached but is faulty (`MarshalError::BadResponse`
+  or `MarshalError::Other`: a malformed or empty body, a bad content-length, a
+  non-403 HTTP error such as 400 or 500, a 403 whose body is not a
+  `REFUSE`/`HARD_STOP` Decision) was classified `Unreachable` and so failed open
+  for eSIM enable/delete, MVNO bind/suspend/reactivate and x86 `spawn_instance`.
+  It is now the new outcome `ShadowMarshalOutcome::Faulty` and blocks all six
+  mobile actions and `spawn_instance`, regardless of the per-action unreachable
+  table (`db0aeb9`, `625e944`, `4e07444`; ADR 0006). The denial reads
+  `DENIED (MARSHAL faulty reply: fail-closed)`, is WORM-audited with
+  `authorized=false`, and the data reset returns `RESET_DENIED_FAULTY = 11`.
+  Genuinely unreachable cases (no proxy, connect failure, timeout, an
+  undecodable kernel-to-proxy `ipc` reply) are unchanged. Availability note:
+  every Runix request is `dry_run: true`, so a CITADEL that rejects dry-run
+  requests answers HTTP 400, and one that fails with 5xx, now blocks every
+  gated action loudly instead of silently allowing it.
+- Fix: `citadel_proxy` could be stalled by one idle or slow client (it served
+  one connection at a time with no read timeout), which the kernel read as
+  MARSHAL unavailable. It now has a 1 s total request-read deadline, a 2 s write
+  timeout, at most 8 concurrent connections (excess closed immediately), an
+  oversized declared length rejected on the 4-byte prefix, and a CITADEL HTTP
+  connect timeout of 1 s and total timeout of 3 s, where a timeout is
+  `MarshalError::Timeout` (`4a26c08`, `f8322c0`). Residual: an attacker who can
+  reach the listener (a local process, or the guest through QEMU guestfwd) can
+  still hold the 8 connections open and reopen them every second to starve
+  valid requests; there is no per-peer limit. The fix for that is
+  controlling who can reach the listener or authenticating the link.
+
+### Added
+
+- CI: boots a real `citadel_proxy` against a mock CITADEL answering a garbage
+  HTTP 200 and an HTTP 500 and asserts the ARM kernel fails closed (faulty
+  reply) for eSIM enable/delete and MVNO suspend (`d8d561e`).
+- Tests: `grid_sandbox_marshal_shadow` gains a third case, `shadow-faulty`,
+  asserting a faulty reply blocks `spawn_instance` and records `Faulty`
+  (`4e07444`); host tests pin the faulty and unreachable classification and the
+  proxy's idle, slow-client, oversized-length and connection-cap behaviour.
+- Docs: ADR [0006](docs/adrs/0006-a-reachable-but-faulty-marshal-reply-fails-closed.md).
+
 ## [0.1.0-beta.1] - 2026-10-12
 
 ### Security

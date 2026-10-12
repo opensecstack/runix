@@ -26,6 +26,25 @@ code ever calls `spawn_instance` at all — see `docs/THREAT_MODEL.md`'s
 MARSHAL/WORM revisit trigger for the current, precise list of what that
 leaves open.
 
+## Update 2026-10-12: a reached-but-faulty reply fails closed
+
+Option B's fail-open applies only to MARSHAL being **unreachable**. A reply that
+was reached but is faulty (`MarshalError::BadResponse`/`MarshalError::Other` on
+the wire: a malformed or empty body, a bad content-length, a non-403 HTTP error
+such as 400 or 500, or a 403 whose body is not a `REFUSE`/`HARD_STOP` Decision,
+including 403 with `EXECUTE`) is now `ShadowMarshalOutcome::Faulty` and
+**blocks** `spawn_instance` (`MarshalEnforcementError::FaultyReply`) and all six
+mobile actions, whatever their per-action unreachable policy. The fail-open
+reasoning in this document covers being unable to reach the gate; it does not
+cover a gate that answered badly. Genuinely unreachable cases (no proxy
+configured, connect failure, `MarshalError::Timeout`, an undecodable
+kernel-to-proxy reply) keep Option B. Operational consequence: a CITADEL that
+rejects dry-run requests (every Runix request is `dry_run: true`) answers 400,
+and one that fails with 5xx does the same; both now block loudly instead of
+silently allowing. Proven for x86 by case 2b (`"shadow-faulty"`) of
+`kernel/tests/grid_sandbox_marshal_shadow.rs`. Decision record:
+[adrs/0006-a-reachable-but-faulty-marshal-reply-fails-closed.md](adrs/0006-a-reachable-but-faulty-marshal-reply-fails-closed.md).
+
 ## Context
 
 Today, `spawn_instance` performs a shadow-mode (observe-only, never blocking) MARSHAL

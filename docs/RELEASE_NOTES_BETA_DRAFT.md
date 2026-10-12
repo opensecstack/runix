@@ -19,11 +19,22 @@ Read this first. This list mirrors "Not claimed" in BETA_CRITERIA.md.
   over plaintext TCP, so it is unauthenticated.
 - **The MARSHAL gate mostly fails open.** With the proxy unreachable or
   unconfigured, eSIM enable/delete, MVNO bind/suspend/reactivate, and the x86
-  `spawn_instance` proceed ungoverned; a malformed or undecodable reply counts
-  as unreachable. The proxy handles one connection at a time and has no read
-  timeout, so the link can be starved into "unreachable". Fail-open success is
-  logged as "not governed"; `Refuse`, `HardStop` and local failure always
-  block. Only the mobile usage reset fails closed.
+  `spawn_instance` proceed ungoverned. A reply that was reached but is faulty
+  (malformed or empty body, bad content-length, a non-403 HTTP error such as
+  400 or 500, a 403 that is not a `REFUSE`/`HARD_STOP` Decision) is not
+  unreachable: it blocks all six mobile actions and `spawn_instance`. This is
+  an availability hazard: every Runix request is `dry_run: true`, so a CITADEL
+  that rejects dry-run requests answers 400, and one that fails with 5xx does
+  the same; every gated action is then blocked, loudly. The proxy is bounded
+  (1 s request-read deadline, 2 s write timeout, at most 8 concurrent
+  connections, CITADEL connect 1 s / total 3 s), but an attacker who can reach
+  its listener (a local process, or the guest through QEMU guestfwd) can still
+  hold the 8 slots and reopen them every second to starve legitimate requests,
+  which the kernel reads as unreachable and so fail-open; there is no per-peer
+  limit. An undecodable kernel-to-proxy `ipc` reply is also still treated as
+  unreachable. Fail-open success is logged as "not governed"; `Refuse`,
+  `HardStop`, a faulty reply and local failure always block. Only the mobile
+  usage reset fails closed when MARSHAL is unreachable.
 - **Only part of the privileged surface is MARSHAL-gated.** Six mobile
   actions and x86 `spawn_instance` are gated. Every other privileged syscall
   (for example RIL access/send/receive, SIM create/install/disable, port I/O,
