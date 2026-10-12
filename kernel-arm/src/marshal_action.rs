@@ -15,7 +15,7 @@
 use alloc::format;
 use alloc::string::String;
 use runix_citadel_integration::ShadowMarshalOutcome;
-use runix_ipc::marshal::{MarshalError, MarshalOutcome, MarshalResponse};
+use runix_ipc::marshal::{MarshalError, MarshalOutcome, MarshalResponse, ResponseDecode};
 
 /// One governed action. `Esim::op` is `"enable"` or `"delete"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +336,24 @@ pub fn classify_response(resp: Option<&MarshalResponse>) -> ShadowMarshalOutcome
     }
 }
 
+/// Pure classification of the raw reply bytes, using the streaming decoder's
+/// three-way verdict (ADR 0006):
+///
+/// - `Complete(resp)` -> [`classify_response`];
+/// - `Malformed` (bytes that can never be a valid response: unknown tag,
+///   outcome or error kind, oversize length, bad UTF-8) -> `Faulty`, a REACHED
+///   but faulty reply, blocked for every action. A garbled real REFUSE must
+///   not become fail-open;
+/// - `Incomplete` (empty, or a valid prefix that stalled: truncated/silent) ->
+///   `Unreachable`, a real timeout, per-action table unchanged.
+pub fn classify_decode(status: &ResponseDecode) -> ShadowMarshalOutcome {
+    match status {
+        ResponseDecode::Complete(resp, _) => classify_response(Some(resp)),
+        ResponseDecode::Malformed => ShadowMarshalOutcome::Faulty,
+        ResponseDecode::Incomplete => ShadowMarshalOutcome::Unreachable,
+    }
+}
+
 /// First source port handed to a MARSHAL evaluation. `49152` itself is left
 /// to the TCP proof (`tcp_proof.rs` / the driver's `TCP_LOCAL_PORT`).
 pub const MARSHAL_LOCAL_PORT_BASE: u16 = 49153;
@@ -599,6 +617,74 @@ mod tests {
             assert_eq!(
                 enforce(policy, GateOutcome::Remote(o)),
                 Err(Blocked::Remote(ShadowMarshalOutcome::Refuse))
+            );
+        }
+    }
+
+    /// Raw reply bytes: malformed bytes (even a garbled real REFUSE) are
+    /// Faulty and block all six actions under both policies; empty or
+    /// incomplete bytes stay Unreachable and follow the pinned table.
+    #[test]
+    fn malformed_bytes_fault_all_six_actions_incomplete_follows_table() {
+        let actions = [
+            MarshalAction::Esim {
+                op: "enable",
+                slot: 0,
+                profile: 0,
+            },
+            MarshalAction::Esim {
+                op: "delete",
+                slot: 0,
+                profile: 0,
+            },
+            MarshalAction::MvnoBind {
+                account: 0,
+                slot: 0,
+                profile: 0,
+            },
+            MarshalAction::MvnoSuspend { account: 0 },
+            MarshalAction::MvnoReactivate { account: 0 },
+            MarshalAction::DataResetUsage { account: 0 },
+        ];
+        let refuse = MarshalResponse::Decision {
+            outcome: MarshalOutcome::Refuse,
+            decision_json: alloc::vec![b'{', b'}'],
+        }
+        .encode();
+        let mut garbled = refuse.clone();
+        garbled[1] = 9; // unknown outcome byte
+        let malformed: [&[u8]; 4] = [&[0x7f, 0, 0, 0, 0, 0], &[0x7f], &[1, 5, 0, 0], &garbled];
+        let incomplete: [&[u8]; 3] = [&[], &refuse[..3], &refuse[..refuse.len() - 1]];
+        for a in &actions {
+            let policy = a.unreachable_policy();
+            for m in malformed {
+                let o = classify_decode(&MarshalResponse::decode_status(m));
+                assert_eq!(o, ShadowMarshalOutcome::Faulty, "{}", a.label());
+                assert_eq!(
+                    enforce(policy, GateOutcome::Remote(o)),
+                    Err(Blocked::Faulty),
+                    "{}",
+                    a.label()
+                );
+            }
+            for i in incomplete {
+                let o = classify_decode(&MarshalResponse::decode_status(i));
+                assert_eq!(o, ShadowMarshalOutcome::Unreachable, "{}", a.label());
+                let want = match policy {
+                    UnreachablePolicy::FailOpen => Ok(()),
+                    UnreachablePolicy::FailClosed => Err(Blocked::Unreachable),
+                };
+                assert_eq!(
+                    enforce(policy, GateOutcome::Remote(o)),
+                    want,
+                    "{}",
+                    a.label()
+                );
+            }
+            // A complete well-formed reply still passes through unchanged.
+            assert_eq!(
+                classify_decode(&MarshalResponse::decode_status(&refuse)),
+                ShadowMarshalOutcome::Refuse
             );
         }
     }

@@ -25,9 +25,10 @@
 //! request-building convention (`dry_run: true`, a minimal but genuinely
 //! well-formed envelope), and the same outcome mapping
 //! (`MarshalResponse::Decision{outcome,..}` passes through;
-//! `Error(PolicyRefused(_))` is `Remote(Refuse)`; any other
-//! `MarshalResponse::Error(_)`, an undecodable reply, or no reply at all
-//! is `Remote(Unreachable)`), with one deliberate divergence: local
+//! `Error(PolicyRefused(_))` is `Remote(Refuse)`; `Error(BadResponse|Other)`
+//! and definitely-malformed reply bytes are `Remote(Faulty)`, fail-closed;
+//! `Error(Unreachable|Timeout)`, an empty/incomplete reply, or no reply at
+//! all is `Remote(Unreachable)`), with one deliberate divergence: local
 //! failures of the kernel's own evaluation machinery are a separate
 //! `GateOutcome::LocalFailure` that fails closed -- see [`evaluate`]. The transport underneath
 //! differs -- that function reaches a user-space MARSHAL proxy via
@@ -48,9 +49,9 @@ use crate::net_process;
 use crate::serial_println;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use runix_citadel_integration::ShadowMarshalOutcome;
-use runix_ipc::marshal::{MarshalError, MarshalRequest, MarshalResponse};
+use runix_ipc::marshal::{MarshalError, MarshalRequest, MarshalResponse, ResponseDecode};
 use runix_kernel_arm::marshal_action::{
-    classify_response, marshal_local_port, GateOutcome, LocalFailure, MarshalAction,
+    classify_decode, marshal_local_port, GateOutcome, LocalFailure, MarshalAction,
 };
 use spin::Mutex;
 
@@ -254,13 +255,16 @@ extern "C" fn marshal_transport_thread() -> ! {
 /// - the remote connect failed or timed out (`status != 0` / empty reply);
 /// - the EL0 process did not report back within the bounded 64-yield budget
 ///   (ambiguous with a slow network, so not blamed on the kernel);
-/// - the reply did not decode, or decoded as `MarshalResponse::Error` of kind
-///   `Unreachable`/`Timeout` (nothing answered).
+/// - the reply was empty or merely incomplete (a valid prefix that stalled),
+///   or decoded as `MarshalResponse::Error` of kind `Unreachable`/`Timeout`
+///   (nothing answered).
 ///
 /// **`Remote(Faulty)` (blocked for EVERY action)**
 /// - the proxy was reached but relayed `MarshalResponse::Error` of kind
 ///   `BadResponse`/`Other` (malformed/empty body, non-403 HTTP error, a 403
-///   that is not a REFUSE/HARD_STOP Decision).
+///   that is not a REFUSE/HARD_STOP Decision);
+/// - the reply bytes are definitely malformed (`ResponseDecode::Malformed`:
+///   unknown tag/outcome/error kind, oversize length, bad UTF-8).
 ///
 /// **`Remote(Refuse)` (blocked)**
 /// - `Decision{Refuse}`, and `MarshalResponse::Error(PolicyRefused(_))`: the
@@ -498,8 +502,20 @@ pub(crate) fn evaluate_configured(
     // `MARSHAL_BUFFER_CAPACITY`, the exact size `setup` mapped.
     let bytes = unsafe { core::slice::from_raw_parts(response_phys as *const u8, len) };
 
-    let decoded = MarshalResponse::decode(bytes).map(|(r, _)| r);
-    if let Some(MarshalResponse::Error(MarshalError::PolicyRefused(reason))) = &decoded {
+    let status = MarshalResponse::decode_status(bytes);
+    if matches!(status, ResponseDecode::Malformed) {
+        serial_println!(
+            "Runix ARM kernel: MARSHAL evaluation for {}: malformed reply ({} bytes): \
+             faulty, fail-closed",
+            action.label(),
+            len
+        );
+    }
+    if let ResponseDecode::Complete(
+        MarshalResponse::Error(MarshalError::PolicyRefused(reason)),
+        _,
+    ) = &status
+    {
         // Reason is at most MAX_MESSAGE_LEN bytes (wire bound); `{:?}` escapes
         // control characters so it stays on one line.
         serial_println!(
@@ -510,6 +526,7 @@ pub(crate) fn evaluate_configured(
     }
     // A policy refusal is an explicit negative answer (Refuse, blocked); every
     // BadResponse/Other is a reached-but-faulty reply (Faulty, blocked for
-    // every action); Unreachable/Timeout/undecodable is Unreachable.
-    Remote(classify_response(decoded.as_ref()))
+    // every action), and so are bytes that can never decode (Malformed);
+    // Unreachable/Timeout/incomplete (empty or stalled) is Unreachable.
+    Remote(classify_decode(&status))
 }

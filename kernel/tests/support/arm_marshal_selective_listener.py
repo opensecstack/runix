@@ -12,11 +12,15 @@ so it can only ever prove the first gated syscall; this one:
   * parses each request's Kerkese JSON `action.type`,
   * answers REFUSE (outcome byte 1) when the type starts with any `--refuse`
     prefix, else EXECUTE (outcome byte 0),
+  * replies with MALFORMED bytes (first byte 0x7f, no valid response tag,
+    then padding) when the type starts with any `--malformed` prefix (this
+    takes precedence over --refuse),
   * logs every decision to stderr.
 
-Usage: arm_marshal_selective_listener.py [port] [--refuse PREFIX]...
+Usage: arm_marshal_selective_listener.py [port] [--refuse PREFIX]... [--malformed PREFIX]...
   port        default 9004 (matches the guestfwd target in ci.yml)
   --refuse P  repeatable; e.g. `--refuse esim.` or `--refuse mvno.suspend_account`
+  --malformed P  repeatable; reply with raw malformed bytes for matching types
 
 Runs until killed. Not a MARSHAL proxy or client.
 
@@ -65,9 +69,17 @@ def decide(action_type: str, refuse_prefixes: list) -> int:
     return OUTCOME_EXECUTE
 
 
+MALFORMED_REPLY = b"\x7f" + b"\x00" * 15  # 0x7f is not a MarshalResponse tag
+
+
+def is_malformed(action_type: str, malformed_prefixes: list) -> bool:
+    return any(action_type.startswith(p) for p in malformed_prefixes)
+
+
 def parse_args(argv: list):
     port = DEFAULT_PORT
     refuse = []
+    malformed = []
     i = 0
     while i < len(argv):
         if argv[i] == "--refuse":
@@ -75,15 +87,28 @@ def parse_args(argv: list):
                 raise SystemExit("--refuse needs a prefix argument")
             refuse.append(argv[i + 1])
             i += 2
+        elif argv[i] == "--malformed":
+            if i + 1 >= len(argv):
+                raise SystemExit("--malformed needs a prefix argument")
+            malformed.append(argv[i + 1])
+            i += 2
         else:
             port = int(argv[i])
             i += 1
-    return port, refuse
+    return port, refuse, malformed
 
 
-def serve_one(conn: socket.socket, refuse: list) -> None:
+def serve_one(conn: socket.socket, refuse: list, malformed: list) -> None:
     kerkese_json = shadow.recv_marshal_request(conn)
     action_type = action_type_of(kerkese_json)
+    if is_malformed(action_type, malformed):
+        conn.sendall(MALFORMED_REPLY)
+        print(
+            f"arm_marshal_selective_listener: action.type={action_type!r} -> MALFORMED",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
     outcome = decide(action_type, refuse)
     decision = DECISION_REFUSE if outcome == OUTCOME_REFUSE else DECISION_EXECUTE
     conn.sendall(encode_response(outcome, decision))
@@ -96,20 +121,20 @@ def serve_one(conn: socket.socket, refuse: list) -> None:
 
 
 def main() -> int:
-    port, refuse = parse_args(sys.argv[1:])
+    port, refuse, malformed = parse_args(sys.argv[1:])
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, port))
     server.listen(8)
     print(
-        f"arm_marshal_selective_listener: listening on {HOST}:{port}, refuse prefixes {refuse!r}",
+        f"arm_marshal_selective_listener: listening on {HOST}:{port}, refuse prefixes {refuse!r}, malformed prefixes {malformed!r}",
         file=sys.stderr,
         flush=True,
     )
     while True:
         conn, _addr = server.accept()
         try:
-            serve_one(conn, refuse)
+            serve_one(conn, refuse, malformed)
         except (OSError, ConnectionError) as err:
             print(f"arm_marshal_selective_listener: connection error: {err}", file=sys.stderr, flush=True)
         finally:

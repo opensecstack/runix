@@ -1842,6 +1842,66 @@ jobs:
           # Eleven evaluations in all: bind 1, enable 3, suspend 1, reactivate 1, data 3, delete 2.
           test "$(grep -c "Runix ARM kernel: MARSHAL evaluation for" /tmp/arm-boot-marshal-faulty.log)" -eq 11
 
+      # Malformed (undecodable) MARSHAL reply bytes fail CLOSED (ADR 0006). The
+      # kernel's receive path used to retry-decode and, when the bytes could never
+      # decode (unknown tag/outcome/error kind, oversize length, bad UTF-8), give up
+      # as Unreachable, i.e. FAIL-OPEN for esim.* and mvno.*: a garbled REFUSE
+      # admitted the action. runix_ipc::marshal::MarshalResponse::decode_status now
+      # tells Malformed from Incomplete; Malformed is ShadowMarshalOutcome::Faulty
+      # and blocked, while an empty or stalled (incomplete) reply stays Unreachable.
+      # Same selective stand-in listener and guestfwd route as the REFUSE step
+      # above, but `--malformed esim.` makes it answer raw bytes that are no valid
+      # response (first byte 0x7f, an unknown tag, then padding) for esim.*, and
+      # EXECUTE for everything else.
+      - name: boot in QEMU and check a malformed MARSHAL reply fails closed (faulty) for eSIM enable and delete
+        run: |
+          trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
+          python3 ../kernel/tests/support/tcp_proof_listener.py &
+          sleep 0.3
+          python3 ../kernel/tests/support/arm_marshal_selective_listener.py 9004 --malformed esim. &
+          sleep 0.3
+          # 25 s: same measured budget as the other MARSHAL boots (same walk).
+          timeout 25 qemu-system-aarch64 \
+            -M virt,secure=on,gic-version=2 -cpu cortex-a53 -nographic \
+            -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
+            -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001,guestfwd=tcp:10.0.2.100:9100-cmd:nc 127.0.0.1 9004" \
+            -device virtio-net-device,netdev=net0 \
+            -global virtio-mmio.force-legacy=false \
+            | tee /tmp/arm-boot-marshal-malformed.log || true
+          # The kernel saw undecodable bytes and says so, then classifies Faulty.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for enable slot=0 profile=0: malformed reply (16 bytes): faulty, fail-closed" /tmp/arm-boot-marshal-malformed.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for delete slot=0 profile=0: malformed reply (16 bytes): faulty, fail-closed" /tmp/arm-boot-marshal-malformed.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for enable slot=0 profile=0: Faulty" /tmp/arm-boot-marshal-malformed.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for delete slot=0 profile=0: Faulty" /tmp/arm-boot-marshal-malformed.log
+          # eSIM enable (two attempts: the suspend that follows is admitted, so the
+          # third attempt is stopped by the MVNO account check before MARSHAL) and
+          # delete (two) are DENIED as a faulty reply and never authorized.
+          grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 0 DENIED (MARSHAL faulty reply: fail-closed)" /tmp/arm-boot-marshal-malformed.log
+          grep -q "SVC: SYS_SIM_DELETE slot 0 profile 0 DENIED (MARSHAL faulty reply: fail-closed)" /tmp/arm-boot-marshal-malformed.log
+          test "$(grep -c "SVC: SYS_SIM_ENABLE slot 0 profile 0 DENIED (MARSHAL faulty reply: fail-closed)" /tmp/arm-boot-marshal-malformed.log)" -eq 2
+          test "$(grep -c "SVC: SYS_SIM_DELETE slot 0 profile 0 DENIED (MARSHAL faulty reply: fail-closed)" /tmp/arm-boot-marshal-malformed.log)" -eq 2
+          if grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 0 authorized" /tmp/arm-boot-marshal-malformed.log; then exit 1; fi
+          if grep -q "SVC: SYS_SIM_DELETE slot 0 profile 0 authorized" /tmp/arm-boot-marshal-malformed.log; then exit 1; fi
+          # Each denial is the kernel's own decision, audited to WORM (authorized=false).
+          grep -q "SVC: MARSHAL faulty reply: fail-closed denial audited to WORM (Disabled -> Enabled, authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot-marshal-malformed.log
+          grep -q "SVC: MARSHAL faulty reply: fail-closed denial audited to WORM (Disabled -> Deleted, authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot-marshal-malformed.log
+          test "$(grep -c "SVC: MARSHAL faulty reply: fail-closed denial audited to WORM" /tmp/arm-boot-marshal-malformed.log)" -eq 4
+          test "$(grep -c "malformed reply (16 bytes): faulty, fail-closed" /tmp/arm-boot-marshal-malformed.log)" -eq 4
+          # Not the fail-open path: no "not governed" line and no unreachable verdict.
+          if grep -q "fail-open" /tmp/arm-boot-marshal-malformed.log; then exit 1; fi
+          if grep -q "not governed" /tmp/arm-boot-marshal-malformed.log; then exit 1; fi
+          if grep -q "MARSHAL unreachable" /tmp/arm-boot-marshal-malformed.log; then exit 1; fi
+          # Negative control: the actions the listener answers EXECUTE are admitted.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.bind_profile account=0 slot=0 profile=0: Execute" /tmp/arm-boot-marshal-malformed.log
+          grep -qF "SVC: SYS_MVNO_BIND account 0 slot 0 profile 0 authorized [MARSHAL verdict: Execute]" /tmp/arm-boot-marshal-malformed.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.suspend_account account=0: Execute" /tmp/arm-boot-marshal-malformed.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.reactivate_account account=0: Execute" /tmp/arm-boot-marshal-malformed.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=0: Execute" /tmp/arm-boot-marshal-malformed.log
+          grep -qF "SVC: SYS_DATA_RESET account 0 authorized (usage 1600 -> 0; new period; MARSHAL verdict: Execute; " /tmp/arm-boot-marshal-malformed.log
+          test "$(grep -c "MARSHAL evaluation for data.reset_usage account=[0-9]*: Execute" /tmp/arm-boot-marshal-malformed.log)" -eq 3
+          # Ten verdicts in all: bind 1, enable 2, suspend 1, reactivate 1, data 3, delete 2.
+          test "$(grep -c "Runix ARM kernel: MARSHAL evaluation for .*: \(Execute\|Faulty\)" /tmp/arm-boot-marshal-malformed.log)" -eq 10
+
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke
   # test) and greps its serial output. Coarser and more brittle than a real
