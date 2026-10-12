@@ -65,9 +65,11 @@
 //! therefore (a) handles each connection on its own thread, up to
 //! [`ProxyLimits::max_connections`] at once (excess connections are closed
 //! immediately, never queued behind a stuck one), and (b) bounds every
-//! connection's lifetime: the whole request must arrive within
-//! [`ProxyLimits::read_deadline`] (a total deadline, not a per-read one, so
-//! a slow-loris trickling one byte at a time is dropped too), and writing
+//! connection's lifetime: the first byte must arrive within
+//! [`ProxyLimits::first_byte_timeout`] (generous: a QEMU `guestfwd` bridge
+//! connects here before the guest has sent anything) and the rest of the
+//! request within [`ProxyLimits::frame_deadline`] (a total deadline, not a
+//! per-read one, so a slow-loris trickling bytes is dropped too), and writing
 //! the response is bounded by [`ProxyLimits::write_timeout`]. The CITADEL
 //! leg is bounded by `HttpKerkeseTransport`'s own connect/total timeouts.
 
@@ -120,18 +122,33 @@ const MAX_REQUEST_BYTES: usize = runix_ipc::marshal::MAX_JSON_LEN + 4;
 /// The kernel's own wait is a bounded *poll-iteration* budget, not a
 /// wall-clock one (`kernel/src/grid_sandbox.rs`'s `SHADOW_MARSHAL_MAX_ITERS`
 /// = 2000 recv polls; `kernel-arm/src/marshal_transport.rs`'s 64-yield
-/// budget), so there is no exact millisecond figure to stay under; the
-/// reproduced failure was an idle client stalling a legitimate request for
-/// more than ~5 s. The defaults keep the worst case for a legitimate request
-/// well below that: a normal request is one small loopback/guestfwd write
-/// (milliseconds), so `read_deadline` = 1 s is generous for it yet drops a
-/// stalled client fast; CITADEL gets connect 1 s / total 3 s (see
-/// `transport.rs`). Worst legitimate case: 1 s read + 3 s CITADEL = 4 s,
-/// and an idle/slow client costs a worker slot for at most 1 s.
+/// budget), so there is no exact millisecond figure to stay under.
+///
+/// The read side has two phases, because the two failure modes differ:
+///
+/// * **Before the first byte** the proxy cannot tell a slow legitimate peer
+///   from an idle one. QEMU `guestfwd` (`-netdev ...,guestfwd=tcp:...-cmd:nc
+///   host port`) starts `nc`, which connects to this proxy, as soon as the
+///   guest's SYN arrives, but the guest (under TCG on a loaded CI runner) can
+///   take whole seconds between completing the handshake and actually
+///   sending the request bytes. A 1 s total deadline counted from accept
+///   (the first hardening attempt) dropped such connections with no reply,
+///   which the kernel reads as "no answer" and then waits out its entire
+///   poll budget. So this phase is generous ([`Self::first_byte_timeout`]);
+///   an idle client only costs one of [`Self::max_connections`] slots.
+/// * **After the first byte** the whole rest of the frame must arrive within
+///   [`Self::frame_deadline`], a *total* (not per-read) bound, so a
+///   slow-loris trickling one byte at a time is cut off. A request is one
+///   small `Send` (milliseconds on loopback), so this can stay short.
+///
+/// CITADEL gets connect 1 s / total 3 s (see `transport.rs`).
 #[derive(Debug, Clone, Copy)]
 pub struct ProxyLimits {
-    /// Total time allowed for a connection to deliver one full request.
-    pub read_deadline: Duration,
+    /// Max idle time from accept until the first request byte arrives.
+    pub first_byte_timeout: Duration,
+    /// Total time allowed, once the first byte has arrived, for the rest of
+    /// the request frame.
+    pub frame_deadline: Duration,
     /// Time allowed for any single write of the response.
     pub write_timeout: Duration,
     /// Max connections handled concurrently; extra ones are closed at once.
@@ -141,7 +158,8 @@ pub struct ProxyLimits {
 impl Default for ProxyLimits {
     fn default() -> Self {
         Self {
-            read_deadline: Duration::from_millis(1000),
+            first_byte_timeout: Duration::from_secs(20),
+            frame_deadline: Duration::from_secs(3),
             write_timeout: Duration::from_millis(2000),
             max_connections: 8,
         }
@@ -154,16 +172,19 @@ impl Default for ProxyLimits {
 /// growing buffer and retrying [`MarshalRequest::decode`] rather than
 /// assuming one `read()` call is enough.
 ///
-/// The whole read must finish by `deadline` (each `read` gets only the
-/// remaining time as its timeout), and a declared length over
-/// `MAX_JSON_LEN` is rejected as soon as the 4-byte prefix is in, before
-/// any body is buffered.
+/// Until the first byte arrives the read is bounded by `first_byte_timeout`
+/// (counted from now); from the first byte on, the rest of the frame must
+/// arrive within `frame_deadline` in total (each `read` gets only the
+/// remaining time as its timeout). A declared length over `MAX_JSON_LEN` is
+/// rejected as soon as the 4-byte prefix is in, before any body is buffered.
 fn read_marshal_request(
     stream: &mut TcpStream,
-    deadline: Instant,
+    first_byte_timeout: Duration,
+    frame_deadline: Duration,
 ) -> std::io::Result<MarshalRequest> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
+    let mut deadline = Instant::now() + first_byte_timeout;
     loop {
         if let Some((request, _consumed)) = MarshalRequest::decode(&buf) {
             return Ok(request);
@@ -197,6 +218,10 @@ fn read_marshal_request(
                 std::io::ErrorKind::UnexpectedEof,
                 "connection closed before a full MarshalRequest was received",
             ));
+        }
+        if buf.is_empty() {
+            // First byte: switch from the idle bound to the total frame bound.
+            deadline = Instant::now() + frame_deadline;
         }
         buf.extend_from_slice(&chunk[..n]);
     }
@@ -491,8 +516,7 @@ pub fn handle_connection_with(
     worm_log: &Mutex<WormLog>,
     limits: &ProxyLimits,
 ) -> std::io::Result<()> {
-    let deadline = Instant::now() + limits.read_deadline;
-    let request = read_marshal_request(stream, deadline)?;
+    let request = read_marshal_request(stream, limits.first_byte_timeout, limits.frame_deadline)?;
     let response = build_response(transport, signing_key, worm_log, &request.kerkese_json);
     stream.set_write_timeout(Some(limits.write_timeout))?;
     stream.write_all(&response.encode())?;
@@ -1360,9 +1384,9 @@ mod tests {
     #[test]
     fn idle_client_does_not_block_a_legitimate_request() {
         // A serial server would hold the legitimate request behind the idle
-        // client for the whole 5 s read deadline.
+        // client for the whole 5 s first-byte timeout.
         let limits = ProxyLimits {
-            read_deadline: Duration::from_secs(5),
+            first_byte_timeout: Duration::from_secs(5),
             ..ProxyLimits::default()
         };
         let transport = HttpKerkeseTransport::new(Some(spawn_mock_server(CANNED_EXECUTE_RESPONSE)));
@@ -1381,7 +1405,8 @@ mod tests {
     #[test]
     fn slow_loris_client_is_dropped_within_the_deadline() {
         let limits = ProxyLimits {
-            read_deadline: Duration::from_millis(500),
+            first_byte_timeout: Duration::from_secs(30),
+            frame_deadline: Duration::from_millis(500),
             ..ProxyLimits::default()
         };
         let transport = HttpKerkeseTransport::new(None);
@@ -1403,7 +1428,8 @@ mod tests {
         // One byte every 200 ms would keep a per-read timeout alive forever;
         // the total deadline (600 ms) must still cut it off.
         let limits = ProxyLimits {
-            read_deadline: Duration::from_millis(600),
+            first_byte_timeout: Duration::from_secs(30),
+            frame_deadline: Duration::from_millis(600),
             ..ProxyLimits::default()
         };
         let addr = start_proxy(HttpKerkeseTransport::new(None), limits);
@@ -1429,11 +1455,81 @@ mod tests {
     }
 
     #[test]
+    fn slow_start_before_the_first_byte_is_still_served() {
+        // Regression for the CI hang: QEMU guestfwd's `nc` connects here
+        // before the (TCG-slow) guest has sent anything. A delay longer than
+        // `frame_deadline` but shorter than `first_byte_timeout` must be
+        // tolerated, then the request answered normally.
+        let limits = ProxyLimits {
+            first_byte_timeout: Duration::from_secs(10),
+            frame_deadline: Duration::from_millis(300),
+            ..ProxyLimits::default()
+        };
+        let transport = HttpKerkeseTransport::new(Some(spawn_mock_server(CANNED_EXECUTE_RESPONSE)));
+        let addr = start_proxy(transport, limits);
+
+        let mut client = TcpStream::connect(addr).expect("connect");
+        std::thread::sleep(Duration::from_millis(1200)); // 4x frame_deadline
+        let encoded = MarshalRequest {
+            kerkese_json: minimal_envelope_json(),
+        }
+        .encode();
+        client.write_all(&encoded).expect("write request");
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let response = loop {
+            if let Some((resp, _)) = MarshalResponse::decode(&buf) {
+                break resp;
+            }
+            let n = client.read(&mut chunk).expect("read response");
+            assert_ne!(n, 0, "proxy dropped a slow-starting but legitimate client");
+            buf.extend_from_slice(&chunk[..n]);
+        };
+        assert_execute_response(response);
+    }
+
+    #[test]
+    fn fully_idle_client_is_dropped_at_the_first_byte_timeout() {
+        let limits = ProxyLimits {
+            first_byte_timeout: Duration::from_millis(600),
+            ..ProxyLimits::default()
+        };
+        let addr = start_proxy(HttpKerkeseTransport::new(None), limits);
+        let mut idle = TcpStream::connect(addr).expect("connect");
+        let start = Instant::now();
+        expect_closed(&mut idle, Duration::from_secs(8));
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
+    }
+
+    #[test]
+    fn slow_start_then_loris_is_cut_off_by_the_frame_deadline() {
+        // The long idle allowance must not extend the frame bound: after the
+        // first byte the clock restarts at `frame_deadline`, not at the
+        // first-byte timeout's remainder.
+        let limits = ProxyLimits {
+            first_byte_timeout: Duration::from_secs(30),
+            frame_deadline: Duration::from_millis(500),
+            ..ProxyLimits::default()
+        };
+        let addr = start_proxy(HttpKerkeseTransport::new(None), limits);
+        let mut c = TcpStream::connect(addr).expect("connect");
+        std::thread::sleep(Duration::from_millis(400));
+        c.write_all(&[0x10]).expect("one byte");
+        let start = Instant::now();
+        expect_closed(&mut c, Duration::from_secs(8));
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
+    }
+
+    #[test]
     fn oversized_declared_length_is_rejected_without_waiting() {
         // Long deadline: rejection must come from the length check, not the
         // timeout.
         let limits = ProxyLimits {
-            read_deadline: Duration::from_secs(30),
+            first_byte_timeout: Duration::from_secs(30),
             ..ProxyLimits::default()
         };
         let addr = start_proxy(HttpKerkeseTransport::new(None), limits);
@@ -1449,10 +1545,10 @@ mod tests {
     fn connections_beyond_the_cap_are_refused_not_queued() {
         // Documented behaviour: with `max_connections` idle clients holding
         // every slot, an extra connection is closed immediately (no
-        // response, no queueing); once the idle ones hit the read deadline
+        // response, no queueing); once the idle ones hit the first-byte timeout
         // and are dropped, legitimate traffic is served again.
         let limits = ProxyLimits {
-            read_deadline: Duration::from_millis(1500),
+            first_byte_timeout: Duration::from_millis(1500),
             max_connections: 2,
             ..ProxyLimits::default()
         };
