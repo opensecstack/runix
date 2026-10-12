@@ -255,7 +255,12 @@ extern "C" fn marshal_transport_thread() -> ! {
 /// - the EL0 process did not report back within the bounded 64-yield budget
 ///   (ambiguous with a slow network, so not blamed on the kernel);
 /// - the reply did not decode, or decoded as `MarshalResponse::Error` of kind
-///   `Unreachable`/`Timeout`/`BadResponse`/`Other` (no usable Decision).
+///   `Unreachable`/`Timeout` (nothing answered).
+///
+/// **`Remote(Faulty)` (blocked for EVERY action)**
+/// - the proxy was reached but relayed `MarshalResponse::Error` of kind
+///   `BadResponse`/`Other` (malformed/empty body, non-403 HTTP error, a 403
+///   that is not a REFUSE/HARD_STOP Decision).
 ///
 /// **`Remote(Refuse)` (blocked)**
 /// - `Decision{Refuse}`, and `MarshalResponse::Error(PolicyRefused(_))`: the
@@ -504,6 +509,7 @@ pub(crate) fn evaluate_configured(
         );
     }
     // A policy refusal is an explicit negative answer (Refuse, blocked); every
-    // other error / undecodable reply is "no usable Decision" (Unreachable).
+    // BadResponse/Other is a reached-but-faulty reply (Faulty, blocked for
+    // every action); Unreachable/Timeout/undecodable is Unreachable.
     Remote(classify_response(decoded.as_ref()))
 }

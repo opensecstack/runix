@@ -2204,7 +2204,9 @@ fn enforce_gate(
 ) -> Result<GateOutcome, MarshalEnforcementError> {
     let result = esim_marshal::enforce(policy, outcome).map(|()| outcome);
     if let Err(
-        blocked @ (MarshalEnforcementError::Local(_) | MarshalEnforcementError::Unreachable),
+        blocked @ (MarshalEnforcementError::Local(_)
+        | MarshalEnforcementError::Unreachable
+        | MarshalEnforcementError::Faulty),
     ) = &result
     {
         audit_event(subject, from, to, false, Some(format!("{blocked}")));

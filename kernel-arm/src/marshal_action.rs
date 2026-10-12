@@ -233,6 +233,11 @@ pub enum Blocked {
     /// [`UnreachablePolicy::FailClosed`]. The kernel's own policy decision,
     /// not a remote governance verdict.
     Unreachable,
+    /// MARSHAL (or its proxy) was REACHED but its reply was faulty
+    /// ([`ShadowMarshalOutcome::Faulty`]). Fail-closed for EVERY action,
+    /// independent of [`MarshalAction::unreachable_policy`]. The kernel's own
+    /// decision, not a remote governance verdict.
+    Faulty,
 }
 
 impl core::fmt::Display for Blocked {
@@ -244,6 +249,7 @@ impl core::fmt::Display for Blocked {
             Blocked::Remote(o) => write!(f, "MARSHAL {o:?}"),
             Blocked::Local(l) => write!(f, "MARSHAL local failure: {}", l.as_str()),
             Blocked::Unreachable => write!(f, "MARSHAL unreachable: fail-closed for this action"),
+            Blocked::Faulty => write!(f, "MARSHAL faulty reply: fail-closed"),
         }
     }
 }
@@ -251,7 +257,8 @@ impl core::fmt::Display for Blocked {
 /// The whole fail-open / fail-closed decision, pure. Remote: `Execute`
 /// allows; `Unreachable` allows under [`UnreachablePolicy::FailOpen`] (Option
 /// B: nothing to honor when the remote is down or unconfigured) and blocks
-/// under `FailClosed`; `Refuse`/`HardStop` block. Every local failure blocks.
+/// under `FailClosed`; `Faulty` (reached, bad reply) blocks under BOTH
+/// policies; `Refuse`/`HardStop` block. Every local failure blocks.
 pub fn enforce(policy: UnreachablePolicy, outcome: GateOutcome) -> Result<(), Blocked> {
     match outcome {
         GateOutcome::Remote(ShadowMarshalOutcome::Execute) => Ok(()),
@@ -259,6 +266,9 @@ pub fn enforce(policy: UnreachablePolicy, outcome: GateOutcome) -> Result<(), Bl
             UnreachablePolicy::FailOpen => Ok(()),
             UnreachablePolicy::FailClosed => Err(Blocked::Unreachable),
         },
+        // A reached-but-faulty reply blocks for every action: the per-action
+        // table only covers a genuinely unreachable MARSHAL.
+        GateOutcome::Remote(ShadowMarshalOutcome::Faulty) => Err(Blocked::Faulty),
         GateOutcome::Remote(o @ ShadowMarshalOutcome::Refuse)
         | GateOutcome::Remote(o @ ShadowMarshalOutcome::HardStop) => Err(Blocked::Remote(o)),
         GateOutcome::LocalFailure(l) => Err(Blocked::Local(l)),
@@ -276,6 +286,9 @@ pub fn verdict_text(outcome: GateOutcome) -> String {
         }
         GateOutcome::Remote(ShadowMarshalOutcome::Unreachable) => {
             String::from("MARSHAL verdict: Unreachable (fail-open: not governed)")
+        }
+        GateOutcome::Remote(ShadowMarshalOutcome::Faulty) => {
+            String::from("MARSHAL verdict: Faulty (blocked: fail-closed)")
         }
         GateOutcome::Remote(o) => format!("MARSHAL verdict: {o:?} (blocked)"),
         GateOutcome::LocalFailure(l) => {
@@ -299,8 +312,12 @@ pub fn reason_with_verdict(base: Option<String>, verdict: &str) -> String {
 /// - `Decision{outcome}` passes through;
 /// - `Error(PolicyRefused(_))` is an explicit negative answer from the proxy's
 ///   own policy layer: `Refuse` (blocked by [`enforce`]);
-/// - `Error(Unreachable|Timeout|BadResponse|Other)` and `None` are "no usable
-///   Decision": `Unreachable` (fail-open). A refusal must never land here.
+/// - `Error(BadResponse|Other)` is a REACHED-but-faulty reply (malformed or
+///   empty body, bad content-length, non-403 HTTP error, a 403 that is not a
+///   REFUSE/HARD_STOP Decision): `Faulty` (blocked for every action);
+/// - `Error(Unreachable|Timeout)` and `None` are "nothing answered":
+///   `Unreachable` (per-action fail-open/closed table). A refusal must never
+///   land here.
 pub fn classify_response(resp: Option<&MarshalResponse>) -> ShadowMarshalOutcome {
     match resp {
         Some(MarshalResponse::Decision { outcome, .. }) => match outcome {
@@ -311,12 +328,10 @@ pub fn classify_response(resp: Option<&MarshalResponse>) -> ShadowMarshalOutcome
         Some(MarshalResponse::Error(MarshalError::PolicyRefused(_))) => {
             ShadowMarshalOutcome::Refuse
         }
-        Some(MarshalResponse::Error(
-            MarshalError::Unreachable(_)
-            | MarshalError::Timeout
-            | MarshalError::BadResponse(_)
-            | MarshalError::Other(_),
-        ))
+        Some(MarshalResponse::Error(MarshalError::BadResponse(_) | MarshalError::Other(_))) => {
+            ShadowMarshalOutcome::Faulty
+        }
+        Some(MarshalResponse::Error(MarshalError::Unreachable(_) | MarshalError::Timeout))
         | None => ShadowMarshalOutcome::Unreachable,
     }
 }
@@ -388,6 +403,13 @@ mod tests {
                     Err(Blocked::Local(l))
                 );
             }
+        }
+        // Faulty blocks under both policies (not the policy's decision).
+        for policy in [FailOpen, FailClosed] {
+            assert_eq!(
+                enforce(policy, GateOutcome::Remote(Faulty)),
+                Err(Blocked::Faulty)
+            );
         }
         // The only cell the policy decides.
         assert_eq!(enforce(FailOpen, GateOutcome::Remote(Unreachable)), Ok(()));
@@ -502,6 +524,83 @@ mod tests {
             format!("{}", Blocked::Unreachable),
             "MARSHAL unreachable: fail-closed for this action"
         );
+        assert_eq!(
+            format!("{}", Blocked::Faulty),
+            "MARSHAL faulty reply: fail-closed"
+        );
+        assert_eq!(
+            verdict_text(GateOutcome::Remote(ShadowMarshalOutcome::Faulty)),
+            "MARSHAL verdict: Faulty (blocked: fail-closed)"
+        );
+    }
+
+    /// Every one of the six actions: a faulty reply blocks (whatever its
+    /// unreachable policy), while Unreachable/Timeout/None still follow the
+    /// pinned per-action table.
+    #[test]
+    fn faulty_blocks_all_six_actions_unreachable_follows_table() {
+        let actions = [
+            MarshalAction::Esim {
+                op: "enable",
+                slot: 0,
+                profile: 0,
+            },
+            MarshalAction::Esim {
+                op: "delete",
+                slot: 0,
+                profile: 0,
+            },
+            MarshalAction::MvnoBind {
+                account: 0,
+                slot: 0,
+                profile: 0,
+            },
+            MarshalAction::MvnoSuspend { account: 0 },
+            MarshalAction::MvnoReactivate { account: 0 },
+            MarshalAction::DataResetUsage { account: 0 },
+        ];
+        let s = || String::from("x");
+        let faulty = [
+            MarshalResponse::Error(MarshalError::BadResponse(s())),
+            MarshalResponse::Error(MarshalError::Other(s())),
+        ];
+        let unreach = [
+            Some(MarshalResponse::Error(MarshalError::Unreachable(s()))),
+            Some(MarshalResponse::Error(MarshalError::Timeout)),
+            None,
+        ];
+        let refused = MarshalResponse::Error(MarshalError::PolicyRefused(s()));
+        for a in &actions {
+            let policy = a.unreachable_policy();
+            for f in &faulty {
+                let o = classify_response(Some(f));
+                assert_eq!(o, ShadowMarshalOutcome::Faulty, "{}", a.label());
+                assert_eq!(
+                    enforce(policy, GateOutcome::Remote(o)),
+                    Err(Blocked::Faulty),
+                    "{}",
+                    a.label()
+                );
+            }
+            for u in &unreach {
+                let o = classify_response(u.as_ref());
+                let want = match policy {
+                    UnreachablePolicy::FailOpen => Ok(()),
+                    UnreachablePolicy::FailClosed => Err(Blocked::Unreachable),
+                };
+                assert_eq!(
+                    enforce(policy, GateOutcome::Remote(o)),
+                    want,
+                    "{}",
+                    a.label()
+                );
+            }
+            let o = classify_response(Some(&refused));
+            assert_eq!(
+                enforce(policy, GateOutcome::Remote(o)),
+                Err(Blocked::Remote(ShadowMarshalOutcome::Refuse))
+            );
+        }
     }
 
     #[test]
@@ -540,11 +639,11 @@ mod tests {
         );
         assert_eq!(
             classify_response(Some(&err(MarshalError::BadResponse(s())))),
-            Unreachable
+            Faulty
         );
         assert_eq!(
             classify_response(Some(&err(MarshalError::Other(s())))),
-            Unreachable
+            Faulty
         );
         assert_eq!(classify_response(None), Unreachable);
         // And a policy refusal is blocked end to end.

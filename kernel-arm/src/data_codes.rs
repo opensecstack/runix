@@ -182,6 +182,11 @@ pub const RESET_BAD_MODE: u64 = 9;
 /// started. Only observable after a reset was actually APPLIED (a MARSHAL-denied
 /// reset records nothing).
 pub const RESET_EARLY_COOLDOWN: u64 = 10;
+/// MARSHAL was reached but its reply was faulty (malformed/empty body, non-403
+/// HTTP error, a 403 that is not a REFUSE/HARD_STOP Decision). Fail-closed for
+/// every action; the kernel's own decision, WORM-audited `authorized=false`.
+/// Nothing changed.
+pub const RESET_DENIED_FAULTY: u64 = 11;
 
 /// `SYS_DATA_RESET`'s second argument (`x2`): the normal reset, under
 /// `data:reset:{account}`, allowed once the billing period has elapsed.
@@ -234,6 +239,7 @@ pub const fn reset_blocked_code(blocked: &Blocked) -> u64 {
         Blocked::Remote(_) => RESET_DENIED_MARSHAL,
         Blocked::Local(_) => RESET_DENIED_LOCAL_FAILURE,
         Blocked::Unreachable => RESET_DENIED_UNREACHABLE,
+        Blocked::Faulty => RESET_DENIED_FAULTY,
     }
 }
 
@@ -977,6 +983,11 @@ mod tests {
             assert_eq!(
                 reset_gate_code(p, GateOutcome::Remote(HardStop)),
                 RESET_DENIED_MARSHAL
+            );
+            // A reached-but-faulty reply is denied under both policies.
+            assert_eq!(
+                reset_gate_code(p, GateOutcome::Remote(Faulty)),
+                RESET_DENIED_FAULTY
             );
             // Every local failure fails CLOSED, with its own code.
             for l in [
