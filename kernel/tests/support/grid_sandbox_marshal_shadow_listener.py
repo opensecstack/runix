@@ -24,6 +24,15 @@ opaque `kerkese_json`.
 `MarshalResponse::Decision`: tag byte `0`, then outcome byte (`0`=Execute,
 `1`=Refuse, `2`=HardStop), then a `u32` little-endian length prefix and that
 many bytes of opaque `decision_json`.
+
+`MarshalResponse::Error`: tag byte `1`, then an error kind byte (`2` =
+`BadResponse`), then a `u16` little-endian length prefix and that many bytes
+of message.
+
+The listener serves TWO connections (each guest-side `spawn_instance`
+evaluation is its own `guestfwd` `nc` connection): the first gets the canned
+Refuse Decision, the second an ipc-level `Error(BadResponse)` (a reached but
+faulty reply, which enforcement must block as `Faulty`).
 """
 
 import socket
@@ -63,28 +72,52 @@ def encode_marshal_response_refuse(decision_json: bytes) -> bytes:
     return bytes(out)
 
 
+def encode_marshal_response_bad_response(msg: bytes) -> bytes:
+    out = bytearray()
+    out.append(1)  # MarshalResponse::Error tag
+    out.append(2)  # MarshalError::BadResponse tag
+    out.extend(struct.pack("<H", len(msg)))
+    out.extend(msg)
+    return bytes(out)
+
+
 def main() -> int:
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
-    server.listen(1)
+    server.listen(2)
 
-    conn, _addr = server.accept()
     try:
-        kerkese_json = recv_marshal_request(conn)
-        print(
-            f"grid_sandbox_marshal_shadow_listener: received shadow evaluation request "
-            f"({len(kerkese_json)} bytes): {kerkese_json!r}",
-            file=sys.stderr,
-        )
-        conn.sendall(encode_marshal_response_refuse(DECISION_JSON))
-        print(
-            "grid_sandbox_marshal_shadow_listener: PASS -- received a MarshalRequest, "
-            "sent a canned Refuse MarshalResponse"
-        )
+        for i in range(2):
+            conn, _addr = server.accept()
+            try:
+                kerkese_json = recv_marshal_request(conn)
+                print(
+                    f"grid_sandbox_marshal_shadow_listener: received shadow evaluation request "
+                    f"{i + 1} ({len(kerkese_json)} bytes): {kerkese_json!r}",
+                    file=sys.stderr,
+                )
+                if i == 0:
+                    conn.sendall(encode_marshal_response_refuse(DECISION_JSON))
+                    print(
+                        "grid_sandbox_marshal_shadow_listener: sent a canned Refuse "
+                        "MarshalResponse"
+                    )
+                else:
+                    conn.sendall(
+                        encode_marshal_response_bad_response(
+                            b"test-only faulty reply (BadResponse)"
+                        )
+                    )
+                    print(
+                        "grid_sandbox_marshal_shadow_listener: sent a canned "
+                        "Error(BadResponse) MarshalResponse"
+                    )
+            finally:
+                conn.close()
+        print("grid_sandbox_marshal_shadow_listener: PASS -- served both connections")
         return 0
     finally:
-        conn.close()
         server.close()
 
 

@@ -276,7 +276,18 @@ fn shadow_marshal_evaluate(module_id: &str, instance_id: &str) -> ShadowMarshalO
                 Some(MarshalResponse::Error(MarshalError::PolicyRefused(_))) => {
                     ShadowMarshalOutcome::Refuse
                 }
-                Some(MarshalResponse::Error(_)) | None => ShadowMarshalOutcome::Unreachable,
+                // Reached, but the reply was faulty (malformed/empty body, bad
+                // content-length, non-403 HTTP error, a 403 that is not a
+                // REFUSE/HARD_STOP Decision): fail-closed, distinct from an
+                // outage.
+                Some(MarshalResponse::Error(
+                    MarshalError::BadResponse(_) | MarshalError::Other(_),
+                )) => ShadowMarshalOutcome::Faulty,
+                // Nothing answered (or no decodable reply): fail-open.
+                Some(MarshalResponse::Error(
+                    MarshalError::Unreachable(_) | MarshalError::Timeout,
+                ))
+                | None => ShadowMarshalOutcome::Unreachable,
             }
         }
     };
@@ -318,6 +329,10 @@ pub enum MarshalEnforcementError {
     /// spawn. Carries the exact outcome so a caller/log message can tell
     /// the two apart without re-deriving it.
     Blocked(ShadowMarshalOutcome),
+    /// A MARSHAL proxy was reached but its reply was faulty
+    /// ([`ShadowMarshalOutcome::Faulty`]). Fail-closed, the kernel's own
+    /// decision rather than a governance verdict.
+    FaultyReply,
 }
 
 impl fmt::Display for MarshalEnforcementError {
@@ -325,6 +340,12 @@ impl fmt::Display for MarshalEnforcementError {
         match self {
             MarshalEnforcementError::Blocked(outcome) => {
                 write!(f, "MARSHAL enforcement blocked this spawn: {outcome:?}")
+            }
+            MarshalEnforcementError::FaultyReply => {
+                write!(
+                    f,
+                    "MARSHAL enforcement blocked this spawn: faulty reply (fail-closed)"
+                )
             }
         }
     }
@@ -388,6 +409,8 @@ fn enforce_marshal_decision(outcome: ShadowMarshalOutcome) -> Result<(), Marshal
         ShadowMarshalOutcome::Unreachable => Ok(()),
         // Reachable and MARSHAL approved: allow.
         ShadowMarshalOutcome::Execute => Ok(()),
+        // Reached, but the reply was faulty: fail-closed.
+        ShadowMarshalOutcome::Faulty => Err(MarshalEnforcementError::FaultyReply),
         // Reachable and MARSHAL said no: fail-closed. Real teeth.
         ShadowMarshalOutcome::Refuse | ShadowMarshalOutcome::HardStop => {
             Err(MarshalEnforcementError::Blocked(outcome))

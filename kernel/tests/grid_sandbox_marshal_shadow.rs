@@ -56,6 +56,12 @@
 //!    `"shadow-unreachable"`; the spawn still succeeds (fail-open), and the
 //!    recorded outcome is `ShadowMarshalOutcome::Unreachable`.
 //!
+//! Case 2b (added with the faulty-reply policy change): after case 2, the same
+//! listener (its second connection) answers an ipc-level `Error(BadResponse)`
+//! for `"shadow-faulty"`; the spawn is blocked with
+//! `MarshalEnforcementError::FaultyReply` and `ShadowMarshalOutcome::Faulty`
+//! is recorded.
+//!
 //! Cases 2 and 3 both run on a dedicated thread holding the one capability
 //! scoped to `marshal_client::SOCKETS_SERVER_PORT` (same reason
 //! `marshal_tcp_roundtrip.rs` uses a dedicated thread: `kernel_main`'s own
@@ -161,6 +167,7 @@ const TCP_LOCAL_PORT: u16 = 49158;
 // Deliberately has no `guestfwd` mapping in this test's QEMU invocation
 // (see this file's own doc comment) — a connection attempt here fails
 // immediately, a faithful "proxy configured but unreachable" case (Path 2).
+const TCP_FAULTY_LOCAL_PORT: u16 = 49160;
 const TCP_UNREACHABLE_PORT: u16 = 9001;
 const TCP_UNREACHABLE_LOCAL_PORT: u16 = 49159;
 
@@ -454,7 +461,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // outlast both of `spawn_configured_instance_thread`'s real round trips
     // (case 2 and case 3), not just one.
     let mut result = TestResult::Pending;
-    for _ in 0..3_000_000 {
+    for _ in 0..4_500_000 {
         scheduler::yield_now();
         #[allow(static_mut_refs)]
         let current = unsafe { RESULT };
@@ -507,6 +514,10 @@ static mut RESULT: TestResult = TestResult::Pending;
 ///   `Err(SpawnInstanceError::MarshalEnforcement(MarshalEnforcementError::Blocked(ShadowMarshalOutcome::Refuse)))`
 ///   (fail-closed — genuinely blocked, no `SpawnedInstance`/token produced)
 ///   and the WormLog records `Refuse`.
+/// - **Case 2b** (`"shadow-faulty"`): same proxy address, the listener's
+///   second connection answers an ipc-level `Error(BadResponse)`. Confirms
+///   `spawn_instance` returns `Err(SpawnInstanceError::MarshalEnforcement(MarshalEnforcementError::FaultyReply))`
+///   (fail-closed) and the WormLog records `Faulty`.
 /// - **Case 3 / Path 2** (`"shadow-unreachable"`): repoints the proxy at an
 ///   address with no `guestfwd` mapping, then confirms `spawn_instance`
 ///   still succeeds (fail-open) and the WormLog records `Unreachable`.
@@ -569,6 +580,55 @@ extern "C" fn spawn_configured_instance_thread() -> ! {
         }
     };
 
+    // --- Case 2b: configured, reachable, but the reply is an ipc-level
+    // Error(BadResponse) (a REACHED but faulty reply): fail-closed, with the
+    // Faulty outcome recorded. Same proxy address as case 2 (the listener's
+    // second connection answers BadResponse), fresh local port. -------------
+    grid_sandbox::set_shadow_marshal_proxy(Some(ShadowMarshalProxyConfig {
+        remote_ip: TCP_REMOTE_IP,
+        remote_port: TCP_REMOTE_PORT,
+        local_port: TCP_FAULTY_LOCAL_PORT,
+    }));
+    let faulty_ok = match grid_sandbox::spawn_instance(
+        "shadow-faulty",
+        SandboxTier::T2Trusted,
+        now,
+        &signing_key,
+    ) {
+        Ok(_instance) => {
+            serial_println!(
+                "grid_sandbox_marshal_shadow: FAIL — shadow-faulty's spawn succeeded, but a                  reached-but-faulty reply must block it (fail-closed)"
+            );
+            false
+        }
+        Err(SpawnInstanceError::MarshalEnforcement(MarshalEnforcementError::FaultyReply)) => {
+            let entries = grid_sandbox::shadow_marshal_log_entries();
+            let recorded = entries
+                .iter()
+                .find(|e| e.instance_id.as_deref() == Some("shadow-faulty"))
+                .and_then(|e| e.shadow_marshal);
+            if recorded == Some(ShadowMarshalOutcome::Faulty) {
+                serial_println!(
+                    "grid_sandbox_marshal_shadow: shadow-faulty's spawn was blocked as                      expected (fail-closed) with Faulty recorded in the WormLog"
+                );
+                true
+            } else {
+                serial_println!(
+                    "grid_sandbox_marshal_shadow: shadow-faulty's spawn was blocked, but                      expected its WormLog entry to carry Some(Faulty), got {:?}",
+                    recorded
+                );
+                false
+            }
+        }
+        Err(e) => {
+            serial_println!(
+                "grid_sandbox_marshal_shadow: shadow-faulty's spawn failed, but not with                  MarshalEnforcementError::FaultyReply: {:?}",
+                e
+            );
+            false
+        }
+    };
+
     // --- Case 3: configured but unreachable (Path 2) — run last on purpose,
     // see this function's own doc comment. ----------------------------------
     grid_sandbox::set_shadow_marshal_proxy(Some(ShadowMarshalProxyConfig {
@@ -625,7 +685,7 @@ extern "C" fn spawn_configured_instance_thread() -> ! {
 
     #[allow(static_mut_refs)]
     unsafe {
-        RESULT = if unreachable_ok && refused_ok {
+        RESULT = if unreachable_ok && refused_ok && faulty_ok {
             TestResult::Pass
         } else {
             TestResult::Fail

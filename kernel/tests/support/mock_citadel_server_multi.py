@@ -18,12 +18,17 @@ full Decision JSON body. Per-action behaviour is chosen by action.type prefix
 
   --status403-refuse PREFIX     403 + REFUSE Decision for matching action types
   --status403-hardstop PREFIX   403 + HARD_STOP Decision for matching types
+  --garbage PREFIX              HTTP 200 with a NON-JSON body (a reached but
+                                faulty reply) for matching action types
+  --http500 PREFIX              HTTP 500 (non-403 HTTP error) for matching types
 
-Everything else gets 200 + EXECUTE. HARD_STOP flags win over REFUSE flags.
+Everything else gets 200 + EXECUTE. Precedence: http500, garbage, HARD_STOP,
+then REFUSE.
 
 Runs until killed (CI backgrounds it; the runner tears it down).
 
 Usage: mock_citadel_server_multi.py [port] [--status403-refuse P]... [--status403-hardstop P]...
+       [--garbage P]... [--http500 P]...
 (port default: mock_citadel_server.PORT)
 """
 
@@ -40,8 +45,17 @@ def decision_body(outcome: str) -> bytes:
     return single.DECISION_JSON.replace(b'"EXECUTE"', b'"' + outcome.encode("ascii") + b'"')
 
 
-def choose(action_type: str, refuse: list, hardstop: list):
-    """Returns (status line, outcome) for an action type."""
+GARBAGE_BODY = b"<<not json: faulty MARSHAL reply>>"
+HTTP500_BODY = b"internal server error"
+
+
+def choose(action_type: str, refuse: list, hardstop: list, garbage=(), http500=()):
+    """Returns (status line, outcome) for an action type. Outcome `GARBAGE`
+    / `HTTP500` mean "answer with the canned faulty body instead of a Decision"."""
+    if any(action_type.startswith(p) for p in http500):
+        return b"500 Internal Server Error", "HTTP500"
+    if any(action_type.startswith(p) for p in garbage):
+        return b"200 OK", "GARBAGE"
     if any(action_type.startswith(p) for p in hardstop):
         return b"403 Forbidden", "HARD_STOP"
     if any(action_type.startswith(p) for p in refuse):
@@ -49,7 +63,7 @@ def choose(action_type: str, refuse: list, hardstop: list):
     return b"200 OK", "EXECUTE"
 
 
-def serve_one(conn: socket.socket, refuse: list, hardstop: list) -> None:
+def serve_one(conn: socket.socket, refuse: list, hardstop: list, garbage=(), http500=()) -> None:
     body = single.read_http_request(conn)
     if not body:
         # Connection opened and closed (or a bare probe) with no request.
@@ -58,8 +72,13 @@ def serve_one(conn: socket.socket, refuse: list, hardstop: list) -> None:
         action_type = json.loads(body)["action"]["type"]
     except (ValueError, KeyError, TypeError):
         action_type = "<unparseable>"
-    status, outcome = choose(action_type, refuse, hardstop)
-    payload = decision_body(outcome)
+    status, outcome = choose(action_type, refuse, hardstop, garbage, http500)
+    if outcome == "GARBAGE":
+        payload = GARBAGE_BODY
+    elif outcome == "HTTP500":
+        payload = HTTP500_BODY
+    else:
+        payload = decision_body(outcome)
     response = (
         b"HTTP/1.1 " + status + b"\r\n"
         b"Content-Type: application/json\r\n"
@@ -80,6 +99,8 @@ def main() -> int:
     ap.add_argument("port", nargs="?", type=int, default=single.PORT)
     ap.add_argument("--status403-refuse", action="append", default=[], metavar="PREFIX")
     ap.add_argument("--status403-hardstop", action="append", default=[], metavar="PREFIX")
+    ap.add_argument("--garbage", action="append", default=[], metavar="PREFIX")
+    ap.add_argument("--http500", action="append", default=[], metavar="PREFIX")
     args = ap.parse_args()
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -89,7 +110,13 @@ def main() -> int:
     while True:
         conn, _addr = server.accept()
         try:
-            serve_one(conn, args.status403_refuse, args.status403_hardstop)
+            serve_one(
+                conn,
+                args.status403_refuse,
+                args.status403_hardstop,
+                args.garbage,
+                args.http500,
+            )
         except OSError as err:
             print(f"mock_citadel_server_multi: connection error: {err}", file=sys.stderr, flush=True)
         finally:
