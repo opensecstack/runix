@@ -1775,6 +1775,73 @@ jobs:
           # Eleven evaluations in all: bind 1, enable 3, suspend 1, reactivate 1, data 3, delete 2.
           test "$(grep -c "Runix ARM kernel: MARSHAL evaluation for" /tmp/arm-boot-marshal-403.log)" -eq 11
 
+      # Reached-but-faulty MARSHAL replies fail CLOSED for every action. A
+      # reply the proxy relays as MarshalError::BadResponse/Other (a 200 with a
+      # non-JSON body, a non-403 HTTP error such as 500, a 403 that is not a
+      # REFUSE/HARD_STOP Decision) used to be classified Unreachable, i.e.
+      # FAIL-OPEN for esim.*, mvno.bind/suspend/reactivate (and the x86
+      # spawn_instance): a CITADEL that answered with garbage ADMITTED the
+      # action. It is now ShadowMarshalOutcome::Faulty and blocked, with its own
+      # DENIED text, regardless of the per-action unreachable table (which still
+      # governs a genuinely unreachable MARSHAL, covered by the steps above).
+      # Same real citadel_proxy build and bridge as the 403 step; the mock
+      # answers HTTP 200 + a non-JSON body for esim.* and HTTP 500 for
+      # mvno.suspend_account, 200 + EXECUTE for the rest.
+      - name: boot in QEMU and check a real citadel_proxy relaying a garbage 200 / HTTP 500 from a mock CITADEL fails closed (faulty reply) for eSIM enable/delete and MVNO suspend
+        run: |
+          trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
+          python3 ../kernel/tests/support/tcp_proof_listener.py &
+          sleep 0.3
+          python3 ../kernel/tests/support/mock_citadel_server_multi.py \
+            --garbage esim. --http500 mvno.suspend_account &
+          sleep 0.3
+          CITADEL_PROXY_LISTEN_ADDR=127.0.0.1:9104 \
+            RUNIX_CITADEL_URL=http://127.0.0.1:9105/marshal/kerkese \
+            ../target/release/citadel_proxy &
+          sleep 0.3
+          # 25 s: same measured budget as the Execute and 403 boots (same walk).
+          timeout 25 qemu-system-aarch64 \
+            -M virt,secure=on,gic-version=2 -cpu cortex-a53 -nographic \
+            -kernel target/aarch64-unknown-none/release/runix-kernel-arm \
+            -netdev "user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9001,guestfwd=tcp:10.0.2.100:9100-cmd:nc 127.0.0.1 9104" \
+            -device virtio-net-device,netdev=net0 \
+            -global virtio-mmio.force-legacy=false \
+            | tee /tmp/arm-boot-marshal-faulty.log || true
+          # Garbage 200 body (esim.*): enable (three attempts) and delete (two) are DENIED as a faulty reply.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for enable slot=0 profile=0: Faulty" /tmp/arm-boot-marshal-faulty.log
+          grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 0 DENIED (MARSHAL faulty reply: fail-closed)" /tmp/arm-boot-marshal-faulty.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for delete slot=0 profile=0: Faulty" /tmp/arm-boot-marshal-faulty.log
+          grep -q "SVC: SYS_SIM_DELETE slot 0 profile 0 DENIED (MARSHAL faulty reply: fail-closed)" /tmp/arm-boot-marshal-faulty.log
+          test "$(grep -c "SVC: SYS_SIM_ENABLE slot 0 profile 0 DENIED (MARSHAL faulty reply: fail-closed)" /tmp/arm-boot-marshal-faulty.log)" -eq 3
+          test "$(grep -c "SVC: SYS_SIM_DELETE slot 0 profile 0 DENIED (MARSHAL faulty reply: fail-closed)" /tmp/arm-boot-marshal-faulty.log)" -eq 2
+          if grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 0 authorized" /tmp/arm-boot-marshal-faulty.log; then exit 1; fi
+          if grep -q "SVC: SYS_SIM_DELETE slot 0 profile 0 authorized" /tmp/arm-boot-marshal-faulty.log; then exit 1; fi
+          # HTTP 500 (mvno.suspend_account): DENIED the same way, registry untouched.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.suspend_account account=0: Faulty" /tmp/arm-boot-marshal-faulty.log
+          grep -q "SVC: SYS_MVNO_SUSPEND account 0 DENIED (MARSHAL faulty reply: fail-closed)" /tmp/arm-boot-marshal-faulty.log
+          if grep -q "SVC: SYS_MVNO_SUSPEND account 0 authorized" /tmp/arm-boot-marshal-faulty.log; then exit 1; fi
+          if grep -q "SVC: SYS_MVNO_SUSPEND account 0 forced disable" /tmp/arm-boot-marshal-faulty.log; then exit 1; fi
+          # Each faulty denial is the kernel's own decision and is audited to WORM
+          # (authorized=false): enable 3 + delete 2 + suspend 1.
+          grep -q "SVC: MARSHAL faulty reply: fail-closed denial audited to WORM (Disabled -> Enabled, authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot-marshal-faulty.log
+          grep -q "SVC: MARSHAL faulty reply: fail-closed denial audited to WORM (Disabled -> Deleted, authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot-marshal-faulty.log
+          grep -q "SVC: MARSHAL faulty reply: fail-closed denial audited to WORM (Active -> Suspended, authorized=false; entries [0-9]*, chain verified true)" /tmp/arm-boot-marshal-faulty.log
+          test "$(grep -c "SVC: MARSHAL faulty reply: fail-closed denial audited to WORM" /tmp/arm-boot-marshal-faulty.log)" -eq 6
+          # A faulty reply is NOT the fail-open path: no "not governed" line and
+          # no unreachable verdict anywhere in this boot.
+          if grep -q "fail-open" /tmp/arm-boot-marshal-faulty.log; then exit 1; fi
+          if grep -q "not governed" /tmp/arm-boot-marshal-faulty.log; then exit 1; fi
+          if grep -q "MARSHAL unreachable" /tmp/arm-boot-marshal-faulty.log; then exit 1; fi
+          # Negative control: actions the mock answers 200 + EXECUTE are still admitted.
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.bind_profile account=0 slot=0 profile=0: Execute" /tmp/arm-boot-marshal-faulty.log
+          grep -qF "SVC: SYS_MVNO_BIND account 0 slot 0 profile 0 authorized [MARSHAL verdict: Execute]" /tmp/arm-boot-marshal-faulty.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.reactivate_account account=0: Execute" /tmp/arm-boot-marshal-faulty.log
+          grep -q "Runix ARM kernel: MARSHAL evaluation for data.reset_usage account=0: Execute" /tmp/arm-boot-marshal-faulty.log
+          grep -qF "SVC: SYS_DATA_RESET account 0 authorized (usage 1600 -> 0; new period; MARSHAL verdict: Execute; " /tmp/arm-boot-marshal-faulty.log
+          test "$(grep -c "MARSHAL evaluation for data" /tmp/arm-boot-marshal-faulty.log)" -eq 3
+          # Eleven evaluations in all: bind 1, enable 3, suspend 1, reactivate 1, data 3, delete 2.
+          test "$(grep -c "Runix ARM kernel: MARSHAL evaluation for" /tmp/arm-boot-marshal-faulty.log)" -eq 11
+
   # Complements kernel-tests above: boots the *full* main.rs demo (every
   # phase's feature, not just basic_boot's minimal boot+CPU-init smoke
   # test) and greps its serial output. Coarser and more brittle than a real
