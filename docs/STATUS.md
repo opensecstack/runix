@@ -2458,8 +2458,8 @@ How the result is classified (`marshal_transport.rs`, `esim_marshal::enforce`):
 
 | Result | Covers | Policy |
 |---|---|---|
-| `Remote(Unreachable)` | Nothing answered: no proxy configured (no process spawned), no device, connect failure (`MarshalError::Unreachable`), `MarshalError::Timeout`, no report within 64 boot-thread yields, or a kernel-to-proxy `ipc` reply that does not decode at all (response `None`) | Fail-open for the five eSIM and MVNO actions. **Fail-closed for `data.reset_usage`** (ADR 0003, below) |
-| `Remote(Faulty)` | MARSHAL was reached but its reply was faulty: `MarshalError::BadResponse` or `MarshalError::Other`, i.e. a malformed or empty body, a bad content-length, a non-403 HTTP error such as 400 or 500, or a 403 whose body is not a `REFUSE`/`HARD_STOP` Decision (including 403 with `EXECUTE`) | **Blocked for all six actions, regardless of the unreachable table** (ADR 0006): `DENIED (MARSHAL faulty reply: fail-closed)`, serial line `...: Faulty`, WORM-audited with `authorized=false`; `data.reset_usage` returns `11` |
+| `Remote(Unreachable)` | Nothing answered: no proxy configured (no process spawned), no device, connect failure (`MarshalError::Unreachable`), `MarshalError::Timeout`, no report within 64 boot-thread yields, or a kernel-to-proxy `ipc` reply that is empty or merely incomplete when the wait ends (silence or a stall; response `None`) | Fail-open for the five eSIM and MVNO actions. **Fail-closed for `data.reset_usage`** (ADR 0003, below) |
+| `Remote(Faulty)` | MARSHAL was reached but its reply was faulty: `MarshalError::BadResponse` or `MarshalError::Other`, i.e. a malformed or empty body, a bad content-length, a non-403 HTTP error such as 400 or 500, or a 403 whose body is not a `REFUSE`/`HARD_STOP` Decision (including 403 with `EXECUTE`); **or reply bytes that can never decode** (`ResponseDecode::Malformed`: unknown tag, outcome or error kind, oversize length, non-UTF-8 message) | **Blocked for all six actions, regardless of the unreachable table** (ADR 0006): `DENIED (MARSHAL faulty reply: fail-closed)`, serial line `...: Faulty`, WORM-audited with `authorized=false`; `data.reset_usage` returns `11` |
 | `Remote(Refuse)` / `Remote(HardStop)` | A decoded CITADEL decision, **or** `MarshalError::PolicyRefused` from `citadel_proxy`'s own policy layer | Blocked, registry and sim untouched, **not WORM-audited** |
 | `LocalFailure(SetupFailed / SpawnFailed / ExcursionFaulted)` | The kernel could not run the evaluation: out of memory, thread spawn, EL0 fault | Fail-closed, `DENIED (MARSHAL local failure: ...)`, WORM-audited with `authorized=false` |
 
@@ -2493,17 +2493,27 @@ parse) no longer fails open: it is `Faulty` and blocks, per
 maps `MarshalError::BadResponse` and `MarshalError::Other` to
 `ShadowMarshalOutcome::Faulty`, which `enforce` blocks under either policy (a host
 test, `faulty_blocks_all_six_actions_unreachable_follows_table`, pins this and
-that `Unreachable`/`Timeout`/`None` still follow the table). The x86
+that `Unreachable`/`Timeout`/`None` still follow the table, and
+`malformed_bytes_fault_all_six_actions_incomplete_follows_table` pins that malformed
+reply bytes are `Faulty` while empty or incomplete bytes stay `Unreachable`). The x86
 `grid_sandbox::spawn_instance` does the same
 (`MarshalEnforcementError::FaultyReply`), proven in QEMU by case 2b
 (`"shadow-faulty"`) of `kernel/tests/grid_sandbox_marshal_shadow.rs` and, for ARM, by a CI boot
 of a real `citadel_proxy` against a mock CITADEL answering a garbage 200 and an HTTP 500.
+Raw malformed reply bytes are covered the same way: x86 case 2c (`"shadow-malformed"`)
+and the ARM boot step `boot in QEMU and check a malformed MARSHAL reply fails closed (faulty) for eSIM enable and delete`.
 **Availability consequence:** every Runix request is `dry_run:true`; a CITADEL that
 rejects dry-run requests answers HTTP 400, which is a faulty reply, so every gated
 action is now blocked loudly instead of silently allowed, and a CITADEL outage that
-yields 5xx does the same. **Still open:** an undecodable kernel-to-proxy `ipc` reply
-(response `None`) is classified `Unreachable`, so it follows the per-action table
-(fail-open for five actions).
+yields 5xx does the same. **Malformed reply bytes also fail closed.** `MarshalResponse::decode_status`
+(`ipc/src/marshal.rs`) separates `Malformed` (bytes no valid response can start with,
+decided as soon as the offending byte arrives, never repaired by later bytes) from
+`Incomplete`; both kernels block `Malformed` as `Faulty`. **Still open:** a reply that is
+merely incomplete when the wait budget ends (silence, a stall, a connection closed
+mid-message) is a real timeout, `Unreachable`, so it follows the per-action table
+(fail-open for five actions). The link is unauthenticated: whoever controls it can
+stall, or forge a well-formed reply (six zero bytes decode as `Decision(Execute)`);
+authenticating the link is the real fix.
 
 **Proxy hardening.** `citadel_proxy` (`desktop/src/citadel/proxy.rs`,
 `ProxyLimits`) now allows a connection 1 s in total to deliver its request, 2 s per response

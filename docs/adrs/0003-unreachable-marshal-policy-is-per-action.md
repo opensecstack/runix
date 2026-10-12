@@ -15,7 +15,8 @@ Every MARSHAL-gated mobile syscall (`esim.enable`, `esim.delete`,
 - a remote verdict: `Execute`, or `Refuse` / `HardStop`;
 - the remote could not be reached or gave no usable answer
   (`Unreachable`: no proxy configured, no network device, connect failure or
-  timeout, an undecodable reply);
+  timeout, an empty or incomplete reply; reply bytes that can never decode are
+  `Faulty` and block, see ADR 0006);
 - the kernel could not run the evaluation at all (`LocalFailure`: process setup
   including out of memory, thread spawn, an EL0 fault);
 - (for the proxy's own policy refusals) a `Refuse`, via `PolicyRefused`.

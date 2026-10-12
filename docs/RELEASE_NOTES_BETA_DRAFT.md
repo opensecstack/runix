@@ -31,8 +31,11 @@ Read this first. This list mirrors "Not claimed" in BETA_CRITERIA.md.
   its listener (a local process, or the guest through QEMU guestfwd) can still
   hold the 8 slots and reopen them every second to starve legitimate requests,
   which the kernel reads as unreachable and so fail-open; there is no per-peer
-  limit. An undecodable kernel-to-proxy `ipc` reply is also still treated as
-  unreachable. Fail-open success is logged as "not governed"; `Refuse`,
+  limit. A kernel-to-proxy `ipc` reply that is empty or incomplete when the wait
+  ends is still treated as unreachable; reply bytes that can never decode
+  (unknown tag, outcome or error kind, oversize length, non-UTF-8 message) are a
+  faulty reply and block. The link is unauthenticated, so an attacker who
+  controls it can still stall (fail-open) or forge a well-formed `Execute`. Fail-open success is logged as "not governed"; `Refuse`,
   `HardStop`, a faulty reply and local failure always block. Only the mobile
   usage reset fails closed when MARSHAL is unreachable.
 - **Only part of the privileged surface is MARSHAL-gated.** Six mobile

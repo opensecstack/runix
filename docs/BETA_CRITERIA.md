@@ -57,8 +57,12 @@ be described as having any of the following.
    consequence is an availability hazard: a CITADEL that rejects dry-run
    requests (every Runix request is `dry_run: true`) answers 400, and one that
    fails with 5xx does the same, so every gated action is blocked, loudly. Still
-   fail-open: no proxy or device, connect failure, timeout, and an undecodable
-   kernel-to-proxy `ipc` reply. The proxy is bounded (1 s request-read
+   fail-open: no proxy or device, connect failure, timeout, and a
+   kernel-to-proxy `ipc` reply that is empty or incomplete when the wait ends.
+   Reply bytes that can never decode (unknown tag, outcome or error kind,
+   oversize length, non-UTF-8 message) are a faulty reply and block. The link
+   is unauthenticated, so an attacker who controls it can still stall (fail-open)
+   or forge a well-formed `Execute`. The proxy is bounded (1 s request-read
    deadline, 2 s write timeout, at most 8 concurrent connections, CITADEL
    connect 1 s / total 3 s), so an idle or slow client cannot stall it, but an
    attacker who can reach its listener (a local process, or the guest through
@@ -254,7 +258,9 @@ path; fails open on unreachable); (b) MET (to a mock CITADEL only);
   CITADEL that reproduces the real handler's HTTP 403 + Decision; no real
   CITADEL is exercised. The same test's third case, `"shadow-faulty"`
   (case 2b in the file), proves a reached-but-faulty reply blocks the spawn
-  with `MarshalEnforcementError::FaultyReply` and records `Faulty` in the WormLog.
+  with `MarshalEnforcementError::FaultyReply` and records `Faulty` in the WormLog;
+  case 2c, `"shadow-malformed"`, does the same for raw reply bytes that are no
+  valid response.
 - (b) `kernel/tests/marshal_tcp_roundtrip.rs` (CI step
   `cargo test marshal_tcp_roundtrip ...`) and `marshal_proxy_e2e.rs` (CI step
   `cargo test marshal_proxy_e2e (real citadel_proxy + mock CITADEL via guestfwd)`:

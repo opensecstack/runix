@@ -36,13 +36,19 @@ including 403 with `EXECUTE`) is now `ShadowMarshalOutcome::Faulty` and
 **blocks** `spawn_instance` (`MarshalEnforcementError::FaultyReply`) and all six
 mobile actions, whatever their per-action unreachable policy. The fail-open
 reasoning in this document covers being unable to reach the gate; it does not
-cover a gate that answered badly. Genuinely unreachable cases (no proxy
-configured, connect failure, `MarshalError::Timeout`, an undecodable
-kernel-to-proxy reply) keep Option B. Operational consequence: a CITADEL that
+cover a gate that answered badly. Reply bytes that can never decode as a
+`MarshalResponse` (unknown tag, outcome or error kind, oversize length, non-UTF-8
+message; `MarshalResponse::decode_status` returns `Malformed`) are also `Faulty`
+and block, so a garbled real `REFUSE` cannot become fail-open. Genuinely
+unreachable cases (no proxy configured, connect failure, `MarshalError::Timeout`,
+an empty or merely incomplete kernel-to-proxy reply when the wait ends) keep
+Option B. The link is unauthenticated: whoever controls it can still stall (a
+timeout, so fail-open for the five actions) or forge a well-formed `Execute`.
+Operational consequence: a CITADEL that
 rejects dry-run requests (every Runix request is `dry_run: true`) answers 400,
 and one that fails with 5xx does the same; both now block loudly instead of
-silently allowing. Proven for x86 by case 2b (`"shadow-faulty"`) of
-`kernel/tests/grid_sandbox_marshal_shadow.rs`. Decision record:
+silently allowing. Proven for x86 by cases 2b (`"shadow-faulty"`) and 2c
+(`"shadow-malformed"`) of `kernel/tests/grid_sandbox_marshal_shadow.rs`. Decision record:
 [adrs/0006-a-reachable-but-faulty-marshal-reply-fails-closed.md](adrs/0006-a-reachable-but-faulty-marshal-reply-fails-closed.md).
 
 ## Context

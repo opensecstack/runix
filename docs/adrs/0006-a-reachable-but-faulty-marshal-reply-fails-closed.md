@@ -43,10 +43,23 @@ the connectivity exists.
    reset returns `RESET_DENIED_FAULTY = 11` (`kernel-arm/src/data_codes.rs`).
 4. **The unreachable table is unchanged.** Genuinely unreachable cases (no proxy,
    no network device, connect failure `MarshalError::Unreachable`,
-   `MarshalError::Timeout`, and an undecodable kernel-to-proxy `ipc` reply, i.e.
-   response `None`) keep ADR 0003's per-action behaviour, pinned by the test
-   `unreachable_policy_table_is_pinned`. `Refuse`, `HardStop`, `PolicyRefused` and
-   local failures are unchanged.
+   `MarshalError::Timeout`, and a kernel-to-proxy `ipc` reply that is empty or
+   merely incomplete when the wait budget ends) keep ADR 0003's per-action
+   behaviour, pinned by the test `unreachable_policy_table_is_pinned`. `Refuse`,
+   `HardStop`, `PolicyRefused` and local failures are unchanged.
+5. **Malformed reply bytes are `Faulty` too.** `MarshalResponse::decode` returned
+   `None` both for "not enough bytes yet" and for bytes that can never be a valid
+   response, and both kernels classified the final `None` as `Unreachable`, so a
+   garbled real `REFUSE` (or any malformed bytes) was fail-open for the five
+   fail-open actions. `runix_ipc::marshal::MarshalResponse::decode_status` now
+   returns `Complete`, `Incomplete` or `Malformed`. `Malformed` (unknown response
+   tag, unknown outcome byte, unknown error kind, a declared length over
+   `MAX_JSON_LEN` / `MAX_MESSAGE_LEN`, a non-UTF-8 message) is monotone (no later
+   byte can repair it) and is decided as soon as the offending byte is present;
+   every proper prefix of a valid encoding stays `Incomplete`. Both kernels map
+   `Malformed` to `Faulty` (x86 as `Error(BadResponse)` from
+   `marshal_client::recv_marshal_response`, ARM via `classify_decode`), with the
+   same blocking and WORM audit as decision 3. `decode` is unchanged.
 
 ## Consequences
 
@@ -63,10 +76,15 @@ Worse, or left open:
   gated action is now blocked, loudly, where it used to be silently allowed. A
   CITADEL outage that yields 5xx does the same. Deployments must confirm their
   CITADEL accepts dry-run Kerkese requests before enabling the gate.
-- **The `None` case is still open.** A kernel-to-proxy `ipc` reply that does not
-  decode at all (response `None`) is still classified `Unreachable`, so for the
-  five fail-open actions it still admits the action. It cannot be told apart from
-  a dead link at that layer.
+- **Malformed bytes now fail closed; silence still does not.** A kernel-to-proxy
+  reply that is merely incomplete when the wait budget is exhausted (silence, a
+  stall, a connection closed mid-message) is a real timeout and stays
+  `Unreachable` by design, so for the five fail-open actions it still admits the
+  action. The link is unauthenticated, so an attacker who controls it can still
+  stall (timeout, so fail-open for `esim.*` and `mvno.*`, bounded only by the proxy
+  hardening below) or forge a well-formed reply: for example six zero bytes decode
+  as `Decision(Execute)`. Failing closed on malformed bytes only removes the
+  accidental bypass; the real fix is authenticating the link.
 - **Starvation residual.** `citadel_proxy` is now bounded (1 s total request-read
   deadline, 2 s write timeout, at most 8 concurrent connections, excess closed
   immediately, oversized declared length rejected on the 4-byte prefix; CITADEL
@@ -92,8 +110,8 @@ Worse, or left open:
 
 ## Revisit when
 
-- The kernel-to-proxy link is authenticated or the `None` case can be told apart
-  from a dead link; then reconsider its classification.
+- The kernel-to-proxy link is authenticated; then reconsider whether an
+  incomplete reply at budget end should still be `Unreachable`.
 - A CITADEL deployment is found that legitimately answers dry-run requests with
   a non-403 error, which would make this blocking unusable there.
 - The maintainers decide any open row of ADR 0003's table, or a bootstrap exception
@@ -102,12 +120,16 @@ Worse, or left open:
 
 ## References
 
-- `kernel-arm/src/marshal_action.rs` (`classify_response`, `enforce`)
+- `ipc/src/marshal.rs` (`MarshalResponse::decode_status`, `ResponseDecode`)
+- `kernel/src/marshal_client.rs` (`recv_marshal_response`)
+- `kernel-arm/src/marshal_action.rs` (`classify_response`, `classify_decode`, `enforce`)
 - `kernel-arm/src/data_codes.rs` (`RESET_DENIED_FAULTY`)
 - `kernel/src/grid_sandbox.rs` (`MarshalEnforcementError::FaultyReply`)
 - `citadel-integration/src/lib.rs` (`ShadowMarshalOutcome::Faulty`)
 - `desktop/src/citadel/proxy.rs` (`ProxyLimits`), `desktop/src/citadel/transport.rs`
-- `kernel/tests/grid_sandbox_marshal_shadow.rs` (case 2b, `shadow-faulty`)
-- `.github/workflows/ci.yml` (the garbage 200 / HTTP 500 ARM boot step)
+- `kernel/tests/grid_sandbox_marshal_shadow.rs` (case 2b, `shadow-faulty`; case 2c,
+  `shadow-malformed`)
+- `.github/workflows/ci.yml` (the garbage 200 / HTTP 500 ARM boot step, and the
+  malformed-reply ARM boot step)
 - [0003](0003-unreachable-marshal-policy-is-per-action.md),
   `docs/MARSHAL-ENFORCEMENT-POLICY.md`, `docs/STATUS.md` "MARSHAL gate for mobile"

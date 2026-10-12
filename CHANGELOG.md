@@ -13,6 +13,19 @@ not claim.
 
 ### Security
 
+- Fix: malformed MARSHAL reply bytes failed open. The kernels decoded the
+  kernel-to-proxy `ipc` reply with `MarshalResponse::decode`, whose `None` meant
+  both "not enough bytes yet" and "can never be valid" (unknown tag, outcome or
+  error kind, oversize length, non-UTF-8 message), so a garbled real `REFUSE`, or
+  any malformed bytes, ended as `Unreachable` and admitted eSIM enable/delete,
+  MVNO bind/suspend/reactivate and x86 `spawn_instance`. The new
+  `MarshalResponse::decode_status` returns `Complete`, `Incomplete` or
+  `Malformed`; `Malformed` is now `ShadowMarshalOutcome::Faulty` and blocks on
+  both kernels (ADR 0006). A reply that is merely incomplete when the wait
+  budget ends (silence or a stall) stays `Unreachable`. Residual: the link is
+  unauthenticated, so an attacker who controls it can still stall (fail-open
+  for the five actions) or forge a well-formed `Execute`; authenticating the
+  link is the real fix.
 - Fix: a MARSHAL reply that was reached but is faulty (`MarshalError::BadResponse`
   or `MarshalError::Other`: a malformed or empty body, a bad content-length, a
   non-403 HTTP error such as 400 or 500, a 403 whose body is not a
@@ -23,8 +36,8 @@ not claim.
   table (`db0aeb9`, `625e944`, `4e07444`; ADR 0006). The denial reads
   `DENIED (MARSHAL faulty reply: fail-closed)`, is WORM-audited with
   `authorized=false`, and the data reset returns `RESET_DENIED_FAULTY = 11`.
-  Genuinely unreachable cases (no proxy, connect failure, timeout, an
-  undecodable kernel-to-proxy `ipc` reply) are unchanged. Availability note:
+  Genuinely unreachable cases (no proxy, connect failure, timeout, an empty or
+  incomplete kernel-to-proxy `ipc` reply) are unchanged. Availability note:
   every Runix request is `dry_run: true`, so a CITADEL that rejects dry-run
   requests answers HTTP 400, and one that fails with 5xx, now blocks every
   gated action loudly instead of silently allowing it.
