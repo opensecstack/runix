@@ -419,6 +419,12 @@ pub enum ShadowMarshalOutcome {
     Refuse,
     HardStop,
     Unreachable,
+    /// MARSHAL (or its proxy) was REACHED but its reply was faulty: a
+    /// malformed/empty body, bad content-length, a non-403 HTTP error, or a
+    /// 403 whose body is not a REFUSE/HARD_STOP Decision. Distinct from
+    /// [`Self::Unreachable`] (nothing answered): enforcement blocks on this
+    /// regardless of any per-action fail-open table.
+    Faulty,
 }
 
 impl ShadowMarshalOutcome {
@@ -428,6 +434,7 @@ impl ShadowMarshalOutcome {
             ShadowMarshalOutcome::Refuse => "refuse",
             ShadowMarshalOutcome::HardStop => "hard_stop",
             ShadowMarshalOutcome::Unreachable => "unreachable",
+            ShadowMarshalOutcome::Faulty => "faulty",
         }
     }
 }
@@ -1194,6 +1201,33 @@ mod tests {
 
         // Still one tamper-evident chain.
         assert!(log.verify_chain());
+    }
+
+    #[test]
+    fn faulty_outcome_is_recorded_hashed_and_distinct() {
+        use ShadowMarshalOutcome::*;
+        // Encodings: existing variants unchanged, Faulty is new and unique.
+        assert_eq!(Execute.as_str(), "execute");
+        assert_eq!(Refuse.as_str(), "refuse");
+        assert_eq!(HardStop.as_str(), "hard_stop");
+        assert_eq!(Unreachable.as_str(), "unreachable");
+        assert_eq!(Faulty.as_str(), "faulty");
+
+        // Each outcome yields a different entry hash (the outcome is
+        // covered by the chain), and the chain verifies.
+        let mut hashes = Vec::new();
+        for o in [Execute, Refuse, HardStop, Unreachable, Faulty] {
+            let mut log = WormLog::new();
+            log.record_shadow_marshal_evaluation("m", "i", o);
+            assert_eq!(log.entries()[0].shadow_marshal, Some(o));
+            assert!(log.verify_chain());
+            hashes.push(log.entries()[0].entry_hash);
+        }
+        for a in 0..hashes.len() {
+            for b in (a + 1)..hashes.len() {
+                assert_ne!(hashes[a], hashes[b]);
+            }
+        }
     }
 
     #[test]
