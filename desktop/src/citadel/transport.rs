@@ -24,7 +24,20 @@
 
 use citadel_kerkese_core::decision::{Decision, Outcome};
 use citadel_kerkese_core::{KerkeseTransport, TransportError};
+use std::time::Duration;
 use tokio::runtime::Runtime;
+
+/// Default TCP connect timeout for the CITADEL HTTP request.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// Default total timeout (connect + send + wait for and read the whole
+/// response) for one CITADEL HTTP request. Kept well under the point at
+/// which the kernel's own bounded poll gives up and treats the proxy as
+/// unreachable (fail-open for some actions): a slow CITADEL must surface as
+/// a definite `TransportError::Timeout` -> `MarshalError::Timeout` answer
+/// from this proxy, not as the kernel's silent poll exhaustion. See
+/// `proxy.rs`'s `ProxyLimits` doc comment for the full budget arithmetic.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(3000);
 
 /// Environment variable holding the CITADEL MARSHAL Kerkese-submission
 /// endpoint URL. Deliberately not a compiled-in default — see this
@@ -56,10 +69,31 @@ impl HttpKerkeseTransport {
     /// closed with `TransportError::Unreachable` until a caller supplies a
     /// real endpoint.
     pub fn new(url: Option<String>) -> Self {
+        Self::with_timeouts(url, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    /// Like [`HttpKerkeseTransport::new`] with explicit CITADEL connect and
+    /// total-request timeouts. A request exceeding either yields
+    /// `TransportError::Timeout`.
+    pub fn with_timeouts(
+        url: Option<String>,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(connect_timeout)
+            .timeout(request_timeout)
+            .build()
+            .expect("failed to build reqwest client for HttpKerkeseTransport");
         Self {
-            client: reqwest::Client::new(),
+            client,
             url,
-            runtime: tokio::runtime::Builder::new_current_thread()
+            // Multi-thread runtime: the proxy calls `submit` from several
+            // worker threads at once, and a current-thread runtime would
+            // serialize those `block_on` calls behind one another, letting
+            // one slow CITADEL request stall all the others.
+            runtime: tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
                 .expect("failed to build Tokio runtime for HttpKerkeseTransport"),
@@ -91,7 +125,13 @@ impl HttpKerkeseTransport {
             .body(envelope_bytes.to_vec())
             .send()
             .await
-            .map_err(|e| TransportError::Unreachable(e.to_string()))?;
+            .map_err(|e| {
+                if e.is_timeout() {
+                    TransportError::Timeout
+                } else {
+                    TransportError::Unreachable(e.to_string())
+                }
+            })?;
 
         let status = response.status();
         if status == reqwest::StatusCode::FORBIDDEN {
@@ -102,10 +142,7 @@ impl HttpKerkeseTransport {
             // body back only if it is a genuine blocked Decision; anything
             // else (garbage, or an inconsistent 403 + EXECUTE) stays a
             // `BadResponse`, never an allow.
-            let body = response
-                .bytes()
-                .await
-                .map_err(|e| TransportError::BadResponse(e.to_string()))?;
+            let body = response.bytes().await.map_err(body_error)?;
             return match serde_json::from_slice::<Decision>(&body) {
                 Ok(d) if matches!(d.outcome, Outcome::Refuse | Outcome::HardStop) => {
                     Ok(body.to_vec())
@@ -121,7 +158,17 @@ impl HttpKerkeseTransport {
             .bytes()
             .await
             .map(|b| b.to_vec())
-            .map_err(|e| TransportError::BadResponse(e.to_string()))
+            .map_err(body_error)
+    }
+}
+
+/// A body-read failure: a timeout stays a `Timeout`, anything else is a
+/// `BadResponse` (as before).
+fn body_error(e: reqwest::Error) -> TransportError {
+    if e.is_timeout() {
+        TransportError::Timeout
+    } else {
+        TransportError::BadResponse(e.to_string())
     }
 }
 
@@ -273,8 +320,40 @@ mod tests {
         let addr = listener.local_addr().expect("local_addr");
         drop(listener);
 
-        let transport = HttpKerkeseTransport::new(Some(format!("http://{addr}/marshal/kerkese")));
+        // Long connect timeout: Windows retries SYNs to a closed port for
+        // ~2 s before reporting refusal.
+        let transport = HttpKerkeseTransport::with_timeouts(
+            Some(format!("http://{addr}/marshal/kerkese")),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
         let err = transport.submit(b"{}").unwrap_err();
         assert!(matches!(err, TransportError::Unreachable(_)));
+    }
+
+    #[test]
+    fn never_answering_citadel_yields_timeout_within_bound() {
+        // Accepts the connection, reads the request, never replies.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                read_http_request(&mut stream);
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        });
+        let transport = HttpKerkeseTransport::with_timeouts(
+            Some(format!("http://{addr}/marshal/kerkese")),
+            Duration::from_millis(500),
+            Duration::from_millis(400),
+        );
+        let start = std::time::Instant::now();
+        let result = transport.submit(b"{}");
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(TransportError::Timeout)),
+            "got {result:?}"
+        );
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
     }
 }
