@@ -106,6 +106,54 @@ fn decode_string(buf: &[u8]) -> Option<(String, usize)> {
     Some((String::from(s), 2 + len))
 }
 
+/// Streaming-decoder verdict on a (possibly partial) byte buffer; see
+/// [`MarshalResponse::decode_status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResponseDecode {
+    /// A full message was decoded; the `usize` is the bytes consumed.
+    Complete(MarshalResponse, usize),
+    /// The buffer is a (so far) valid prefix of a message: keep accumulating.
+    Incomplete,
+    /// The bytes already present can never be part of any valid response
+    /// (unknown tag/outcome/error kind, declared length over its bound,
+    /// non-UTF-8 string). More bytes cannot repair it.
+    Malformed,
+}
+
+/// `Ok(None)` = need more bytes, `Err(())` = definitely malformed.
+type Step<T> = Result<Option<T>, ()>;
+
+fn status_bytes(buf: &[u8]) -> Step<usize> {
+    if buf.len() < 4 {
+        return Ok(None);
+    }
+    let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if len > MAX_JSON_LEN {
+        return Err(());
+    }
+    if buf.len() < 4 + len {
+        return Ok(None);
+    }
+    Ok(Some(4 + len))
+}
+
+fn status_string(buf: &[u8]) -> Step<usize> {
+    if buf.len() < 2 {
+        return Ok(None);
+    }
+    let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+    if len > MAX_MESSAGE_LEN {
+        return Err(());
+    }
+    if buf.len() < 2 + len {
+        return Ok(None);
+    }
+    if core::str::from_utf8(&buf[2..2 + len]).is_err() {
+        return Err(());
+    }
+    Ok(Some(2 + len))
+}
+
 /// Kernel client -> MARSHAL proxy, over a fixed request port (still
 /// capability-gated at the port level, same "port proves you may talk to
 /// this service at all" posture [`crate::fs`]'s own doc comment describes
@@ -250,6 +298,18 @@ impl MarshalError {
             _ => None,
         }
     }
+
+    /// Bytes of an error body (after the response tag byte 1), or why not.
+    fn status(buf: &[u8]) -> Step<usize> {
+        let Some(&tag) = buf.first() else {
+            return Ok(None);
+        };
+        match tag {
+            1 => Ok(Some(1)),
+            0 | 2 | 3 | 4 => Ok(status_string(&buf[1..])?.map(|n| 1 + n)),
+            _ => Err(()),
+        }
+    }
 }
 
 /// MARSHAL proxy -> kernel client, over a fixed response port.
@@ -312,6 +372,38 @@ impl MarshalResponse {
                 Some((MarshalResponse::Error(err), 1 + n))
             }
             _ => None,
+        }
+    }
+
+    /// Like [`MarshalResponse::decode`], but distinguishes "not enough bytes
+    /// yet" ([`ResponseDecode::Incomplete`]) from "these bytes can never be a
+    /// valid response" ([`ResponseDecode::Malformed`]). Guarantees, for a
+    /// streaming caller: `Malformed` is monotone (every extension of a
+    /// `Malformed` buffer is `Malformed`); every proper prefix of a valid
+    /// encoding is `Incomplete`; `decode(buf).is_some()` iff the result is
+    /// `Complete`, with identical contents. Never panics.
+    pub fn decode_status(buf: &[u8]) -> ResponseDecode {
+        let Some(&tag) = buf.first() else {
+            return ResponseDecode::Incomplete;
+        };
+        let verdict: Step<()> = match tag {
+            0 => match buf.get(1) {
+                None => Ok(None),
+                Some(&b) if MarshalOutcome::from_byte(b).is_none() => Err(()),
+                Some(_) => status_bytes(&buf[2..]).map(|o| o.map(|_| ())),
+            },
+            1 => MarshalError::status(&buf[1..]).map(|o| o.map(|_| ())),
+            _ => Err(()),
+        };
+        match verdict {
+            Err(()) => ResponseDecode::Malformed,
+            Ok(None) => ResponseDecode::Incomplete,
+            // Framing is complete and valid; the typed decode builds the value.
+            Ok(Some(())) => match MarshalResponse::decode(buf) {
+                Some((resp, n)) => ResponseDecode::Complete(resp, n),
+                // Unreachable by construction; fail closed rather than panic.
+                None => ResponseDecode::Malformed,
+            },
         }
     }
 }
@@ -434,6 +526,156 @@ mod tests {
         .encode();
         for cut in 0..full.len() {
             assert_eq!(MarshalResponse::decode(&full[..cut]), None);
+        }
+    }
+
+    fn is_malformed(b: &[u8]) -> bool {
+        MarshalResponse::decode_status(b) == ResponseDecode::Malformed
+    }
+
+    #[test]
+    fn status_empty_and_valid_prefixes_are_incomplete() {
+        assert_eq!(
+            MarshalResponse::decode_status(&[]),
+            ResponseDecode::Incomplete
+        );
+        for resp in [
+            MarshalResponse::Decision {
+                outcome: MarshalOutcome::Refuse,
+                decision_json: alloc::vec![1, 2, 3],
+            },
+            MarshalResponse::Error(MarshalError::Timeout),
+            MarshalResponse::Error(MarshalError::PolicyRefused(String::from("why"))),
+        ] {
+            let full = resp.encode();
+            for cut in 0..full.len() {
+                assert_eq!(
+                    MarshalResponse::decode_status(&full[..cut]),
+                    ResponseDecode::Incomplete
+                );
+            }
+            assert_eq!(
+                MarshalResponse::decode_status(&full),
+                ResponseDecode::Complete(resp, full.len())
+            );
+        }
+    }
+
+    #[test]
+    fn status_invalid_bytes_are_malformed_immediately() {
+        // Unknown top-level tag, with nothing after it.
+        assert!(is_malformed(&[0x7f]));
+        assert!(is_malformed(&[2]));
+        assert!(is_malformed(&[0x7f, 0, 0, 0, 0, 0]));
+        // Unknown outcome byte (2 bytes in).
+        assert!(is_malformed(&[0, 3]));
+        assert!(is_malformed(&[0, 0xff]));
+        // Unknown error kind (2 bytes in).
+        assert!(is_malformed(&[1, 5]));
+        assert!(is_malformed(&[1, 0xff, 0, 0]));
+        // Declared Decision JSON length over MAX_JSON_LEN (4 length bytes in).
+        let mut over = alloc::vec![0u8, 0];
+        over.extend_from_slice(&((MAX_JSON_LEN as u32) + 1).to_le_bytes());
+        assert!(is_malformed(&over));
+        // Exactly MAX_JSON_LEN is merely incomplete.
+        let mut at = alloc::vec![0u8, 0];
+        at.extend_from_slice(&(MAX_JSON_LEN as u32).to_le_bytes());
+        assert_eq!(
+            MarshalResponse::decode_status(&at),
+            ResponseDecode::Incomplete
+        );
+        // Declared string length over MAX_MESSAGE_LEN, for every string kind.
+        for kind in [0u8, 2, 3, 4] {
+            let mut w = alloc::vec![1u8, kind];
+            w.extend_from_slice(&((MAX_MESSAGE_LEN as u16) + 1).to_le_bytes());
+            assert!(is_malformed(&w));
+        }
+        // Invalid UTF-8 in an otherwise well-framed string.
+        assert!(is_malformed(&[1, 3, 2, 0, 0xff, 0xfe]));
+        // Six zero bytes are a well-formed Execute (documented forgery limit).
+        assert!(matches!(
+            MarshalResponse::decode_status(&[0; 6]),
+            ResponseDecode::Complete(
+                MarshalResponse::Decision {
+                    outcome: MarshalOutcome::Execute,
+                    ..
+                },
+                6
+            )
+        ));
+    }
+
+    fn arb_response() -> impl Strategy<Value = MarshalResponse> {
+        let msg = r"\PC{0,60}";
+        prop_oneof![
+            (0u8..3, proptest::collection::vec(any::<u8>(), 0..300)).prop_map(|(o, j)| {
+                MarshalResponse::Decision {
+                    outcome: MarshalOutcome::from_byte(o).unwrap(),
+                    decision_json: j,
+                }
+            }),
+            msg.prop_map(|m| MarshalResponse::Error(MarshalError::Unreachable(m))),
+            Just(MarshalResponse::Error(MarshalError::Timeout)),
+            msg.prop_map(|m| MarshalResponse::Error(MarshalError::BadResponse(m))),
+            msg.prop_map(|m| MarshalResponse::Error(MarshalError::Other(m))),
+            msg.prop_map(|m| MarshalResponse::Error(MarshalError::PolicyRefused(m))),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn status_proper_prefixes_of_valid_are_incomplete(resp in arb_response()) {
+            let full = resp.encode();
+            for cut in 0..full.len() {
+                prop_assert_eq!(
+                    MarshalResponse::decode_status(&full[..cut]),
+                    ResponseDecode::Incomplete
+                );
+            }
+            prop_assert_eq!(
+                MarshalResponse::decode_status(&full),
+                ResponseDecode::Complete(resp, full.len())
+            );
+        }
+
+        #[test]
+        fn status_agrees_with_decode(buf in proptest::collection::vec(any::<u8>(), 0..64)) {
+            let st = MarshalResponse::decode_status(&buf);
+            match MarshalResponse::decode(&buf) {
+                Some((r, n)) => prop_assert_eq!(st, ResponseDecode::Complete(r, n)),
+                None => prop_assert!(!matches!(st, ResponseDecode::Complete(..))),
+            }
+        }
+
+        #[test]
+        fn status_malformed_is_monotone(
+            buf in proptest::collection::vec(any::<u8>(), 0..48),
+            ext in proptest::collection::vec(any::<u8>(), 0..48),
+        ) {
+            if is_malformed(&buf) {
+                let mut longer = buf.clone();
+                longer.extend_from_slice(&ext);
+                prop_assert!(is_malformed(&longer));
+            }
+        }
+
+        #[test]
+        fn status_malformed_prefix_of_stream_stays_malformed(
+            buf in proptest::collection::vec(any::<u8>(), 1..48),
+        ) {
+            // Once a streaming reader sees Malformed at some length, it is
+            // Malformed at every longer length of the same stream.
+            let mut seen = false;
+            for n in 0..=buf.len() {
+                let m = is_malformed(&buf[..n]);
+                prop_assert!(!seen || m);
+                seen |= m;
+            }
+        }
+
+        #[test]
+        fn status_never_panics(buf in proptest::collection::vec(any::<u8>(), 0..128)) {
+            let _ = MarshalResponse::decode_status(&buf);
         }
     }
 
