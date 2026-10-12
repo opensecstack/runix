@@ -25,7 +25,7 @@
 //! ([`runix_ipc::sockets`]): open a handle, connect it to the proxy's
 //! `remote_ip`/`remote_port`, send the encoded [`MarshalRequest`] as one or
 //! more [`SocketRequest::Send`]s, poll [`SocketRequest::Recv`] for the
-//! answering bytes and decode them with [`MarshalResponse::decode`] (this
+//! answering bytes and decode them with [`MarshalResponse::decode_status`] (this
 //! decoder is already resumable/streaming-safe — TCP delivering the
 //! response across multiple reads is the same kind of partial-data problem
 //! it was built to handle), then close the handle.
@@ -98,8 +98,9 @@
 //! participation (owner-or-accepted-server identity), not a fresh port
 //! capability check per call — see `kernel::ipc`'s `is_participant`.
 
+use alloc::string::String;
 use alloc::vec::Vec;
-use runix_ipc::marshal::{MarshalRequest, MarshalResponse};
+use runix_ipc::marshal::{MarshalError, MarshalRequest, MarshalResponse, ResponseDecode};
 use runix_ipc::sockets::{SocketRequest, SocketResponse, MAX_PAYLOAD_LEN};
 
 /// Fixed sockets IPC server port — see this module's own doc comment for
@@ -288,11 +289,16 @@ fn close_socket(session_id: u64, handle: u8, max_iters: u32) {
 /// issuing [`SocketRequest::Recv`] repeatedly (it never blocks — see
 /// [`runix_ipc::sockets::SocketResponse::Data`]'s doc comment) and
 /// accumulating the returned bytes into a growing buffer decoded with
-/// [`MarshalResponse::decode`] — resumable across however many
+/// [`MarshalResponse::decode_status`] — resumable across however many
 /// [`SocketRequest::Recv`] rounds (and however many underlying TCP
 /// segments) the response actually arrives in, exactly the partial-data
 /// problem that decoder was built to handle. `None` if nothing decodable
-/// arrives within `max_polls` rounds.
+/// arrives within `max_polls` rounds (silence or a stalled, still-incomplete
+/// reply: a real timeout). Bytes that can never be a valid response
+/// ([`ResponseDecode::Malformed`]: unknown tag/outcome/kind, oversize length,
+/// bad UTF-8) are NOT a timeout: they are a reachable-but-faulty reply and
+/// surface immediately as `Error(BadResponse)`, which callers classify as
+/// fail-closed (ADR 0006) instead of fail-open "unreachable".
 fn recv_marshal_response(session_id: u64, handle: u8, max_polls: u32) -> Option<MarshalResponse> {
     let mut buf: Vec<u8> = Vec::new();
     for i in 0..max_polls {
@@ -310,8 +316,14 @@ fn recv_marshal_response(session_id: u64, handle: u8, max_polls: u32) -> Option<
         {
             if h == handle {
                 buf.extend_from_slice(&data);
-                if let Some((response, _consumed)) = MarshalResponse::decode(&buf) {
-                    return Some(response);
+                match MarshalResponse::decode_status(&buf) {
+                    ResponseDecode::Complete(response, _consumed) => return Some(response),
+                    ResponseDecode::Malformed => {
+                        return Some(MarshalResponse::Error(MarshalError::BadResponse(
+                            String::from("malformed ipc reply"),
+                        )));
+                    }
+                    ResponseDecode::Incomplete => {}
                 }
             }
         }

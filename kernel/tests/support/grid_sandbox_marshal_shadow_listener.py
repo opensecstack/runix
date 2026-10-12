@@ -29,10 +29,13 @@ many bytes of opaque `decision_json`.
 `BadResponse`), then a `u16` little-endian length prefix and that many bytes
 of message.
 
-The listener serves TWO connections (each guest-side `spawn_instance`
+The listener serves THREE connections (each guest-side `spawn_instance`
 evaluation is its own `guestfwd` `nc` connection): the first gets the canned
 Refuse Decision, the second an ipc-level `Error(BadResponse)` (a reached but
-faulty reply, which enforcement must block as `Faulty`).
+faulty reply, which enforcement must block as `Faulty`), the third raw
+MALFORMED bytes (first byte 0x7f, no valid tag, then padding), which the
+kernel's streaming decoder classifies `Malformed` and must also block as
+`Faulty` (not retry into a fail-open timeout).
 """
 
 import socket
@@ -81,14 +84,19 @@ def encode_marshal_response_bad_response(msg: bytes) -> bytes:
     return bytes(out)
 
 
+def malformed_reply() -> bytes:
+    # 0x7f is not a MarshalResponse tag (0 = Decision, 1 = Error).
+    return b"\x7f" + b"\x00" * 15
+
+
 def main() -> int:
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
-    server.listen(2)
+    server.listen(3)
 
     try:
-        for i in range(2):
+        for i in range(3):
             conn, _addr = server.accept()
             try:
                 kerkese_json = recv_marshal_request(conn)
@@ -103,6 +111,12 @@ def main() -> int:
                         "grid_sandbox_marshal_shadow_listener: sent a canned Refuse "
                         "MarshalResponse"
                     )
+                elif i == 2:
+                    conn.sendall(malformed_reply())
+                    print(
+                        "grid_sandbox_marshal_shadow_listener: sent canned MALFORMED "
+                        "reply bytes (unknown tag 0x7f)"
+                    )
                 else:
                     conn.sendall(
                         encode_marshal_response_bad_response(
@@ -115,7 +129,7 @@ def main() -> int:
                     )
             finally:
                 conn.close()
-        print("grid_sandbox_marshal_shadow_listener: PASS -- served both connections")
+        print("grid_sandbox_marshal_shadow_listener: PASS -- served all three connections")
         return 0
     finally:
         server.close()

@@ -62,6 +62,15 @@
 //! `MarshalEnforcementError::FaultyReply` and `ShadowMarshalOutcome::Faulty`
 //! is recorded.
 //!
+//! Case 2c (added with the malformed-reply change, ADR 0006): the listener's
+//! third connection answers raw bytes that are no valid `MarshalResponse` at
+//! all (first byte `0x7f`, an unknown tag, then padding) for
+//! `"shadow-malformed"`; `marshal_client` classifies them `Malformed`
+//! (`ResponseDecode`), the spawn is blocked with
+//! `MarshalEnforcementError::FaultyReply`, and `Faulty` is recorded. Before
+//! this change such bytes were retried until the budget ran out and became
+//! `Unreachable` (fail-open).
+//!
 //! Cases 2 and 3 both run on a dedicated thread holding the one capability
 //! scoped to `marshal_client::SOCKETS_SERVER_PORT` (same reason
 //! `marshal_tcp_roundtrip.rs` uses a dedicated thread: `kernel_main`'s own
@@ -168,6 +177,7 @@ const TCP_LOCAL_PORT: u16 = 49158;
 // (see this file's own doc comment) — a connection attempt here fails
 // immediately, a faithful "proxy configured but unreachable" case (Path 2).
 const TCP_FAULTY_LOCAL_PORT: u16 = 49160;
+const TCP_MALFORMED_LOCAL_PORT: u16 = 49161;
 const TCP_UNREACHABLE_PORT: u16 = 9001;
 const TCP_UNREACHABLE_LOCAL_PORT: u16 = 49159;
 
@@ -460,8 +470,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // loop's own cadence catches it, so this thread's own wait needs to
     // outlast both of `spawn_configured_instance_thread`'s real round trips
     // (case 2 and case 3), not just one.
+    // (6_000_000 yields, up from 4_500_000: case 2c adds a fourth real TCP
+    // round trip to the one thread being waited on. This test only runs on
+    // the Linux runner, so the headroom is not measured locally; it only
+    // keeps a slow runner from tripping the wait.)
     let mut result = TestResult::Pending;
-    for _ in 0..4_500_000 {
+    for _ in 0..6_000_000 {
         scheduler::yield_now();
         #[allow(static_mut_refs)]
         let current = unsafe { RESULT };
@@ -518,6 +532,9 @@ static mut RESULT: TestResult = TestResult::Pending;
 ///   second connection answers an ipc-level `Error(BadResponse)`. Confirms
 ///   `spawn_instance` returns `Err(SpawnInstanceError::MarshalEnforcement(MarshalEnforcementError::FaultyReply))`
 ///   (fail-closed) and the WormLog records `Faulty`.
+/// - **Case 2c** (`"shadow-malformed"`): the listener's third connection
+///   answers raw malformed bytes (unknown tag `0x7f`). Confirms the spawn is
+///   blocked with `FaultyReply` and the WormLog records `Faulty`.
 /// - **Case 3 / Path 2** (`"shadow-unreachable"`): repoints the proxy at an
 ///   address with no `guestfwd` mapping, then confirms `spawn_instance`
 ///   still succeeds (fail-open) and the WormLog records `Unreachable`.
@@ -629,6 +646,55 @@ extern "C" fn spawn_configured_instance_thread() -> ! {
         }
     };
 
+    // --- Case 2c: configured, reachable, but the reply bytes are not a valid
+    // MarshalResponse at all (unknown tag 0x7f + padding): MALFORMED, which
+    // must fail closed (Faulty), not be retried into a timeout/fail-open. The
+    // listener's third connection sends them. --------------------------------
+    grid_sandbox::set_shadow_marshal_proxy(Some(ShadowMarshalProxyConfig {
+        remote_ip: TCP_REMOTE_IP,
+        remote_port: TCP_REMOTE_PORT,
+        local_port: TCP_MALFORMED_LOCAL_PORT,
+    }));
+    let malformed_ok = match grid_sandbox::spawn_instance(
+        "shadow-malformed",
+        SandboxTier::T2Trusted,
+        now,
+        &signing_key,
+    ) {
+        Ok(_instance) => {
+            serial_println!(
+                "grid_sandbox_marshal_shadow: FAIL - shadow-malformed's spawn succeeded, but a malformed reply must block it (fail-closed)"
+            );
+            false
+        }
+        Err(SpawnInstanceError::MarshalEnforcement(MarshalEnforcementError::FaultyReply)) => {
+            let entries = grid_sandbox::shadow_marshal_log_entries();
+            let recorded = entries
+                .iter()
+                .find(|e| e.instance_id.as_deref() == Some("shadow-malformed"))
+                .and_then(|e| e.shadow_marshal);
+            if recorded == Some(ShadowMarshalOutcome::Faulty) {
+                serial_println!(
+                    "grid_sandbox_marshal_shadow: shadow-malformed's spawn was blocked as expected (fail-closed) with Faulty recorded in the WormLog"
+                );
+                true
+            } else {
+                serial_println!(
+                    "grid_sandbox_marshal_shadow: shadow-malformed's spawn was blocked, but expected its WormLog entry to carry Some(Faulty), got {:?}",
+                    recorded
+                );
+                false
+            }
+        }
+        Err(e) => {
+            serial_println!(
+                "grid_sandbox_marshal_shadow: shadow-malformed's spawn failed, but not with MarshalEnforcementError::FaultyReply: {:?}",
+                e
+            );
+            false
+        }
+    };
+
     // --- Case 3: configured but unreachable (Path 2) — run last on purpose,
     // see this function's own doc comment. ----------------------------------
     grid_sandbox::set_shadow_marshal_proxy(Some(ShadowMarshalProxyConfig {
@@ -685,7 +751,7 @@ extern "C" fn spawn_configured_instance_thread() -> ! {
 
     #[allow(static_mut_refs)]
     unsafe {
-        RESULT = if unreachable_ok && refused_ok && faulty_ok {
+        RESULT = if unreachable_ok && refused_ok && faulty_ok && malformed_ok {
             TestResult::Pass
         } else {
             TestResult::Fail
