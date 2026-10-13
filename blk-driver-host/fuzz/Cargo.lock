@@ -16,7 +16,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "blk-driver-host"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "ed25519-dalek",
  "linked_list_allocator",
@@ -275,7 +275,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "runix-capability-manager"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "runix-ipc"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "runix-capability-manager",
  "serde",

@@ -2,14 +2,16 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 file covers the changes since the published Alpha release, the tag
-`v0.1.0-alpha`, up to version `0.1.0-beta.1`. Every entry was derived from the
-commit history (`git log v0.1.0-alpha..HEAD`, 91 commits, 2026-10-01 to
-2026-10-12); work that already shipped in `v0.1.0-alpha` is not repeated here.
+`v0.1.0-alpha`, up to version `0.1.0-beta.2`. Every entry was derived from the
+commit history (`git log v0.1.0-alpha..HEAD`, 105 commits, 2026-10-01 to
+2026-10-13); work that already shipped in `v0.1.0-alpha` is not repeated here.
 See [docs/STATUS.md](docs/STATUS.md) for what is verified and
 [docs/BETA_CRITERIA.md](docs/BETA_CRITERIA.md) for what Beta claims and does
 not claim.
 
 ## [Unreleased]
+
+## [0.1.0-beta.2] - 2026-10-13
 
 ### Security
 
@@ -229,5 +231,6 @@ not claim.
   binaries such as `net-driver-host-arm` built before the crates that embed
   them) (`5c31c15`, `22bc3b2`, `468a85f`, `6e98f4e`, `200cfd8`, `a67dde2`).
 
-[Unreleased]: https://github.com/opensecstack/runix/compare/v0.1.0-beta.1...HEAD
+[Unreleased]: https://github.com/opensecstack/runix/compare/v0.1.0-beta.2...HEAD
+[0.1.0-beta.2]: https://github.com/opensecstack/runix/compare/v0.1.0-beta.1...v0.1.0-beta.2
 [0.1.0-beta.1]: https://github.com/opensecstack/runix/compare/v0.1.0-alpha...v0.1.0-beta.1

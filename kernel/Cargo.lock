@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "runix-capability-manager"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "runix-citadel-integration"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "citadel-kerkese-core",
  "ed25519-dalek",
@@ -282,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "runix-ipc"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "runix-capability-manager",
  "serde",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "runix-kernel"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "bootloader_api",
  "ed25519-dalek",

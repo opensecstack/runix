@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "abi-consistency"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 
 [[package]]
 name = "aead"
@@ -1352,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "runix-capability-manager"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -1364,7 +1364,7 @@ dependencies = [
 
 [[package]]
 name = "runix-citadel-integration"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "citadel-kerkese-core 1.0.0",
  "ed25519-dalek",
@@ -1376,7 +1376,7 @@ dependencies = [
 
 [[package]]
 name = "runix-desktop"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "citadel-kerkese-core 0.1.0",
  "ed25519-dalek",
@@ -1394,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "runix-ipc"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "proptest",
  "runix-capability-manager",
@@ -1404,7 +1404,7 @@ dependencies = [
 
 [[package]]
 name = "runix-mobile"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "runix-capability-manager",
  "runix-citadel-integration",
@@ -1412,7 +1412,7 @@ dependencies = [
 
 [[package]]
 name = "runix-tls-client"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "embedded-io",
  "embedded-tls",
@@ -1423,7 +1423,7 @@ dependencies = [
 
 [[package]]
 name = "runix-wasm-runtime"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "wasmi",
  "wat",

@@ -1,7 +1,7 @@
 [package]
 name = "runix-kernel-arm"
 description = "Runix microkernel, ARM/TrustZone boot bring-up (mobile L1). Alpha scope: EL3 Secure Monitor boot, UART, exception vectors -- see src/main.rs's module doc comment for status and the naming/placement decision this crate represents."
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"

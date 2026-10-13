@@ -1,7 +1,7 @@
 [package]
 name = "net-driver-host-arm"
 description = "Network driver host, ARM: the aarch64-unknown-none analogue of net-driver-host — a freestanding ring 3 / EL0 binary owning a virtio-mmio network device and running smoltcp (TCP client only, Beta mobile item 2.5 'Stage 3: real outbound TCP at EL0'). Ports kernel-arm/src/virtio_mmio.rs + virtio_net.rs's EL1 virtqueue bring-up to a process-private, non-identity-mapped address space. Not yet loaded by anything — see main.rs's module doc comment for the loader-integration contract this binary assumes but does not itself implement."
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"

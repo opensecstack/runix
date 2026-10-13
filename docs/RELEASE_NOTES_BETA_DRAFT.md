@@ -6,6 +6,30 @@ release. The exit criteria and the evidence for every statement below are in
 [../CHANGELOG.md](../CHANGELOG.md); detailed implementation state is in
 [STATUS.md](STATUS.md).
 
+## Changes since v0.1.0-beta.1
+
+If you are on `v0.1.0-beta.1`, these are the differences (full list in
+[../CHANGELOG.md](../CHANGELOG.md)):
+
+- **A MARSHAL reply that is reached but faulty now blocks.** In beta.1 a
+  malformed or empty body, a non-403 HTTP error (400, 500), or malformed
+  `ipc` bytes were classified as unreachable, which is fail-open for the five
+  eSIM and MVNO actions and for `spawn_instance`. They now fail closed for all
+  six mobile actions and `spawn_instance`, and the denial is recorded in WORM.
+  A side effect: a CITADEL that rejects dry-run requests (HTTP 400) or that
+  fails with 5xx now blocks every gated action, loudly.
+- **`citadel_proxy` is hardened** against idle and slow clients (bounded
+  deadlines, at most 8 concurrent connections, a timeout on the CITADEL
+  request). The first version of these deadlines was too tight for a slow
+  emulated guest and was relaxed before this release.
+- More CI: the faulty-reply and malformed-reply paths, the `kernel-arm` and
+  `net-driver-host-arm` unit tests, and a timeout and proxy log on the
+  `marshal_proxy_e2e` step.
+
+What did **not** change: the kernel-to-proxy link is still unauthenticated and
+requests are still `dry_run`, a real CITADEL `EXECUTE` is still out of reach, and
+an attacker who controls the link can still stall a reply or forge `Execute`.
+
 ## Known limitations and what this release does NOT claim
 
 Read this first. This list mirrors "Not claimed" in BETA_CRITERIA.md.
