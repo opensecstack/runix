@@ -464,12 +464,24 @@ jobs:
         run: |
           python3 tests/support/mock_citadel_server.py &
           sleep 0.3
+          # The proxy's stderr is kept (not lost) so a hang or failure is
+          # explainable: it logs refused connections and connection errors.
+          # The test normally takes under a minute; it has no internal
+          # wall-clock bound (a closed connection looks like nothing-yet to
+          # the kernel client), so bound it here and print the proxy log if
+          # it fails or times out.
           CITADEL_PROXY_LISTEN_ADDR=127.0.0.1:9104 \
             RUNIX_CITADEL_URL=http://127.0.0.1:9105/marshal/kerkese \
-            ../target/release/citadel_proxy &
+            ../target/release/citadel_proxy 2> "$RUNNER_TEMP/citadel_proxy.err" &
           sleep 0.3
+          rc=0
           RUNIX_NETDEV_ARG="user,id=net0,guestfwd=tcp:10.0.2.100:9000-cmd:nc 127.0.0.1 9104" \
-            cargo test --target x86_64-unknown-none --test marshal_proxy_e2e
+            timeout 420 cargo test --target x86_64-unknown-none --test marshal_proxy_e2e || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "marshal_proxy_e2e exited $rc (124 = timed out); citadel_proxy stderr follows:"
+            cat "$RUNNER_TEMP/citadel_proxy.err" || true
+            exit "$rc"
+          fi
       # grid_sandbox::spawn_instance's real MARSHAL enforcement (the test
       # file name keeps the old "shadow" wording). Three cases in one boot:
       # unconfigured (no networking attempted, records Unreachable, spawn

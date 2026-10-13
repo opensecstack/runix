@@ -2516,13 +2516,15 @@ stall, or forge a well-formed reply (six zero bytes decode as `Decision(Execute)
 authenticating the link is the real fix.
 
 **Proxy hardening.** `citadel_proxy` (`desktop/src/citadel/proxy.rs`,
-`ProxyLimits`) now allows a connection 1 s in total to deliver its request, 2 s per response
+`ProxyLimits`) now allows a connection a 20 s idle allowance before its first request byte and then 3 s in
+total for the rest of the frame (a first version allowed 1 s in total from accept, which a slow
+emulated guest can exceed; it was relaxed), 2 s per response
 write, and handles at most 8 connections at once (a thread per connection; excess
 connections are closed immediately, not queued). It rejects an oversized declared length
 from the 4-byte prefix. Its CITADEL HTTP leg (`desktop/src/citadel/transport.rs`) has a 1 s connect and
 3 s total timeout; a timeout is `MarshalError::Timeout`. Default listen address is
 `127.0.0.1:9000`. **Residual:** an attacker who can reach the listener (a local process,
-or the guest through QEMU guestfwd) can hold 8 connections open and reopen them every second
+or the guest through QEMU guestfwd) can hold 8 connections open and reopen them every ~20 s
 to starve legitimate requests, which the kernel reads as unavailable. There is no per-peer limit;
 the real fix is controlling who can reach the listener or authenticating the link.
 

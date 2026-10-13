@@ -26,10 +26,10 @@ Read this first. This list mirrors "Not claimed" in BETA_CRITERIA.md.
   an availability hazard: every Runix request is `dry_run: true`, so a CITADEL
   that rejects dry-run requests answers 400, and one that fails with 5xx does
   the same; every gated action is then blocked, loudly. The proxy is bounded
-  (1 s request-read deadline, 2 s write timeout, at most 8 concurrent
-  connections, CITADEL connect 1 s / total 3 s), but an attacker who can reach
+  (20 s idle allowance before the first request byte, 3 s for the rest of the
+  frame, 2 s write timeout, at most 8 concurrent connections, CITADEL connect 1 s / total 3 s), but an attacker who can reach
   its listener (a local process, or the guest through QEMU guestfwd) can still
-  hold the 8 slots and reopen them every second to starve legitimate requests,
+  hold the 8 slots and reopen them every ~20 s to starve legitimate requests,
   which the kernel reads as unreachable and so fail-open; there is no per-peer
   limit. A kernel-to-proxy `ipc` reply that is empty or incomplete when the wait
   ends is still treated as unreachable; reply bytes that can never decode

@@ -85,18 +85,28 @@ Worse, or left open:
   hardening below) or forge a well-formed reply: for example six zero bytes decode
   as `Decision(Execute)`. Failing closed on malformed bytes only removes the
   accidental bypass; the real fix is authenticating the link.
-- **Starvation residual.** `citadel_proxy` is now bounded (1 s total request-read
-  deadline, 2 s write timeout, at most 8 concurrent connections, excess closed
+- **Starvation residual.** `citadel_proxy` is now bounded (a 20 s idle allowance
+  before the first request byte, then a 3 s total deadline for the rest of the frame, 2 s write timeout, at most 8 concurrent connections, excess closed
   immediately, oversized declared length rejected on the 4-byte prefix; CITADEL
   HTTP connect 1 s, total 3 s, a timeout being `MarshalError::Timeout`). Default
   listen address is `127.0.0.1:9000`. An attacker who can reach the listener (a
   local process, or the guest through QEMU guestfwd) can still hold 8
-  connections open and reopen them every second, starving legitimate requests,
+  connections open and reopen them every ~20 s, starving legitimate requests,
   which the kernel reads as unavailable and so fail-open for five actions. There
   is no per-peer limit. The real fix is controlling who can reach the listener
   or authenticating the link.
 - The verdict is still unauthenticated and `dry_run` is still `true`; this
   change does not make an `Execute` a live approval.
+- **The x86 kernel client cannot detect a closed connection.** If the proxy
+  closes the connection without replying, `net-driver-host` keeps answering the
+  kernel's receive with an empty `Data` (it never reports EOF, because the socket
+  stays open in CloseWait), which the client reads as "nothing yet" and so waits
+  out its whole poll budget (2,000,000 polls in `marshal_client.rs`), effectively
+  unbounded in a test. A prompt `Unreachable` would need `net-driver-host` to
+  report EOF and the `ipc::sockets` wire format to carry it. `kernel-arm` is
+  bounded (64 yields). This is why a stalled or dropped request looks like a hang,
+  not a failure; CI bounds the `marshal_proxy_e2e` step with a timeout and prints
+  the proxy's stderr for that reason.
 
 ## Alternatives considered
 

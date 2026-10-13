@@ -43,13 +43,14 @@ not claim.
   gated action loudly instead of silently allowing it.
 - Fix: `citadel_proxy` could be stalled by one idle or slow client (it served
   one connection at a time with no read timeout), which the kernel read as
-  MARSHAL unavailable. It now has a 1 s total request-read deadline, a 2 s write
+  MARSHAL unavailable. It now has a 20 s idle allowance before the first request byte and a 3 s total deadline for the rest of the frame (a first version with a 1 s total deadline was
+  too tight for a slow emulated guest and was relaxed), a 2 s write
   timeout, at most 8 concurrent connections (excess closed immediately), an
   oversized declared length rejected on the 4-byte prefix, and a CITADEL HTTP
   connect timeout of 1 s and total timeout of 3 s, where a timeout is
   `MarshalError::Timeout` (`4a26c08`, `f8322c0`). Residual: an attacker who can
   reach the listener (a local process, or the guest through QEMU guestfwd) can
-  still hold the 8 connections open and reopen them every second to starve
+  still hold the 8 connections open and reopen them every ~20 s to starve
   valid requests; there is no per-peer limit. The fix for that is
   controlling who can reach the listener or authenticating the link.
 

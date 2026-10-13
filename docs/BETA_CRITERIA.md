@@ -62,11 +62,11 @@ be described as having any of the following.
    Reply bytes that can never decode (unknown tag, outcome or error kind,
    oversize length, non-UTF-8 message) are a faulty reply and block. The link
    is unauthenticated, so an attacker who controls it can still stall (fail-open)
-   or forge a well-formed `Execute`. The proxy is bounded (1 s request-read
-   deadline, 2 s write timeout, at most 8 concurrent connections, CITADEL
+   or forge a well-formed `Execute`. The proxy is bounded (20 s idle allowance before the
+   first request byte, 3 s for the rest of the frame, 2 s write timeout, at most 8 concurrent connections, CITADEL
    connect 1 s / total 3 s), so an idle or slow client cannot stall it, but an
    attacker who can reach its listener (a local process, or the guest through
-   QEMU guestfwd) can still hold the 8 slots and reopen them every second to
+   QEMU guestfwd) can still hold the 8 slots and reopen them every ~20 s to
    starve legitimate requests, which the kernel reads as unreachable. There is
    no per-peer limit. Fail-open success is logged as "not governed"; `Refuse`,
    `HardStop`, a faulty reply and local failure always block.
