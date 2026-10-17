@@ -43,10 +43,12 @@ be described as having any of the following.
    `actor_token` or `sig_operator` Gate 1 needs, and the MARSHAL principal on
    mobile is the placeholder `el0:arm-demo` ([ROADMAP.md](ROADMAP.md) open
    question "Operator identity", STATUS.md "MARSHAL gate for mobile").
-2. **The MARSHAL gate mostly fails open.** If the proxy is unreachable, eSIM
-   enable/delete and MVNO bind/suspend/reactivate proceed ungoverned (ADR
-   [0003](adrs/0003-unreachable-marshal-policy-is-per-action.md)). Only
-   `data.reset_usage` fails closed. On x86, `grid_sandbox::spawn_instance`
+2. **The MARSHAL gate fails open for three of six mobile actions.** If the proxy is
+   unreachable, eSIM enable and MVNO bind/suspend proceed ungoverned (ADR
+   [0003](adrs/0003-unreachable-marshal-policy-is-per-action.md)). `data.reset_usage`,
+   `esim.delete` and `mvno.reactivate_account` fail closed (ADR
+   [0008](adrs/0008-esim-delete-and-mvno-reactivate-fail-closed-when-marshal-unreachable.md)).
+   On x86, `grid_sandbox::spawn_instance`
    also fails open on an unreachable or unconfigured proxy
    ([MARSHAL-ENFORCEMENT-POLICY.md](MARSHAL-ENFORCEMENT-POLICY.md)). A reply
    that was reached but is faulty (malformed or empty body, bad content-length,
@@ -54,9 +56,12 @@ be described as having any of the following.
    `REFUSE`/`HARD_STOP` Decision) is not unreachable: it blocks all six mobile
    actions and x86 `spawn_instance` (ADR
    [0006](adrs/0006-a-reachable-but-faulty-marshal-reply-fails-closed.md)). The
-   consequence is an availability hazard: a CITADEL that rejects dry-run
-   requests (every Runix request is `dry_run: true`) answers 400, and one that
-   fails with 5xx does the same, so every gated action is blocked, loudly. Still
+   consequence is a possible availability hazard. CITADEL documents a setting,
+   `CITADEL_DRY_RUN_ALLOWED=false`, under which a Kerkese with `dry_run: true`
+   (every Runix request) is answered 400; a CITADEL that fails with 5xx also
+   blocks every gated action, loudly. The audited CITADEL source does not
+   implement that setting, so the 400 case is not an observed behaviour
+   ([ADR 0007](adrs/0007-dry-run-true-stays-until-operator-identity.md)). Still
    fail-open: no proxy or device, connect failure, timeout, and a
    kernel-to-proxy `ipc` reply that is empty or incomplete when the wait ends.
    Reply bytes that can never decode (unknown tag, outcome or error kind,
@@ -120,10 +125,12 @@ be described as having any of the following.
     VoIP, roaming governance) is not started.
 14. **MARSHAL verdicts are not authenticated, and only part of the privileged
     surface is gated.** The kernel-to-proxy reply is unsigned JSON/`ipc` over
-    plaintext TCP. Every request is `dry_run: true` (a simulation request).
+    plaintext TCP. Every request is `dry_run: true`, hardcoded. Runix's docs call
+    this a simulation request, but the audited CITADEL source does not treat it as
+    one, so do not rely on it as a simulation ([ADR 0007](adrs/0007-dry-run-true-stays-until-operator-identity.md)).
     An attacker who can reach the proxy listener can still starve the link
-    into "unreachable" (bounded, not prevented), which fails open for most
-    actions. Only the six mobile actions below and x86 `spawn_instance` ask
+    into "unreachable" (bounded, not prevented), which fails open for three of the
+    six mobile actions and for x86 `spawn_instance`. Only the six mobile actions below and x86 `spawn_instance` ask
     MARSHAL; every other privileged syscall in `kernel-arm/src/svc.rs` and
     `kernel/src/syscall.rs` is capability-checked only. On mobile,
     `Refuse`/`HardStop` denials are not written to WORM.
@@ -235,8 +242,6 @@ device stops answering.
 - FAT32 only; no other filesystem; no permissions model beyond the tokens.
 - The driver has no device reset after quarantine; it stays failed until reboot.
 - No hardware verification (QEMU virtio-blk only).
-- STATUS.md's older text says no QEMU test forces the timeout; that is stale,
-  `blk_fs_quarantine.rs` now does (see this file's evidence).
 
 ## D4. MARSHAL integration (desktop): PARTIAL
 
@@ -334,7 +339,8 @@ separate resource); and every successful transition is audited at the syscall bo
 - `identity` is an opaque `u64`, not an ICCID/IMSI; no profile download (RSP,
   SM-DP+), no real profile data.
 - Deleted containers are never reclaimed; no persistence across reboot.
-- Governance of enable/delete rests on item M4 and is fail-open.
+- Governance of enable rests on item M4 and is fail-open; governance of delete is
+  fail-closed when MARSHAL is unreachable (ADR 0008).
 
 ## M3. Data policy engine: PARTIAL
 
@@ -398,9 +404,12 @@ outage; (e) **NOT MET**.
   exactly three data evaluations). This step proves the chain, not live
   governance: the mock answers `EXECUTE` to anything.
 - (d): the plain boot step asserts `MARSHAL verdict: Unreachable (fail-open:
-  not governed)` for eSIM/MVNO and `DENIED (MARSHAL unreachable: fail-closed
-  for this action)` for the reset. Policy in ADR
-  [0003](adrs/0003-unreachable-marshal-policy-is-per-action.md).
+  not governed)` for eSIM enable and MVNO bind/suspend, and `DENIED (MARSHAL
+  unreachable: fail-closed for this action)` for the reset, the eSIM deletes and the
+  MVNO reactivate. Policy in ADR
+  [0003](adrs/0003-unreachable-marshal-policy-is-per-action.md), and ADR
+  [0008](adrs/0008-esim-delete-and-mvno-reactivate-fail-closed-when-marshal-unreachable.md)
+  for delete and reactivate.
 - Faulty replies: CI step `boot in QEMU and check a real citadel_proxy relaying a garbage 200 / HTTP 500 from a mock CITADEL fails closed (faulty reply) for eSIM enable/delete and MVNO suspend`
   (real `citadel_proxy`, mock CITADEL answering a non-JSON 200 for `esim.*` and
   HTTP 500 for `mvno.suspend_account`; asserts `DENIED (MARSHAL faulty reply:
@@ -414,8 +423,10 @@ outage; (e) **NOT MET**.
 
 **Remains:**
 - (e): no operator identity (Not claimed 1); signing key is the demo key.
-- Five of six actions fail open (Not claimed 2). Whether any should fail
-  closed is an open decision in ADR 0003.
+- Three of six actions fail open when MARSHAL is unreachable: `esim.enable`,
+  `mvno.bind_profile`, `mvno.suspend_account` (Not claimed 2). Whether any of them
+  should fail closed is an open decision in ADR 0003. `esim.delete` and
+  `mvno.reactivate_account` were decided fail-closed in ADR 0008.
 - A `Refuse`/`HardStop` block is not WORM-audited (STATUS.md table, serial
   line only); local failures and fail-closed-unreachable denials are.
 - Link is plaintext TCP and the verdict is unsigned.

@@ -8,7 +8,9 @@
 ADR 0003 made the "MARSHAL is unreachable" policy a per-action table
 (`MarshalAction::unreachable_policy()`): `data.reset_usage` fails closed, and
 `esim.enable`, `esim.delete`, `mvno.bind_profile`, `mvno.suspend_account` and
-`mvno.reactivate_account` fail open. Its fail-open reasoning is the bootstrap
+`mvno.reactivate_account` fail open. [ADR 0008](0008-esim-delete-and-mvno-reactivate-fail-closed-when-marshal-unreachable.md)
+has since moved `esim.delete` and `mvno.reactivate_account` to fail closed, so only
+`esim.enable`, `mvno.bind_profile` and `mvno.suspend_account` now fail open. Its fail-open reasoning is the bootstrap
 deadlock: enabling an eSIM profile can be what provides the connectivity needed to
 reach the gate, so a phone cannot ask first.
 
@@ -71,17 +73,23 @@ Better:
 
 Worse, or left open:
 
-- **Availability hazard.** Every Runix request is `dry_run:true`. A CITADEL that
-  rejects dry-run requests answers HTTP 400, which is a faulty reply, so every
-  gated action is now blocked, loudly, where it used to be silently allowed. A
-  CITADEL outage that yields 5xx does the same. Deployments must confirm their
-  CITADEL accepts dry-run Kerkese requests before enabling the gate.
+- **Availability hazard.** Every Runix request is `dry_run:true`. CITADEL's
+  documentation describes a production setting, `CITADEL_DRY_RUN_ALLOWED=false`,
+  under which a dry-run Kerkese is answered HTTP 400. The CITADEL source audited
+  for [ADR 0007](0007-dry-run-true-stays-until-operator-identity.md) does not
+  implement that setting, so this is a possible hazard, not a demonstrated one.
+  If a deployment does enforce it, the 400 is a faulty reply, so every gated
+  action is blocked, loudly, where it used to be silently allowed. A CITADEL
+  outage that yields 5xx does the same. Deployments should confirm their CITADEL
+  accepts dry-run Kerkese requests before enabling the gate.
 - **Malformed bytes now fail closed; silence still does not.** A kernel-to-proxy
   reply that is merely incomplete when the wait budget is exhausted (silence, a
   stall, a connection closed mid-message) is a real timeout and stays
-  `Unreachable` by design, so for the five fail-open actions it still admits the
-  action. The link is unauthenticated, so an attacker who controls it can still
-  stall (timeout, so fail-open for `esim.*` and `mvno.*`, bounded only by the proxy
+  `Unreachable` by design, so for the fail-open actions it still admits the
+  action (after [0008](0008-esim-delete-and-mvno-reactivate-fail-closed-when-marshal-unreachable.md):
+  `esim.enable`, `mvno.bind_profile`, `mvno.suspend_account`; `esim.delete` and
+  `mvno.reactivate_account` now deny). The link is unauthenticated, so an attacker
+  who controls it can still stall (timeout, so fail-open for those three, bounded only by the proxy
   hardening below) or forge a well-formed reply: for example six zero bytes decode
   as `Decision(Execute)`. Failing closed on malformed bytes only removes the
   accidental bypass; the real fix is authenticating the link.
@@ -92,7 +100,8 @@ Worse, or left open:
   listen address is `127.0.0.1:9000`. An attacker who can reach the listener (a
   local process, or the guest through QEMU guestfwd) can still hold 8
   connections open and reopen them every ~20 s, starving legitimate requests,
-  which the kernel reads as unavailable and so fail-open for five actions. There
+  which the kernel reads as unavailable and so fail-open for the three actions that
+  still fail open (see 0008). There
   is no per-peer limit. The real fix is controlling who can reach the listener
   or authenticating the link.
 - The verdict is still unauthenticated and `dry_run` is still `true`; this
@@ -122,8 +131,10 @@ Worse, or left open:
 
 - The kernel-to-proxy link is authenticated; then reconsider whether an
   incomplete reply at budget end should still be `Unreachable`.
-- A CITADEL deployment is found that legitimately answers dry-run requests with
-  a non-403 error, which would make this blocking unusable there.
+- A CITADEL deployment is found that answers dry-run requests with a non-403
+  error (for example one that enforces the documented `CITADEL_DRY_RUN_ALLOWED=false`,
+  see [ADR 0007](0007-dry-run-true-stays-until-operator-identity.md)), which would
+  make this blocking unusable there.
 - The maintainers decide any open row of ADR 0003's table, or a bootstrap exception
   or offline grant is designed.
 - A per-peer limit or restriction on who may reach the proxy listener exists.

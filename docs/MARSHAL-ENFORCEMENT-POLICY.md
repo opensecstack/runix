@@ -43,13 +43,22 @@ and block, so a garbled real `REFUSE` cannot become fail-open. Genuinely
 unreachable cases (no proxy configured, connect failure, `MarshalError::Timeout`,
 an empty or merely incomplete kernel-to-proxy reply when the wait ends) keep
 Option B. The link is unauthenticated: whoever controls it can still stall (a
-timeout, so fail-open for the five actions) or forge a well-formed `Execute`.
-Operational consequence: a CITADEL that
-rejects dry-run requests (every Runix request is `dry_run: true`) answers 400,
-and one that fails with 5xx does the same; both now block loudly instead of
-silently allowing. Proven for x86 by cases 2b (`"shadow-faulty"`) and 2c
+timeout, so fail-open for the three fail-open mobile actions) or forge a well-formed `Execute`.
+Operational consequence: every Runix request is `dry_run: true` (ADR 0007). If a
+CITADEL rejects dry-run requests with HTTP 400, as its docs describe under
+`CITADEL_DRY_RUN_ALLOWED=false` (the audited CITADEL source does not implement that
+setting, and no deployment has been observed doing it), that 400 is a faulty reply and
+blocks loudly instead of silently allowing. A CITADEL that fails with 5xx does the
+same. Proven for x86 by cases 2b (`"shadow-faulty"`) and 2c
 (`"shadow-malformed"`) of `kernel/tests/grid_sandbox_marshal_shadow.rs`. Decision record:
 [adrs/0006-a-reachable-but-faulty-marshal-reply-fails-closed.md](adrs/0006-a-reachable-but-faulty-marshal-reply-fails-closed.md).
+
+**Option B is no longer uniform across the mobile actions (2026-10-17, ADR 0008).**
+When MARSHAL is unreachable, `data.reset_usage`, `esim.delete` and
+`mvno.reactivate_account` now fail closed (denied, WORM-audited with `authorized=false`,
+state unchanged). `esim.enable`, `mvno.bind_profile` and `mvno.suspend_account` keep
+Option B's fail-open. The x86 `spawn_instance` decision is unchanged and still follows
+Option B as written.
 
 ## Context
 

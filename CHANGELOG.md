@@ -11,6 +11,33 @@ not claim.
 
 ## [Unreleased]
 
+### Security
+
+- Fix: `esim.delete` and `mvno.reactivate_account` failed open when MARSHAL was
+  unreachable, so anyone who could drop the link could delete a profile (which is
+  irreversible) or restore a suspended account. Both now fail closed, as
+  `data.reset_usage` already did: the denial reads `DENIED (MARSHAL unreachable:
+  fail-closed for this action)`, leaves state untouched, and is WORM-audited with
+  `authorized=false` (ADR 0008). `esim.enable`, `mvno.bind_profile` and
+  `mvno.suspend_account` still fail open. In the plain boots (no proxy), both
+  deletes and the reactivation are now denied, so the account stays Suspended and
+  the profile is never deleted there.
+- kernel-arm: the demo Ed25519 trust root (`DEMO_SEED` in `src/capabilities.rs`) is
+  gated behind the `insecure-demo-keys` feature, which is on by default, as in
+  `kernel/`. A build without the feature stops with a `compile_error!` that names
+  the missing key provisioning, instead of silently shipping the demo key. CI runs
+  a `--no-default-features` build and checks for that message.
+
+### Added
+
+- Docs: ADR [0007](docs/adrs/0007-dry-run-true-stays-until-operator-identity.md)
+  keeps `dry_run: true` hardcoded on every MARSHAL request until operator identity
+  exists. The audited CITADEL source does not treat dry-run as a simulation, and the
+  `CITADEL_DRY_RUN_ALLOWED=false` setting its docs describe is not implemented there.
+- Docs: ADR [0008](docs/adrs/0008-esim-delete-and-mvno-reactivate-fail-closed-when-marshal-unreachable.md)
+  records the fail-closed decision for delete and reactivate and the reasons the
+  other three gated actions stay fail-open.
+
 ## [0.1.0-beta.2] - 2026-10-13
 
 ### Security

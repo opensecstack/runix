@@ -16,8 +16,10 @@ If you are on `v0.1.0-beta.1`, these are the differences (full list in
   `ipc` bytes were classified as unreachable, which is fail-open for the five
   eSIM and MVNO actions and for `spawn_instance`. They now fail closed for all
   six mobile actions and `spawn_instance`, and the denial is recorded in WORM.
-  A side effect: a CITADEL that rejects dry-run requests (HTTP 400) or that
-  fails with 5xx now blocks every gated action, loudly.
+  A side effect: a CITADEL that fails with 5xx now blocks every gated action,
+  loudly. A CITADEL that rejects dry-run requests with HTTP 400 would do the same.
+  The CITADEL docs describe that setting, but the audited CITADEL source does not
+  implement it (ADR 0007).
 - **`citadel_proxy` is hardened** against idle and slow clients (bounded
   deadlines, at most 8 concurrent connections, a timeout on the CITADEL
   request). The first version of these deadlines was too tight for a slow
@@ -38,18 +40,21 @@ Read this first. This list mirrors "Not claimed" in BETA_CRITERIA.md.
   only `Execute` verdicts come from mocks that approve every request (and a
   selective test listener that returns `Execute` by default). No operator
   identity exists, so a real approval is currently impossible. Every MARSHAL
-  request is sent with `dry_run: true`, which is a simulation request, not a
-  committed execution. The kernel-to-proxy verdict is unsigned JSON/`ipc`
+  request is sent with `dry_run: true`, which is hardcoded. Runix's docs call that a
+  simulation request, but the audited CITADEL source does not treat it as one
+  (ADR 0007): the audited source appends each request to the WORM chain, so assume a
+  shared CITADEL records these requests. The kernel-to-proxy verdict is unsigned JSON/`ipc`
   over plaintext TCP, so it is unauthenticated.
-- **The MARSHAL gate mostly fails open.** With the proxy unreachable or
-  unconfigured, eSIM enable/delete, MVNO bind/suspend/reactivate, and the x86
+- **The MARSHAL gate fails open for three of six mobile actions.** With the proxy
+  unreachable or unconfigured, eSIM enable, MVNO bind/suspend, and the x86
   `spawn_instance` proceed ungoverned. A reply that was reached but is faulty
   (malformed or empty body, bad content-length, a non-403 HTTP error such as
   400 or 500, a 403 that is not a `REFUSE`/`HARD_STOP` Decision) is not
   unreachable: it blocks all six mobile actions and `spawn_instance`. This is
-  an availability hazard: every Runix request is `dry_run: true`, so a CITADEL
-  that rejects dry-run requests answers 400, and one that fails with 5xx does
-  the same; every gated action is then blocked, loudly. The proxy is bounded
+  a possible availability hazard: every Runix request is `dry_run: true`. If a
+  CITADEL rejects dry-run requests with 400 (documented by CITADEL, not
+  implemented in the audited source, and not observed in a deployment), and one
+  that fails with 5xx does the same, and every gated action is then blocked, loudly. The proxy is bounded
   (20 s idle allowance before the first request byte, 3 s for the rest of the
   frame, 2 s write timeout, at most 8 concurrent connections, CITADEL connect 1 s / total 3 s), but an attacker who can reach
   its listener (a local process, or the guest through QEMU guestfwd) can still
@@ -60,8 +65,9 @@ Read this first. This list mirrors "Not claimed" in BETA_CRITERIA.md.
   (unknown tag, outcome or error kind, oversize length, non-UTF-8 message) are a
   faulty reply and block. The link is unauthenticated, so an attacker who
   controls it can still stall (fail-open) or forge a well-formed `Execute`. Fail-open success is logged as "not governed"; `Refuse`,
-  `HardStop`, a faulty reply and local failure always block. Only the mobile
-  usage reset fails closed when MARSHAL is unreachable.
+  `HardStop`, a faulty reply and local failure always block. The mobile usage
+  reset, eSIM delete and MVNO reactivate fail closed when MARSHAL is unreachable
+  (ADR 0008).
 - **Only part of the privileged surface is MARSHAL-gated.** Six mobile
   actions and x86 `spawn_instance` are gated. Every other privileged syscall
   (for example RIL access/send/receive, SIM create/install/disable, port I/O,
