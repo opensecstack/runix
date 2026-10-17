@@ -55,6 +55,15 @@ spin = "0.9"
 # the scratch usage that forces real codegen, not just dependency resolution.
 smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "alloc"] }
 
+[features]
+default = ["insecure-demo-keys"]
+# Gates the hardcoded demo Ed25519 trust root in `src/capabilities.rs`
+# (`DEMO_SEED`) -- same reasoning as `kernel/Cargo.toml`'s own
+# `insecure-demo-keys` feature: there is no real key provisioning yet, so this
+# catches an accidental release build with the demo key baked in at *compile*
+# time. Disabling it is a `compile_error!`, not a different key source.
+insecure-demo-keys = []
+
 # Two targets, same reason net-driver-host has two (see its Cargo.toml):
 # the binary is freestanding `#![no_std] #![no_main]` on
 # `aarch64-unknown-none` and therefore untestable, so pure logic with no

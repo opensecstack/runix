@@ -22,6 +22,23 @@
 //! exists, holding a small fixed set of resources," not yet a real
 //! per-caller model. Wiring this into an actual scheduler is real
 //! follow-up work, not something to fake here.
+//!
+//! # Compile-time barrier on the demo key
+//!
+//! Gated behind the `insecure-demo-keys` feature (on by default -- see
+//! `Cargo.toml`), mirroring `kernel/src/capabilities.rs`: the hardcoded seed
+//! below (and every key derived from it) can never end up in a build that
+//! did not explicitly ask for it. Disabling default features gets the
+//! [`compile_error!`] below instead of a silently shipped demo key.
+
+#[cfg(not(feature = "insecure-demo-keys"))]
+compile_error!(
+    "kernel-arm/src/capabilities.rs's hardcoded Ed25519 demo trust root \
+     requires the `insecure-demo-keys` feature. There is no real key \
+     provisioning yet (see this module's doc comment) -- if you're building \
+     something meant to ship, that has to exist first. If this is still a \
+     dev/beta build, re-enable default features."
+);
 
 use alloc::string::String;
 use alloc::vec::Vec;

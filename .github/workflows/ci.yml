@@ -552,6 +552,21 @@ jobs:
         run: cargo clippy --target aarch64-unknown-none -- -D warnings
       - name: build
         run: cargo build --target aarch64-unknown-none --release
+      # The demo signing key's compile-time barrier must actually trip: a
+      # build without default features (i.e. without `insecure-demo-keys`)
+      # has to FAIL, and with our compile_error! message specifically (not
+      # some unrelated breakage that would pass this check by accident).
+      - name: demo signing key barrier (no-default-features build must fail)
+        run: |
+          if cargo build --target aarch64-unknown-none --no-default-features 2> nodefault.log; then
+            echo "::error::kernel-arm built without insecure-demo-keys; the compile_error! barrier is gone"
+            exit 1
+          fi
+          grep -q "requires the .insecure-demo-keys. feature" nodefault.log || {
+            cat nodefault.log
+            echo "::error::build failed, but not with the insecure-demo-keys compile_error!"
+            exit 1
+          }
       - name: install QEMU (aarch64)
         run: sudo apt-get update && sudo apt-get install -y qemu-system-arm
       - name: boot in QEMU and check EL3 boot, exception resume, GIC, EL3->EL1 drop
