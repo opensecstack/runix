@@ -126,12 +126,23 @@ impl MarshalAction<'_> {
     /// failures block regardless of this policy.)
     pub fn unreachable_policy(&self) -> UnreachablePolicy {
         match self {
-            // FailOpen: eSIM enable/delete act on a single local profile and the
-            // MVNO gate has already checked the account owns it; an outsider who
-            // can only take the network down gains no new service from it
-            // (Option B in docs/MARSHAL-ENFORCEMENT-POLICY.md; behaviour kept
-            // exactly as before this policy existed).
-            MarshalAction::Esim { .. } => UnreachablePolicy::FailOpen,
+            // FailOpen: eSIM enable acts on a single local profile and the MVNO
+            // gate has already checked the account owns it; an outsider who can
+            // only take the network down gains no new service from it. Kept
+            // open because enabling a profile may be needed to BOOTSTRAP the
+            // connectivity that MARSHAL itself is reached over (Option B in
+            // docs/MARSHAL-ENFORCEMENT-POLICY.md; docs/adrs/0008). This is the
+            // ONLY eSIM op that is open, and it is named explicitly.
+            MarshalAction::Esim { op: "enable", .. } => UnreachablePolicy::FailOpen,
+            // FailClosed: deleting a profile is IRREVERSIBLE (Deleted is
+            // terminal in sim.rs), so an unreachable MARSHAL (which anyone able
+            // to drop the network can cause) must not wave it through; the
+            // delete is denied and WORM-audited instead (docs/adrs/0008).
+            // This is also the catch-all for eSIM: any `op` other than
+            // "enable" (today only "delete" exists) fails closed, so a new op
+            // string added later is ungoverned-by-default only if someone
+            // deliberately lists it above.
+            MarshalAction::Esim { .. } => UnreachablePolicy::FailClosed,
             // FailOpen: binding a profile to an account is capacity bookkeeping
             // the registry itself bounds; unchanged Option B behaviour.
             MarshalAction::MvnoBind { .. } => UnreachablePolicy::FailOpen,
@@ -139,10 +150,11 @@ impl MarshalAction<'_> {
             // cut service because MARSHAL is down would help an abuser, so the
             // pre-existing Option B behaviour is kept.
             MarshalAction::MvnoSuspend { .. } => UnreachablePolicy::FailOpen,
-            // FailOpen: reactivation restores a suspended account, but the
-            // pre-existing behaviour is deliberately kept unchanged here; flip
-            // this line if the restoring direction should also fail closed.
-            MarshalAction::MvnoReactivate { .. } => UnreachablePolicy::FailOpen,
+            // FailClosed: reactivation RESTORES service to an account that was
+            // suspended, the same shape as the usage reset below; an
+            // unreachable MARSHAL must not wave it through, so it is denied
+            // and WORM-audited instead (docs/adrs/0008).
+            MarshalAction::MvnoReactivate { .. } => UnreachablePolicy::FailClosed,
             // FailClosed: a usage reset RESTORES data service to an account
             // whose policy cut it off. An unreachable MARSHAL (which anyone
             // able to drop the network can cause) must not wave through the
@@ -455,7 +467,7 @@ mod tests {
                     slot: 0,
                     profile: 0,
                 },
-                FailOpen,
+                FailClosed,
             ),
             (
                 MarshalAction::MvnoBind {
@@ -466,11 +478,31 @@ mod tests {
                 FailOpen,
             ),
             (MarshalAction::MvnoSuspend { account: 0 }, FailOpen),
-            (MarshalAction::MvnoReactivate { account: 0 }, FailOpen),
+            (MarshalAction::MvnoReactivate { account: 0 }, FailClosed),
             (MarshalAction::DataResetUsage { account: 0 }, FailClosed),
         ];
         for (action, expected) in table {
             assert_eq!(action.unreachable_policy(), expected, "{}", action.label());
+        }
+    }
+
+    #[test]
+    fn unknown_esim_op_fails_closed() {
+        // Only "enable" is named FailOpen; anything else must not silently
+        // inherit that (docs/adrs/0008).
+        for op in [
+            "", "Enable", "ENABLE", "install", "disable", "wipe", "enable ",
+        ] {
+            let action = MarshalAction::Esim {
+                op,
+                slot: 0,
+                profile: 0,
+            };
+            assert_eq!(
+                action.unreachable_policy(),
+                UnreachablePolicy::FailClosed,
+                "op {op:?} must fail closed"
+            );
         }
     }
 

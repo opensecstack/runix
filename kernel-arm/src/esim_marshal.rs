@@ -32,8 +32,8 @@
 //!   reporting back within its bounded budget, an undecodable reply):
 //!   `Remote(Unreachable)` -> **fail-open** (Option B,
 //!   `docs/MARSHAL-ENFORCEMENT-POLICY.md`) UNLESS the action's
-//!   `MarshalAction::unreachable_policy()` is `FailClosed` (today only the
-//!   data usage-period reset), in which case it is blocked and WORM-audited.
+//!   `MarshalAction::unreachable_policy()` is `FailClosed` (today the data
+//!   usage-period reset, eSIM delete and MVNO reactivate), in which case it is blocked and WORM-audited.
 //! - **The kernel failed to run the evaluation** (process setup failing,
 //!   including out of memory; thread spawn failing; the EL0 excursion
 //!   faulting): `LocalFailure(..)` -> **fail-closed**. A buggy or hostile

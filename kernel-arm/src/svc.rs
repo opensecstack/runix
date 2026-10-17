@@ -64,7 +64,9 @@
 //!   `Refuse`/`HardStop` prints `SVC: SYS_MVNO_<X> account A [...] DENIED
 //!   (MARSHAL <Outcome>)`, returns `1`, and leaves the registry untouched (no
 //!   WORM entry, no forced disable); `Unreachable` (no proxy configured, or
-//!   it did not answer) is fail-open exactly as for eSIM, while a *local*
+//!   it did not answer) is fail-open for bind and suspend but fail-closed for
+//!   reactivate (`DENIED (MARSHAL unreachable: fail-closed for this action)`,
+//!   state untouched, WORM-audited), while a *local*
 //!   failure of the evaluation machinery (see below) is fail-closed:
 //!   `DENIED (MARSHAL local failure: <reason>)`, returns `1`, state untouched,
 //!   and a WORM entry `authorized=false` records the denial. The evaluation runs
@@ -242,7 +244,7 @@
 //! bounded budget, undecodable reply) is `Remote(Unreachable)` and fail-open
 //! (Option B, `docs/MARSHAL-ENFORCEMENT-POLICY.md`) -- except for an action
 //! whose `MarshalAction::unreachable_policy()` is `FailClosed` (the data
-//! usage-period reset), which is denied with `Blocked::Unreachable` and
+//! usage-period reset, eSIM delete and MVNO reactivate; `docs/adrs/0008`), which is denied with `Blocked::Unreachable` and
 //! WORM-audited like a local failure. Every success records the verdict that
 //! allowed it (`verdict_text`) in its WORM reason and serial line, so an
 //! `Unreachable` fail-open success reads "not governed"; the kernel *failing to
