@@ -42,7 +42,9 @@ or a broken link is fine.
 |---|----------|--------|
 | [0001](0001-data-syscalls-not-marshal-gated.md) | Data policy syscalls are not MARSHAL-gated; the engine only requests | Accepted (2026-10-10); amended by 0002 |
 | [0002](0002-usage-reset-is-marshal-gated.md) | The usage-period reset is the one MARSHAL-gated data action | Accepted (2026-10-11) |
-| [0003](0003-unreachable-marshal-policy-is-per-action.md) | What happens when MARSHAL is unreachable is decided per action | Accepted for the reset; open for the other gated actions (2026-10-11) |
+| [0003](0003-unreachable-marshal-policy-is-per-action.md) | What happens when MARSHAL is unreachable is decided per action | Accepted for the reset; delete and reactivate decided in 0008; enable, bind and suspend open (2026-10-11) |
 | [0004](0004-early-usage-reset-has-its-own-capability.md) | A usage reset before the billing period ends needs its own capability | Accepted (2026-10-11) |
 | [0005](0005-no-period-reset-installs-a-period-and-early-resets-have-a-cooldown.md) | A reset on a no-period account installs a period; early resets have a cooldown | Accepted (2026-10-11); refines 0004 |
 | [0006](0006-a-reachable-but-faulty-marshal-reply-fails-closed.md) | A reachable but faulty MARSHAL reply fails closed | Accepted (2026-10-12); refines 0003 |
+| [0007](0007-dry-run-true-stays-until-operator-identity.md) | Every MARSHAL request stays `dry_run: true` until operator identity exists | Accepted (2026-10-17); qualifies the "simulation" wording |
+| [0008](0008-esim-delete-and-mvno-reactivate-fail-closed-when-marshal-unreachable.md) | `esim.delete` and `mvno.reactivate_account` fail closed when MARSHAL is unreachable | Accepted (2026-10-17); decides two rows of 0003 |

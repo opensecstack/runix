@@ -78,6 +78,22 @@
 //!   stack offset were wrong, this is the syscall that would show it (as a
 //!   garbage identity in `svc.rs`'s `SYS_SIM_INSTALL` print).
 //!
+//! # Plain boots: reactivate and delete are fail-closed (ADR 0008)
+//!
+//! The walk below describes the sequence when MARSHAL answers `Execute`.
+//! `mvno.reactivate_account` and `esim.delete` fail CLOSED when MARSHAL is
+//! unreachable, and the plain boots have no proxy, so there: `REACTIVATE(0)`
+//! is DENIED and the account stays Suspended; the following `ENABLE` is
+//! denied again (MVNO) and `STATUS` stays `Disabled`; `SESSION_OPEN` is denied
+//! `AccountSuspended`; the (still DENIED) usage reset is followed by a clean
+//! reconcile (a Suspended account raises no usage incidents); both `DELETE`s
+//! are DENIED by the gate (never reaching `sim.rs`, so the "Enabled `DELETE`
+//! must fail" proof is not observable in those boots) and `STATUS` stays
+//! `Disabled` rather than `Deleted`; the binding is never released. The
+//! `INSTALL`-over-`Enabled` rejection is placed right after the first
+//! `STATUS (Enabled)` so it is still exercised there. The unbound second
+//! profile part is unaffected. CI asserts the plain-boot outcomes.
+//!
 //! # The MVNO additions
 //!
 //! `BIND(0,0,0)` sits between `INSTALL` and the first `ENABLE` because
@@ -131,10 +147,11 @@
 //! AUTHORIZED (a reachable MARSHAL that answers Execute). In the plain boot
 //! configurations there is no MARSHAL proxy, the evaluation is `Unreachable`,
 //! and the reset is FAIL-CLOSED (ADR 0003): `RESET(0)` is DENIED, usage stays
-//! 1600, the next `SESSION_OPEN` is still DENIED CapExceeded, `RECONCILE`
-//! reports one incident (`anomalous-usage-no-escalation`: the over-cap
-//! account was never restricted) and `SESSION_CLOSE` is refused (no session is
-//! open). CI asserts the plain-boot sequence.
+//! 1600, the next `SESSION_OPEN` is still denied (`AccountSuspended`, since the
+//! reactivation was also denied, see above), `RECONCILE` reports zero
+//! incidents (a Suspended account raises no usage incident) and
+//! `SESSION_CLOSE` is refused (no session is open). CI asserts the plain-boot
+//! sequence.
 //!
 //! The billing-period advice (`SYS_DATA_PERIOD`, read-only, not MARSHAL-gated,
 //! no new MARSHAL evaluation) is called twice with account 0 and once with 99.
@@ -403,6 +420,17 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x1, #0",
         "mov x2, #0",
         "svc #0",
+        // SYS_SIM_INSTALL(0, 0, 0x6666) -- expected to FAIL (moved here, while
+        // the profile is Enabled: later the plain boot leaves it Disabled): re-installing
+        // over the live Enabled profile would swap its identity (and, with
+        // the old shared transition table, demote it). sim.rs now allows
+        // install from Created only, so this is WrongState(Enabled) and the
+        // profile's identity stays 0x1234.
+        "mov x0, {sys_sim_install}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "mov x3, #0x6666",
+        "svc #0",
         // --- Data policy demo (Beta item 4.3). Placed here deliberately:
         // profile 0 is bound to account 0 and Enabled right now, which is the
         // only moment a data session can be allowed, and it precedes the
@@ -518,18 +546,26 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x1, #0",
         "mov x2, #0",
         "svc #0",
-        // SYS_MVNO_REACTIVATE(0) -- Suspended -> Active. Profiles stay
-        // Disabled until explicitly enabled again.
+        // SYS_MVNO_REACTIVATE(0) -- Suspended -> Active where MARSHAL answers
+        // Execute. Profiles stay Disabled until explicitly enabled again.
+        // mvno.reactivate_account is FAIL-CLOSED when MARSHAL is unreachable
+        // (docs/adrs/0008), so in the plain boots (no proxy) this is DENIED:
+        // the account STAYS Suspended, and everything below that assumed it
+        // Active reads the Suspended outcome instead (the next ENABLE is
+        // denied again, STATUS stays Disabled, SESSION_OPEN is denied
+        // AccountSuspended). CI asserts both variants.
         "mov x0, {sys_mvno_reactivate}",
         "mov x1, #0",
         "svc #0",
-        // SYS_SIM_ENABLE(0, 0) -- authorized again, restoring the Enabled
-        // state the DELETE-must-fail check below depends on.
+        // SYS_SIM_ENABLE(0, 0) -- authorized again where the reactivation
+        // succeeded; denied (MVNO AccountNotActive(Suspended)) in the plain
+        // boots, where it did not.
         "mov x0, {sys_sim_enable}",
         "mov x1, #0",
         "mov x2, #0",
         "svc #0",
-        // SYS_SIM_STATUS(0, 0) -- expect state 2 (Enabled) again.
+        // SYS_SIM_STATUS(0, 0) -- state 2 (Enabled) again where reactivated;
+        // state 1 (Disabled) in the plain boots.
         "mov x0, {sys_sim_status}",
         "mov x1, #0",
         "mov x2, #0",
@@ -649,27 +685,21 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x1, #2",
         "mov x2, #0",
         "svc #0",
-        // SYS_SIM_INSTALL(0, 0, 0x6666) -- expected to FAIL: re-installing
-        // over the live Enabled profile would swap its identity (and, with
-        // the old shared transition table, demote it). sim.rs now allows
-        // install from Created only, so this is WrongState(Enabled) and the
-        // profile's identity stays 0x1234.
-        "mov x0, {sys_sim_install}",
-        "mov x1, #0",
-        "mov x2, #0",
-        "mov x3, #0x6666",
-        "svc #0",
-        // SYS_SIM_DELETE(0, 0) -- expected to FAIL, and that failure is the
-        // point: the capability check passes (sim:delete:0:0 is held) and
-        // the MARSHAL gate passes, but the profile is still Enabled and
-        // sim.rs forbids Enabled -> Deleted outright. See this module's doc
-        // comment.
+        // SYS_SIM_DELETE(0, 0) -- where the profile is still Enabled (a
+        // reachable MARSHAL that executed the reactivation) this is expected
+        // to FAIL, and that failure is the point: the capability check passes
+        // (sim:delete:0:0 is held) and the MARSHAL gate passes, but sim.rs
+        // forbids Enabled -> Deleted outright. See this module's doc comment.
+        // esim.delete is FAIL-CLOSED when MARSHAL is unreachable
+        // (docs/adrs/0008): in the plain boots the gate denies it BEFORE
+        // sim.rs is reached (the profile is Disabled there anyway).
         "mov x0, {sys_sim_delete}",
         "mov x1, #0",
         "mov x2, #0",
         "svc #0",
         // SYS_SIM_DISABLE(0, 0) -- Enabled -> Disabled. No MARSHAL gate
-        // (recoverable direction), still audited.
+        // (recoverable direction), still audited. In the plain boots the
+        // profile is already Disabled, so this FAILS (wrong state).
         "mov x0, {sys_sim_disable}",
         "mov x1, #0",
         "mov x2, #0",
@@ -679,13 +709,15 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x1, #0",
         "mov x2, #0",
         "svc #0",
-        // SYS_SIM_DELETE(0, 0) again -- now legal from Disabled, so this
-        // one succeeds where the identical call above was rejected.
+        // SYS_SIM_DELETE(0, 0) again -- legal from Disabled, so with a
+        // reachable MARSHAL this succeeds where the identical call above was
+        // rejected. In the plain boots it is DENIED again (fail-closed).
         "mov x0, {sys_sim_delete}",
         "mov x1, #0",
         "mov x2, #0",
         "svc #0",
-        // SYS_SIM_STATUS(0, 0) -- expect state 3 (Deleted), terminal.
+        // SYS_SIM_STATUS(0, 0) -- state 3 (Deleted), terminal, where the
+        // delete was authorized; still 1 (Disabled) in the plain boots.
         "mov x0, {sys_sim_status}",
         "mov x1, #0",
         "mov x2, #0",

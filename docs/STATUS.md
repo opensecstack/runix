@@ -2446,10 +2446,13 @@ The transport runs each evaluation in a fresh `net-driver-host-arm` EL0
 process, with its own address space and its own TCP source port. The process
 sends the encoded `runix-ipc` `MarshalRequest` to the configured proxy and
 copies the reply back via `SYS_MARSHAL_PROOF_DONE` (15). The kernel decodes
-the reply with `MarshalResponse::decode`. Every request sets `"dry_run": true`,
-which is hardcoded in `kerkese_json`, and `citadel_proxy` forwards that flag
-upstream; dry-run is a simulation request, not a committed execution, so even a
-real `EXECUTE` would not be a live approval. The reply is unsigned JSON/`ipc`
+the reply with `MarshalResponse::decode_status`. Every request sets `"dry_run": true`,
+which is hardcoded in `kerkese_json` (ADR 0007), and `citadel_proxy` forwards that
+flag upstream. Runix's documentation calls this a simulation request, but the audited
+CITADEL source does not behave that way: it evaluates the request in full and appends
+it to the WORM chain, and the `CITADEL_DRY_RUN_ALLOWED=false` setting that the CITADEL
+docs describe is not implemented in that source. Runix's verdict is unauthenticated
+(ADR 0006), so an `EXECUTE` must not be relied on as authorization. The reply is unsigned JSON/`ipc`
 over plaintext TCP (unauthenticated). The proxy is bounded (see "Proxy
 hardening" below): a slow or idle client cannot stall it, but an attacker who can
 reach its listener can still starve it, which the kernel reads as unreachable. The principal is `el0:arm-demo`, role `operator`.
@@ -2458,7 +2461,7 @@ How the result is classified (`marshal_transport.rs`, `esim_marshal::enforce`):
 
 | Result | Covers | Policy |
 |---|---|---|
-| `Remote(Unreachable)` | Nothing answered: no proxy configured (no process spawned), no device, connect failure (`MarshalError::Unreachable`), `MarshalError::Timeout`, no report within 64 boot-thread yields, or a kernel-to-proxy `ipc` reply that is empty or merely incomplete when the wait ends (silence or a stall; response `None`) | Fail-open for the five eSIM and MVNO actions. **Fail-closed for `data.reset_usage`** (ADR 0003, below) |
+| `Remote(Unreachable)` | Nothing answered: no proxy configured (no process spawned), no device, connect failure (`MarshalError::Unreachable`), `MarshalError::Timeout`, no report within 64 boot-thread yields, or a kernel-to-proxy `ipc` reply that is empty or merely incomplete when the wait ends (silence or a stall; response `None`) | Fail-open for `esim.enable`, `mvno.bind_profile` and `mvno.suspend_account`. **Fail-closed for `data.reset_usage`, `esim.delete` and `mvno.reactivate_account`** (ADR 0003, ADR 0008, below) |
 | `Remote(Faulty)` | MARSHAL was reached but its reply was faulty: `MarshalError::BadResponse` or `MarshalError::Other`, i.e. a malformed or empty body, a bad content-length, a non-403 HTTP error such as 400 or 500, or a 403 whose body is not a `REFUSE`/`HARD_STOP` Decision (including 403 with `EXECUTE`); **or reply bytes that can never decode** (`ResponseDecode::Malformed`: unknown tag, outcome or error kind, oversize length, non-UTF-8 message) | **Blocked for all six actions, regardless of the unreachable table** (ADR 0006): `DENIED (MARSHAL faulty reply: fail-closed)`, serial line `...: Faulty`, WORM-audited with `authorized=false`; `data.reset_usage` returns `11` |
 | `Remote(Refuse)` / `Remote(HardStop)` | A decoded CITADEL decision, **or** `MarshalError::PolicyRefused` from `citadel_proxy`'s own policy layer | Blocked, registry and sim untouched, **not WORM-audited** |
 | `LocalFailure(SetupFailed / SpawnFailed / ExcursionFaulted)` | The kernel could not run the evaluation: out of memory, thread spawn, EL0 fault | Fail-closed, `DENIED (MARSHAL local failure: ...)`, WORM-audited with `authorized=false` |
@@ -2471,11 +2474,11 @@ refusal classify as unreachable (fail-open). The transport now relays a 403
 Decision, proven in CI only against a mock CITADEL that reproduces it.
 
 The `Unreachable` fail-open row has a consequence that has to be stated plainly. While the
-MARSHAL proxy is unreachable, five consequential mobile operations (eSIM enable
-and delete, MVNO bind, suspend and reactivate) proceed without governance.
+MARSHAL proxy is unreachable, three consequential mobile operations (eSIM enable,
+MVNO bind and suspend) proceed without governance.
 Any failure of the link (proxy down, connection refused, no answer within the
-budget) turns the gate off for those operations. The usage-period reset is the
-exception: it is fail-closed (see below). A proxy policy rejection is
+budget) turns the gate off for those operations. The usage-period reset, the eSIM
+delete and the MVNO reactivate are the exceptions: they are fail-closed (see below). A proxy policy rejection is
 NOT fail-open any more: it used to be (`citadel_proxy` returned its own
 `POLICY_REFUSE` as `MarshalError::Other` and the kernel mapped every `Error`
 to the unreachable class, so an explicit "no" was treated as an outage). It
@@ -2502,16 +2505,18 @@ reply bytes are `Faulty` while empty or incomplete bytes stay `Unreachable`). Th
 of a real `citadel_proxy` against a mock CITADEL answering a garbage 200 and an HTTP 500.
 Raw malformed reply bytes are covered the same way: x86 case 2c (`"shadow-malformed"`)
 and the ARM boot step `boot in QEMU and check a malformed MARSHAL reply fails closed (faulty) for eSIM enable and delete`.
-**Availability consequence:** every Runix request is `dry_run:true`; a CITADEL that
-rejects dry-run requests answers HTTP 400, which is a faulty reply, so every gated
-action is now blocked loudly instead of silently allowed, and a CITADEL outage that
+**Availability consequence:** every Runix request is `dry_run:true`. If a CITADEL rejects
+dry-run requests with HTTP 400 (the CITADEL docs describe this under
+`CITADEL_DRY_RUN_ALLOWED=false`; the audited source does not implement it, and no
+deployment has been observed doing so, ADR 0007), that 400 is a faulty reply, so every
+gated action is blocked loudly instead of silently allowed. A CITADEL outage that
 yields 5xx does the same. **Malformed reply bytes also fail closed.** `MarshalResponse::decode_status`
 (`ipc/src/marshal.rs`) separates `Malformed` (bytes no valid response can start with,
 decided as soon as the offending byte arrives, never repaired by later bytes) from
 `Incomplete`; both kernels block `Malformed` as `Faulty`. **Still open:** a reply that is
 merely incomplete when the wait budget ends (silence, a stall, a connection closed
 mid-message) is a real timeout, `Unreachable`, so it follows the per-action table
-(fail-open for five actions). The link is unauthenticated: whoever controls it can
+(fail-open for three actions). The link is unauthenticated: whoever controls it can
 stall, or forge a well-formed reply (six zero bytes decode as `Decision(Execute)`);
 authenticating the link is the real fix.
 
@@ -2530,13 +2535,16 @@ the real fix is controlling who can reach the listener or authenticating the lin
 
 **The per-action policy (ADR 0003).** `MarshalAction::unreachable_policy()`
 (`kernel-arm/src/marshal_action.rs`) is one exhaustive `match` that gives each
-action `FailOpen` or `FailClosed`. `data.reset_usage` is `FailClosed`: an
-`Unreachable` verdict, including "no proxy configured" as in the plain boot
-configurations, is denied with `DENIED (MARSHAL unreachable: fail-closed for this
-action)`, returns code `6`, leaves state untouched, and is WORM-audited with
-`authorized=false`. The other five stay `FailOpen`, and whether any of them should
-change is an open decision with its own table of candidates and the availability
-trade-off: [adrs/0003-unreachable-marshal-policy-is-per-action.md](adrs/0003-unreachable-marshal-policy-is-per-action.md).
+action `FailOpen` or `FailClosed`. `data.reset_usage`, `esim.delete` and
+`mvno.reactivate_account` are `FailClosed`: an `Unreachable` verdict, including "no
+proxy configured" as in the plain boot configurations, is denied with `DENIED (MARSHAL
+unreachable: fail-closed for this action)`, leaves state untouched, and is WORM-audited
+with `authorized=false` (the reset returns code `6`). The other three
+(`esim.enable`, `mvno.bind_profile`, `mvno.suspend_account`) stay `FailOpen`, and
+whether any of them should change is an open decision with its own table of candidates
+and the availability trade-off: [adrs/0003-unreachable-marshal-policy-is-per-action.md](adrs/0003-unreachable-marshal-policy-is-per-action.md).
+The `esim.delete` and `mvno.reactivate_account` decision is recorded in
+[adrs/0008-esim-delete-and-mvno-reactivate-fail-closed-when-marshal-unreachable.md](adrs/0008-esim-delete-and-mvno-reactivate-fail-closed-when-marshal-unreachable.md).
 `Refuse`, `HardStop`, `Faulty` and local failures block under either policy.
 
 **Verdicts are recorded.** Every gated success writes the verdict that let it
@@ -3006,8 +3014,18 @@ the reset, at steps 12 to 16. In order:
 10. `SESSION_CLOSE(0, 0, 0)`: closed by the caller (`0`, audited).
 11. `RECONCILE`: zero incidents.
 
-The second phase runs after the walk's second `ENABLE`, which re-enables profile 0.
-Account 0 is Active again, usage is still 1600 of 1000 bytes, and no session is open.
+On the execute path, the second phase runs after the walk's second `ENABLE`, which
+re-enables profile 0. Account 0 is Active again, usage is still 1600 of 1000 bytes, and
+no session is open.
+
+In the plain boots (no proxy) this phase differs, per ADR 0008. `mvno.reactivate_account`
+and `esim.delete` are fail-closed, so `REACTIVATE(0)` is denied and the account stays
+Suspended; the `ENABLE` that follows it is denied (MVNO `AccountNotActive(Suspended)`) and
+the profile stays `Disabled`; both `SYS_SIM_DELETE` calls are denied by the gate, and the
+binding is never released. Steps 12 and 14 therefore report `AccountSuspended` rather than
+`CapExceeded`, and step 15 reports zero incidents, because a Suspended account raises no
+usage incident. CI asserts these plain-boot outcomes, and the module comment in
+`kernel-arm/src/el0.rs` describes the same sequence.
 
 12. `SESSION_OPEN(0, 0, 0)`: denied `CapExceeded` (`6`). The cap is still in force.
 13. `SYS_DATA_RESET(0)`: capability `data:reset:0`, then MARSHAL `data.reset_usage`
@@ -3019,13 +3037,14 @@ Account 0 is Active again, usage is still 1600 of 1000 bytes, and no session is 
     reconciler's memory cleared, and the next billing period starts at the reset's
     tick. The reset closes no session in either case.
 14. `SESSION_OPEN(0, 0, 0)`: after an authorized reset, allowed (`0`), `used=0`, and
-    service is restored. After a denied one, denied `CapExceeded` (`6`) again.
+    service is restored. After a denied one, denied `CapExceeded` (`6`) again, or
+    `AccountSuspended` in the plain boots (see above).
 15. `RECONCILE`: after an authorized reset, zero incidents, because the reset cleared
-    `last_used` and 1600 -> 0 is not a regression. After a denied one, one incident,
-    `anomalous-usage-no-escalation`, because usage is still over the escalation
-    threshold. CI asserts the one-incident result in both plain boots, where the walk's
-    reconcile counts are 2, 1, 0, 1. The zero-incident result after an authorized
-    reset is not asserted in CI.
+    `last_used` and 1600 -> 0 is not a regression. After a denied one where the account
+    is not Suspended, one incident, `anomalous-usage-no-escalation`, because usage is
+    still over the escalation threshold. In the plain boots the account is Suspended, so
+    the reconcile reports zero incidents; CI asserts that, and the reconcile counts there
+    are 2, 1, 0, 0. The zero-incident result after an authorized reset is not asserted in CI.
 16. `SESSION_CLOSE(0, 0, 0)`: after an authorized reset, closed by the caller (`0`,
     audited). After a denied one there is no open session (step 12 was denied), so the
     close is refused as "no such open session" (`2`). CI does not assert this line.
@@ -3037,14 +3056,16 @@ before any state is read or MARSHAL is consulted.
 
 Documented choices:
 
-- **A clean pass needs either a suspended account or a reset.** After `REACTIVATE`
-  the account is Active again at 160% of cap. `anomalous-usage-no-escalation` fires
+- **A clean pass needs either a suspended account or a reset.** On the execute path,
+  after `REACTIVATE` the account is Active again at 160% of cap. `anomalous-usage-no-escalation` fires
   for an Active account whether or not a session is open, and the reconciler would
   correctly raise it again. The first clean pass is therefore the one at step 11,
-  while the account is suspended. The one at step 15 is clean only when the reset
-  was authorized (the eSIM-refuse and execute boots, where it is not asserted). In
-  the plain boots the denied reset leaves usage over the cap, so step 15 reports one
-  incident.
+  while the account is suspended. On the execute path, the one at step 15 is clean
+  only when the reset was authorized (the eSIM-refuse and execute boots, where it is
+  not asserted). In the plain boots, REACTIVATE and the reset are both denied, so the account stays
+  Suspended and step 15 is also clean (CI asserts zero incidents). Where a reset is
+  denied but the account is not Suspended, usage stays over the cap and step 15 reports
+  one incident.
 - **Real demo numbers.** Account 0 is the only entry in the kernel's plan table:
   cap 1000 bytes, throttle at 80% (800), escalation at 150% (1500), roaming not
   allowed. The walk feeds 900 and then 700. Nothing else in the boot exercises a

@@ -61,8 +61,8 @@
 //! any function here is called: `evaluate` may run a nested EL0 excursion, so
 //! it must never run under [`REGISTRY`]'s lock (every public function below
 //! takes that lock internally). A `Refuse`/`HardStop` -- or a *local* failure
-//! of the evaluation machinery, which fails closed while an unreachable remote
-//! stays fail-open -- therefore leaves this
+//! of the evaluation machinery, which fails closed (as does an unreachable
+//! remote for reactivate only; bind and suspend stay fail-open) -- therefore leaves this
 //! registry untouched. Nothing in this module talks to MARSHAL.
 //!
 //! # Demo data

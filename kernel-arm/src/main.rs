@@ -92,7 +92,7 @@
 //!   and gets denied on an unauthorized slot -- proving the capability
 //!   boundary is uniform across resource kinds, not something
 //!   special-cased for RIL. `ENABLE`/`DELETE` additionally route through
-//!   `esim_marshal.rs`, a structurally-complete but fail-open MARSHAL gate
+//!   `esim_marshal.rs`, a MARSHAL gate (fail-open for enable, fail-closed for delete when MARSHAL is unreachable)
 //!   (no transport on this crate yet), and every real transition is
 //!   appended to a `citadel-integration` `WormLog`. Deliberately not a
 //!   real SIM/eSIM implementation (no APDU protocol, no GSMA SGP.22, no
