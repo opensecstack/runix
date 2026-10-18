@@ -2463,8 +2463,34 @@ How the result is classified (`marshal_transport.rs`, `esim_marshal::enforce`):
 |---|---|---|
 | `Remote(Unreachable)` | Nothing answered: no proxy configured (no process spawned), no device, connect failure (`MarshalError::Unreachable`), `MarshalError::Timeout`, no report within 64 boot-thread yields, or a kernel-to-proxy `ipc` reply that is empty or merely incomplete when the wait ends (silence or a stall; response `None`) | Fail-open for `esim.enable`, `mvno.bind_profile` and `mvno.suspend_account`. **Fail-closed for `data.reset_usage`, `esim.delete` and `mvno.reactivate_account`** (ADR 0003, ADR 0008, below) |
 | `Remote(Faulty)` | MARSHAL was reached but its reply was faulty: `MarshalError::BadResponse` or `MarshalError::Other`, i.e. a malformed or empty body, a bad content-length, a non-403 HTTP error such as 400 or 500, or a 403 whose body is not a `REFUSE`/`HARD_STOP` Decision (including 403 with `EXECUTE`); **or reply bytes that can never decode** (`ResponseDecode::Malformed`: unknown tag, outcome or error kind, oversize length, non-UTF-8 message) | **Blocked for all six actions, regardless of the unreachable table** (ADR 0006): `DENIED (MARSHAL faulty reply: fail-closed)`, serial line `...: Faulty`, WORM-audited with `authorized=false`; `data.reset_usage` returns `11` |
-| `Remote(Refuse)` / `Remote(HardStop)` | A decoded CITADEL decision, **or** `MarshalError::PolicyRefused` from `citadel_proxy`'s own policy layer | Blocked, registry and sim untouched, **not WORM-audited** |
+| `Remote(Refuse)` / `Remote(HardStop)` | A decoded CITADEL decision, **or** `MarshalError::PolicyRefused` from `citadel_proxy`'s own policy layer | Blocked, registry and sim untouched, WORM-audited with `authorized=false` (class `gate-blocked`, ADR 0009; the serial line is `SVC: MARSHAL Refuse denial audited to WORM (...)`) |
 | `LocalFailure(SetupFailed / SpawnFailed / ExcursionFaulted)` | The kernel could not run the evaluation: out of memory, thread spawn, EL0 fault | Fail-closed, `DENIED (MARSHAL local failure: ...)`, WORM-audited with `authorized=false` |
+
+**The bounded mobile WORM chain (ADR 0009, `kernel-arm/src/audit_chain.rs`).** The
+`ESIM_WORM_LOG` chain is still one hash-chained, append-only `WormLog`, but each of ten
+event classes has a fixed quota of individual entries (`applied` 128, `data-activity`
+64, `gate-blocked` 24, `gate-fail-closed` 24, `cap-denial.esim`, `.mvno` and `.data` 16
+each, `rejected` 48, `incident` 32, `clean-pass` 8). Summary slots (8 per class) bring
+the total to 456 entries. An event past its class's quota is counted and coalesced into
+a summary entry, committed at 1, 4, 16, ... and at most 8 times per class, and the
+coalescing is printed on serial. `BoundedAudit::verify` checks the hash chain and the
+bound's own books. The serial lines to expect:
+
+- `SVC: WORM chain bound: entries N/456, coalesced events M, chain verified V`, printed
+  at the end of each `SYS_DATA_RECONCILE` call, followed by one
+  `SVC: WORM chain bound: class <name> recorded ...` line per class that has coalesced.
+- `SVC: WORM class <name> coalesced: ...`, when an event is counted instead of appended.
+- `SVC: <syscall> <args> capability denial audited to WORM (authorized=false, class
+  cap-denial.<family>; entries N, chain verified V)`, after the unchanged `DENIED` line.
+- `SVC: <syscall> ... MVNO gate refusal audited to WORM (...)`, for the MVNO enable
+  gate's refusal (class `rejected`).
+
+The plain-boot CI steps assert the capability-denial, MVNO-gate and clean-pass lines.
+The `Refuse` audit line is asserted in the two `MARSHAL REFUSE` steps, which use the
+test-only `arm_marshal_selective_listener.py` as the MARSHAL stand-in, not the real
+`citadel_proxy`. The `HardStop` audit line is asserted in the real `citadel_proxy`
+403 step, against a mock CITADEL. None of these assertions has yet been observed in a
+CI run of this change.
 
 Only six mobile actions are MARSHAL-gated; the other syscalls in `svc.rs`
 (RIL, SIM create/install/disable, IPC, the five other data syscalls) are
@@ -2775,7 +2801,9 @@ which call it is making.
   WORM entries. The feed does not consult account standing or profile binding.
 - *Close:* capability; plain profile argument; the open row is removed if present.
 - *Reconcile:* capability; snapshot from copies; `reconcile`; WORM entries for each
-  incident; `mark_observed`; incident count.
+  new incident (a finding already recorded by the previous pass is not repeated, and a
+  clean pass is recorded once per state change, ADR 0009); `mark_observed`; incident
+  count.
 - *Reset:* capability (`data:reset:{account}`); entitlement; account exists;
   MARSHAL evaluate and enforce (`data.reset_usage`), with no lock held; only then
   the counter reset, the `last_used` clear and, if the account has a period, the
@@ -2829,7 +2857,8 @@ records.
 What it does, in order (`svc.rs`'s `data_reset`):
 
 1. Capability `data:reset:{account}`, re-checked on every call. A denial prints to
-   the serial log only.
+   the serial log and is WORM-audited with `authorized=false` (class `cap-denial.data`,
+   ADR 0009).
 2. Entitlement, then account existence (a lookup in the registry that fails only for
    an unknown account). Both run before the gate, so a reset that cannot happen costs
    no network round trip. Each refusal is WORM-audited with `authorized=false`.
@@ -2837,9 +2866,9 @@ What it does, in order (`svc.rs`'s `data_reset`):
    `{"type":"data.reset_usage","account":A}`. Only `Execute` proceeds. `Unreachable`
    denies, because this action's policy is fail-closed (ADR 0003): no proxy, a
    connect failure or a timeout all leave the reset undone, and the denial is
-   WORM-audited. `Refuse` and `HardStop` deny, and nothing is audited for them, as
-   for the other gated syscalls. A local evaluation failure denies and is
-   WORM-audited.
+   WORM-audited. `Refuse` and `HardStop` deny and are WORM-audited too (class
+   `gate-blocked`, ADR 0009), as for the other gated syscalls. A local evaluation
+   failure denies and is WORM-audited.
 4. Only then the data lock. The counter goes to the pure `reset_usage()` (zero),
    the reconciler's `last_used` for the account is cleared, and, if the account has
    a billing period, `next_period(old, now)` is installed with the request marker
@@ -2984,10 +3013,13 @@ entry. The exceptions are listed at the end of this subsection.
   to be audited on every call, which let a holder of the scope grow the chain by
   polling; fixed 2026-10-11).
 
-Not audited, serial line only: capability denials on all six data syscalls, a
-malformed argument to `SYS_DATA_SESSION_CLOSE`, a reconcile pass with zero
-incidents, a reset that MARSHAL `Refuse`s or `HardStop`s, as for the other gated
-syscalls, and any billing-period poll after the first request in a period.
+Since ADR 0009, capability denials on all six data syscalls, and a reset that MARSHAL
+`Refuse`s or `HardStop`s, are WORM-audited with `authorized=false` (classes
+`cap-denial.data` and `gate-blocked`), within their quotas. A consecutive clean
+reconcile pass is counted, not appended; the first clean pass after a non-clean one is
+recorded (class `clean-pass`). Not audited, serial line only: a malformed argument to
+`SYS_DATA_SESSION_CLOSE`, an unknown reset mode, and any billing-period poll after the
+first request in a period.
 
 **What the boot walk proves.** The walk in `el0.rs` runs between the first `ENABLE`
 (profile 0 is bound to account 0 and `Enabled`) and the existing `SUSPEND(0)`. That
@@ -3106,9 +3138,12 @@ open, and 28 to 30 are the period's own.
   bookkeeping fact until a data path exists.
 - Sessions survive suspension and deletion. Only `SYS_DATA_SESSION_CLOSE` removes
   them.
-- Calls past the capability check append WORM entries, and nothing bounds the log.
-  The reconciler re-records the same incidents on every call while drift persists.
-- The reconciler runs only when called, and a clean pass leaves no WORM entry.
+- Calls past the capability check append WORM entries. The chain is now bounded per
+  event class (456 entries at most, ADR 0009), so a flood is counted and summarised
+  rather than growing it, but a class's first `quota` events are the ones kept, the
+  quotas are global rather than per caller, and the serial log is still unbounded.
+- The reconciler runs only when called. A persistent incident is recorded once, and a
+  clean pass is recorded once and then counted (ADR 0009); nothing runs it on a schedule.
 - The snapshot and the session-open decision read live state under separate locks.
   That is consistent with one EL0 context and IRQs masked during the SVC handler,
   and not otherwise.
@@ -3240,13 +3275,18 @@ Documenting them surfaced hardening gaps; the first four are closed (2026-10-11)
   size as well as over the buffer size, and `RxToken::consume` uses
   `saturating_sub`, so a bypassed validator yields an empty slice instead of a
   wrapped `from_raw_parts` length. Covered by unit tests and a proptest over every
-  `u32` length. Residual: a rejected completion is dropped without re-posting its
-  RX descriptor, so a lying device can slowly drain RX buffers (availability only).
-- **Closed: virtio queue size validation** in both drivers. The size must be a
+  `u32` length. The residual that a rejected completion was dropped without
+  re-posting its RX descriptor was fixed on 2026-10-18 (THREAT_MODEL F1): a bad length
+  now re-posts its buffer, and an out-of-range descriptor id names no buffer and is
+  skipped.
+- **Closed: virtio queue size validation** in both x86_64 drivers. The size must be a
   power of two within the driver's real minimum and 256 (`net-driver-host`: 8 for
   RX, 4 for TX; `blk-driver-host`: 4). A bad size now fails the probe cleanly
   (FAIL line, result bytes set to FAIL, device never marked ready) instead of
-  aborting. QEMU's default 256 passes.
+  aborting. QEMU's default 256 passes. `net-driver-host-arm` (MMIO v2, where the
+  driver writes `QueueNum` itself) instead picks the largest power of two no greater
+  than `min(QueueNumMax, 256)`, and fails with `QueueSetupFailed` (result=3) only if
+  that is below its 8 RX or 4 TX descriptors (2026-10-18, THREAT_MODEL F6).
 - **Closed: `blk-driver-host` stale completion after a poll timeout.** A timeout
   now quarantines the queue (`QueueHealth::Faulted`): later requests fail before
   touching the queue, and the filesystem IPC handlers answer `FsError::DeviceFailed`.

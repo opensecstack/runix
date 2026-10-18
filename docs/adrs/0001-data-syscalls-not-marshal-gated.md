@@ -86,7 +86,9 @@ Worse, or left open (each is a recorded known gap in `docs/STATUS.md`):
 - **There is no governed usage-period reset**, so an account past its cap stays
   denied until reboot.
 - **The audit is not total.** Decisions, requests and incidents are on the WORM
-  chain; capability denials and a few malformed-argument refusals are serial-only.
+  chain, and (since [0009](0009-bounded-worm-chain-and-denial-auditing.md)) so are
+  the data syscalls' capability denials, within a per-class quota. A few
+  malformed-argument refusals are still serial-only.
 - `PolicyDecisionRecord::replays()` detects an internally inconsistent record,
   not a fully recomputed forgery, and the kernel records a text description on
   the chain rather than the struct.

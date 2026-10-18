@@ -132,8 +132,11 @@ be described as having any of the following.
     into "unreachable" (bounded, not prevented), which fails open for three of the
     six mobile actions and for x86 `spawn_instance`. Only the six mobile actions below and x86 `spawn_instance` ask
     MARSHAL; every other privileged syscall in `kernel-arm/src/svc.rs` and
-    `kernel/src/syscall.rs` is capability-checked only. On mobile,
-    `Refuse`/`HardStop` denials are not written to WORM.
+    `kernel/src/syscall.rs` is capability-checked only. On mobile, denial auditing
+    is quota-limited (ADR 0009): `Refuse`/`HardStop` denials and capability denials
+    on the eSIM, MVNO and data syscalls are WORM-audited, but each class keeps only
+    its first quota of entries, and capability denials on the RIL and IPC syscalls
+    are serial-only.
 
 ## Summary
 
@@ -309,6 +312,10 @@ one compiled-in demo account, not for subscribers.
   `... DENIED (MVNO NotBound)`, and `MVNO network selection PASS`).
   The same assertions repeat in step
   `boot in QEMU without secure=on and check the no-EL3 path`.
+- Audit lines (ADR 0009), in both of those plain-boot steps: the MVNO gate refusal
+  (`SYS_SIM_ENABLE ... MVNO gate refusal audited to WORM (... class rejected ...)`) and
+  the MVNO capability denials (`... capability denial audited to WORM (... class
+  cap-denial.mvno ...)`). Not yet observed in a CI run of this change.
 
 **Remains:**
 - One compiled-in demo account; no persistence; selection runs on a fixed
@@ -348,9 +355,10 @@ separate resource); and every successful transition is audited at the syscall bo
 escalation percentage) determines session and usage decisions; a reconciler
 reports drift between observed state and the plan; a billing-period model
 gates the usage reset; and the reset is capability- and MARSHAL-gated with
-its period refusal, success, and local-failure or unreachable denial audited
-(a MARSHAL `Refuse`/`HardStop` denial is not WORM-audited). The partial point: the engine only advises,
-and the inputs are asserted rather than measured.
+its period refusal, success, and local-failure, unreachable and `Refuse`/`HardStop`
+denial audited, and its capability denials too (ADR 0009, quota-limited per class).
+The partial point: the engine only advises, and the inputs are asserted rather than
+measured.
 
 **Evidence:**
 - Pure-logic host tests (`mobile/src/policy.rs`, `reconcile.rs`, `period.rs`):
@@ -362,6 +370,13 @@ and the inputs are asserted rather than measured.
   `boot in QEMU and check EL3 boot, exception resume, GIC, EL3->EL1 drop`
   and `boot in QEMU and check a real citadel_proxy EXECUTE admits eSIM enable (Beta item 2.6 follow-up)`
   (the latter asserts the reset against a mock CITADEL).
+- Audit lines (ADR 0009): the plain-boot steps assert the data capability-denial
+  lines (`... capability denial audited to WORM (... class cap-denial.data ...)`) and
+  the reconciler's clean-pass lines. The `MARSHAL Refuse denial audited` lines for the
+  data reset are asserted in the `MARSHAL REFUSE` steps, which use the test-only
+  selective stand-in listener, not the real `citadel_proxy`. Reconciler incident
+  dedupe is covered only by host tests in `kernel-arm/src/audit_chain.rs`. None of
+  these lines has yet been observed in a CI run of this change.
 - Design records: ADRs [0001](adrs/0001-data-syscalls-not-marshal-gated.md)
   to [0005](adrs/0005-no-period-reset-installs-a-period-and-early-resets-have-a-cooldown.md).
 
@@ -380,14 +395,16 @@ and the inputs are asserted rather than measured.
 **Done means (checkable):** (a) each consequential mobile action asks
 MARSHAL through the proxy before it takes effect; (b) `Refuse`/`HardStop`
 blocks it and leaves state untouched; (c) the verdict that allowed an action
-is recorded (denials by `Refuse`/`HardStop` are not); (d) unreachable-MARSHAL behavior is an explicit per-action
+is recorded (the `Refuse`/`HardStop` denial is also WORM-audited since ADR 0009); (d) unreachable-MARSHAL behavior is an explicit per-action
 policy; (e) a real CITADEL `EXECUTE` with a real operator identity admits an
 action.
 
 **Status by clause:** (a) MET for six actions; other privileged syscalls are not
 MARSHAL-gated (`esim.enable`, `esim.delete`,
 `mvno.bind_profile`, `mvno.suspend_account`, `mvno.reactivate_account`,
-`data.reset_usage`); (b) MET; (c) PARTIAL (successful verdicts only);
+`data.reset_usage`); (b) MET; (c) PARTIAL (the allowing verdict is recorded on
+successes; `Refuse`/`HardStop` denials are WORM-audited since ADR 0009, within the
+class quota);
 (d) MET as a policy, exercised in CI only against absent routes, never a real
 outage; (e) **NOT MET**.
 
@@ -399,6 +416,11 @@ outage; (e) **NOT MET**.
   block, proven in CI against stand-ins and against a mock CITADEL that
   reproduces the real handler's HTTP 403 + Decision; no real CITADEL is
   exercised.
+  Denial audit (ADR 0009): the two `MARSHAL REFUSE` steps assert `SVC: MARSHAL Refuse
+  denial audited to WORM (...)` against the test-only selective stand-in listener, not
+  the real `citadel_proxy`. The real-`citadel_proxy` 403 step asserts `SVC: MARSHAL
+  HardStop denial audited to WORM (...)`. None of these lines has yet been observed
+  in a CI run of this change.
 - (a), (c): CI step `boot in QEMU and check a real citadel_proxy EXECUTE admits eSIM enable (Beta item 2.6 follow-up)`
   (real `citadel_proxy`, mock CITADEL; asserts `MARSHAL verdict: Execute` and
   exactly three data evaluations). This step proves the chain, not live
@@ -427,8 +449,9 @@ outage; (e) **NOT MET**.
   `mvno.bind_profile`, `mvno.suspend_account` (Not claimed 2). Whether any of them
   should fail closed is an open decision in ADR 0003. `esim.delete` and
   `mvno.reactivate_account` were decided fail-closed in ADR 0008.
-- A `Refuse`/`HardStop` block is not WORM-audited (STATUS.md table, serial
-  line only); local failures and fail-closed-unreachable denials are.
+- Denial audit is quota-limited (ADR 0009): once a class is full, further
+  `Refuse`/`HardStop` blocks are counted, not individually recorded. RIL and IPC
+  capability denials are serial-only (STATUS.md, "The bounded mobile WORM chain").
 - Link is plaintext TCP and the verdict is unsigned.
 - A proxy built before `MarshalError::PolicyRefused` reports its own policy
   rejections as `MarshalError::Other`, which is now a faulty reply and blocks

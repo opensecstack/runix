@@ -41,7 +41,8 @@ the connectivity exists.
 3. **The denial is the kernel's own and is audited.** Text:
    `DENIED (MARSHAL faulty reply: fail-closed)`; serial evaluation line
    `...: Faulty`; WORM entry `authorized=false`, like the fail-closed-unreachable
-   denial (unlike `Refuse`/`HardStop` on mobile, which are not audited). The data
+   denial (unlike `Refuse`/`HardStop` on mobile, which were not audited at the time;
+   superseded by [0009](0009-bounded-worm-chain-and-denial-auditing.md) on this point). The data
    reset returns `RESET_DENIED_FAULTY = 11` (`kernel-arm/src/data_codes.rs`).
 4. **The unreachable table is unchanged.** Genuinely unreachable cases (no proxy,
    no network device, connect failure `MarshalError::Unreachable`,
