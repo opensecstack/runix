@@ -1067,6 +1067,41 @@ jobs:
           grep -q "Runix ARM kernel: MVNO network selection PASS" /tmp/arm-boot.log
           # The suspend handshake must never report a leaked Enabled profile.
           if grep -q "AUDIT FAILED" /tmp/arm-boot.log; then exit 1; fi
+          # Bounded WORM chain and denial auditing (ADR 0009, Beta gap closure A2/A3).
+          # Capability denials are WORM-audited (authorized=false) in quota-limited
+          # per-family classes, and a caller with no capability cannot grow the chain
+          # (the quota/coalescing itself is proven by the audit_chain host tests; this
+          # boot proves the wiring). Each denial prints a confirmation line AFTER its
+          # unchanged DENIED line. The counts are the walk's own denials:
+          # eSIM 2, MVNO 3, data 5.
+          grep -qF "SVC: SYS_SIM_CREATE slot 99 capability denial audited to WORM (authorized=false, class cap-denial.esim; entries" /tmp/arm-boot.log
+          grep -qF "SVC: SYS_SIM_STATUS slot 99 profile 0 capability denial audited to WORM (authorized=false, class cap-denial.esim; entries" /tmp/arm-boot.log
+          grep -qF "SVC: SYS_MVNO_BIND account 99 slot 0 profile 1 capability denial audited to WORM (authorized=false, class cap-denial.mvno; entries" /tmp/arm-boot.log
+          grep -qF "SVC: SYS_MVNO_BIND account 0 slot 0 profile 2 capability denial audited to WORM (authorized=false, class cap-denial.mvno; entries" /tmp/arm-boot.log
+          grep -qF "SVC: SYS_MVNO_SUSPEND account 99 capability denial audited to WORM (authorized=false, class cap-denial.mvno; entries" /tmp/arm-boot.log
+          grep -qF "SVC: SYS_DATA_SESSION_OPEN account 99 slot 0 capability denial audited to WORM (authorized=false, class cap-denial.data; entries" /tmp/arm-boot.log
+          grep -qF "SVC: SYS_DATA_ACCOUNT account 99 capability denial audited to WORM (authorized=false, class cap-denial.data; entries" /tmp/arm-boot.log
+          grep -qF "SVC: SYS_DATA_RESET account 99 capability denial audited to WORM (authorized=false, class cap-denial.data; entries" /tmp/arm-boot.log
+          grep -qF "SVC: SYS_DATA_RESET(early) account 0 capability denial audited to WORM (authorized=false, class cap-denial.data; entries" /tmp/arm-boot.log
+          grep -qF "SVC: SYS_DATA_PERIOD account 99 capability denial audited to WORM (authorized=false, class cap-denial.data; entries" /tmp/arm-boot.log
+          test "$(grep -c "capability denial audited to WORM (authorized=false, class cap-denial.esim;" /tmp/arm-boot.log)" -eq 2
+          test "$(grep -c "capability denial audited to WORM (authorized=false, class cap-denial.mvno;" /tmp/arm-boot.log)" -eq 3
+          test "$(grep -c "capability denial audited to WORM (authorized=false, class cap-denial.data;" /tmp/arm-boot.log)" -eq 5
+          # The MVNO enable gate's refusals (the Suspended owner twice, the never-bound
+          # profile once) are audited too; the existing DENIED lines (counted above) are unchanged.
+          test "$(grep -c "MVNO gate refusal audited to WORM (authorized=false, class rejected; entries" /tmp/arm-boot.log)" -eq 3
+          grep -qF "SVC: SYS_SIM_ENABLE slot 0 profile 1 MVNO gate refusal audited to WORM (authorized=false, class rejected; entries" /tmp/arm-boot.log
+          # A reconcile pass that finds nothing is recorded once, on the state change;
+          # the next consecutive clean pass is COALESCED into a counted summary entry
+          # (not a new individual entry), and nothing else in this boot comes near a quota.
+          grep -qF "SVC: SYS_DATA_RECONCILE clean pass #1 WORM-recorded (state change: the previous pass was not clean)" /tmp/arm-boot.log
+          grep -qF "SVC: SYS_DATA_RECONCILE clean pass #2 coalesced (counted; not a new WORM entry)" /tmp/arm-boot.log
+          grep -q "SVC: WORM class clean-pass coalesced: 1 event(s) counted, summary entry committed (entries [0-9]*/[0-9]*, chain verified true)" /tmp/arm-boot.log
+          test "$(grep -c "SVC: WORM class .* coalesced:" /tmp/arm-boot.log)" -eq 1
+          grep -q "SVC: WORM chain bound: entries [0-9]*/[0-9]*, coalesced events 1, chain verified true" /tmp/arm-boot.log
+          grep -q "SVC: WORM chain bound: class clean-pass recorded 1/8, coalesced 1, summaries 1," /tmp/arm-boot.log
+          # Every "audited to WORM" confirmation reports a verifying chain.
+          if grep "audited to WORM (" /tmp/arm-boot.log | grep -qv "chain verified true"; then exit 1; fi
           # Beta mobile item 2.5, "Stage 3: real outbound TCP at EL0"
           # (kernel-arm/src/tcp_proof.rs): a genuine compiled
           # net-driver-host-arm binary, loaded as its own EL0 process with a
@@ -1410,6 +1445,41 @@ jobs:
           grep -q "Runix ARM kernel: MVNO network selection PASS" /tmp/arm-boot-nosecure.log
           # The suspend handshake must never report a leaked Enabled profile.
           if grep -q "AUDIT FAILED" /tmp/arm-boot-nosecure.log; then exit 1; fi
+          # Bounded WORM chain and denial auditing (ADR 0009, Beta gap closure A2/A3).
+          # Capability denials are WORM-audited (authorized=false) in quota-limited
+          # per-family classes, and a caller with no capability cannot grow the chain
+          # (the quota/coalescing itself is proven by the audit_chain host tests; this
+          # boot proves the wiring). Each denial prints a confirmation line AFTER its
+          # unchanged DENIED line. The counts are the walk's own denials:
+          # eSIM 2, MVNO 3, data 5.
+          grep -qF "SVC: SYS_SIM_CREATE slot 99 capability denial audited to WORM (authorized=false, class cap-denial.esim; entries" /tmp/arm-boot-nosecure.log
+          grep -qF "SVC: SYS_SIM_STATUS slot 99 profile 0 capability denial audited to WORM (authorized=false, class cap-denial.esim; entries" /tmp/arm-boot-nosecure.log
+          grep -qF "SVC: SYS_MVNO_BIND account 99 slot 0 profile 1 capability denial audited to WORM (authorized=false, class cap-denial.mvno; entries" /tmp/arm-boot-nosecure.log
+          grep -qF "SVC: SYS_MVNO_BIND account 0 slot 0 profile 2 capability denial audited to WORM (authorized=false, class cap-denial.mvno; entries" /tmp/arm-boot-nosecure.log
+          grep -qF "SVC: SYS_MVNO_SUSPEND account 99 capability denial audited to WORM (authorized=false, class cap-denial.mvno; entries" /tmp/arm-boot-nosecure.log
+          grep -qF "SVC: SYS_DATA_SESSION_OPEN account 99 slot 0 capability denial audited to WORM (authorized=false, class cap-denial.data; entries" /tmp/arm-boot-nosecure.log
+          grep -qF "SVC: SYS_DATA_ACCOUNT account 99 capability denial audited to WORM (authorized=false, class cap-denial.data; entries" /tmp/arm-boot-nosecure.log
+          grep -qF "SVC: SYS_DATA_RESET account 99 capability denial audited to WORM (authorized=false, class cap-denial.data; entries" /tmp/arm-boot-nosecure.log
+          grep -qF "SVC: SYS_DATA_RESET(early) account 0 capability denial audited to WORM (authorized=false, class cap-denial.data; entries" /tmp/arm-boot-nosecure.log
+          grep -qF "SVC: SYS_DATA_PERIOD account 99 capability denial audited to WORM (authorized=false, class cap-denial.data; entries" /tmp/arm-boot-nosecure.log
+          test "$(grep -c "capability denial audited to WORM (authorized=false, class cap-denial.esim;" /tmp/arm-boot-nosecure.log)" -eq 2
+          test "$(grep -c "capability denial audited to WORM (authorized=false, class cap-denial.mvno;" /tmp/arm-boot-nosecure.log)" -eq 3
+          test "$(grep -c "capability denial audited to WORM (authorized=false, class cap-denial.data;" /tmp/arm-boot-nosecure.log)" -eq 5
+          # The MVNO enable gate's refusals (the Suspended owner twice, the never-bound
+          # profile once) are audited too; the existing DENIED lines (counted above) are unchanged.
+          test "$(grep -c "MVNO gate refusal audited to WORM (authorized=false, class rejected; entries" /tmp/arm-boot-nosecure.log)" -eq 3
+          grep -qF "SVC: SYS_SIM_ENABLE slot 0 profile 1 MVNO gate refusal audited to WORM (authorized=false, class rejected; entries" /tmp/arm-boot-nosecure.log
+          # A reconcile pass that finds nothing is recorded once, on the state change;
+          # the next consecutive clean pass is COALESCED into a counted summary entry
+          # (not a new individual entry), and nothing else in this boot comes near a quota.
+          grep -qF "SVC: SYS_DATA_RECONCILE clean pass #1 WORM-recorded (state change: the previous pass was not clean)" /tmp/arm-boot-nosecure.log
+          grep -qF "SVC: SYS_DATA_RECONCILE clean pass #2 coalesced (counted; not a new WORM entry)" /tmp/arm-boot-nosecure.log
+          grep -q "SVC: WORM class clean-pass coalesced: 1 event(s) counted, summary entry committed (entries [0-9]*/[0-9]*, chain verified true)" /tmp/arm-boot-nosecure.log
+          test "$(grep -c "SVC: WORM class .* coalesced:" /tmp/arm-boot-nosecure.log)" -eq 1
+          grep -q "SVC: WORM chain bound: entries [0-9]*/[0-9]*, coalesced events 1, chain verified true" /tmp/arm-boot-nosecure.log
+          grep -q "SVC: WORM chain bound: class clean-pass recorded 1/8, coalesced 1, summaries 1," /tmp/arm-boot-nosecure.log
+          # Every "audited to WORM" confirmation reports a verifying chain.
+          if grep "audited to WORM (" /tmp/arm-boot-nosecure.log | grep -qv "chain verified true"; then exit 1; fi
           # Same net TCP proof as the secure boot above (see its comments)
           # -- tcp_proof.rs's address-space/loader/scheduler work is EL1/
           # EL0-side and security-state-independent, so it must hold on both
@@ -1475,6 +1545,12 @@ jobs:
           # literal point of this item.
           grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 0 DENIED (MARSHAL Refuse)" \
             /tmp/arm-boot-marshal-refuse.log
+          # A reachable MARSHAL's Refuse is WORM-audited (class gate-blocked, authorized=false),
+          # not only printed (ADR 0009): one confirmation line per audited denial.
+          # (Reasoned from svc.rs's enforce_gate, NOT executed locally: needs the guestfwd/nc bridge.)
+          grep -qF "SVC: MARSHAL Refuse denial audited to WORM (Disabled -> Enabled, authorized=false; entries" /tmp/arm-boot-marshal-refuse.log
+          grep -qF "SVC: MARSHAL Refuse denial audited to WORM (Disabled -> Deleted, authorized=false; entries" /tmp/arm-boot-marshal-refuse.log
+          if grep "denial audited to WORM (" /tmp/arm-boot-marshal-refuse.log | grep -qv "chain verified true"; then exit 1; fi
           # The selective listener executes the MVNO actions, so bind still
           # succeeded here (the profile is bound and enable reached MARSHAL).
           grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.bind_profile account=0 slot=0 profile=0: Execute" \
@@ -1575,6 +1651,13 @@ jobs:
             /tmp/arm-boot-marshal-refuse-mvno.log
           grep -q "SVC: SYS_MVNO_SUSPEND account 0 DENIED (MARSHAL Refuse)" \
             /tmp/arm-boot-marshal-refuse-mvno.log
+          # Refuse denials are WORM-audited (class gate-blocked, ADR 0009): the suspend, and the
+          # resets (3 normal: account 0 once and account 2 twice; 2 early: account 1 twice --
+          # the counts follow from the pinned evaluation counts below).
+          # (Reasoned from svc.rs's enforce_gate, NOT executed locally: needs the guestfwd/nc bridge.)
+          grep -qF "SVC: MARSHAL Refuse denial audited to WORM (Active -> Suspended, authorized=false; entries" /tmp/arm-boot-marshal-refuse-mvno.log
+          test "$(grep -c "SVC: MARSHAL Refuse denial audited to WORM (usage period in force -> new usage period (counter reset), authorized=false;" /tmp/arm-boot-marshal-refuse-mvno.log)" -eq 3
+          test "$(grep -c "SVC: MARSHAL Refuse denial audited to WORM (usage period in force -> new usage period (counter reset; EARLY override), authorized=false;" /tmp/arm-boot-marshal-refuse-mvno.log)" -eq 2
           # Registry untouched: the suspend body never ran.
           if grep -q "SVC: SYS_MVNO_SUSPEND account 0 authorized" /tmp/arm-boot-marshal-refuse-mvno.log; then exit 1; fi
           if grep -q "SVC: SYS_MVNO_SUSPEND account 0 forced disable" /tmp/arm-boot-marshal-refuse-mvno.log; then exit 1; fi
@@ -1816,11 +1899,18 @@ jobs:
           test "$(grep -c "SVC: SYS_SIM_DELETE slot 0 profile 0 DENIED (MARSHAL Refuse)" /tmp/arm-boot-marshal-403.log)" -eq 2
           if grep -q "SVC: SYS_SIM_ENABLE slot 0 profile 0 authorized" /tmp/arm-boot-marshal-403.log; then exit 1; fi
           if grep -q "SVC: SYS_SIM_DELETE slot 0 profile 0 authorized" /tmp/arm-boot-marshal-403.log; then exit 1; fi
+          # Each Refuse is WORM-audited (class gate-blocked, ADR 0009): enable x3, delete x2.
+          # (Reasoned from svc.rs's enforce_gate, NOT executed locally: needs the guestfwd/nc bridge.)
+          test "$(grep -c "SVC: MARSHAL Refuse denial audited to WORM (Disabled -> Enabled, authorized=false; entries" /tmp/arm-boot-marshal-403.log)" -eq 3
+          test "$(grep -c "SVC: MARSHAL Refuse denial audited to WORM (Disabled -> Deleted, authorized=false; entries" /tmp/arm-boot-marshal-403.log)" -eq 2
           # 403 + HARD_STOP (mvno.suspend_account): DENIED with the HardStop text, registry untouched.
           grep -q "Runix ARM kernel: MARSHAL evaluation for mvno.suspend_account account=0: HardStop" /tmp/arm-boot-marshal-403.log
           grep -q "SVC: SYS_MVNO_SUSPEND account 0 DENIED (MARSHAL HardStop)" /tmp/arm-boot-marshal-403.log
           if grep -q "SVC: SYS_MVNO_SUSPEND account 0 authorized" /tmp/arm-boot-marshal-403.log; then exit 1; fi
           if grep -q "SVC: SYS_MVNO_SUSPEND account 0 forced disable" /tmp/arm-boot-marshal-403.log; then exit 1; fi
+          # ...and the HardStop is WORM-audited too (class gate-blocked).
+          # (Reasoned from svc.rs's enforce_gate, NOT executed locally: needs the guestfwd/nc bridge.)
+          grep -qF "SVC: MARSHAL HardStop denial audited to WORM (Active -> Suspended, authorized=false; entries" /tmp/arm-boot-marshal-403.log
           # The blocked verdicts were read from the 403 body, not mistaken for an
           # unreachable CITADEL: no fail-open line anywhere in this boot.
           if grep -q "fail-open" /tmp/arm-boot-marshal-403.log; then exit 1; fi
