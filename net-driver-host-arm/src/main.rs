@@ -471,13 +471,31 @@ fn bring_up_interface(info: &NetBootInfo) -> Result<(Interface, RunixNetDevice),
         }
     };
 
-    let rx_size = match net.negotiate_queue_size(virtio_net::QUEUE_RX, REQUESTED_QUEUE_SIZE) {
+    // Minimum sizes = descriptors posted per queue (indices 0..count), so no
+    // posted index can be >= the negotiated size; see
+    // `net_driver_host_arm::choose_queue_size`. Failure goes through the
+    // existing `QueueSetupFailed` result code (result=3).
+    let rx_size = match net.negotiate_queue_size(
+        virtio_net::QUEUE_RX,
+        REQUESTED_QUEUE_SIZE,
+        smoltcp_device::RX_BUFFER_COUNT as u16,
+    ) {
         Ok(size) => size,
-        Err(_) => return Err(ProofResult::QueueSetupFailed),
+        Err(_) => {
+            write_all(b"net-driver-host-arm: unsupported virtio RX queue size\n");
+            return Err(ProofResult::QueueSetupFailed);
+        }
     };
-    let tx_size = match net.negotiate_queue_size(virtio_net::QUEUE_TX, REQUESTED_QUEUE_SIZE) {
+    let tx_size = match net.negotiate_queue_size(
+        virtio_net::QUEUE_TX,
+        REQUESTED_QUEUE_SIZE,
+        smoltcp_device::TX_BUFFER_COUNT as u16,
+    ) {
         Ok(size) => size,
-        Err(_) => return Err(ProofResult::QueueSetupFailed),
+        Err(_) => {
+            write_all(b"net-driver-host-arm: unsupported virtio TX queue size\n");
+            return Err(ProofResult::QueueSetupFailed);
+        }
     };
     if net
         .setup_queue(virtio_net::QUEUE_RX, rx_size, info.rx_queue_phys)
