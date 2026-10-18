@@ -668,7 +668,84 @@ mod tests {
         );
     }
 
+    /// Calls the REAL `post_rx_buffer`, returning (result, writes made). A
+    /// refusal is a `debug_assert` panic in debug builds (caught here and
+    /// reported as `false`) and a silent skip in release builds, so the same
+    /// refusal path is exercised and checked under both profiles.
+    fn real_post(posted: &mut RxPosted, index: usize, expect_refusal: bool) -> (bool, u32) {
+        let mut writes = 0u32;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_rx_buffer(posted, index, || writes += 1)
+        }));
+        let ran = match outcome {
+            Ok(ran) => {
+                assert!(
+                    !cfg!(debug_assertions) || !expect_refusal,
+                    "debug build must trip the assert on a refusal (index {index})"
+                );
+                ran
+            }
+            Err(_) => {
+                assert!(
+                    cfg!(debug_assertions) && expect_refusal,
+                    "unexpected panic posting index {index}"
+                );
+                false
+            }
+        };
+        (ran, writes)
+    }
+
     proptest! {
+        /// Unconditional `post_rx_buffer` calls (no pre-check of `is_posted`)
+        /// with in-range, unrepresentable and huge indices, interleaved with
+        /// releases. The avail write runs exactly once per not-posted ->
+        /// posted transition, never for an already-posted or unrepresentable
+        /// index, and the posted mask always equals an independent model.
+        #[test]
+        fn post_rx_buffer_refusal_path(
+            ops in proptest::collection::vec(
+                (any::<bool>(), prop_oneof![
+                    8 => 0usize..12,
+                    2 => 12usize..40,
+                    1 => Just(usize::MAX),
+                ]),
+                0..400,
+            )
+        ) {
+            let mut posted = RxPosted::none();
+            let mut model = [false; 32];
+            let mut total_writes = 0u32;
+            let mut expected_writes = 0u32;
+            for (is_post, index) in ops {
+                if is_post {
+                    let legal = index < 32 && !model[index];
+                    let (ran, writes) = real_post(&mut posted, index, !legal);
+                    prop_assert_eq!(ran, legal, "index {}", index);
+                    prop_assert_eq!(writes, u32::from(legal), "index {}", index);
+                    total_writes += writes;
+                    if legal {
+                        model[index] = true;
+                        expected_writes += 1;
+                    }
+                } else {
+                    posted.release(index);
+                    if index < 32 {
+                        model[index] = false;
+                    }
+                }
+                for (i, &set) in model.iter().enumerate() {
+                    prop_assert_eq!(posted.is_posted(i), set, "bit {}", i);
+                }
+                prop_assert_eq!(
+                    posted.count() as usize,
+                    model.iter().filter(|&&b| b).count()
+                );
+                prop_assert!(!posted.is_posted(usize::MAX));
+                prop_assert_eq!(total_writes, expected_writes);
+            }
+        }
+
         /// Any interleaving of honest completions (ids 0..8, any len), forged
         /// entries (in-range ids, whether or not posted, repeats, and
         /// out-of-range ids) and TX-full/free phases. Invariants hold at every
