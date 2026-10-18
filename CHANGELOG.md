@@ -13,6 +13,21 @@ not claim.
 
 ### Security
 
+- Fix: `kernel-arm` never set `SCTLR_EL1.nTWE`, so on a core where it resets to 0 an
+  EL0 `wfe` (the idle loops at the end of the EL0 payloads and the panic handler of
+  `net-driver-host-arm`) trapped to EL1 with EC 0x01 instead of idling. `mmu.rs` now
+  sets it, with the MMU bit, through the pure helper `hw_contract::sctlr_with_mmu_and_el0_wfe`
+  (a read-modify-write that only ORs bits in). QEMU's cortex-a53 resets `SCTLR_EL1` to
+  `0xc50838` (measured by printing it before `install()`), which already has `nTWE` set,
+  so the change is a no-op there and is for real silicon, where the reset value is
+  UNKNOWN; it is covered by the helper's unit tests only.
+- Fix: `net_process::setup` took the boot-info mode and the MARSHAL request bytes
+  independently, so a mismatch would have faulted at EL0 on first access to unmapped
+  request pages. It now rejects mode 1 without bytes, mode 0 with bytes and unknown modes
+  before allocating or mapping anything, through the existing error path.
+- Tests: a property test drives the real `post_rx_buffer`/`try_post` refusal in both net
+  drivers, in debug and release; removing the refusal is no longer caught only by the
+  two cfg-gated unit tests.
 - Fix: `net-driver-host-arm` accepted a device-written RX length below the 12-byte
   virtio-net header, and `RxToken::consume` subtracted the header length without
   saturating, so a length under 12 underflowed into a huge slice length
