@@ -98,7 +98,11 @@ not claim.
   `grid-sandbox-host`, `net-driver-host`, `blk-driver-host` and `net-driver-host-arm`,
   after adding the `x86_64-unknown-none` and `aarch64-unknown-none` targets. These
   crates are not workspace members, so the root steps never checked them.
-  `undocumented_unsafe_blocks` is now enforced for the three that enable it.
+  `undocumented_unsafe_blocks` is enforced for all four: `net-driver-host-arm` gained
+  the attribute after its 12 undocumented `unsafe` sites were given `// SAFETY:`
+  comments. The same change fixes the `x0` operand of the two `svc #0` blocks in
+  `net-driver-host-arm`'s `_start`: it was declared `in(..)` although the kernel
+  overwrites `x0` with its return value, and is now `inout("x0") .. => _`.
 
 - Docs: ADR [0007](docs/adrs/0007-dry-run-true-stays-until-operator-identity.md)
   keeps `dry_run: true` hardcoded on every MARSHAL request until operator identity

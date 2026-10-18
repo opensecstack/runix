@@ -378,7 +378,9 @@ pub struct Virtqueue {
 impl Virtqueue {
     /// # Safety
     /// `region_va` must point to `3 * QUEUE_ALIGN` bytes of readable/
-    /// writable memory this process exclusively owns, zeroed before this is
+    /// writable memory this process exclusively owns, aligned to at least 8
+    /// (`VirtqDesc`'s alignment; a `QUEUE_ALIGN`-aligned page address
+    /// satisfies this), zeroed before this is
     /// called — a stale used/avail index left over from whatever
     /// previously occupied this memory would desynchronize the ring from
     /// the device's own idea of it. `qsize` must satisfy
@@ -402,6 +404,15 @@ impl Virtqueue {
     }
 
     pub fn init_avail_flags(&mut self) {
+        // SAFETY: `avail_flags`/`avail_idx` are `region_va + QUEUE_ALIGN` and
+        // `+ 2`, i.e. 2-byte aligned (region is >= 8-aligned) and inside the
+        // second page of the `3 * QUEUE_ALIGN` region that `Virtqueue::new`'s
+        // contract says is RW, exclusively owned and valid for this
+        // process's lifetime (in this crate: the loader-mapped
+        // `NET_RXQ_VA`/`NET_TXQ_VA` regions). This is a safe `pub fn`, so
+        // soundness rests on `new` being the only constructor and its
+        // contract having been met; `&mut self` rules out aliasing in this
+        // process. Volatile because the device reads this memory.
         unsafe {
             core::ptr::write_volatile(self.avail_flags, 0);
             core::ptr::write_volatile(self.avail_idx, 0);
@@ -425,6 +436,23 @@ impl Virtqueue {
     /// `MAX_QUEUE_SIZE` (256, in `lib.rs`): the descriptor table is one page
     /// of 16-byte entries, so a larger index writes past it.
     pub unsafe fn post(&mut self, index: u16, buf_phys: u64, buf_len: u32, writable: bool) {
+        // SAFETY: not checked here; established by the caller per this fn's
+        // `# Safety` plus `new`'s contract. (1) `desc.add(index)` stays in
+        // the descriptor page because the caller guarantees `index <
+        // MAX_QUEUE_SIZE` (256 * 16 bytes = exactly `QUEUE_ALIGN`); the
+        // pointer is 8-aligned (region >= 8-aligned, 16-byte stride).
+        // (2) `avail_idx` is read back from memory this driver alone writes
+        // (device only reads the avail ring); even if the device scribbled
+        // on it, any `u16` is valid and the slot is `idx % qsize`, with
+        // `qsize` a nonzero power of two <= 256 (`new`'s contract via
+        // `queue_size_is_valid`), so the slot lies at byte offset
+        // `4 + 2 * (qsize - 1) <= 514` of the avail page -- inside it, and
+        // 2-aligned. (3) All pointers derive from the `new` region, RW and
+        // exclusively owned; `&mut self` plus the single-threaded process
+        // means no concurrent CPU-side access (only the device, hence the
+        // volatile accesses). Stores to `buf_phys`/`buf_len` are plain data
+        // handed to the device; their validity is the `# Safety` DMA
+        // obligation above.
         unsafe {
             let desc_ptr = self.desc.add(index as usize);
             core::ptr::write_volatile(
@@ -455,10 +483,25 @@ impl Virtqueue {
     /// TCG.
     pub fn poll_used(&mut self) -> Option<(u32, u32)> {
         dsb_sy();
+        // SAFETY: `used_idx` is `region_va + 2*QUEUE_ALIGN + 2`: 2-aligned,
+        // inside the third page of the region `Virtqueue::new`'s contract
+        // makes readable and owned for the process lifetime. The device
+        // writes this value concurrently, hence volatile; every `u16` bit
+        // pattern is a valid `u16`, and it is only compared, never used as
+        // an index.
         let idx = unsafe { core::ptr::read_volatile(self.used_idx) };
         if idx == self.last_used_seen {
             return None;
         }
+        // SAFETY: the element index is `last_used_seen % qsize`, reduced by
+        // this driver's own `qsize` (nonzero power of two <= 256 by `new`'s
+        // contract) and a driver-private counter, so nothing the device
+        // wrote influences the address: byte offset `4 + 8 * (qsize - 1) <=
+        // 2044` of the used page, inside it, and 4-aligned (`used_base + 4`
+        // with an 8-aligned region; `UsedElem` is two `u32`s). The element
+        // contents are device-written and untrusted, but any bit pattern is
+        // a valid `UsedElem`; the caller must range-check `id`/`len`
+        // (`validate_rx_completion`) before using them.
         let elem = unsafe {
             core::ptr::read_volatile(
                 self.used_ring

@@ -91,7 +91,7 @@ jobs:
       # The four ring-3 host crates above are not workspace members, so the
       # root `cargo fmt --check` and `cargo clippy --workspace` never see them.
       # They hold the `unsafe` MMIO/DMA code that parses device-written data,
-      # and three of them carry `#![warn(clippy::undocumented_unsafe_blocks)]`,
+      # and all four carry `#![warn(clippy::undocumented_unsafe_blocks)]`,
       # which only means something if clippy actually runs with `-D warnings`.
       # grid-sandbox-host has no library target (so `--bins` only); the
       # freestanding targets are checked on stable, no build-std needed.
