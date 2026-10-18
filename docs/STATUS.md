@@ -2566,9 +2566,10 @@ action `FailOpen` or `FailClosed`. `data.reset_usage`, `esim.delete` and
 proxy configured" as in the plain boot configurations, is denied with `DENIED (MARSHAL
 unreachable: fail-closed for this action)`, leaves state untouched, and is WORM-audited
 with `authorized=false` (the reset returns code `6`). The other three
-(`esim.enable`, `mvno.bind_profile`, `mvno.suspend_account`) stay `FailOpen`, and
-whether any of them should change is an open decision with its own table of candidates
-and the availability trade-off: [adrs/0003-unreachable-marshal-policy-is-per-action.md](adrs/0003-unreachable-marshal-policy-is-per-action.md).
+(`esim.enable`, `mvno.bind_profile`, `mvno.suspend_account`) stay `FailOpen` by decision
+(ADR 0008: enable may be needed to bootstrap connectivity, bind is a prerequisite of enable,
+suspend is the restrictive direction), with the candidates and the availability trade-off in
+[adrs/0003-unreachable-marshal-policy-is-per-action.md](adrs/0003-unreachable-marshal-policy-is-per-action.md).
 The `esim.delete` and `mvno.reactivate_account` decision is recorded in
 [adrs/0008-esim-delete-and-mvno-reactivate-fail-closed-when-marshal-unreachable.md](adrs/0008-esim-delete-and-mvno-reactivate-fail-closed-when-marshal-unreachable.md).
 `Refuse`, `HardStop`, `Faulty` and local failures block under either policy.

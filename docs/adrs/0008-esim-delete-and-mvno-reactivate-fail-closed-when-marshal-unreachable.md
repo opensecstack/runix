@@ -34,7 +34,7 @@ one-sided enough to decide now:
    |---|---|
    | `esim.enable` | Bootstrap: enabling a profile can be what provides the connectivity needed to reach MARSHAL, so failing closed could deadlock a phone that has no other route. Revisit only with a designed bootstrap exception. |
    | `mvno.suspend_account` | The restrictive direction. Refusing to cut service because the gate is down would help an abuser; allowing it when unsure fails safe for the operator. |
-   | `mvno.bind_profile` | Undecided. It depends on whether binding a profile to an account is part of device bootstrap (first-boot provisioning of an offline device). Until that is settled it keeps its existing behaviour. |
+   | `mvno.bind_profile` | **Decided 2026-10-18: stays FailOpen.** Binding is a prerequisite of enabling: `mvno::gate_enable` returns `NotBound` for an unbound profile (`kernel-arm/src/mvno.rs`, asserted in the boot walk), so a profile cannot be enabled until it has been bound. `esim.enable` is fail-open because enabling may be what gives a fresh device the connectivity to reach MARSHAL. If `bind_profile` failed closed, a device provisioned offline could never bind and so could never enable, which would make the `esim.enable` exemption pointless. Revisit together with `esim.enable` (a bootstrap exception or time-limited offline grants), or if first provisioning is guaranteed to happen online. |
 
 4. **Out of scope: x86 `grid_sandbox::spawn_instance`.** It also has an
    "unreachable" case, but flipping it would break every dev and CI boot that
@@ -75,15 +75,17 @@ Worse, or left open:
   of a gate that an outsider can disable is highest exactly for an irreversible
   action and for lifting a restriction.
 - **Flip all five.** Rejected for `esim.enable` (bootstrap deadlock, 0003).
-  `mvno.suspend_account` is rejected on direction of effect, `mvno.bind_profile`
-  is left undecided as above.
+  `mvno.suspend_account` is rejected on direction of effect, and
+  `mvno.bind_profile` is rejected because binding is a prerequisite of enabling
+  (see the table above).
 
 ## Revisit when
 
 - A bootstrap exception or offline grant is designed (could re-open `enable`,
   and relax the availability cost of these two).
-- It is decided whether profile binding is part of device bootstrap
-  (`mvno.bind_profile`).
+- First provisioning of a device is guaranteed to happen with MARSHAL reachable, or a
+  bootstrap exception is designed for `esim.enable`: `mvno.bind_profile` should then be
+  reconsidered together with it.
 - `grid_sandbox::spawn_instance` gets a distinguishable "not configured" state.
 
 ## References

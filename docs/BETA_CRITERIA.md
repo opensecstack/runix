@@ -446,9 +446,11 @@ outage; (e) **NOT MET**.
 **Remains:**
 - (e): no operator identity (Not claimed 1); signing key is the demo key.
 - Three of six actions fail open when MARSHAL is unreachable: `esim.enable`,
-  `mvno.bind_profile`, `mvno.suspend_account` (Not claimed 2). Whether any of them
-  should fail closed is an open decision in ADR 0003. `esim.delete` and
-  `mvno.reactivate_account` were decided fail-closed in ADR 0008.
+  `mvno.bind_profile`, `mvno.suspend_account` (Not claimed 2). They stay fail-open by
+  decision, each with a recorded reason (ADR 0008: enable may be needed to bootstrap
+  connectivity, bind is a prerequisite of enable, suspend is the restrictive direction);
+  the revisit conditions are in that ADR. `esim.delete` and `mvno.reactivate_account`
+  were decided fail-closed in ADR 0008.
 - Denial audit is quota-limited (ADR 0009): once a class is full, further
   `Refuse`/`HardStop` blocks are counted, not individually recorded. RIL and IPC
   capability denials are serial-only (STATUS.md, "The bounded mobile WORM chain").
