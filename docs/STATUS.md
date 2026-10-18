@@ -1,4 +1,4 @@
-# Runix status (Alpha)
+# Runix status (Alpha complete, Beta in progress)
 
 This is the detailed, narrative engineering log of what's actually built,
 verified, and (importantly) what broke along the way — as opposed to
@@ -9,10 +9,14 @@ that cross crate or trust boundaries are recorded separately, with their
 alternatives and revisit triggers, in the
 [architecture decision records](adrs/README.md).
 
-We are currently in **Alpha**. The kernel's own bring-up — all 9 "Kernel
+Alpha is **complete** and Beta is in progress (what Beta means and where each
+item stands: [BETA_CRITERIA.md](BETA_CRITERIA.md); the Beta sections are further
+down). The text below this point began as the Alpha log and keeps that voice.
+The kernel's own bring-up — all 9 "Kernel
 build stages" (see [BUILDING.md](BUILDING.md)) — is **complete**: boot, serial
 output, exception handling, paging, a working kernel heap, PIC/PIT timer
-interrupts, cooperative round-robin context switching, a syscall ABI
+interrupts, round-robin context switching (timer-driven preemption as well as
+voluntary yield; see "Real, timer-interrupt-driven preemption" below), a syscall ABI
 (`int 0x80`), byte channels between threads, a real ring 0 → ring 3
 transition, and a QEMU-native `cargo test` harness are all working, verified
 end to end in QEMU (the `main.rs` demo boots through every phase, exercises

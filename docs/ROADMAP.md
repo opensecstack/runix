@@ -16,6 +16,32 @@ Beta item, the evidence for it today, and what remains are in
 [BETA_CRITERIA.md](BETA_CRITERIA.md). See [STATUS.md](STATUS.md) for exactly
 what is implemented and verified.
 
+## Post-v1.0 (not scheduled)
+
+The table above ends at v1.0 and contains no row for running Runix on real
+hardware. These are **not** part of Alpha, Beta, RC or v1.0 as scoped, and
+have no target date:
+
+- real hardware support (drivers beyond the virtio devices used under QEMU,
+  firmware/UEFI handling, real storage, graphics, input and network cards);
+- an installer, an ISO and a bootable-USB image for the desktop;
+- an Android-phone port (a locked bootloader, vendor secure world and
+  baseband mean it is a per-device port, not a build target);
+- any media pipeline or media-player application.
+
+Every phase so far has been verified under QEMU only (see
+[BETA_CRITERIA.md](BETA_CRITERIA.md), "QEMU-only verification"). A v1.0 that
+meets this table is therefore not an installable operating system, and nothing
+here should be read as promising one.
+
+**Constraint on RC and v1.0.** Several rows above (hardware attestation, the
+WORM boot chain, secure update channel) and the key provisioning they depend
+on need a trust root that lives outside the kernel image (firmware, a boot
+chain, a secure element). That cannot be demonstrated under QEMU alone, so RC
+needs at least a minimal real-hardware bring-up for those rows, even though
+broad hardware support is out of scope. How minimal, and on which hardware,
+is not decided.
+
 ## Open questions
 
 - **License**: workspace default stays Apache-2.0 through Alpha and Beta.
