@@ -47,6 +47,7 @@ pub mod capabilities;
 pub mod data_codes;
 pub mod data_state;
 pub mod elf;
+pub mod hw_contract;
 pub mod loader;
 pub mod marshal_action;
 pub mod reclaim;

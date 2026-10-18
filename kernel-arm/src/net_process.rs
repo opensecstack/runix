@@ -408,6 +408,10 @@ pub fn setup(
     info: NetBootInfo,
     request_bytes: Option<&[u8]>,
 ) -> Result<(AddressSpace, LoadedImage, Option<u64>), &'static str> {
+    // `info.mode` and `request_bytes` must agree (the request/response
+    // regions are mapped only for `Some`); refuse before building anything.
+    runix_kernel_arm::hw_contract::check_net_mode(info.mode, request_bytes.is_some())?;
+
     let elf = Elf64::parse(elf).map_err(elf_error_message)?;
 
     let mut space = AddressSpace::new().map_err(|e| e.message())?;

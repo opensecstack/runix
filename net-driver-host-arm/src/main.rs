@@ -440,12 +440,9 @@ pub extern "C" fn _start() -> ! {
     loop {
         // SAFETY: `wfe` has no memory or stack operand and writes no
         // register or flag, so `nostack, preserves_flags` hold. It is
-        // permitted at EL0 only if `SCTLR_EL1.nTWE` is set; `kernel-arm`
-        // does not configure that bit (`mmu.rs` only sets `M`), so on a
-        // core where it resets to 0 this traps to EL1 as an exception
-        // instead of idling. That is a liveness question, not a memory-
-        // safety one -- nothing here is left in an inconsistent state
-        // either way.
+        // permitted at EL0 only if `SCTLR_EL1.nTWE` is set; `kernel-arm`'s
+        // `mmu::install` sets it (via `hw_contract`), so this idles rather
+        // than trapping to EL1. Liveness, not memory safety, either way.
         unsafe {
             core::arch::asm!("wfe", options(nostack, preserves_flags));
         }

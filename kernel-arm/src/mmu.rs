@@ -302,7 +302,11 @@ pub unsafe fn install() {
 
         let mut sctlr: u64;
         core::arch::asm!("mrs {}, SCTLR_EL1", out(reg) sctlr);
-        sctlr |= 1 << 0; // M: enable the MMU
+        // M: enable the MMU. nTWE (bit 18): let EL0 execute `wfe` instead of
+        // trapping to EL1 (EC 0x01) -- EL0 payloads idle with `wfe`, and the
+        // reset value of this bit is architecturally UNKNOWN. Read-modify-
+        // write; every other bit is preserved. See `hw_contract`.
+        sctlr = runix_kernel_arm::hw_contract::sctlr_with_mmu_and_el0_wfe(sctlr);
         core::arch::asm!("msr SCTLR_EL1, {}", in(reg) sctlr);
         core::arch::asm!("isb"); // the next fetched instruction must see translation active
     }
