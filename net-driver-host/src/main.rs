@@ -152,6 +152,16 @@ struct NetBootInfo {
     /// give. `1` only in `kernel/tests/net_driver_dns.rs`, which alone
     /// verifies a real resolved address.
     use_dns: u8,
+    /// IPv4 octets of the DNS server `run_dns_lookup` queries; all-zero
+    /// (every boot/test that predates this field, since the boot page is
+    /// zero-filled) means the default [`DNS_SERVER_IP`] (`8.8.8.8`).
+    /// `kernel/tests/net_driver_dns_mock.rs` sets `10.0.2.2` (the SLIRP
+    /// gateway, which forwards UDP to a host socket on `127.0.0.1:53`) to
+    /// resolve against a deterministic mock instead of the real internet.
+    /// Appended after `use_dns` at offset 124: fits in the struct's own
+    /// tail padding, so `size_of` stays 128 and `NET_RESULT_OFFSET` is
+    /// unaffected.
+    dns_server: [u8; 4],
 }
 
 const NET_INFO_VA: usize = 0x_1111_3333_0000;
@@ -480,6 +490,7 @@ pub extern "C" fn _start() -> ! {
             &mut iface,
             &mut device,
             next_iteration + final_iteration + 1,
+            info.dns_server,
         );
     }
 
@@ -710,7 +721,12 @@ fn run_tcp_proof(iface: &mut Interface, device: &mut RunixNetDevice, start_itera
 /// exactly which boot/test paths set it. Runs on the same `iface`/`device`
 /// as every prior phase (a fresh `SocketSet` per phase, matching this
 /// file's existing per-phase-loop style).
-fn run_dns_lookup(iface: &mut Interface, device: &mut RunixNetDevice, start_iteration: u32) {
+fn run_dns_lookup(
+    iface: &mut Interface,
+    device: &mut RunixNetDevice,
+    start_iteration: u32,
+    dns_server_octets: [u8; 4],
+) {
     // `[DNS_SERVER_IP; 4]`, not a single-element slice: smoltcp's own
     // `DnsQuery` state machine gives each entry in the server list its own
     // ~10-second retry/timeout budget before declaring the whole query
@@ -719,7 +735,17 @@ fn run_dns_lookup(iface: &mut Interface, device: &mut RunixNetDevice, start_iter
     // see `Cargo.toml`'s own comment) multiplies that budget instead of
     // giving a real-internet round trip only one ~10-second window to land
     // in.
-    let dns_socket = dns::Socket::new(&[IpAddress::Ipv4(DNS_SERVER_IP); 4], vec![]);
+    let dns_server = if dns_server_octets == [0, 0, 0, 0] {
+        DNS_SERVER_IP
+    } else {
+        Ipv4Address::new(
+            dns_server_octets[0],
+            dns_server_octets[1],
+            dns_server_octets[2],
+            dns_server_octets[3],
+        )
+    };
+    let dns_socket = dns::Socket::new(&[IpAddress::Ipv4(dns_server); 4], vec![]);
     let mut sockets = SocketSet::new(vec![]);
     let dns_handle = sockets.add(dns_socket);
 
