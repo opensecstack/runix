@@ -1,0 +1,57 @@
+# Coverage-guided fuzzing (cargo-fuzz / libFuzzer + AddressSanitizer).
+#
+# Deliberately NOT a PR gate: a fuzz run is open-ended, time-boxed rather than
+# pass/fail-deterministic, and can find a new crash on code a PR never touched.
+# So this only runs on demand (workflow_dispatch) and on a weekly schedule --
+# never on push or pull_request. A failure uploads the crashing input as an
+# artifact; reproduce locally with
+#   cd <dir> && cargo +nightly fuzz run <target> artifacts/<target>/<crash-file>
+name: fuzz
+
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds to fuzz each target (libFuzzer -max_total_time)"
+        required: false
+        default: "60"
+  schedule:
+    # Mondays 03:17 UTC.
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { dir: capability-manager/fuzz, target: verify_fuzz }
+          - { dir: net-driver-host/fuzz, target: smoltcp_fuzz }
+          - { dir: blk-driver-host/fuzz, target: fat32_parse_fuzz }
+          - { dir: blk-driver-host/fuzz, target: chain_link_values_fuzz }
+          - { dir: blk-driver-host/fuzz, target: first_free_cluster_fuzz }
+          - { dir: blk-driver-host/fuzz, target: boot_sector_fuzz }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.dir }}
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.2
+      - name: fuzz ${{ matrix.target }}
+        working-directory: ${{ matrix.dir }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ inputs.seconds || 60 }}
+      - name: upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: ${{ matrix.dir }}/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
