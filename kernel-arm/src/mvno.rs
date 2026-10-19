@@ -219,6 +219,13 @@ pub fn owner_of(slot: usize, profile: u8) -> Option<u64> {
     REGISTRY.lock().owner_of(key(slot, profile)).map(|a| a.0)
 }
 
+/// `true` if `account` owns at least one bound profile (any lifecycle state).
+/// Registry lock only, released on return. A thin wrapper over the registry's
+/// `profiles_of`; the usage feed's binding check.
+pub fn has_bound_profile(account: u64) -> bool {
+    !REGISTRY.lock().profiles_of(AccountId(account)).is_empty()
+}
+
 /// Every account and its live status, in registry order (a copy; the lock is
 /// released on return). The reconciler's account list.
 pub fn accounts() -> Vec<(u64, AccountStatus)> {

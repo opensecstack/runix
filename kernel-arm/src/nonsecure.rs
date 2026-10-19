@@ -482,6 +482,12 @@ fn el1_setup() -> ! {
     );
     crate::capabilities::issue_and_hold(crate::capabilities::data_usage_resource(0), now);
     serial_println!("Runix ARM kernel: data usage capability issued (account 0, demo trust root)");
+    // Account 1 (Active, entitled, owns NO profile) also gets the usage feed, and
+    // only that: el0_demo's feed of it is the proof that metering is refused for
+    // an account with no bound profile (ADR 0010), which needs the capability
+    // check to PASS first (a missing grant would be a capability denial instead).
+    crate::capabilities::issue_and_hold(crate::capabilities::data_usage_resource(1), now);
+    serial_println!("Runix ARM kernel: data usage capability issued (account 1, demo trust root)");
     crate::capabilities::issue_and_hold(crate::capabilities::data_reconcile_resource(), now);
     serial_println!("Runix ARM kernel: data reconcile capability issued (demo trust root)");
     // The usage-period RESET is its own scope (it lifts a cap) and, unlike the

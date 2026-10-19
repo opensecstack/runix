@@ -61,6 +61,41 @@ pub const USAGE_NO_ENTITLEMENT: u64 = 5;
 pub const USAGE_NO_SUCH_ACCOUNT: u64 = 6;
 /// The usage table is full; the bytes were not counted.
 pub const USAGE_TABLE_FULL: u64 = 7;
+/// The account is not `Active` (Suspended or Closed): the bytes were not
+/// counted. See [`usage_feed_refusal`] for the policy.
+pub const USAGE_NOT_ACTIVE: u64 = 8;
+/// The account owns no bound profile, so there is no SIM the bytes could have
+/// passed over: not counted. See [`usage_feed_refusal`].
+pub const USAGE_NO_PROFILE: u64 = 9;
+
+/// Standing/binding policy of the usage FEED (`SYS_DATA_ACCOUNT`), applied after
+/// the capability and entitlement checks and the registry lookup. `None` =
+/// metering may proceed.
+///
+/// - Not `Active` -> [`USAGE_NOT_ACTIVE`]. A Suspended account's profiles were
+///   force-disabled and its sessions closed (ADR 0010), so there is no service
+///   whose use could be metered; a feed arriving anyway is a stale or confused
+///   meter, and counting it would grow a cap the account cannot be using (and
+///   could later make a reactivated account look over-cap). Closed is the same.
+///   Refused rather than counted-and-flagged: the counter is evidence the
+///   reconciler trusts, so it only takes bytes it can attribute to service.
+/// - Active but with no bound profile -> [`USAGE_NO_PROFILE`]. Usage with no SIM
+///   to carry it cannot have happened.
+///
+/// Standing is checked first so a Suspended account with profiles reports the
+/// more fundamental reason.
+pub const fn usage_feed_refusal(status: AccountStatus, has_bound_profile: bool) -> Option<u64> {
+    match status {
+        AccountStatus::Active => {
+            if has_bound_profile {
+                None
+            } else {
+                Some(USAGE_NO_PROFILE)
+            }
+        }
+        AccountStatus::Suspended | AccountStatus::Closed => Some(USAGE_NOT_ACTIVE),
+    }
+}
 
 /// Encode the engine's optional request as the `SYS_DATA_ACCOUNT` return
 /// value: `None` -> 0, `NotifyOnly` -> 1, `Throttle` -> 2, `SuspendAccount`
@@ -701,11 +736,47 @@ mod tests {
             USAGE_NO_ENTITLEMENT,
             USAGE_NO_SUCH_ACCOUNT,
             USAGE_TABLE_FULL,
+            USAGE_NOT_ACTIVE,
+            USAGE_NO_PROFILE,
             99,
             u64::MAX,
         ] {
             assert_eq!(action_request_from_code(refusal), None);
             assert!(refusal >= USAGE_DENIED);
+        }
+    }
+
+    #[test]
+    fn usage_refusal_codes_are_pinned_and_distinct() {
+        let all = [
+            USAGE_DENIED,
+            USAGE_NO_ENTITLEMENT,
+            USAGE_NO_SUCH_ACCOUNT,
+            USAGE_TABLE_FULL,
+            USAGE_NOT_ACTIVE,
+            USAGE_NO_PROFILE,
+        ];
+        assert_eq!(all, [4, 5, 6, 7, 8, 9]);
+        assert_eq!(USAGE_NOT_ACTIVE, 8);
+        assert_eq!(USAGE_NO_PROFILE, 9);
+    }
+
+    #[test]
+    fn usage_feed_policy_by_standing_and_binding() {
+        assert_eq!(usage_feed_refusal(AccountStatus::Active, true), None);
+        assert_eq!(
+            usage_feed_refusal(AccountStatus::Active, false),
+            Some(USAGE_NO_PROFILE)
+        );
+        for bound in [true, false] {
+            assert_eq!(
+                usage_feed_refusal(AccountStatus::Suspended, bound),
+                Some(USAGE_NOT_ACTIVE)
+            );
+            assert_eq!(
+                usage_feed_refusal(AccountStatus::Closed, bound),
+                Some(USAGE_NOT_ACTIVE)
+            );
         }
     }
 
