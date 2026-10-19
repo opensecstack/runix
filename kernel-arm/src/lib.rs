@@ -28,6 +28,7 @@
 
 extern crate alloc;
 
+pub mod audit_chain;
 /// `#[cfg(test)]`-only, not unconditional like [`elf`] -- unlike `elf.rs`,
 /// this module is *not* wholly hardware-independent (`issue_and_hold` needs
 /// `crate::svc::frequency_hz()`, a real generic-timer read that only exists
@@ -46,6 +47,7 @@ pub mod capabilities;
 pub mod data_codes;
 pub mod data_state;
 pub mod elf;
+pub mod hw_contract;
 pub mod loader;
 pub mod marshal_action;
 pub mod reclaim;

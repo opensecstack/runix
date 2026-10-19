@@ -40,6 +40,26 @@ const SYS_WRITE: u64 = 1;
 /// silently assumed preserved.
 unsafe fn syscall(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     let ret: u64;
+    // SAFETY: `svc #0` from EL0 is the kernel-arm syscall gate
+    // (`el1_vectors.rs` lower-EL-sync vector -> `el1_vector_common` ->
+    // `svc.rs::dispatch`, then `eret` back to the next EL0 instruction). The
+    // vector convention is `x0` = number in / return value out, so `x0` is
+    // the one `inout` that yields `ret`. `x1`-`x3` carry the arguments and
+    // are `inout(..) => _` (discarded) rather than `in`, the conservative
+    // declaration described above. `el1_vector_common` stores x1-x18 and
+    // x29/x30 on entry and reloads them before `eret` (the doc comment above
+    // says x5-x8 are not saved; `el1_vectors.rs` lines `stp x5, x6` /
+    // `stp x7, x8` show they are, so declaring them `lateout _` is merely
+    // conservative, not required); x19-x28 and SP_EL0 are callee-saved/
+    // untouched by the Rust handler. Not verified here: v0-v31 are not
+    // declared clobbered, which relies on the EL1 kernel (softfloat target
+    // `aarch64-unknown-none`) never using FP/SIMD registers. No `nomem`/
+    // `readonly`/`nostack`/`preserves_flags` options are given, so the
+    // compiler conservatively assumes the call reads/writes memory and
+    // clobbers flags. The asm itself dereferences nothing; whether `num`'s
+    // arguments are acceptable is the `# Safety` contract above, enforced by
+    // the kernel's own checks (the sole use today, `SYS_WRITE`, takes a
+    // scalar byte and no pointer).
     unsafe {
         core::arch::asm!(
             "svc #0",

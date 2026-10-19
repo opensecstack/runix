@@ -46,6 +46,7 @@
 
 #![no_std]
 #![no_main]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 extern crate alloc;
 
@@ -311,10 +312,31 @@ pub enum ProofResult {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    // SAFETY: `LockedHeap::init` requires a valid, unused, RW region of
+    // `HEAP_SIZE` bytes that nothing else touches, and a single call before
+    // any allocation. `kernel-arm/src/net_process.rs` maps exactly
+    // `NET_HEAP_PAGES` (64) private RW pages at `NET_HEAP_START`
+    // (0x8800_0000), i.e. 256 KiB == `HEAP_SIZE` starting at `HEAP_START`,
+    // disjoint from every other fixed VA in this file (info page 0x8810_0000
+    // and up) and from the ELF segments. This is the first statement of the
+    // entry point, which runs once, single-threaded, so no allocation can
+    // precede it. That the loader really mapped these pages is the loader
+    // contract (not checked here; an unmapped heap would fault, not corrupt).
     unsafe {
         ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
     }
 
+    // SAFETY: the loader (`net_process.rs::build_net_boot_info`) maps a
+    // fresh private 4 KiB page at `NET_INFO_VA`, which is page- (so 8-)
+    // aligned as `NetBootInfo` needs, and writes a `NetBootInfo` into it
+    // (`size_of` is 144 bytes, asserted `<= 4096` on the loader's mirror
+    // copy) before `eret`ing here. Every field is an integer or integer
+    // array, so any bit pattern is a valid value. EL1 writes the page only
+    // before this process starts, and this process only reads it (no
+    // result is written back into the page), so the shared reference
+    // cannot alias a write; the page stays mapped for the process lifetime,
+    // making the unbounded `'static` borrow sound. Not checked here: that
+    // the page really is mapped (the loader contract).
     let info = unsafe { &*(NET_INFO_VA as *const NetBootInfo) };
 
     match Mode::from_u64(info.mode) {
@@ -339,10 +361,23 @@ pub extern "C" fn _start() -> ! {
             // by convention, not by a shared dependency) -- it must match
             // `kernel-arm/src/svc.rs`'s `SYS_NET_PROOF_DONE` exactly.
             const SYS_NET_PROOF_DONE: u64 = 14;
+            // SAFETY: `svc #0` with scalar-only arguments (syscall number
+            // and the result code); no pointer is passed, so the kernel
+            // cannot be made to touch this process's memory through it, and
+            // the asm itself accesses none. The kernel's `finish` never
+            // resumes this process once it claims the continuation; if it
+            // did return (wrong number / no live continuation), `x0` would
+            // be overwritten with the error return. That is why `x0` is
+            // declared `inout(..) => _` (discarded) rather than `in`: the
+            // ABI is `x0` = number in / return value out, and an `in`
+            // operand would let the compiler assume `x0` still holds the
+            // syscall number afterwards. `x1` is preserved by the handler
+            // (see `syscall.rs`'s module doc), so it stays `in`.
+            // No `nomem` option, so memory is assumed clobbered.
             unsafe {
                 core::arch::asm!(
                     "svc #0",
-                    in("x0") SYS_NET_PROOF_DONE,
+                    inout("x0") SYS_NET_PROOF_DONE => _,
                     in("x1") result as u64,
                     options(nostack),
                 );
@@ -375,10 +410,17 @@ pub extern "C" fn _start() -> ! {
             // match whatever `kernel-arm/src/svc.rs` defines for
             // `SYS_MARSHAL_PROOF_DONE` once that side lands.
             const SYS_MARSHAL_PROOF_DONE: u64 = 15;
+            // SAFETY: as for `SYS_NET_PROOF_DONE` above -- `svc #0` with
+            // scalar-only arguments (number, status, response byte count);
+            // no pointer is passed, the asm accesses no memory itself, and
+            // control either never returns or falls into the `wfe` loop
+            // below. `x0` is `inout(..) => _` because the kernel overwrites
+            // it with its return value (see the note above); `x1`/`x2` are
+            // preserved by the handler, so they stay `in`.
             unsafe {
                 core::arch::asm!(
                     "svc #0",
-                    in("x0") SYS_MARSHAL_PROOF_DONE,
+                    inout("x0") SYS_MARSHAL_PROOF_DONE => _,
                     in("x1") status as u64,
                     in("x2") response_len,
                     options(nostack),
@@ -396,6 +438,11 @@ pub extern "C" fn _start() -> ! {
     // payload's own trailing `wfe` loop for the identical "should never
     // actually be reached" reason.
     loop {
+        // SAFETY: `wfe` has no memory or stack operand and writes no
+        // register or flag, so `nostack, preserves_flags` hold. It is
+        // permitted at EL0 only if `SCTLR_EL1.nTWE` is set; `kernel-arm`'s
+        // `mmu::install` sets it (via `hw_contract`), so this idles rather
+        // than trapping to EL1. Liveness, not memory safety, either way.
         unsafe {
             core::arch::asm!("wfe", options(nostack, preserves_flags));
         }
@@ -471,13 +518,31 @@ fn bring_up_interface(info: &NetBootInfo) -> Result<(Interface, RunixNetDevice),
         }
     };
 
-    let rx_size = match net.negotiate_queue_size(virtio_net::QUEUE_RX, REQUESTED_QUEUE_SIZE) {
+    // Minimum sizes = descriptors posted per queue (indices 0..count), so no
+    // posted index can be >= the negotiated size; see
+    // `net_driver_host_arm::choose_queue_size`. Failure goes through the
+    // existing `QueueSetupFailed` result code (result=3).
+    let rx_size = match net.negotiate_queue_size(
+        virtio_net::QUEUE_RX,
+        REQUESTED_QUEUE_SIZE,
+        smoltcp_device::RX_BUFFER_COUNT as u16,
+    ) {
         Ok(size) => size,
-        Err(_) => return Err(ProofResult::QueueSetupFailed),
+        Err(_) => {
+            write_all(b"net-driver-host-arm: unsupported virtio RX queue size\n");
+            return Err(ProofResult::QueueSetupFailed);
+        }
     };
-    let tx_size = match net.negotiate_queue_size(virtio_net::QUEUE_TX, REQUESTED_QUEUE_SIZE) {
+    let tx_size = match net.negotiate_queue_size(
+        virtio_net::QUEUE_TX,
+        REQUESTED_QUEUE_SIZE,
+        smoltcp_device::TX_BUFFER_COUNT as u16,
+    ) {
         Ok(size) => size,
-        Err(_) => return Err(ProofResult::QueueSetupFailed),
+        Err(_) => {
+            write_all(b"net-driver-host-arm: unsupported virtio TX queue size\n");
+            return Err(ProofResult::QueueSetupFailed);
+        }
     };
     if net
         .setup_queue(virtio_net::QUEUE_RX, rx_size, info.rx_queue_phys)
@@ -492,6 +557,23 @@ fn bring_up_interface(info: &NetBootInfo) -> Result<(Interface, RunixNetDevice),
         return Err(ProofResult::QueueSetupFailed);
     }
 
+    // SAFETY: meets `RunixNetDevice::new`'s contract (which this call site,
+    // not `new`, must establish). `NET_RXQ_VA`/`NET_TXQ_VA` are the fixed,
+    // page-aligned, distinct VAs at which `net_process.rs::map_contiguous_
+    // region` maps a freshly `alloc_zeroed`, physically contiguous
+    // `3 * QUEUE_ALIGN` RW region each (never otherwise mapped or touched by
+    // this process, so zeroed and exclusively owned). `rx_size`/`tx_size`
+    // come from `negotiate_queue_size` with `min` = `RX_BUFFER_COUNT`/
+    // `TX_BUFFER_COUNT`, hence satisfy `queue_size_is_valid` (power of two,
+    // >= the buffer count, <= 256) -- the early returns above guarantee we
+    // only get here on `Ok`. `NET_RXBUF_VA`/`NET_TXBUF_VA` are the bases of
+    // the individually page-mapped RX/TX buffers whose physical addresses
+    // the loader recorded in `info.rx_buffer_phys`/`tx_buffer_phys`. Not
+    // checked here: that the loader mapped all of this (a loader contract,
+    // see `NetBootInfo`'s doc). The queue regions' physical bases are given
+    // to the device by `setup_queue` above, and the device is not yet
+    // `DRIVER_OK` (`mark_ready` follows), so it is not reading the rings
+    // while `new` initializes them.
     let mut device = unsafe {
         RunixNetDevice::new(
             info.mmio_base as usize,
@@ -766,6 +848,9 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     // fault instead of halting anything. `wfe` is unprivileged at EL0.
     write_byte(b'?');
     loop {
+        // SAFETY: as for the identical `wfe` loop at the end of `_start`: no
+        // memory/stack/register/flag effect; the EL0-permission caveat on
+        // `SCTLR_EL1.nTWE` is a liveness matter, not a memory-safety one.
         unsafe {
             core::arch::asm!("wfe", options(nostack, preserves_flags));
         }

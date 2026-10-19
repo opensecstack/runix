@@ -13,6 +13,61 @@ not claim.
 
 ### Security
 
+- Fix: `kernel-arm` never set `SCTLR_EL1.nTWE`, so on a core where it resets to 0 an
+  EL0 `wfe` (the idle loops at the end of the EL0 payloads and the panic handler of
+  `net-driver-host-arm`) trapped to EL1 with EC 0x01 instead of idling. `mmu.rs` now
+  sets it, with the MMU bit, through the pure helper `hw_contract::sctlr_with_mmu_and_el0_wfe`
+  (a read-modify-write that only ORs bits in). QEMU's cortex-a53 resets `SCTLR_EL1` to
+  `0xc50838` (measured by printing it before `install()`), which already has `nTWE` set,
+  so the change is a no-op there and is for real silicon, where the reset value is
+  UNKNOWN; it is covered by the helper's unit tests only.
+- Fix: `net_process::setup` took the boot-info mode and the MARSHAL request bytes
+  independently, so a mismatch would have faulted at EL0 on first access to unmapped
+  request pages. It now rejects mode 1 without bytes, mode 0 with bytes and unknown modes
+  before allocating or mapping anything, through the existing error path.
+- Tests: a property test drives the real `post_rx_buffer`/`try_post` refusal in both net
+  drivers, in debug and release; removing the refusal is no longer caught only by the
+  two cfg-gated unit tests.
+- Fix: `net-driver-host-arm` accepted a device-written RX length below the 12-byte
+  virtio-net header, and `RxToken::consume` subtracted the header length without
+  saturating, so a length under 12 underflowed into a huge slice length
+  (undefined behaviour in a release build). The validator now rejects `len < 12`
+  and `consume` saturates, the same fix `net-driver-host` received earlier. The
+  ARM driver's queue-size handling is a separate fix (F6, below).
+- Fix: `net-driver-host` and `net-driver-host-arm` could permanently lose RX buffers.
+  `receive()` consumed a used-ring entry before checking its descriptor id and length
+  and before checking for a free TX slot, and an early return did not re-post the
+  buffer, so a hostile or bad completion, or a burst while TX was full, removed one of
+  the eight RX buffers for good. The TX slot is now checked first. A valid descriptor
+  id with an invalid length is dropped and its buffer re-posted. An out-of-range
+  descriptor id is counted and skipped, with no buffer re-posted. At most 16 used
+  entries are examined per call. The policy lives in a pure `rx_policy.rs` module with
+  host tests. x86 is covered by the existing QEMU ICMP and DHCP tests, which exercise
+  the happy path only. The ARM crate has not been run under QEMU for this change beyond
+  a boot. A forged used entry that arrives after its buffer was legitimately re-posted
+  can still duplicate an avail entry (`docs/THREAT_MODEL.md`, F1 and F4).
+- Fix: `net-driver-host` and `net-driver-host-arm` did not track which RX buffers they
+  had posted, so a completion for a buffer the driver still held (a repeat within one
+  batch, or while a delivered frame was outstanding) could be delivered a second time,
+  and its re-post could write a second avail entry for that buffer. The driver now keeps
+  one posted bit per RX buffer, sets it only on the path that writes an avail entry
+  (which refuses a second write), and clears it when a used entry is accepted. A
+  completion for a buffer it holds is counted and skipped, not delivered or re-posted.
+  Re-posts of dropped completions are deferred to the end of the batch, so a repeat
+  within one batch is caught. Host tests cover the guard, and four call-sequence tests
+  pin the order in which `receive()` takes a TX slot before polling the RX ring. x86 QEMU
+  ICMP, DHCP and TCP tests pass. The guard does not catch a forged entry that arrives
+  after its buffer was legitimately re-posted; that entry can still duplicate an avail
+  entry (`docs/THREAT_MODEL.md`, F4).
+- Fix: `net-driver-host-arm` accepted any device-reported `QueueNumMax` except 0 while
+  always posting 8 RX and 4 TX descriptors, so a small or non-power-of-two queue could
+  break the RX path. The driver now programs the largest power of two no greater than
+  `min(QueueNumMax, 256)`, and fails through the existing queue-setup failure
+  (result=3) only when that is below the posted descriptor count. This is a protocol
+  violation by a non-spec device, not a memory-safety bug. Unlike x86, which rejects an
+  invalid size, the ARM driver clamps it, because MMIO v2 lets the driver write
+  `QueueNum` itself (`docs/THREAT_MODEL.md`, F6). A device with a small `QueueNumMax`
+  has not been tested, since QEMU reports 256.
 - Fix: `esim.delete` and `mvno.reactivate_account` failed open when MARSHAL was
   unreachable, so anyone who could drop the link could delete a profile (which is
   irreversible) or restore a suspended account. Both now fail closed, as
@@ -27,8 +82,42 @@ not claim.
   `kernel/`. A build without the feature stops with a `compile_error!` that names
   the missing key provisioning, instead of silently shipping the demo key. CI runs
   a `--no-default-features` build and checks for that message.
+- Fix: the kernel-arm WORM chain had no size bound, and a caller holding a data,
+  session or eSIM capability could grow it without limit. `SYS_DATA_RECONCILE` also
+  re-recorded the same incident on every call. The chain is still one hash-chained
+  append-only log, but each of ten event classes now has a fixed quota of entries (456
+  in total, including summary slots). An event past its class's quota is counted and
+  coalesced into a summary entry, committed at 1, 4, 16 and so on, at most 8 times per
+  class, and the coalescing is printed on serial. `verify` also checks the bound's
+  accounting (ADR 0009). A persistent reconciler incident is recorded once, when first
+  seen, and a clean reconcile pass is recorded once after a non-clean one and then
+  counted. Residual: each class keeps its first quota of events, the quotas are global
+  rather than per caller, `applied` can be exhausted (later changes are counted, not
+  refused), the serial log is unbounded, and the chain is still volatile and unsigned.
+- Fix: denials that were serial-only on mobile are now WORM-audited with
+  `authorized=false`, within the same per-class quotas: MARSHAL `Refuse` and `HardStop`
+  blocks, capability denials on the six eSIM, three MVNO and six data syscalls, and the
+  MVNO enable gate's refusal (ADR 0009). Capability denials on the RIL and IPC
+  syscalls, a malformed `SYS_DATA_SESSION_CLOSE` argument, an unknown reset mode and
+  the no-period `SYS_DATA_PERIOD` poll remain serial-only.
 
 ### Added
+
+- Docs: ADR [0009](docs/adrs/0009-bounded-worm-chain-and-denial-auditing.md) records
+  the per-class bound, the coalescing rule, the denial auditing and the residual gaps
+  that remain open.
+- CI: the kernel-arm boot steps assert the new capability-denial, MVNO gate-refusal
+  and clean-pass audit lines. The `Refuse` and `HardStop` audit lines are asserted in
+  the MARSHAL steps, which have not yet been observed in a CI run of this change.
+- CI: the `host` job runs `cargo fmt --check` and `cargo clippy -D warnings` on
+  `grid-sandbox-host`, `net-driver-host`, `blk-driver-host` and `net-driver-host-arm`,
+  after adding the `x86_64-unknown-none` and `aarch64-unknown-none` targets. These
+  crates are not workspace members, so the root steps never checked them.
+  `undocumented_unsafe_blocks` is enforced for all four: `net-driver-host-arm` gained
+  the attribute after its 12 undocumented `unsafe` sites were given `// SAFETY:`
+  comments. The same change fixes the `x0` operand of the two `svc #0` blocks in
+  `net-driver-host-arm`'s `_start`: it was declared `in(..)` although the kernel
+  overwrites `x0` with its return value, and is now `inout("x0") .. => _`.
 
 - Docs: ADR [0007](docs/adrs/0007-dry-run-true-stays-until-operator-identity.md)
   keeps `dry_run: true` hardcoded on every MARSHAL request until operator identity

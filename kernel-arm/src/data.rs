@@ -72,10 +72,12 @@
 //! Every policy decision, every engine request and every reconciler incident
 //! is still WORM-audited (on the same chain as the eSIM/MVNO transitions, via
 //! `svc.rs`'s `audit_event`): "not gated" is not "not recorded". The audit is
-//! NOT total, though: capability denials print to the serial log only (the
-//! same as every other syscall here), as do a malformed `SESSION_CLOSE`
-//! argument and a close of a session that is not open, and a reconcile pass
-//! that finds nothing writes no entry.
+//! bounded and NOT total, though (ADR 0009): the chain gives each class of
+//! event a fixed quota and counts the overflow, capability denials are
+//! audited in their own quota-limited class, a persistent reconciler incident
+//! is recorded once and a run of clean passes is one entry plus a counter. A
+//! malformed `SESSION_CLOSE` argument and an unknown reset mode are still
+//! serial-only.
 //!
 //! # Lock order
 //!

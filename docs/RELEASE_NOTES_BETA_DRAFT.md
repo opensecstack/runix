@@ -73,10 +73,13 @@ Read this first. This list mirrors "Not claimed" in BETA_CRITERIA.md.
   (for example RIL access/send/receive, SIM create/install/disable, port I/O,
   IPC send/receive, `SYS_RANDOM`, the five other data syscalls) is
   capability-checked only.
-- **On mobile, `Refuse`/`HardStop` denials are not written to WORM** (serial
-  line only). Only local-failure and fail-closed-unreachable denials are
-  audited. On x86, `spawn_instance` records every outcome in an in-memory
-  `WormLog`.
+- **On mobile, denial auditing is quota-limited** (ADR 0009). `Refuse`/`HardStop`
+  denials and capability denials on the eSIM, MVNO and data syscalls are written to
+  the WORM chain with `authorized=false`, but each event class keeps only its first
+  quota of entries and then counts further events. Capability denials on the RIL
+  and IPC syscalls, a malformed `SYS_DATA_SESSION_CLOSE` argument, an unknown reset
+  mode and the no-period `SYS_DATA_PERIOD` poll stay serial-only. On x86,
+  `spawn_instance` records every outcome in an in-memory `WormLog`.
 - **`spawn_instance` is called only from tests.** The boot path loads the
   Grid Sandbox host without going through the MARSHAL-gated entry point.
 - **Boot-time module authorization is a wiring proof, not an enforcing gate.**

@@ -111,7 +111,7 @@ pub const QUEUE_ALIGN: usize = 4096;
 /// `net-driver-host/src/virtio.rs::MAX_SUPPORTED_QUEUE_SIZE` enforces, for
 /// the identical reason: a `QueueNumMax` larger than this would not fit
 /// this driver's fixed one-page descriptor table.
-pub const MAX_SUPPORTED_QUEUE_SIZE: u16 = 256;
+pub const MAX_SUPPORTED_QUEUE_SIZE: u16 = net_driver_host_arm::MAX_QUEUE_SIZE;
 
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 
@@ -151,13 +151,15 @@ pub enum VirtioNetError {
     NoVersion1(u32),
     /// `FEATURES_OK` was written but read back clear.
     FeaturesRejected(u32),
-    /// `QueueNumMax` for this queue is smaller than the queue size this
-    /// driver asked to use, or larger than [`MAX_SUPPORTED_QUEUE_SIZE`]
-    /// (would not fit this driver's fixed one-page descriptor table).
+    /// No valid queue size exists for this queue: `min(QueueNumMax,
+    /// requested, MAX_SUPPORTED_QUEUE_SIZE)` is below `min` (the number of
+    /// descriptors this driver posts) or zero. See
+    /// `net_driver_host_arm::choose_queue_size`.
     QueueSizeUnsupported {
         queue: u32,
         requested: u16,
         max: u32,
+        min: u16,
     },
     /// `QueueReady` was written but read back clear.
     QueueNotReady(u32),
@@ -182,10 +184,11 @@ impl core::fmt::Display for VirtioNetError {
                 queue,
                 requested,
                 max,
+                min,
             } => write!(
                 f,
-                "queue {queue} QueueNumMax={max}, need between 1 and \
-                 min(requested {requested}, {MAX_SUPPORTED_QUEUE_SIZE})"
+                "queue {queue} QueueNumMax={max}: no power-of-two size in \
+                 {min}..=min(requested {requested}, {MAX_SUPPORTED_QUEUE_SIZE})"
             ),
             VirtioNetError::QueueNotReady(q) => write!(f, "queue {q} QueueReady read back clear"),
         }
@@ -256,28 +259,28 @@ impl VirtioNet {
         read32(self.base + REG_QUEUE_NUM_MAX)
     }
 
-    /// Picks a queue size for `queue_index`: the smaller of `requested` and
-    /// the device's own `QueueNumMax`, rejected outright if that would
-    /// exceed [`MAX_SUPPORTED_QUEUE_SIZE`] (would not fit this driver's
-    /// fixed one-page descriptor table) or be zero (the device has no
-    /// usable queue here at all).
+    /// Picks the queue size for `queue_index`. MMIO v2 lets the driver
+    /// write any `QueueNum <= QueueNumMax`, so this chooses the largest
+    /// power of two `<= min(QueueNumMax, requested,
+    /// MAX_SUPPORTED_QUEUE_SIZE)` and fails only if that is below
+    /// `min_size` (the number of descriptors this driver posts on the
+    /// queue, so no posted index is ever `>= qsize`), including a device
+    /// reporting 0. See `net_driver_host_arm::choose_queue_size`.
     pub fn negotiate_queue_size(
         &self,
         queue_index: u32,
         requested: u16,
+        min_size: u16,
     ) -> Result<u16, VirtioNetError> {
         let max = self.queue_num_max(queue_index);
-        let usable = max
-            .min(u32::from(requested))
-            .min(u32::from(MAX_SUPPORTED_QUEUE_SIZE));
-        if usable == 0 {
-            return Err(VirtioNetError::QueueSizeUnsupported {
+        net_driver_host_arm::choose_queue_size(max, requested, min_size).ok_or(
+            VirtioNetError::QueueSizeUnsupported {
                 queue: queue_index,
                 requested,
                 max,
-            });
-        }
-        Ok(usable as u16)
+                min: min_size,
+            },
+        )
     }
 
     /// Tells the device where `queue_index`'s three ring regions live
@@ -375,10 +378,15 @@ pub struct Virtqueue {
 impl Virtqueue {
     /// # Safety
     /// `region_va` must point to `3 * QUEUE_ALIGN` bytes of readable/
-    /// writable memory this process exclusively owns, zeroed before this is
+    /// writable memory this process exclusively owns, aligned to at least 8
+    /// (`VirtqDesc`'s alignment; a `QUEUE_ALIGN`-aligned page address
+    /// satisfies this), zeroed before this is
     /// called — a stale used/avail index left over from whatever
     /// previously occupied this memory would desynchronize the ring from
-    /// the device's own idea of it.
+    /// the device's own idea of it. `qsize` must satisfy
+    /// `net_driver_host_arm::queue_size_is_valid` for the number of
+    /// descriptors posted (power of two, >= highest posted index + 1,
+    /// <= 256): all ring accesses then stay inside their own page.
     pub unsafe fn new(region_va: usize, qsize: u16) -> Self {
         let desc = region_va as *mut VirtqDesc;
         let avail_base = region_va + QUEUE_ALIGN;
@@ -396,6 +404,15 @@ impl Virtqueue {
     }
 
     pub fn init_avail_flags(&mut self) {
+        // SAFETY: `avail_flags`/`avail_idx` are `region_va + QUEUE_ALIGN` and
+        // `+ 2`, i.e. 2-byte aligned (region is >= 8-aligned) and inside the
+        // second page of the `3 * QUEUE_ALIGN` region that `Virtqueue::new`'s
+        // contract says is RW, exclusively owned and valid for this
+        // process's lifetime (in this crate: the loader-mapped
+        // `NET_RXQ_VA`/`NET_TXQ_VA` regions). This is a safe `pub fn`, so
+        // soundness rests on `new` being the only constructor and its
+        // contract having been met; `&mut self` rules out aliasing in this
+        // process. Volatile because the device reads this memory.
         unsafe {
             core::ptr::write_volatile(self.avail_flags, 0);
             core::ptr::write_volatile(self.avail_idx, 0);
@@ -415,8 +432,27 @@ impl Virtqueue {
     /// `buf_phys`/`buf_len` must describe memory this process actually
     /// owns and that outlives the device's use of it (until the
     /// corresponding used-ring entry appears) — same contract as handing a
-    /// raw pointer to any DMA-capable device.
+    /// raw pointer to any DMA-capable device. `index` must be below
+    /// `MAX_QUEUE_SIZE` (256, in `lib.rs`): the descriptor table is one page
+    /// of 16-byte entries, so a larger index writes past it.
     pub unsafe fn post(&mut self, index: u16, buf_phys: u64, buf_len: u32, writable: bool) {
+        // SAFETY: not checked here; established by the caller per this fn's
+        // `# Safety` plus `new`'s contract. (1) `desc.add(index)` stays in
+        // the descriptor page because the caller guarantees `index <
+        // MAX_QUEUE_SIZE` (256 * 16 bytes = exactly `QUEUE_ALIGN`); the
+        // pointer is 8-aligned (region >= 8-aligned, 16-byte stride).
+        // (2) `avail_idx` is read back from memory this driver alone writes
+        // (device only reads the avail ring); even if the device scribbled
+        // on it, any `u16` is valid and the slot is `idx % qsize`, with
+        // `qsize` a nonzero power of two <= 256 (`new`'s contract via
+        // `queue_size_is_valid`), so the slot lies at byte offset
+        // `4 + 2 * (qsize - 1) <= 514` of the avail page -- inside it, and
+        // 2-aligned. (3) All pointers derive from the `new` region, RW and
+        // exclusively owned; `&mut self` plus the single-threaded process
+        // means no concurrent CPU-side access (only the device, hence the
+        // volatile accesses). Stores to `buf_phys`/`buf_len` are plain data
+        // handed to the device; their validity is the `# Safety` DMA
+        // obligation above.
         unsafe {
             let desc_ptr = self.desc.add(index as usize);
             core::ptr::write_volatile(
@@ -447,10 +483,25 @@ impl Virtqueue {
     /// TCG.
     pub fn poll_used(&mut self) -> Option<(u32, u32)> {
         dsb_sy();
+        // SAFETY: `used_idx` is `region_va + 2*QUEUE_ALIGN + 2`: 2-aligned,
+        // inside the third page of the region `Virtqueue::new`'s contract
+        // makes readable and owned for the process lifetime. The device
+        // writes this value concurrently, hence volatile; every `u16` bit
+        // pattern is a valid `u16`, and it is only compared, never used as
+        // an index.
         let idx = unsafe { core::ptr::read_volatile(self.used_idx) };
         if idx == self.last_used_seen {
             return None;
         }
+        // SAFETY: the element index is `last_used_seen % qsize`, reduced by
+        // this driver's own `qsize` (nonzero power of two <= 256 by `new`'s
+        // contract) and a driver-private counter, so nothing the device
+        // wrote influences the address: byte offset `4 + 8 * (qsize - 1) <=
+        // 2044` of the used page, inside it, and 4-aligned (`used_base + 4`
+        // with an 8-aligned region; `UsedElem` is two `u32`s). The element
+        // contents are device-written and untrusted, but any bit pattern is
+        // a valid `UsedElem`; the caller must range-check `id`/`len`
+        // (`validate_rx_completion`) before using them.
         let elem = unsafe {
             core::ptr::read_volatile(
                 self.used_ring

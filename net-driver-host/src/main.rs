@@ -476,7 +476,11 @@ pub extern "C" fn _start() -> ! {
         // offset here is safe; a future test enabling both at once would
         // need to thread the later of the two phases' own consumed
         // iteration count through instead.
-        run_dns_lookup(&mut iface, &mut device, next_iteration + final_iteration + 1);
+        run_dns_lookup(
+            &mut iface,
+            &mut device,
+            next_iteration + final_iteration + 1,
+        );
     }
 
     if info.serve_sockets != 0 {
@@ -790,7 +794,10 @@ fn run_dns_lookup(iface: &mut Interface, device: &mut RunixNetDevice, start_iter
         if resolved {
             let octets = resolved_ip.octets();
             for (i, octet) in octets.iter().enumerate() {
-                core::ptr::write_volatile((NET_INFO_VA + NET_DNS_ADDR_OFFSET + i) as *mut u8, *octet);
+                core::ptr::write_volatile(
+                    (NET_INFO_VA + NET_DNS_ADDR_OFFSET + i) as *mut u8,
+                    *octet,
+                );
             }
         }
     }

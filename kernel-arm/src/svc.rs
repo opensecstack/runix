@@ -179,12 +179,13 @@
 //!   `data.reset_usage`, not any of them). They ARE audited,
 //!   but not exhaustively: every policy decision, every request the engine
 //!   makes (worded as a REQUEST, not an action) and every reconciler incident
-//!   goes to the same WORM chain. Capability denials, a malformed
-//!   `SESSION_CLOSE` argument, a close of a session that is not open, and a
-//!   reconcile pass with zero incidents are serial-only (as is a reset
-//!   capability denial). See `data.rs` for the
-//!   fuller argument and the lock order (registry -> sim -> data; data is a
-//!   leaf).
+//!   goes to the same WORM chain. Capability denials are audited too (class
+//!   `cap-denial.data`, quota-limited, ADR 0009). Still serial-only: a
+//!   malformed `SESSION_CLOSE` argument, an unknown reset mode and the
+//!   no-period poll. A persistent reconciler incident is recorded once, not on
+//!   every pass, and a run of clean passes is one entry plus a counter. See
+//!   `data.rs` for the fuller argument and the lock order (registry -> sim ->
+//!   data; data is a leaf).
 //!
 //!   `SYS_DATA_RECONCILE` is structurally read-only: it builds a snapshot
 //!   from copies of live state, hands it to the pure `reconcile`, prints and
@@ -254,7 +255,10 @@
 //! MVNO ones), because a hostile EL0 could otherwise exhaust resources by
 //! looping on governed syscalls and bypass MARSHAL. A local-failure denial is
 //! WORM-audited via [`enforce_gate`] (it is a security-relevant denial but not
-//! a remote governance decision); `Refuse`/`HardStop` denials are unchanged.
+//! a remote governance decision); `Refuse`/`HardStop` denials are audited too,
+//! in their own class (ADR 0009). Capability denials, the MVNO enable gate's
+//! refusal and every other refusal are audited in quota-limited classes, so the
+//! chain is bounded (`audit_chain.rs`).
 //!
 //! Independently of the gate, every real lifecycle transition
 //! (`INSTALL`/`ENABLE`/`DISABLE`/`DELETE`) appends an entry to a
@@ -263,9 +267,12 @@
 
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 use spin::Mutex;
 
-use runix_citadel_integration::WormLog;
+use runix_kernel_arm::audit_chain::{
+    AuditClass, AuditOutcome, BoundedAudit, CleanPass, ReconcileMemory, TOTAL_CAPACITY,
+};
 
 use crate::esim_marshal::{self, MarshalEnforcementError};
 use crate::serial::write_byte;
@@ -441,7 +448,11 @@ const SIM_CREATE_FAILED: u64 = 256;
 /// `check()`'s call site instead of hardcoding this.
 const MARSHAL_PRINCIPAL: &str = "el0:arm-demo";
 
-/// The audit chain every real eSIM lifecycle transition appends to.
+/// The audit chain every audited decision appends to: a `citadel_integration`
+/// `WormLog` wrapped in [`BoundedAudit`], which gives each event class a fixed
+/// quota and coalesces overflow into counted summary entries, so no caller can
+/// grow it without limit (ADR 0009). Nothing is appended except through
+/// [`audit_event`].
 ///
 /// `Option`-wrapped and lazily initialized rather than constructed inline,
 /// because `WormLog::new()` is not a `const fn` (it is `Default`-derived
@@ -449,9 +460,14 @@ const MARSHAL_PRINCIPAL: &str = "el0:arm-demo";
 /// out the shape `capabilities.rs`'s `CURRENT_CAPABILITIES` uses
 /// (`Mutex::new(Vec::new())`, where the inner constructor *is* `const`),
 /// so this takes the next-simplest thing that needs no extra dependency:
-/// `None` until [`audit_transition`]'s first call. The `Mutex` is the same
+/// `None` until [`audit_event`]'s first call. The `Mutex` is the same
 /// `spin::Mutex` used everywhere else in this crate.
-static ESIM_WORM_LOG: Mutex<Option<WormLog>> = Mutex::new(None);
+static ESIM_WORM_LOG: Mutex<Option<BoundedAudit>> = Mutex::new(None);
+
+/// The reconciler's memory of its previous pass (dedupe of persistent
+/// incidents, coalescing of clean passes); see `audit_chain::ReconcileMemory`.
+/// A separate lock from [`ESIM_WORM_LOG`], never held across an audit call.
+static RECONCILE_MEMORY: Mutex<ReconcileMemory> = Mutex::new(ReconcileMemory::new());
 
 /// Appends one eSIM lifecycle transition to [`ESIM_WORM_LOG`].
 ///
@@ -488,12 +504,24 @@ fn audit_transition(
         None => reason,
     };
     audit_event(
+        applied_or_rejected(authorized),
         &subject,
         &format!("{from:?}"),
         &format!("{to:?}"),
         authorized,
         reason,
     );
+}
+
+/// The class of a transition outcome: a change that happened is `Applied`
+/// (reserved room), one the state machine or registry refused is `Rejected`
+/// (quota-limited, because a capability holder can repeat a refused call).
+fn applied_or_rejected(authorized: bool) -> AuditClass {
+    if authorized {
+        AuditClass::Applied
+    } else {
+        AuditClass::Rejected
+    }
 }
 
 /// The subject-and-strings form of [`audit_transition`], for transitions that
@@ -505,20 +533,85 @@ fn audit_transition(
 /// only" philosophy as [`audit_transition`] -- `mvno.rs`'s data model never
 /// logs. A refused change is recorded `authorized: false` with the
 /// registry's error as the reason.
-fn audit_event(subject: &str, from: &str, to: &str, authorized: bool, reason: Option<String>) {
-    let mut guard = ESIM_WORM_LOG.lock();
-    guard
-        .get_or_insert_with(WormLog::new)
-        .record_lifecycle_transition(subject, from, to, authorized, reason);
+///
+/// `class` picks the quota the entry draws on (ADR 0009). When that class is
+/// out of quota the event is **coalesced** -- counted, its reason remembered,
+/// and a summary entry committed on the 1 / 4 / 16 ... boundary -- and the
+/// returned [`AuditOutcome::Coalesced`] says so; a serial line is printed here
+/// for every coalesced event, so an event that did not become its own entry is
+/// never invisible. Callers that print their own "audited to WORM" line must
+/// do so only for [`AuditOutcome::Recorded`].
+fn audit_event(
+    class: AuditClass,
+    subject: &str,
+    from: &str,
+    to: &str,
+    authorized: bool,
+    reason: Option<String>,
+) -> AuditOutcome {
+    let outcome = {
+        let mut guard = ESIM_WORM_LOG.lock();
+        guard
+            .get_or_insert_with(BoundedAudit::new)
+            .record(class, subject, from, to, authorized, reason)
+    };
+    announce_coalesced(&outcome);
+    outcome
+}
+
+/// Counts an event of `class` that is deliberately not given its own entry
+/// (a repeated clean reconcile pass), with the same summary behaviour as an
+/// overflow, and announces it.
+fn audit_coalesce(class: AuditClass, reason: &str) -> AuditOutcome {
+    let outcome = {
+        let mut guard = ESIM_WORM_LOG.lock();
+        guard
+            .get_or_insert_with(BoundedAudit::new)
+            .note_coalesced(class, reason)
+    };
+    announce_coalesced(&outcome);
+    outcome
+}
+
+/// The serial line for a coalesced event. Prints nothing for `Recorded`.
+fn announce_coalesced(outcome: &AuditOutcome) {
+    if let AuditOutcome::Coalesced {
+        class,
+        dropped,
+        summary_committed,
+        last_reason,
+    } = outcome
+    {
+        if *summary_committed {
+            let (entries, chain_ok) = audit_chain_summary();
+            serial_println!(
+                "SVC: WORM class {} coalesced: {} event(s) counted, summary entry committed (entries {}/{}, chain verified {}); last: {}",
+                class.name(),
+                dropped,
+                entries,
+                TOTAL_CAPACITY,
+                chain_ok,
+                last_reason
+            );
+        } else {
+            serial_println!(
+                "SVC: WORM class {} coalesced: {} event(s) counted, no new entry (last: {})",
+                class.name(),
+                dropped,
+                last_reason
+            );
+        }
+    }
 }
 
 /// `(entry count, chain verifies)` for [`ESIM_WORM_LOG`] -- printed after the
 /// suspend handshake so the audit trail is visible in the serial log, not
-/// just asserted.
+/// just asserted. "Verifies" is `BoundedAudit::verify`: the hash chain AND the
+/// bound's own accounting.
 fn audit_chain_summary() -> (usize, bool) {
     let guard = ESIM_WORM_LOG.lock();
     match guard.as_ref() {
-        Some(log) => (log.entries().len(), log.verify_chain()),
+        Some(log) => (log.len(), log.verify()),
         None => (0, true),
     }
 }
@@ -528,12 +621,22 @@ fn audit_chain_summary() -> (usize, bool) {
 /// so the serial log shows what the audit trail really holds.
 fn audit_last_entry() -> Option<(bool, Option<String>)> {
     let guard = ESIM_WORM_LOG.lock();
-    let entry = guard.as_ref()?.entries().last()?;
-    Some((entry.authorized, entry.reason.clone()))
+    guard.as_ref()?.last_entry()
 }
 
-/// Prints the last WORM entry's flag and reason for a `SYS_DATA_RESET` line.
-fn print_reset_readback(label: &str, account: u64) {
+/// Prints the last WORM entry's flag and reason for a `SYS_DATA_RESET` line --
+/// only if `outcome` says this event's own entry is the newest one; a coalesced
+/// event has no entry of its own to read back.
+fn print_reset_readback(label: &str, account: u64, outcome: &AuditOutcome) {
+    if let AuditOutcome::Coalesced { class, .. } = outcome {
+        serial_println!(
+            "SVC: {} account {} WORM entry: <coalesced: class {} is saturated>",
+            label,
+            account,
+            class.name()
+        );
+        return;
+    }
     match audit_last_entry() {
         Some((authorized, reason)) => serial_println!(
             "SVC: {} account {} WORM entry: authorized={} reason={}",
@@ -547,6 +650,79 @@ fn print_reset_readback(label: &str, account: u64) {
             label,
             account
         ),
+    }
+}
+
+/// Prints the "audited to WORM" confirmation line for a refusal or denial the
+/// caller just recorded with [`audit_event`]. Only a [`AuditOutcome::Recorded`]
+/// event gets it (a coalesced one was already announced by [`audit_event`]).
+fn report_audit(label: &str, authorized: bool, outcome: &AuditOutcome) {
+    if let AuditOutcome::Recorded { class } = outcome {
+        let (entries, chain_ok) = audit_chain_summary();
+        serial_println!(
+            "SVC: {} audited to WORM (authorized={}, class {}; entries {}, chain verified {})",
+            label,
+            authorized,
+            class.name(),
+            entries,
+            chain_ok
+        );
+    }
+}
+
+/// Audits a capability denial (`authorized=false`) at a syscall boundary.
+///
+/// The DENIED serial line is the caller's and is unchanged; this appends the
+/// WORM entry (subject = the resource that was checked) in the quota-limited
+/// `class` -- a caller with no capability can issue this denial as often as it
+/// likes, so it must never be able to grow the chain (ADR 0009) -- and prints
+/// the confirmation line `SVC: {label} capability denial audited to WORM (...)`.
+/// `label` names the syscall and its arguments, e.g. `SYS_SIM_CREATE slot 99`.
+fn audit_capability_denial<E: core::fmt::Display>(
+    class: AuditClass,
+    label: &str,
+    resource: &str,
+    denial: &E,
+) {
+    let outcome = audit_event(
+        class,
+        resource,
+        "capability check",
+        "denied",
+        false,
+        Some(format!("{label}: capability denied: {denial}")),
+    );
+    report_audit(&format!("{label} capability denial"), false, &outcome);
+}
+
+/// Prints how much of the bound is in use and which classes have coalesced,
+/// so the serial log shows a saturated class instead of hiding it.
+fn print_bound_status() {
+    let guard = ESIM_WORM_LOG.lock();
+    let Some(log) = guard.as_ref() else {
+        return;
+    };
+    let (entries, chain_ok) = (log.len(), log.verify());
+    serial_println!(
+        "SVC: WORM chain bound: entries {}/{}, coalesced events {}, chain verified {}",
+        entries,
+        TOTAL_CAPACITY,
+        log.total_dropped(),
+        chain_ok
+    );
+    for class in AuditClass::ALL {
+        let s = log.stats(class);
+        if s.dropped > 0 {
+            serial_println!(
+                "SVC: WORM chain bound: class {} recorded {}/{}, coalesced {}, summaries {}, last: {}",
+                class.name(),
+                s.recorded,
+                s.quota,
+                s.dropped,
+                s.summaries,
+                s.last_reason
+            );
+        }
     }
 }
 
@@ -568,6 +744,7 @@ fn release_binding_after_delete(slot: usize, profile_id: u8) {
         Ok(None) => {}
         Ok(Some(owner)) => {
             audit_event(
+                AuditClass::Applied,
                 &subject,
                 &format!("Bound(account {})", owner.0),
                 "Unbound",
@@ -582,7 +759,14 @@ fn release_binding_after_delete(slot: usize, profile_id: u8) {
             );
         }
         Err(e) => {
-            audit_event(&subject, "Bound", "Unbound", false, Some(format!("{e:?}")));
+            audit_event(
+                AuditClass::Rejected,
+                &subject,
+                "Bound",
+                "Unbound",
+                false,
+                Some(format!("{e:?}")),
+            );
             serial_println!(
                 "\nSVC: SYS_SIM_DELETE slot {} profile {} unbind FAILED ({:?})",
                 slot,
@@ -736,6 +920,12 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                 },
                 Err(e) => {
                     serial_println!("\nSVC: SYS_SIM_CREATE slot {} DENIED ({})", slot, e);
+                    audit_capability_denial(
+                        AuditClass::CapDenialEsim,
+                        &format!("SYS_SIM_CREATE slot {slot}"),
+                        &crate::capabilities::sim_resource(slot),
+                        &e,
+                    );
                     SIM_CREATE_FAILED
                 }
             }
@@ -783,6 +973,12 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                         profile_id,
                         e
                     );
+                    audit_capability_denial(
+                        AuditClass::CapDenialEsim,
+                        &format!("SYS_SIM_INSTALL slot {slot} profile {profile_id}"),
+                        &crate::capabilities::sim_profile_resource(slot, profile_id),
+                        &e,
+                    );
                     1
                 }
             }
@@ -805,6 +1001,24 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                             slot,
                             profile_id,
                             e
+                        );
+                        // Audited like every other refusal after the
+                        // capability check (quota-limited class `rejected`:
+                        // a holder can repeat a refused enable).
+                        let outcome = audit_event(
+                            AuditClass::Rejected,
+                            &crate::capabilities::sim_profile_resource(slot, profile_id),
+                            &format!("{:?}", ProfileState::Disabled),
+                            &format!("{:?}", ProfileState::Enabled),
+                            false,
+                            Some(format!("refused by the MVNO enable gate: {e:?}")),
+                        );
+                        report_audit(
+                            &format!(
+                                "SYS_SIM_ENABLE slot {slot} profile {profile_id} MVNO gate refusal"
+                            ),
+                            false,
+                            &outcome,
                         );
                         return 1;
                     }
@@ -877,6 +1091,12 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                         profile_id,
                         e
                     );
+                    audit_capability_denial(
+                        AuditClass::CapDenialEsim,
+                        &format!("SYS_SIM_ENABLE slot {slot} profile {profile_id}"),
+                        &crate::capabilities::sim_profile_resource(slot, profile_id),
+                        &e,
+                    );
                     1
                 }
             }
@@ -926,6 +1146,12 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                         slot,
                         profile_id,
                         e
+                    );
+                    audit_capability_denial(
+                        AuditClass::CapDenialEsim,
+                        &format!("SYS_SIM_DISABLE slot {slot} profile {profile_id}"),
+                        &crate::capabilities::sim_profile_resource(slot, profile_id),
+                        &e,
                     );
                     1
                 }
@@ -1005,6 +1231,12 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                         profile_id,
                         e
                     );
+                    audit_capability_denial(
+                        AuditClass::CapDenialEsim,
+                        &format!("SYS_SIM_DELETE slot {slot} profile {profile_id}"),
+                        &crate::capabilities::sim_delete_resource(slot, profile_id),
+                        &e,
+                    );
                     1
                 }
             }
@@ -1041,6 +1273,12 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                         slot,
                         profile_id,
                         e
+                    );
+                    audit_capability_denial(
+                        AuditClass::CapDenialEsim,
+                        &format!("SYS_SIM_STATUS slot {slot} profile {profile_id}"),
+                        &crate::capabilities::sim_profile_resource(slot, profile_id),
+                        &e,
                     );
                     SIM_STATUS_DENIED
                 }
@@ -1153,6 +1391,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                     let result = crate::mvno::bind(account, slot, profile_id);
                     let (authorized, reason) = audit_outcome(&result);
                     audit_event(
+                        applied_or_rejected(authorized),
                         &crate::capabilities::sim_profile_resource(slot, profile_id),
                         "Unbound",
                         &format!("Bound(account {account})"),
@@ -1190,6 +1429,14 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                         profile_id,
                         e
                     );
+                    audit_capability_denial(
+                        AuditClass::CapDenialMvno,
+                        &format!(
+                            "SYS_MVNO_BIND account {account} slot {slot} profile {profile_id}"
+                        ),
+                        &account_res,
+                        &e,
+                    );
                     1
                 }
             }
@@ -1222,6 +1469,12 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                 }
                 Err(e) => {
                     serial_println!("\nSVC: SYS_MVNO_SUSPEND account {} DENIED ({})", account, e);
+                    audit_capability_denial(
+                        AuditClass::CapDenialMvno,
+                        &format!("SYS_MVNO_SUSPEND account {account}"),
+                        &crate::capabilities::mvno_suspend_resource(account),
+                        &e,
+                    );
                     1
                 }
             }
@@ -1251,6 +1504,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                     let result = crate::mvno::reactivate(account);
                     let (authorized, reason) = audit_outcome(&result);
                     audit_event(
+                        applied_or_rejected(authorized),
                         &crate::capabilities::mvno_account_resource(account),
                         "Suspended",
                         "Active",
@@ -1281,6 +1535,12 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                         "\nSVC: SYS_MVNO_REACTIVATE account {} DENIED ({})",
                         account,
                         e
+                    );
+                    audit_capability_denial(
+                        AuditClass::CapDenialMvno,
+                        &format!("SYS_MVNO_REACTIVATE account {account}"),
+                        &crate::capabilities::mvno_account_resource(account),
+                        &e,
                     );
                     1
                 }
@@ -1326,6 +1586,7 @@ fn suspend_account(account: u64, verdict: &str) -> u64 {
     let result = crate::mvno::suspend(account);
     let (authorized, reason) = audit_outcome(&result);
     audit_event(
+        applied_or_rejected(authorized),
         &account_subject,
         "Active",
         "Suspended",
@@ -1359,6 +1620,7 @@ fn suspend_account(account: u64, verdict: &str) -> u64 {
             Err(e) => (false, Some(format!("{e}"))),
         };
         audit_event(
+            applied_or_rejected(authorized),
             &crate::capabilities::sim_profile_resource(k.slot, k.profile),
             "Enabled",
             "Disabled (forced by MVNO suspend)",
@@ -1418,6 +1680,11 @@ fn suspend_account(account: u64, verdict: &str) -> u64 {
 /// happened, and `reason` carries the replayable description.
 fn audit_data_session(account: u64, authorized: bool, to: &str, reason: String) {
     audit_event(
+        if authorized {
+            AuditClass::DataActivity
+        } else {
+            AuditClass::Rejected
+        },
         &crate::capabilities::data_session_resource(account),
         "Closed",
         to,
@@ -1441,10 +1708,17 @@ fn data_account(account: u64, bytes: u64) -> u64 {
     let resource = crate::capabilities::data_usage_resource(account);
     if let Err(e) = check(&resource) {
         serial_println!("\nSVC: SYS_DATA_ACCOUNT account {} DENIED ({})", account, e);
+        audit_capability_denial(
+            AuditClass::CapDenialData,
+            &format!("SYS_DATA_ACCOUNT account {account}"),
+            &resource,
+            &e,
+        );
         return USAGE_DENIED;
     }
     let Some(entitlement) = demo_entitlement(account) else {
         audit_event(
+            AuditClass::Rejected,
             &resource,
             "Metered",
             "Metered",
@@ -1461,6 +1735,7 @@ fn data_account(account: u64, bytes: u64) -> u64 {
     };
     if crate::mvno::standing(account).is_none() {
         audit_event(
+            AuditClass::Rejected,
             &resource,
             "Metered",
             "Metered",
@@ -1477,6 +1752,7 @@ fn data_account(account: u64, bytes: u64) -> u64 {
         Ok(v) => v,
         Err(_) => {
             audit_event(
+                AuditClass::Rejected,
                 &resource,
                 "Metered",
                 "Metered",
@@ -1494,6 +1770,7 @@ fn data_account(account: u64, bytes: u64) -> u64 {
     let assessment = runix_mobile::policy::evaluate_usage(&entitlement, &after);
     let described = describe_usage_assessment(&entitlement, &after, &assessment);
     audit_event(
+        AuditClass::DataActivity,
         &resource,
         &format!("used {}", before.used_bytes),
         &format!("used {}", after.used_bytes),
@@ -1508,6 +1785,7 @@ fn data_account(account: u64, bytes: u64) -> u64 {
         // the caller makes it, is its own MARSHAL-gated `Active -> Suspended`
         // entry on `mvno:account:{id}`).
         audit_event(
+            AuditClass::DataActivity,
             &resource,
             &format!("band {:?}", assessment.band),
             &format!("REQUEST {request:?} (advisory; nothing was performed by this syscall)"),
@@ -1555,6 +1833,12 @@ fn data_session_open(account: u64, slot: usize, packed: u64) -> u64 {
             account,
             slot,
             e
+        );
+        audit_capability_denial(
+            AuditClass::CapDenialData,
+            &format!("SYS_DATA_SESSION_OPEN account {account} slot {slot}"),
+            &resource,
+            &e,
         );
         return SESSION_REFUSED_CAPABILITY;
     }
@@ -1734,6 +2018,12 @@ fn data_session_close(account: u64, slot: usize, arg: u64) -> u64 {
             slot,
             e
         );
+        audit_capability_denial(
+            AuditClass::CapDenialData,
+            &format!("SYS_DATA_SESSION_CLOSE account {account} slot {slot}"),
+            &crate::capabilities::data_session_resource(account),
+            &e,
+        );
         return CLOSE_DENIED;
     }
     // Plain profile id: the roaming bit has no meaning for a close, and a
@@ -1749,6 +2039,7 @@ fn data_session_close(account: u64, slot: usize, arg: u64) -> u64 {
     };
     if crate::data::close_session(account, slot, profile) {
         audit_event(
+            AuditClass::DataActivity,
             &crate::capabilities::data_session_resource(account),
             "Open",
             "Closed (by caller via SYS_DATA_SESSION_CLOSE)",
@@ -1764,6 +2055,7 @@ fn data_session_close(account: u64, slot: usize, arg: u64) -> u64 {
         CLOSE_OK
     } else {
         audit_event(
+            AuditClass::Rejected,
             &crate::capabilities::data_session_resource(account),
             "Closed",
             "Closed",
@@ -1807,6 +2099,12 @@ fn data_reconcile() -> u64 {
     let resource = crate::capabilities::data_reconcile_resource();
     if let Err(e) = check(&resource) {
         serial_println!("\nSVC: SYS_DATA_RECONCILE DENIED ({})", e);
+        audit_capability_denial(
+            AuditClass::CapDenialData,
+            "SYS_DATA_RECONCILE",
+            &resource,
+            &e,
+        );
         return RECONCILE_DENIED;
     }
     let (observed, usage_rows) = crate::data::snapshot_for_reconcile();
@@ -1831,39 +2129,125 @@ fn data_reconcile() -> u64 {
         observed.profiles.len(),
         observed.sessions.len()
     );
+    // One key per finding, regular incidents first and then period incidents
+    // (the order they are printed in). A key names WHAT was found and omits
+    // what merely changes between calls: a period incident's `observed` is the
+    // current tick, which differs on every call, so it is left out.
+    let mut keys: Vec<String> = Vec::with_capacity(incidents.len() + period_incidents.len());
     for incident in &incidents {
-        audit_event(
-            &format!("{}:{}", resource, incident.subject),
-            &format!("expected {}", incident.expected),
-            &format!("observed {}", incident.observed),
-            false,
-            Some(format!(
-                "RECONCILER EVIDENCE (observed drift, not a denial; nothing was corrected): {}",
-                incident.kind
-            )),
-        );
-        serial_println!(
-            "SVC: SYS_DATA_RECONCILE incident {} (WORM-recorded as evidence; nothing corrected)",
-            incident
-        );
+        keys.push(format!(
+            "{}|{}|{}|{}",
+            incident.kind, incident.subject, incident.expected, incident.observed
+        ));
     }
     for incident in &period_incidents {
+        keys.push(format!(
+            "period|{:?}|{}|{}",
+            incident.kind, incident.account, incident.expected
+        ));
+    }
+    // Dedupe (ADR 0009): a finding is WORM-recorded the first time a pass
+    // reports it and again only if a later pass reports it after it had
+    // stopped being reported; a finding that persists across passes is
+    // reported on the serial log every time but costs no further entry. The
+    // memory lock is released before anything is audited.
+    let plan = RECONCILE_MEMORY.lock().observe(&keys);
+    for (i, incident) in incidents.iter().enumerate() {
+        if plan.fresh[i] {
+            let outcome = audit_event(
+                AuditClass::Incident,
+                &format!("{}:{}", resource, incident.subject),
+                &format!("expected {}", incident.expected),
+                &format!("observed {}", incident.observed),
+                false,
+                Some(format!(
+                    "RECONCILER EVIDENCE (observed drift, not a denial; nothing was corrected): {}",
+                    incident.kind
+                )),
+            );
+            match outcome {
+                AuditOutcome::Recorded { .. } => serial_println!(
+                    "SVC: SYS_DATA_RECONCILE incident {} (WORM-recorded as evidence; nothing corrected)",
+                    incident
+                ),
+                AuditOutcome::Coalesced { .. } => serial_println!(
+                    "SVC: SYS_DATA_RECONCILE incident {} (class incident is saturated: counted, not individually WORM-recorded; nothing corrected)",
+                    incident
+                ),
+            }
+        } else {
+            serial_println!(
+                "SVC: SYS_DATA_RECONCILE incident {} (unchanged since the previous pass: already WORM-recorded, not repeated; nothing corrected)",
+                incident
+            );
+        }
+    }
+    for (j, incident) in period_incidents.iter().enumerate() {
         // Evidence, exactly like the incidents above: authorized=false because
         // the observed state (an elapsed period nobody reset, or a rewound
         // clock) is not the expected one; `expected`/`observed` are ticks.
-        audit_event(
-            &format!("{}:period:{}", resource, incident.account),
-            &format!("expected {}", incident.expected),
-            &format!("observed {}", incident.observed),
-            false,
-            Some(format!(
-                "RECONCILER EVIDENCE (observed drift, not a denial; nothing was corrected): billing period: {incident}"
-            )),
-        );
-        serial_println!(
-            "SVC: SYS_DATA_RECONCILE period incident {} (WORM-recorded as evidence; nothing corrected)",
-            incident
-        );
+        if plan.fresh[incidents.len() + j] {
+            let outcome = audit_event(
+                AuditClass::Incident,
+                &format!("{}:period:{}", resource, incident.account),
+                &format!("expected {}", incident.expected),
+                &format!("observed {}", incident.observed),
+                false,
+                Some(format!(
+                    "RECONCILER EVIDENCE (observed drift, not a denial; nothing was corrected): billing period: {incident}"
+                )),
+            );
+            match outcome {
+                AuditOutcome::Recorded { .. } => serial_println!(
+                    "SVC: SYS_DATA_RECONCILE period incident {} (WORM-recorded as evidence; nothing corrected)",
+                    incident
+                ),
+                AuditOutcome::Coalesced { .. } => serial_println!(
+                    "SVC: SYS_DATA_RECONCILE period incident {} (class incident is saturated: counted, not individually WORM-recorded; nothing corrected)",
+                    incident
+                ),
+            }
+        } else {
+            serial_println!(
+                "SVC: SYS_DATA_RECONCILE period incident {} (unchanged since the previous pass: already WORM-recorded, not repeated; nothing corrected)",
+                incident
+            );
+        }
+    }
+    // A clean pass is recorded once per state change (the first clean pass
+    // after a pass that reported something, or the first pass at all); every
+    // consecutive clean pass after it is counted, not appended, so a caller
+    // polling a clean system cannot grow the chain (ADR 0009).
+    match plan.clean {
+        Some(CleanPass::Record { clean_passes }) => {
+            let outcome = audit_event(
+                AuditClass::CleanPass,
+                &resource,
+                "reconcile pass: findings or none yet",
+                "reconcile pass: clean",
+                true,
+                Some(format!(
+                    "RECONCILER EVIDENCE: pass ran and found no incident (clean pass #{clean_passes}); consecutive clean passes are counted, not appended"
+                )),
+            );
+            if let AuditOutcome::Recorded { .. } = outcome {
+                serial_println!(
+                    "SVC: SYS_DATA_RECONCILE clean pass #{} WORM-recorded (state change: the previous pass was not clean)",
+                    clean_passes
+                );
+            }
+        }
+        Some(CleanPass::Coalesce { clean_passes }) => {
+            audit_coalesce(
+                AuditClass::CleanPass,
+                &format!("reconcile clean pass #{clean_passes}, unchanged since the last recorded clean pass"),
+            );
+            serial_println!(
+                "SVC: SYS_DATA_RECONCILE clean pass #{} coalesced (counted; not a new WORM entry)",
+                clean_passes
+            );
+        }
+        None => {}
     }
     // After the snapshot was built and the incidents recorded.
     crate::data::mark_observed(&usage_rows);
@@ -1875,6 +2259,7 @@ fn data_reconcile() -> u64 {
         entries,
         chain_ok
     );
+    print_bound_status();
     total as u64
 }
 
@@ -1905,9 +2290,9 @@ fn data_reconcile() -> u64 {
 /// WORM wording: only the FIRST request for a period is audited (the
 /// transition into "requested"; `PeriodAdvice::first_request`). Later polls
 /// return the same code and print the serial line but add no entry, so a caller
-/// cannot grow the audit chain without bound by polling. Capability denials
-/// and the no-period refusal are serial-only, like every other data syscall's
-/// non-decision refusals.
+/// cannot grow the audit chain without bound by polling. A capability denial is
+/// audited in its quota-limited class (ADR 0009); the no-period refusal stays
+/// serial-only.
 fn data_period(account: u64) -> u64 {
     use runix_kernel_arm::data_codes::{
         describe_period_assessment, period_assessment_code, PERIOD_DENIED, PERIOD_NO_PERIOD,
@@ -1915,6 +2300,12 @@ fn data_period(account: u64) -> u64 {
     let resource = crate::capabilities::data_session_resource(account);
     if let Err(e) = check(&resource) {
         serial_println!("\nSVC: SYS_DATA_PERIOD account {} DENIED ({})", account, e);
+        audit_capability_denial(
+            AuditClass::CapDenialData,
+            &format!("SYS_DATA_PERIOD account {account}"),
+            &resource,
+            &e,
+        );
         return PERIOD_DENIED;
     }
     // The explicit `now` for the pure model, read here at call time. Nothing
@@ -1940,6 +2331,7 @@ fn data_period(account: u64) -> u64 {
         // reset happened. The real reset, if a caller makes it, is its own
         // MARSHAL-gated `used N -> used 0` entry on `data:reset:{id}`.
         audit_event(
+            AuditClass::DataActivity,
             &resource,
             "billing period in progress",
             "REQUEST ResetUsage (advisory; nothing was performed by this syscall)",
@@ -2036,10 +2428,17 @@ fn data_reset(account: u64, mode_arg: u64) -> u64 {
     };
     if let Err(e) = check(&resource) {
         serial_println!("\nSVC: {} account {} DENIED ({})", label, account, e);
+        audit_capability_denial(
+            AuditClass::CapDenialData,
+            &format!("{label} account {account}"),
+            &resource,
+            &e,
+        );
         return RESET_DENIED_CAPABILITY;
     }
     if demo_entitlement(account).is_none() {
         audit_event(
+            AuditClass::Rejected,
             &resource,
             "usage period in force",
             "usage period in force",
@@ -2057,6 +2456,7 @@ fn data_reset(account: u64, mode_arg: u64) -> u64 {
     }
     if crate::mvno::standing(account).is_none() {
         audit_event(
+            AuditClass::Rejected,
             &resource,
             "usage period in force",
             "usage period in force",
@@ -2086,7 +2486,8 @@ fn data_reset(account: u64, mode_arg: u64) -> u64 {
         gate_now,
         demo_early_reset_cooldown_ticks(freq),
     ) {
-        audit_event(
+        let outcome = audit_event(
+            AuditClass::Rejected,
             &resource,
             "usage period in force",
             "usage period in force",
@@ -2094,15 +2495,17 @@ fn data_reset(account: u64, mode_arg: u64) -> u64 {
             Some(format!("refused: {refusal}; {mode_text}")),
         );
         serial_println!("\nSVC: {} account {} REFUSED ({})", label, account, refusal);
-        let (entries, chain_ok) = audit_chain_summary();
-        serial_println!(
-            "SVC: {} account {} period refusal audited to WORM (authorized=false; entries {}, chain verified {})",
-            label,
-            account,
-            entries,
-            chain_ok
-        );
-        print_reset_readback(label, account);
+        if let AuditOutcome::Recorded { .. } = outcome {
+            let (entries, chain_ok) = audit_chain_summary();
+            serial_println!(
+                "SVC: {} account {} period refusal audited to WORM (authorized=false; entries {}, chain verified {})",
+                label,
+                account,
+                entries,
+                chain_ok
+            );
+        }
+        print_reset_readback(label, account, &outcome);
         return reset_refusal_code(&refusal);
     }
     // No lock held across this call. A block leaves usage and `last_used` alone.
@@ -2146,7 +2549,8 @@ fn data_reset(account: u64, mode_arg: u64) -> u64 {
             account
         );
     }
-    audit_event(
+    let outcome = audit_event(
+        AuditClass::Applied,
         &resource,
         &format!("used {}", before.used_bytes),
         &format!("used {}", after.used_bytes),
@@ -2177,7 +2581,7 @@ fn data_reset(account: u64, mode_arg: u64) -> u64 {
         account,
         period_text
     );
-    print_reset_readback(label, account);
+    print_reset_readback(label, account, &outcome);
     RESET_OK
 }
 
@@ -2192,8 +2596,9 @@ fn check(resource: &str) -> Result<(), runix_capability_manager::CapabilityError
 /// appended to the WORM chain as `authorized: false` with the reason, against
 /// the intended transition `subject: from -> to`, since each is a
 /// security-relevant denial that is the kernel's own decision, not a remote
-/// governance verdict. `Refuse`/`HardStop` denials are left exactly as they
-/// were (no audit entry).
+/// governance verdict. A reachable MARSHAL's `Refuse`/`HardStop` denial is
+/// audited too (its own class, ADR 0009), so every block this gate makes is in
+/// the chain, subject to the class quotas.
 ///
 /// `Ok` carries the verdict that let the action through, so the success path
 /// can record it ([`verdict_text`]).
@@ -2205,22 +2610,30 @@ fn enforce_gate(
     to: &str,
 ) -> Result<GateOutcome, MarshalEnforcementError> {
     let result = esim_marshal::enforce(policy, outcome).map(|()| outcome);
-    if let Err(
-        blocked @ (MarshalEnforcementError::Local(_)
-        | MarshalEnforcementError::Unreachable
-        | MarshalEnforcementError::Faulty),
-    ) = &result
-    {
-        audit_event(subject, from, to, false, Some(format!("{blocked}")));
-        let (entries, chain_ok) = audit_chain_summary();
-        serial_println!(
-            "SVC: {} denial audited to WORM ({} -> {}, authorized=false; entries {}, chain verified {})",
-            blocked,
-            from,
-            to,
-            entries,
-            chain_ok
-        );
+    if let Err(blocked) = &result {
+        // Every block is audited: a reachable MARSHAL's `Refuse`/`HardStop`
+        // (class `gate-blocked`) as well as the kernel's own fail-closed
+        // decisions (class `gate-fail-closed`). Separate, quota-limited
+        // classes: a caller that can trigger a block repeatedly cannot grow the
+        // chain, and cannot use up the room for the other kind.
+        let class = match blocked {
+            MarshalEnforcementError::Remote(_) => AuditClass::GateBlocked,
+            MarshalEnforcementError::Local(_)
+            | MarshalEnforcementError::Unreachable
+            | MarshalEnforcementError::Faulty => AuditClass::GateFailClosed,
+        };
+        let recorded = audit_event(class, subject, from, to, false, Some(format!("{blocked}")));
+        if let AuditOutcome::Recorded { .. } = recorded {
+            let (entries, chain_ok) = audit_chain_summary();
+            serial_println!(
+                "SVC: {} denial audited to WORM ({} -> {}, authorized=false; entries {}, chain verified {})",
+                blocked,
+                from,
+                to,
+                entries,
+                chain_ok
+            );
+        }
     }
     result
 }

@@ -3,8 +3,8 @@
 **Status**: Accepted for `data.reset_usage` (fail-closed), and, by
 [0008](0008-esim-delete-and-mvno-reactivate-fail-closed-when-marshal-unreachable.md),
 for `esim.delete` and `mvno.reactivate_account` (fail-closed). Open for
-`esim.enable`, `mvno.bind_profile` and `mvno.suspend_account`, which keep their
-existing fail-open behaviour until the maintainers decide otherwise. Accepted
+`esim.enable`, `mvno.bind_profile` and `mvno.suspend_account`, which stay
+fail-open by decision (0008, each with a recorded reason). Accepted
 2026-10-11. Refines
 [0002](0002-usage-reset-is-marshal-gated.md). Refined by
 [0006](0006-a-reachable-but-faulty-marshal-reply-fails-closed.md) and
@@ -57,7 +57,7 @@ uncomfortable once the data reset existed:
    | `esim.delete` | **FailClosed** (decided in [0008](0008-esim-delete-and-mvno-reactivate-fail-closed-when-marshal-unreachable.md)) | Irreversible. |
    | `mvno.reactivate_account` | **FailClosed** (decided in [0008](0008-esim-delete-and-mvno-reactivate-fail-closed-when-marshal-unreachable.md)) | Restores service, same shape as the reset. |
    | `esim.enable` | FailOpen (unchanged) | See "Open" below; confirmed in 0008. |
-   | `mvno.bind_profile` | FailOpen (unchanged) | See "Open" below; still undecided (0008). |
+   | `mvno.bind_profile` | FailOpen (unchanged) | Confirmed in 0008 (2026-10-18): binding is a prerequisite of `esim.enable`. |
    | `mvno.suspend_account` | FailOpen (unchanged) | See "Open" below; confirmed in 0008. |
 
 3. **A fail-closed denial is the kernel's own decision and is audited.** It
@@ -107,7 +107,7 @@ availability trade-off.
 | Action | Case for FailClosed | Case for FailOpen |
 |---|---|---|
 | `esim.delete` | Irreversible. The strongest remaining candidate. **Decided: FailClosed (0008).** | An offline user cannot remove a broken profile. |
-| `mvno.bind_profile` | Claims ownership of a profile for an account. | Provisioning on a device that is offline. |
+| `mvno.bind_profile` | Claims ownership of a profile for an account. **Decided: stays FailOpen (0008).** | Provisioning on a device that is offline; binding must precede enabling. |
 | `mvno.suspend_account` | Cuts a subscriber's service; abuse is a denial-of-service lever. | Suspension is the *restrictive* direction; allowing it when unsure fails safe for the operator. |
 | `mvno.reactivate_account` | Restores service, the same shape as the reset. **Decided: FailClosed (0008).** | An offline operator cannot restore a wrongly suspended account. |
 | `esim.enable` | Switches the active subscription. | **Bootstrap deadlock**: enabling a profile can be what provides the connectivity needed to reach MARSHAL. Keep fail-open unless a bootstrap exception is designed. |

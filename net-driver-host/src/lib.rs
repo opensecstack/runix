@@ -24,6 +24,13 @@
 #[cfg(test)]
 extern crate alloc;
 
+// F1 RX-servicing policy: compiled into the bin via `smoltcp_device`'s own
+// `mod rx_policy;`, and included here under `cfg(test)` only so its tests run
+// on the host (the bin has no test harness).
+#[cfg(test)]
+#[path = "smoltcp_device/rx_policy.rs"]
+mod rx_policy;
+
 pub const VIRTIO_NET_HDR_LEN: usize = 10;
 pub const ETH_HEADER_LEN: usize = 14;
 pub const ARP_PAYLOAD_LEN: usize = 28;

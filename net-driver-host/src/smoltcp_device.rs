@@ -7,10 +7,14 @@
 //! with zero smoltcp awareness, and it stays that way — this module is the
 //! only thing that knows both worlds exist.
 
+use crate::syscall::write_all;
 use crate::virtio::{self, Virtqueue};
 use net_driver_host::validate_rx_completion;
 use smoltcp::phy::{Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
+
+mod rx_policy;
+use rx_policy::{post_rx_buffer, service_rx, RxPosted, RxRing, TxPort};
 
 const RX_QUEUE_INDEX: u16 = 0;
 const TX_QUEUE_INDEX: u16 = 1;
@@ -38,6 +42,15 @@ pub struct RunixNetDevice {
     /// reclaimed. No `Vec`/free-list crate needed for `TX_BUFFER_COUNT`
     /// this small — a linear scan for the first `false` is plenty.
     tx_in_use: [bool; TX_BUFFER_COUNT],
+    /// Count of used-ring entries whose `desc_id` was out of range (device
+    /// lied about buffer ownership). See `rx_policy` rule 3.
+    rx_unidentified: u32,
+    /// Count of used-ring entries for an in-range buffer the device does not
+    /// own (not posted). See `rx_policy` rule 4.
+    rx_not_owned: u32,
+    /// Driver-side ownership: bit per RX buffer, set while it is in the avail
+    /// ring. See `rx_policy` rules 4-6.
+    rx_posted: RxPosted,
 }
 
 impl RunixNetDevice {
@@ -79,6 +92,7 @@ impl RunixNetDevice {
         // ready -- it must never see itself as "ready" with nowhere to
         // write an incoming frame, same requirement Phase 1's `_start`
         // already documents.
+        let mut rx_posted = RxPosted::none();
         for (i, &phys) in rx_buffer_phys.iter().enumerate() {
             // SAFETY: `i < RX_BUFFER_COUNT` (8) satisfies `post`'s `index <
             // 256`; `phys` is the physical address of RX buffer `i`, a
@@ -86,9 +100,9 @@ impl RunixNetDevice {
             // its whole lifetime (this fn's contract), so it outlives the
             // device's use of it. The device is not yet marked ready, so
             // nothing is consuming the ring concurrently.
-            unsafe {
+            post_rx_buffer(&mut rx_posted, i, || unsafe {
                 rx_queue.post(i as u16, phys, RX_BUFFER_SIZE, true);
-            }
+            });
         }
 
         RunixNetDevice {
@@ -100,33 +114,39 @@ impl RunixNetDevice {
             tx_buffer_va,
             tx_buffer_phys,
             tx_in_use: [false; TX_BUFFER_COUNT],
+            rx_unidentified: 0,
+            rx_not_owned: 0,
+            rx_posted,
         }
     }
 
     pub fn notify_rx(&self) {
         virtio::notify(self.net_io_base, RX_QUEUE_INDEX);
     }
+}
 
+/// Borrowed view of the TX queue and slot flags for `rx_policy::service_rx`
+/// (and `transmit`).
+struct TxSlots<'a> {
+    tx_queue: &'a mut Virtqueue,
+    tx_in_use: &'a mut [bool; TX_BUFFER_COUNT],
+}
+
+impl TxPort for TxSlots<'_> {
+    /// Frees any TX slot the device has finished reading -- this must run
+    /// before handing out a "free" slot, or a slot still in flight could be
+    /// overwritten while the device is still reading it -- then returns the
+    /// first free slot. Same "don't trust a device-reported index past what
+    /// we actually posted" stance as for RX: an out-of-range `desc_id` is
+    /// silently ignored, not trusted.
     fn free_tx_slot(&mut self) -> Option<usize> {
-        self.reap_tx_completions();
-        self.tx_in_use.iter().position(|&used| !used)
-    }
-
-    /// Frees any TX slot the device has finished reading — must run before
-    /// handing out a "free" slot, or a slot still in flight could be
-    /// overwritten while the device is still reading it. Not
-    /// `validate_rx_completion` reused here (that function's bounds are
-    /// specifically documented in terms of RX buffer semantics) — this is
-    /// the same "don't trust a device-reported index past what we
-    /// actually posted" stance, just plain-inlined for TX, where an
-    /// out-of-range `desc_id` is silently ignored rather than trusted.
-    fn reap_tx_completions(&mut self) {
         while let Some((desc_id, _len)) = self.tx_queue.poll_used() {
             let index = desc_id as usize;
             if index < TX_BUFFER_COUNT {
                 self.tx_in_use[index] = false;
             }
         }
+        self.tx_in_use.iter().position(|&used| !used)
     }
 }
 
@@ -139,6 +159,7 @@ impl RunixNetDevice {
 // of borrowing it.
 pub struct RunixRxToken<'a> {
     rx_queue: &'a mut Virtqueue,
+    rx_posted: &'a mut RxPosted,
     net_io_base: u16,
     rx_buffer_va: usize,
     rx_buffer_phys: [u64; RX_BUFFER_COUNT],
@@ -156,6 +177,83 @@ pub struct RunixTxToken<'a> {
     tx_buffer_va: usize,
     tx_buffer_phys: [u64; TX_BUFFER_COUNT],
     slot: usize,
+}
+
+/// Borrowed view of the RX queue for `rx_policy::next_rx_frame`.
+struct RxPort<'a> {
+    rx_queue: &'a mut Virtqueue,
+    net_io_base: u16,
+    rx_buffer_phys: &'a [u64; RX_BUFFER_COUNT],
+    posted: &'a mut RxPosted,
+    unidentified: &'a mut u32,
+    not_owned: &'a mut u32,
+}
+
+impl RxRing for RxPort<'_> {
+    fn poll_used(&mut self) -> Option<(u32, u32)> {
+        self.rx_queue.poll_used()
+    }
+
+    fn posted(&self) -> RxPosted {
+        *self.posted
+    }
+
+    fn release(&mut self, index: usize) {
+        self.posted.release(index);
+    }
+
+    fn repost(&mut self, index: usize) {
+        // Defense in depth: `rx_policy` only asks for `index < RX_BUFFER_COUNT`.
+        if index >= RX_BUFFER_COUNT {
+            return;
+        }
+        let (posted, rx_queue, phys) = (
+            &mut *self.posted,
+            &mut *self.rx_queue,
+            self.rx_buffer_phys[index],
+        );
+        // SAFETY: `index < RX_BUFFER_COUNT` (checked
+        // above) satisfies `post`'s `index < 256`; `rx_buffer_phys[index]` is
+        // that RX buffer's physical address, a one-page buffer owned for the
+        // process's lifetime. No slice into the buffer is live: slices are
+        // only created inside `RunixRxToken::consume`, which has returned (a
+        // token needs the `&mut RunixNetDevice` that `receive()` holds, and
+        // none is outstanding), and the frame is being dropped unread. The
+        // avail ring never gets a second entry for this buffer: the driver
+        // tracks ownership itself (`RxPosted`), `post_rx_buffer` writes only
+        // on a not-posted -> posted transition and refuses otherwise, and the
+        // bit was cleared when the device's used entry for it was accepted, so
+        // this no longer rests on the device being honest about which ids it
+        // completes. STILL ASSUMED: the device does not write the buffer's
+        // memory after it has returned it through the used ring (until it is
+        // posted again). This is the unique `&mut` to the queue.
+        let wrote = post_rx_buffer(posted, index, || unsafe {
+            rx_queue.post(index as u16, phys, RX_BUFFER_SIZE, true);
+        });
+        if wrote {
+            virtio::notify(self.net_io_base, RX_QUEUE_INDEX);
+        }
+    }
+
+    fn note_unidentified(&mut self) {
+        if *self.unidentified == 0 {
+            write_all(
+                b"net-driver: device returned out-of-range RX desc id; ignored
+",
+            );
+        }
+        *self.unidentified = self.unidentified.saturating_add(1);
+    }
+
+    fn note_not_owned(&mut self) {
+        if *self.not_owned == 0 {
+            write_all(
+                b"net-driver: device completed an RX buffer it does not own; ignored
+",
+            );
+        }
+        *self.not_owned = self.not_owned.saturating_add(1);
+    }
 }
 
 impl Device for RunixNetDevice {
@@ -182,9 +280,28 @@ impl Device for RunixNetDevice {
         // answered, but never progressing to an actual TCP SYN). Only
         // `TxToken::consume` marks a slot in-use now, at the point it's
         // actually posted to the device.
-        let (desc_id, len) = self.rx_queue.poll_used()?;
-        let (index, len) = validate_rx_completion(desc_id, len, RX_BUFFER_COUNT)?;
-        let tx_slot = self.free_tx_slot()?;
+        //
+        // Order matters (F1): the TX slot is checked BEFORE any used entry is
+        // consumed, and an invalid completion re-posts its buffer -- see
+        // `rx_policy`'s module doc.
+        //
+        // The ordering (TX slot first, RX ring untouched when none) lives in
+        // `rx_policy::service_rx`, which is host-tested with call-order mocks;
+        // nothing is duplicated here.
+        let mut tx_port = TxSlots {
+            tx_queue: &mut self.tx_queue,
+            tx_in_use: &mut self.tx_in_use,
+        };
+        let mut rx_port = RxPort {
+            rx_queue: &mut self.rx_queue,
+            net_io_base: self.net_io_base,
+            rx_buffer_phys: &self.rx_buffer_phys,
+            posted: &mut self.rx_posted,
+            unidentified: &mut self.rx_unidentified,
+            not_owned: &mut self.rx_not_owned,
+        };
+        let service = service_rx(&mut rx_port, &mut tx_port, RX_BUFFER_COUNT)?;
+        let (tx_slot, index, len) = (service.tx_slot, service.index, service.len);
 
         let net_io_base = self.net_io_base;
         let rx_buffer_va = self.rx_buffer_va;
@@ -195,6 +312,7 @@ impl Device for RunixNetDevice {
         Some((
             RunixRxToken {
                 rx_queue: &mut self.rx_queue,
+                rx_posted: &mut self.rx_posted,
                 net_io_base,
                 rx_buffer_va,
                 rx_buffer_phys,
@@ -215,7 +333,11 @@ impl Device for RunixNetDevice {
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         // Same reasoning as `receive()` above: the slot isn't marked
         // in-use until `TxToken::consume` actually posts it.
-        let slot = self.free_tx_slot()?;
+        let slot = TxSlots {
+            tx_queue: &mut self.tx_queue,
+            tx_in_use: &mut self.tx_in_use,
+        }
+        .free_tx_slot()?;
         Some(RunixTxToken {
             tx_queue: &mut self.tx_queue,
             tx_in_use: &mut self.tx_in_use[slot],
@@ -245,8 +367,10 @@ impl smoltcp::phy::RxToken for RunixRxToken<'_> {
         F: FnOnce(&[u8]) -> R,
     {
         // SAFETY: `index < RX_BUFFER_COUNT` and `VIRTIO_NET_HDR_LEN <= len <=
-        // RX_BUFFER_SIZE` (4096) were enforced by `validate_rx_completion` in
-        // `receive()`, so the range `rx_buffer_va + index * 4096 + 10 ..` of
+        // RX_BUFFER_SIZE` (4096) were enforced by `validate_rx_completion`,
+        // which `rx_policy::classify_rx_completion` calls (reached via
+        // `next_rx_frame`, from `service_rx`, from `receive()`); only a
+        // `Deliver` verdict builds this token, so the range `rx_buffer_va + index * 4096 + 10 ..` of
         // length `len - 10` lies inside RX buffer `index`'s page
         // (`RunixNetDevice::new`'s contract). As defense in depth the length
         // uses `saturating_sub`, so even a bypassed validator yields an
@@ -268,22 +392,30 @@ impl smoltcp::phy::RxToken for RunixRxToken<'_> {
         // Re-post this descriptor as RX before returning -- the buffer's
         // content has already been consumed by `f` above, so it's safe to
         // hand back to the device immediately.
-        //
-        // SAFETY: `self.index < RX_BUFFER_COUNT` (validated in `receive()`)
-        // satisfies `post`'s `index < 256`; `rx_buffer_phys[index]` is that
-        // same RX buffer's physical address, a one-page buffer owned for the
-        // process's lifetime, and nothing borrows its contents any more
-        // (`buf` is out of use). `self.rx_queue` is the unique `&mut` to the
-        // queue held by this token.
-        unsafe {
-            self.rx_queue.post(
-                self.index as u16,
-                self.rx_buffer_phys[self.index],
-                RX_BUFFER_SIZE,
-                true,
-            );
+        let RunixRxToken {
+            rx_queue,
+            rx_posted,
+            rx_buffer_phys,
+            index,
+            net_io_base,
+            ..
+        } = self;
+        // SAFETY: `index < RX_BUFFER_COUNT`
+        // (validated by `classify_rx_completion`, see above) satisfies `post`'s `index < 256`;
+        // `rx_buffer_phys[index]` is that same RX buffer's physical address, a
+        // one-page buffer owned for the process's lifetime, and nothing
+        // borrows its contents any more (`buf` is out of use). `self.rx_queue`
+        // is the unique `&mut` to the queue held by this token. `receive()`
+        // cleared this buffer's posted bit when it accepted the device's used
+        // entry, so `post_rx_buffer` writes exactly one avail entry here (it
+        // refuses, writing nothing, if the buffer were somehow already
+        // posted); a drop of the token without `consume` never re-posts.
+        let wrote = post_rx_buffer(rx_posted, index, || unsafe {
+            rx_queue.post(index as u16, rx_buffer_phys[index], RX_BUFFER_SIZE, true);
+        });
+        if wrote {
+            virtio::notify(net_io_base, RX_QUEUE_INDEX);
         }
-        virtio::notify(self.net_io_base, RX_QUEUE_INDEX);
         result
     }
 }
@@ -298,10 +430,10 @@ impl smoltcp::phy::TxToken for RunixTxToken<'_> {
         // + slot * 4096` .. `+ 4096` is exactly TX buffer `slot`'s own page
         // (`RunixNetDevice::new`'s contract), valid RW for the process's
         // lifetime; `u8` alignment 1. Exclusivity: `free_tx_slot` only
-        // returns a slot after `reap_tx_completions` saw the device return
-        // it (or it was never posted), and this token holds the device's only
-        // `&mut` TX queue borrow, so there is at most one live `TxToken`
-        // and no other slice over this page. ASSUMPTION: the device does not
+        // returns a slot whose `tx_in_use` flag is clear (never posted, or
+        // reaped from a used-ring entry by its `poll_used` loop), and this
+        // token holds the device's only `&mut` TX queue borrow, so there is
+        // at most one live `TxToken` and no other slice over this page. ASSUMPTION: the device does not
         // read a slot it has already returned through the used ring.
         let buf = unsafe {
             core::slice::from_raw_parts_mut((self.tx_buffer_va + self.slot * 4096) as *mut u8, 4096)
