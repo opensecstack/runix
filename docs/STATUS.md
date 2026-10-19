@@ -2194,14 +2194,14 @@ build` succeeds for both crates, and `cargo +nightly fuzz run <target> --
 timeout, or sanitizer report — `verify_fuzz` completed 107,242 runs,
 `smoltcp_fuzz` ran until its time budget was interrupted at over 474,000
 runs; both are legitimate "harness builds and runs clean" results, not
-evidence of exhaustive coverage. No CI wiring yet: `cargo-fuzz` needs
-nightly and, in CI, likely ASan support whose availability on
-`ubuntu-latest` runners hasn't been confirmed, and a fuzz run is exactly
-the kind of open-ended, potentially-flaky job that shouldn't gate every
-merge — so for now this stays a documented local-run workflow (`cd
-capability-manager/fuzz && cargo +nightly fuzz run verify_fuzz`, similarly
-for `net-driver-host/fuzz`'s `smoltcp_fuzz`), revisited if/when a
-`workflow_dispatch`-triggered smoke job is worth the added CI surface.
+evidence of exhaustive coverage. CI wiring: `.github/workflows/fuzz.yml` (added
+2026-10-19; not yet run on GitHub) runs these targets, and the `blk-driver-host` ones
+below, on `workflow_dispatch` and on a weekly schedule only, never on push or pull
+request. A fuzz run is open-ended and can fail on code a PR never touched, so it is not a
+merge gate, and a failing run uploads the crashing input as an artifact. Whether
+`ubuntu-latest` supports the ASan build was not confirmed before the workflow was
+written. Local runs still work: `cd capability-manager/fuzz && cargo +nightly fuzz run
+verify_fuzz`, similarly for `net-driver-host/fuzz`'s `smoltcp_fuzz`.
 
 **`blk-driver-host`'s allocator — the fuzz-coverage half of the same
 "concurrent allocators" gap named above, closed separately.** The
@@ -2225,19 +2225,23 @@ today only because every real caller derives that value from a
 tightening it was out of this task's scope). Both verified in WSL Fedora,
 same constraint as the two fuzz crates above.
 
-**Explicitly still NOT fuzzed**: `blk-driver-host`'s FAT32 *parser itself*
-(`boot_sector_parse`, directory-entry parsing, LFN fragment reassembly,
-short-name checksums) still has only the `proptest` coverage described in
-this document's Filesystem-driver Phase 2 section above — the fuzz targets
-above cover the allocator, not the parser. Also unfuzzed:
-`net-driver-host`'s virtio-net completion validation
-(`validate_rx_completion`, covered by its own `proptest` suite only) and
-anything in `kernel/` itself (no parser there takes fully untrusted input
-today). None of this is a regression — it's the same "proptest first,
-`cargo-fuzz` where the corpus-driven, coverage-guided difference actually
-matters" prioritization this document has used throughout — but it means
-"fuzzing exists in this repo" should not be read as "the FAT32 parser is
-fuzzed."
+**The FAT32 parser in `blk-driver-host`, now.** The fuzz crate has four targets. The
+`fat32_parse_fuzz` target covers directory-entry and LFN-fragment parsing
+(`parse_short_dir_entry`, `parse_lfn_fragment`) and the bounded FAT chain walk
+(`fat_entry_at`, `is_end_of_chain`). `boot_sector_fuzz` (added 2026-10-19, not yet run in
+CI) covers `BootSectorInfo::parse` and its cluster-to-sector arithmetic, the `FsInfoSector`
+parse and encode round trip, `find_reusable_slot` and `encode_short_name`. A local WSL run
+with ASan completed 53,183 executions with no finding. Its seed corpus directories are
+gitignored.
+
+**Explicitly still NOT fuzzed**: LFN reassembly across fragments (`fat32_parse_fuzz`
+parses one fragment at a time, not a whole name), `net-driver-host`'s virtio-net
+completion validation (`validate_rx_completion`, covered by its own `proptest` suite
+only) and anything in `kernel/` itself (no parser there takes fully untrusted input
+today). None of this is a regression. It is the same "proptest first, `cargo-fuzz` where
+the corpus-driven, coverage-guided difference actually matters" prioritization this
+document has used throughout. It does mean "fuzzing exists in this repo" should not be
+read as "every FAT32 path is fuzzed."
 
 ## Mobile L1: ARM/TrustZone boot bring-up (`kernel-arm/`)
 
@@ -2425,8 +2429,10 @@ Simplifications, all deliberate at this stage:
 
 - In-memory only. Accounts, bindings, sim state, data usage and sessions, and
   the WORM chain are lost on reboot.
-- The one account is compiled in (`open_demo_account`, `AccountRegistry::demo`).
-  It is demo data, not a subscriber base.
+- The accounts are compiled in: three demo accounts (ids 0 to 2, opened in
+  `nonsecure.rs` through `mvno.rs`; `AccountRegistry::demo`). They are demo data,
+  not a subscriber base, and nothing can open or close one at runtime
+  (`docs/adrs/0010-*`, BETA_CRITERIA M1).
 - The MARSHAL principal is the placeholder `el0:arm-demo`, not a token subject
   (see the MARSHAL section and the THREAT_MODEL gaps).
 - Selection is proven on a fixed candidate list at boot, against a local
@@ -2766,7 +2772,7 @@ its own copies of the numbers, as the other mobile syscalls do.
 
 | No. | Syscall | Arguments (x1, x2, x3) | Capability | Returns |
 |---|---|---|---|---|
-| 19 | `SYS_DATA_ACCOUNT` | account, bytes | `data:usage:{account}` | `0` none, `1` notify, `2` throttle, `3` suspend requested (advice); `4`–`7` refused |
+| 19 | `SYS_DATA_ACCOUNT` | account, bytes | `data:usage:{account}` | `0` none, `1` notify, `2` throttle, `3` suspend requested (advice); `4`–`9` refused |
 | 20 | `SYS_DATA_SESSION_OPEN` | account, slot, profile \| roaming<<8 | `data:session:{account}` | `0` allow, `1` allow throttled; `2`–`6` engine denial; `7`–`13` refused |
 | 21 | `SYS_DATA_SESSION_CLOSE` | account, slot, profile | `data:session:{account}` | `0` closed, `1` denied, `2` not open, `3` bad argument |
 | 22 | `SYS_DATA_RECONCILE` | none | `data:reconcile` | incident count; `u64::MAX` if denied |
@@ -2775,7 +2781,9 @@ its own copies of the numbers, as the other mobile syscalls do.
 
 The refusal codes are named. For `SYS_DATA_ACCOUNT`: `4` no capability, `5` no
 entitlement for the account, `6` no such account, `7` usage table full (bytes not
-counted). For `SYS_DATA_SESSION_OPEN`: `7` no capability, `8` no entitlement, `9`
+counted), `8` account not Active (Suspended or Closed), `9` Active with no bound profile.
+`8` and `9` are refused before the counter is touched, audited as `Rejected`, and create
+no usage row (ADR 0010). For `SYS_DATA_SESSION_OPEN`: `7` no capability, `8` no entitlement, `9`
 no such account, `10` profile not bound to this account, `11` unknown profile, `12`
 malformed argument, `13` allowed by policy but the session table is full, so
 nothing was recorded. The reset's codes are `RESET_OK`, `RESET_DENIED_CAPABILITY`,
@@ -2802,8 +2810,10 @@ which call it is making.
   ownership check comes before the lifecycle read, so the state of another
   account's profile is not revealed through a different code. The decision and the
   insert happen in one critical section under the `DATA` lock.
-- *Usage feed:* capability; entitlement; account exists; saturating add; engine;
-  WORM entries. The feed does not consult account standing or profile binding.
+- *Usage feed:* capability; entitlement; account exists; standing (Active only, else
+  code `8`); profile binding (a bound profile, else code `9`); saturating add; engine;
+  WORM entries. The standing and binding checks run before the add, so a refused call
+  changes nothing (ADR 0010). The bytes themselves are still caller-asserted.
 - *Close:* capability; plain profile argument; the open row is removed if present.
 - *Reconcile:* capability; snapshot from copies; `reconcile`; WORM entries for each
   new incident (a finding already recorded by the previous pass is not repeated, and a
@@ -2992,7 +3002,10 @@ entry. The exceptions are listed at the end of this subsection.
   allowed open that the full table could not record is `authorized=false`, and its
   reason says so.
 - `data:session:{id}`, close: `Open -> Closed (by caller via SYS_DATA_SESSION_CLOSE)`,
-  `authorized=true`. Closing a session that is not open is `Closed -> Closed`,
+  `authorized=true`. A row that a governed suspend, SIM delete or operator SIM disable
+  closes is `Open -> Closed (kernel cleanup after MVNO suspend | SIM delete | operator SIM
+  disable)`, `authorized=true`, with the reason `slot S profile P`, one entry per row
+  (ADR 0010). Closing a session that is not open is `Closed -> Closed`,
   `authorized=false`.
 - `data:reconcile:<subject>`, incident: `expected <fact> -> observed <fact>`,
   `authorized=false`, with a reason beginning `RECONCILER EVIDENCE (observed drift,
@@ -3044,12 +3057,21 @@ the reset, at steps 12 to 16. In order:
 7. `RECONCILE`: two incidents, `usage-over-cap-not-restricted` (expected
    `Suspended`, observed `1600/1000`) and `anomalous-usage-no-escalation` (expected
    `150%`, observed `1600/1000`).
-8. `SUSPEND(0)`, the existing MARSHAL-gated suspension. Profile 0 is force-disabled.
-9. `RECONCILE`: one incident, `session-without-enabled-profile` (expected
-   `Enabled`, observed `Disabled`). The usage incidents are gone. Suspension does
-   not close sessions.
-10. `SESSION_CLOSE(0, 0, 0)`: closed by the caller (`0`, audited).
-11. `RECONCILE`: zero incidents.
+8. `SUSPEND(0)`, the existing MARSHAL-gated suspension. Profile 0 is force-disabled, and
+   the governed path closes the open session on it (kernel cleanup, audited:
+   `closed by kernel cleanup after MVNO suspend`; ADR 0010).
+9. `ACCOUNT(0, 0)`: refused `USAGE_NOT_ACTIVE` (`8`), because account 0 is now Suspended.
+   `ACCOUNT(1, 1)`: refused `USAGE_NO_PROFILE` (`9`), because account 1 is Active but owns
+   no bound profile. Neither changes a counter or creates a usage row. Where the suspend
+   was refused, account 0 stays Active, and this 0-byte feed is accepted and changes
+   nothing.
+10. `RECONCILE`: zero incidents. The usage incidents went with the suspension, and the
+    session went with the cleanup, so nothing is reported. This is the first clean pass,
+    recorded in the chain (ADR 0009). Where the suspend was refused, the two usage
+    incidents remain.
+11. `SESSION_CLOSE(0, 0, 0)`: refused as no such open session (`2`) and audited as a
+    rejection, because the cleanup already closed the row. Where the suspend was refused,
+    the session is still open, and this closes it normally.
 
 On the execute path, the second phase runs after the walk's second `ENABLE`, which
 re-enables profile 0. Account 0 is Active again, usage is still 1600 of 1000 bytes, and
@@ -3081,10 +3103,16 @@ usage incident. CI asserts these plain-boot outcomes, and the module comment in
     is not Suspended, one incident, `anomalous-usage-no-escalation`, because usage is
     still over the escalation threshold. In the plain boots the account is Suspended, so
     the reconcile reports zero incidents; CI asserts that, and the reconcile counts there
-    are 2, 1, 0, 0. The zero-incident result after an authorized reset is not asserted in CI.
-16. `SESSION_CLOSE(0, 0, 0)`: after an authorized reset, closed by the caller (`0`,
-    audited). After a denied one there is no open session (step 12 was denied), so the
-    close is refused as "no such open session" (`2`). CI does not assert this line.
+    are 2, 0, 0 (the middle one is the first clean pass, right after the suspend whose
+    governed cleanup closed the session; the last is the second clean pass, coalesced).
+    The zero-incident result after an authorized reset is not asserted in CI.
+16. `SYS_SIM_DISABLE(0, 0)`, Enabled to Disabled (ungated, the recoverable direction).
+    Where the reset was authorized and a session reopened, the governed disable closes it
+    (`closed by kernel cleanup after operator SIM disable`, audited; ADR 0010). In the plain
+    boots the profile is already Disabled, so the disable fails (wrong state) and closes
+    nothing. The operator-disable cleanup line is asserted only by the mock-EXECUTE CI
+    step, which has not yet been observed. The caller's own close is no longer in this
+    phase: the governed path does that work.
 
 Denial proofs: `SESSION_OPEN(0, 0, 1)` on profile 1, which is installed but never
 bound, is refused with `10`. `SESSION_OPEN(99, ...)`, `ACCOUNT(99, ...)`,
@@ -3096,22 +3124,23 @@ Documented choices:
 - **A clean pass needs either a suspended account or a reset.** On the execute path,
   after `REACTIVATE` the account is Active again at 160% of cap. `anomalous-usage-no-escalation` fires
   for an Active account whether or not a session is open, and the reconciler would
-  correctly raise it again. The first clean pass is therefore the one at step 11,
+  correctly raise it again. The first clean pass is therefore the one at step 10,
   while the account is suspended. On the execute path, the one at step 15 is clean
   only when the reset was authorized (the eSIM-refuse and execute boots, where it is
   not asserted). In the plain boots, REACTIVATE and the reset are both denied, so the account stays
   Suspended and step 15 is also clean (CI asserts zero incidents). Where a reset is
   denied but the account is not Suspended, usage stays over the cap and step 15 reports
   one incident.
-- **Real demo numbers.** Account 0 is the only entry in the kernel's plan table:
+- **Real demo numbers.** Accounts 0, 1 and 2 share one plan in the kernel's table:
   cap 1000 bytes, throttle at 80% (800), escalation at 150% (1500), roaming not
-  allowed. The walk feeds 900 and then 700. Nothing else in the boot exercises a
-  second account's plan.
+  allowed. The walk feeds account 0 900 and then 700. Account 1's feed is refused for
+  having no bound profile, so no other account's plan is exercised.
 
-**Tests.** 104 host tests cover the data layer, counted by `#[test]` attributes in
-the source: 19 in `policy.rs`, 21 in `reconcile.rs` and 18 in `period.rs`
-(`mobile/`), 26 in `data_state.rs` and 20 in `data_codes.rs` (the `kernel-arm` lib
-target). They cover the band boundaries at `u64::MAX`, the replay property, the deny-reason precedence, the table bounds, idempotent opens,
+**Tests.** 122 host tests cover the data layer, counted by `#[test]` attributes in
+the source: 19 in `policy.rs`, 21 in `reconcile.rs` and 25 in `period.rs`
+(`mobile/`), 33 in `data_state.rs` and 24 in `data_codes.rs` (the `kernel-arm` lib
+target). The `kernel-arm` lib has 161 `#[test]` functions in all, run by CI step
+`test (host-side unit tests)`. They cover the band boundaries at `u64::MAX`, the replay property, the deny-reason precedence, the table bounds, idempotent opens,
 and the encodings of every return code. The reset's gate decision is among them:
 `Refuse`, `HardStop`, local failures and `Unreachable` block, and only `Execute`
 passes. The reset's counter change, `last_used` clear and period install are tested
@@ -3141,8 +3170,10 @@ open, and 28 to 30 are the period's own.
   account Active, and an already-open session stays open.
 - Sessions are a kernel table that no traffic path reads. A denial is a
   bookkeeping fact until a data path exists.
-- Sessions survive suspension and deletion. Only `SYS_DATA_SESSION_CLOSE` removes
-  them.
+- Sessions are closed by the governed suspend, SIM delete and operator SIM disable
+  (ADR 0010), and by the caller's `SYS_DATA_SESSION_CLOSE`, and by nothing else. A future
+  path that ends a session's precondition must call the same cleanup, or it leaves a row
+  that the reconciler reports only when called.
 - Calls past the capability check append WORM entries. The chain is now bounded per
   event class (456 entries at most, ADR 0009), so a flood is counted and summarised
   rather than growing it, but a class's first `quota` events are the ones kept, the
@@ -3152,11 +3183,13 @@ open, and 28 to 30 are the period's own.
 - The snapshot and the session-open decision read live state under separate locks.
   That is consistent with one EL0 context and IRQs masked during the SVC handler,
   and not otherwise.
-- The usage feed does not check standing or binding, so a suspended account keeps
-  accruing counted usage.
-- Demo plans and the single account are compiled in. There is no provisioning path.
-- The billing period is demo data: account 0 gets one period at tick 0, 500 ms
-  long, and every other account has none. Nothing provisions a real billing cycle.
+- The usage feed refuses accounts that are not Active and accounts with no bound profile
+  (ADR 0010). The byte counts it takes are still caller-asserted.
+- Demo plans and the three demo accounts (0 to 2) are compiled in. There is no
+  provisioning path.
+- The billing period is demo data: account 0 gets one period at tick 0, 500 ms long,
+  account 1 gets a one-day demo period, and account 2 has none until its first reset
+  installs a one-day one. Nothing provisions a real billing cycle.
 - The period clock is the generic counter's value, not a calendar. A period is
   measured from its start tick and is not aligned to a billing date. A restart
   starts the counter, and the in-memory period data, again (gap 29).

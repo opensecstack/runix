@@ -6,8 +6,8 @@ evidence reference below was checked against the tree at the time of writing
 (file exists; test or step is named in `.github/workflows/ci.yml`). Re-check
 before relying on it; [STATUS.md](STATUS.md) is the detailed record.
 
-Status as of the commit that added this file: **0 of 8 items fully MET against
-their own full roadmap wording; 3 MET as scoped below, 5 PARTIAL, 0 NOT MET.**
+Status as of 2026-10-19 (Tier 2 work; its new CI assertions are not yet observed in a CI run): **0 of 8 items fully MET against
+their own full roadmap wording; 4 MET as scoped below, 4 PARTIAL, 0 NOT MET.**
 The "done" statements here were written by the maintainers of this repo
 against what the code does; they are deliberately narrow so that MET means
 something checkable. Where a roadmap item reads wider than the statement, the
@@ -96,7 +96,7 @@ be described as having any of the following.
    persistence: accounts, sessions, usage and the WORM chain are lost on
    reboot. (Local `THREAT_MODEL.md` mobile gaps 13, 28, 29; STATUS.md "Data
    policy engine".)
-7. **No real carrier, SIM or subscriber data.** The one MVNO account is
+7. **No real carrier, SIM or subscriber data.** Three MVNO accounts (0 to 2) are
    compiled in; eSIM `identity` is an opaque `u64`, not an ICCID/IMSI; there is
    no RSP/profile download, modem, RIL or carrier feed.
 8. **Flat capability set on `kernel-arm`.** One `CURRENT_CAPABILITIES` set is
@@ -112,9 +112,13 @@ be described as having any of the following.
 11. **QEMU-only verification.** No hardware (x86 or ARM) has been booted.
     Network tests rely on QEMU user-mode networking (`guestfwd`).
 12. **Two tests are deliberately not in CI**: `kernel/tests/net_driver_dns.rs`
-    (the CI runner gets no DNS answer from 8.8.8.8; see commit `ce9a203`) and
+    (the CI runner gets no DNS answer from 8.8.8.8; see commit `ce9a203`; it runs only in
+    the separate `dns-diagnose` workflow, which is not on `main`) and
     `kernel/tests/syscall_cost.rs` (a timing measurement, not a pass/fail
-    check). DNS resolution is therefore not CI-verified.
+    check). Resolution against a real resolver is therefore not CI-verified.
+    `kernel/tests/net_driver_dns_mock.rs` is in CI as its own step (added 2026-10-19, not
+    yet observed in a CI run). It sends the guest's query to a host mock through the SLIRP
+    gateway, so the resolver path is proven against that mock, not against the internet.
 13. **Not a full release process.** The Alpha has a tag (`v0.1.0-alpha`) and a
     notes-only GitHub release with no binary artifacts attached. This Beta adds
     a tag-triggered workflow (`.github/workflows/release.yml`) that builds the
@@ -148,7 +152,7 @@ be described as having any of the following.
 | D4 | Desktop | MARSHAL integration | PARTIAL |
 | M1 | Mobile | MVNO stack core | PARTIAL |
 | M2 | Mobile | eSIM lifecycle | MET (as scoped) |
-| M3 | Mobile | Data policy engine | PARTIAL |
+| M3 | Mobile | Data policy engine | MET (as scoped) |
 | M4 | Mobile | MARSHAL integration | PARTIAL |
 
 "CI step" below means a step name in `.github/workflows/ci.yml`. Tests named
@@ -205,11 +209,16 @@ IPC surface to complete a TCP exchange, with more than one concurrent handle.
   using `guestfwd`).
 - `kernel/tests/ipc_session.rs`, `ipc_bad_port.rs`, `ioport_range.rs`.
 - CI step `test net-driver-host (host-side property tests)`, and the
-  fuzz/property coverage of the RX parsing boundary (STATUS.md).
+  property coverage of the RX parsing boundary (STATUS.md). A `cargo-fuzz` target for that
+  boundary (`net-driver-host/fuzz`) runs only in the manual or weekly `fuzz` workflow
+  (`.github/workflows/fuzz.yml`), not as a PR gate; that workflow has not yet run on GitHub.
 - CI job `boot` greps `net-driver-host: ICMP echo reply received`.
 
 **Remains (outside the scoped statement):**
-- DNS exists in the driver but `kernel/tests/net_driver_dns.rs` is not in CI.
+- DNS exists in the driver. `kernel/tests/net_driver_dns.rs` (real egress) is not in CI.
+  `kernel/tests/net_driver_dns_mock.rs` covers the resolver path in CI against a host mock
+  through the SLIRP gateway (added 2026-10-19, not yet observed in a CI run; its Linux
+  assumptions are unverified).
 - No UDP socket surface; no interrupt-driven RX/TX; no real wall-clock time.
 - No TLS consumer (see Not claimed 9).
 - Verified only against QEMU user-mode networking.
@@ -241,9 +250,17 @@ device stops answering.
 **Remains:**
 - Over IPC, a write is an in-place overwrite of an existing file within one
   sector, no resize (`ipc/src/fs.rs`, `FsRequest::Write` doc). Create, delete
-  and grow are internal to the driver only.
+  and grow are internal to the driver only. Decided for Beta (D3-b): they stay
+  driver-internal. Exposing them needs new request variants, distinct per-operation
+  capability resources (today one `file:<name>` token covers a file), quota and disk-fill
+  handling, a redone allocator-safety argument, and a MARSHAL-gating decision for
+  destructive delete. Revisit before any caller needs them (RC).
 - FAT32 only; no other filesystem; no permissions model beyond the tokens.
 - The driver has no device reset after quarantine; it stays failed until reboot.
+  Decided for Beta (D3-a): quarantine is permanent until the driver restarts, because
+  fail-closed is the Beta posture. A device reset mid-write could leave FAT state
+  inconsistent, and a reset would loosen a deliberate design. A supervisor that respawns
+  the driver is the better recovery model. Revisit with that supervisor, or reset in RC.
 - No hardware verification (QEMU virtio-blk only).
 
 ## D4. MARSHAL integration (desktop): PARTIAL
@@ -255,8 +272,8 @@ a mock CITADEL is ever reached); (c) the
 action is audited to WORM; (d) a real CITADEL decision, obtained with a real
 operator identity, can allow an action.
 
-**Status by clause:** (a) MET for `grid_sandbox::spawn_instance` (test-only call
-path; fails open on unreachable); (b) MET (to a mock CITADEL only);
+**Status by clause:** (a) mechanism MET, test-only caller, ungoverned in practice
+(`grid_sandbox::spawn_instance` fails open on unreachable); (b) MET (to a mock CITADEL only);
 (c) PARTIAL; (d) **NOT MET**.
 
 **Evidence:**
@@ -284,7 +301,13 @@ path; fails open on unreachable); (b) MET (to a mock CITADEL only);
   The proxy attaches only its own Verifier signature
   ([RFC-VERIFIER-IDENTITY.md](RFC-VERIFIER-IDENTITY.md)). Decision on identity
   architecture is open and tracked as RC scope in ROADMAP.
-- `spawn_instance` is never called outside tests (Not claimed 3).
+- `spawn_instance` is never called outside tests (Not claimed 3). Decided for Beta
+  (D4-a): no production caller ships. A boot-time caller would be ungoverned in practice,
+  because no dev or CI boot sets `RUNIX_MARSHAL_PROXY_ADDR`, so the call would pass
+  unchecked. A ring-3 syscall caller needs a tier-derivation design first (the tier is
+  caller-supplied today, and the allowlist is built from that same tier), and a latency
+  measurement against the T1 300 ms budget. Revisit once a deployment exists for the proxy
+  and both of those are done.
 - Unreachable or unconfigured proxy fails open (Not claimed 2).
 - The verdict is not authenticated end to end (unsigned JSON over plaintext
   TCP between kernel and proxy), and every request is `dry_run: true`
@@ -300,7 +323,7 @@ suspend force-disables bound profiles and re-checks, delete frees the
 binding); capabilities scope bind, suspend and reactivate separately; network
 selection is a pure function with distinguishable refusal reasons; all of it
 runs in the kernel's syscall path. The partial point is that it does so for
-one compiled-in demo account, not for subscribers.
+three compiled-in demo accounts (0 to 2), not for subscribers.
 
 **Evidence:**
 - Host tests of `mobile/src/account.rs` and `selection.rs`: CI step `test`
@@ -318,11 +341,17 @@ one compiled-in demo account, not for subscribers.
   cap-denial.mvno ...)`). Not yet observed in a CI run of this change.
 
 **Remains:**
-- One compiled-in demo account; no persistence; selection runs on a fixed
+- Three compiled-in demo accounts (0 to 2); no persistence; selection runs on a fixed
   candidate list. No modem, RIL or carrier source feeds it; no billing,
   rating or provisioning backend.
 - The MARSHAL principal is the placeholder `el0:arm-demo`.
-- Closed accounts keep their slot forever.
+- Decided for Beta (M1-a): no provisioning and no slot reclamation. Account ids are
+  sequential and never reused by design, because reusing one would let a stale token
+  authorize a new account. No syscall closes an account, so "closed accounts keep their
+  slot" is latent, not observed. A provisioned account would be unusable without runtime
+  capability-token issuance, which needs key custody (RC). Per-account resources are
+  issued only at boot, and the data plan tables cover accounts 0 to 2 only. Revisit with
+  persistence and key custody (RC/v1.0).
 
 ## M2. eSIM lifecycle: MET (as scoped)
 
@@ -349,7 +378,7 @@ separate resource); and every successful transition is audited at the syscall bo
 - Governance of enable rests on item M4 and is fail-open; governance of delete is
   fail-closed when MARSHAL is unreachable (ADR 0008).
 
-## M3. Data policy engine: PARTIAL
+## M3. Data policy engine: MET (as scoped)
 
 **Done means:** an account's plan (cap, throttle percentage, roaming flag,
 escalation percentage) determines session and usage decisions; a reconciler
@@ -357,8 +386,6 @@ reports drift between observed state and the plan; a billing-period model
 gates the usage reset; and the reset is capability- and MARSHAL-gated with
 its period refusal, success, and local-failure, unreachable and `Refuse`/`HardStop`
 denial audited, and its capability denials too (ADR 0009, quota-limited per class).
-The partial point: the engine only advises, and the inputs are asserted rather than
-measured.
 
 **Evidence:**
 - Pure-logic host tests (`mobile/src/policy.rs`, `reconcile.rs`, `period.rs`):
@@ -377,10 +404,34 @@ measured.
   selective stand-in listener, not the real `citadel_proxy`. Reconciler incident
   dedupe is covered only by host tests in `kernel-arm/src/audit_chain.rs`. None of
   these lines has yet been observed in a CI run of this change.
+- Session cleanup and usage-feed refusals (ADR 0010): the steps
+  `boot in QEMU and check EL3 boot, exception resume, GIC, EL3->EL1 drop` and
+  `boot in QEMU without secure=on and check the no-EL3 path` assert
+  `closed by kernel cleanup after MVNO suspend` (and that the
+  `session-without-enabled-profile` incident never appears), and the refusals
+  `DENIED (account is Suspended, not Active; returns code 8)` and
+  `DENIED (account has no bound profile; returns code 9)`. The step
+  `boot in QEMU and check a real citadel_proxy EXECUTE admits eSIM enable` asserts two
+  cleanup lines (suspend, operator SIM disable). The secure-boot walk was run locally
+  only (a scratch build with the demo token lifetime raised; see THREAT_MODEL gap 3). The
+  other steps were not run locally, and none of these lines has yet been observed in a
+  CI run of this change.
 - Design records: ADRs [0001](adrs/0001-data-syscalls-not-marshal-gated.md)
-  to [0005](adrs/0005-no-period-reset-installs-a-period-and-early-resets-have-a-cooldown.md).
+  to [0005](adrs/0005-no-period-reset-installs-a-period-and-early-resets-have-a-cooldown.md),
+  and [0010](adrs/0010-governed-session-cleanup-and-advisory-data-policy.md).
 
 **Remains:**
+- Decided, not a gap (M3-c, ADR 0010): no code performs an `ActionRequest`, and the
+  engine stays advisory. This is the partial point the statement used to carry. Revisit
+  when usage is measured from an authenticated source (THREAT_MODEL gap 13) and the kernel
+  has an operator identity (ADR 0007), so that a kernel-initiated suspension has an actor
+  MARSHAL's separation-of-duties rules can accept.
+- The inputs are asserted, not measured. The usage feed refuses accounts that are not
+  Active and accounts with no bound profile (ADR 0010), but the byte count is still
+  unauthenticated.
+- The governed suspend, delete and operator disable close the sessions they end (ADR
+  0010). A future path that ends a session's precondition without calling the cleanup
+  would leave a row, and the reconciler reports it only when called.
 - No data path: nothing consults a session before network I/O and nothing
   measures bytes. `SYS_DATA_ACCOUNT` is a demo syscall.
 - `ActionRequest` (`NotifyOnly`, `Throttle`, `SuspendAccount`) is advice; no
