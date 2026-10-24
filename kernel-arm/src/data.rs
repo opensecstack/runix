@@ -20,7 +20,12 @@
 //! kernel glue is the enforcement point, and a request is carried out by the
 //! CALLER through an existing governed syscall under the caller's OWN
 //! capability. The four data syscalls therefore never suspend, disable,
-//! close or mutate account/profile state in response to an `ActionRequest`:
+//! close or mutate account/profile state in response to an `ActionRequest`
+//! (the one thing that closes sessions on its own is NOT the policy path: the
+//! governed suspend / operator-disable / delete paths drop the sessions of the
+//! account or profile they have just ended, via [`close_sessions_for_account`]
+//! and [`close_sessions_for_profile`] -- derived-state cleanup by an already
+//! capability- and MARSHAL-gated caller, `docs/adrs/0010-*`):
 //!
 //! - `SYS_DATA_ACCOUNT` adds to a usage counter and returns the engine's
 //!   request as a small code. It is a metering write, not a governance
@@ -203,6 +208,20 @@ pub fn decide_and_open(
 /// Remove a session; `true` if it was open.
 pub fn close_session(account: u64, slot: usize, profile: u8) -> bool {
     DATA.lock().close_session(account, slot, profile)
+}
+
+/// Remove every session of `account`; the removed rows. Derived-state cleanup
+/// for a GOVERNED caller (MVNO suspend, after its capability + MARSHAL gate and
+/// the forced disable) -- never reachable from the policy engine's advice.
+/// Call with no other lock held (DATA is the leaf).
+pub fn close_sessions_for_account(account: u64) -> Vec<DataSession> {
+    DATA.lock().close_sessions_for_account(account)
+}
+
+/// Remove every session on `(slot, profile)`; the removed rows. Same contract
+/// as [`close_sessions_for_account`] (operator disable, delete + unbind).
+pub fn close_sessions_for_profile(slot: usize, profile: u8) -> Vec<DataSession> {
+    DATA.lock().close_sessions_for_profile(slot, profile)
 }
 
 /// Everything the reconciler compares, as one immutable snapshot built from

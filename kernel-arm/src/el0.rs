@@ -124,13 +124,16 @@
 //! REQUESTS suspension), `SESSION_OPEN` (denied CapExceeded), `RECONCILE`
 //! (raises `UsageOverCapNotRestricted` and `AnomalousUsageNoEscalation`). The
 //! existing `SUSPEND(0)` that follows IS the caller carrying out that
-//! request through the governed path. After the forced-disable `STATUS`:
-//! `RECONCILE` (the usage incidents are gone; the still-open session on the
-//! now-Disabled profile raises `SessionWithoutEnabledProfile`),
-//! `SESSION_CLOSE` (the caller finishing the restriction), `RECONCILE` (clean).
-//! That last reconcile is deliberately placed while the account is Suspended:
-//! once reactivated it is Active with usage still over threshold and no
-//! billing-period reset, which the reconciler would rightly flag again.
+//! request through the governed path, and that governed suspend also closes the
+//! account's data sessions itself (kernel cleanup, audited; ADR 0010). After the
+//! forced-disable `STATUS`: `ACCOUNT(0, 0)` (REFUSED, code 8: account Suspended)
+//! and `ACCOUNT(1, 1)` (REFUSED, code 9: Active but no bound profile), then
+//! `RECONCILE` (the usage incidents are gone AND no session is left on the
+//! Disabled profile: zero incidents), then `SESSION_CLOSE` (too late: nothing is
+//! open, `CLOSE_NOT_OPEN`, audited as a rejection). That reconcile is
+//! deliberately placed while the account is Suspended: once reactivated it is
+//! Active with usage still over threshold and no billing-period reset, which the
+//! reconciler would rightly flag again.
 //! Denial proofs: `SESSION_OPEN(0, 0, 1)` on the installed-but-unbound
 //! profile, and `SESSION_OPEN(99, ..)` / `ACCOUNT(99, ..)` with no capability.
 //!
@@ -142,16 +145,17 @@
 //! 1600 -> 0, MARSHAL-gated), `SESSION_OPEN` (allowed -- service restored),
 //! `RECONCILE` (zero incidents: an open session on an Enabled profile under
 //! the cap, and no `UsageRegression` because the reset cleared the
-//! reconciler's memory), `SESSION_CLOSE`. `RESET(99)` is the denial proof
+//! reconciler's memory). The walk does not close that session: the operator
+//! `SIM_DISABLE` near the end does it (kernel cleanup, ADR 0010). `RESET(99)` is the denial proof
 //! (no `data:reset:99` capability). That is the sequence when the reset is
 //! AUTHORIZED (a reachable MARSHAL that answers Execute). In the plain boot
 //! configurations there is no MARSHAL proxy, the evaluation is `Unreachable`,
 //! and the reset is FAIL-CLOSED (ADR 0003): `RESET(0)` is DENIED, usage stays
 //! 1600, the next `SESSION_OPEN` is still denied (`AccountSuspended`, since the
 //! reactivation was also denied, see above), `RECONCILE` reports zero
-//! incidents (a Suspended account raises no usage incident) and
-//! `SESSION_CLOSE` is refused (no session is open). CI asserts the plain-boot
-//! sequence.
+//! incidents (a Suspended account raises no usage incident; this is the second
+//! clean pass, so ADR 0009's coalescing is still exercised: the first clean pass
+//! is the one right after the suspend). CI asserts the plain-boot sequence.
 //!
 //! The billing-period advice (`SYS_DATA_PERIOD`, read-only, not MARSHAL-gated,
 //! no new MARSHAL evaluation) is called twice with account 0 and once with 99.
@@ -518,26 +522,41 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x1, #0",
         "mov x2, #0",
         "svc #0",
-        // SYS_DATA_RECONCILE -- the suspension satisfied the engine's
-        // request: the two usage incidents are gone (the account is no longer
-        // Active). What remains is a real finding: the data session was never
-        // closed, and it now sits on a Disabled profile
-        // (SessionWithoutEnabledProfile). Suspending does not close sessions
-        // behind the caller's back; that is the caller's act, next.
+        // SYS_DATA_ACCOUNT(0, 0) -- the usage feed for the now-SUSPENDED account
+        // 0: REFUSED (USAGE_NOT_ACTIVE, code 8; ADR 0010). An Active account would
+        // meter it (this walk's refuse/faulty configs leave account 0 Active, where
+        // the 0-byte feed is accepted and changes nothing: it is 0 bytes on purpose
+        // so the counter those boots assert, 1600, cannot move).
+        "mov x0, {sys_data_account}",
+        "mov x1, #0",
+        "mov x2, #0",
+        "svc #0",
+        // SYS_DATA_ACCOUNT(1, 1) -- account 1 is Active and entitled, and this
+        // context holds data:usage:1, but it owns NO bound profile: REFUSED
+        // (USAGE_NO_PROFILE, code 9) in every boot config; no usage row is created.
+        "mov x0, {sys_data_account}",
+        "mov x1, #1",
+        "mov x2, #1",
+        "svc #0",
+        // SYS_DATA_RECONCILE -- the suspension satisfied the engine's request:
+        // the two usage incidents are gone (the account is no longer Active),
+        // and so is the session: the governed suspend closed account 0's data
+        // session itself right after the forced disable (kernel cleanup, audited;
+        // ADR 0010), so nothing sits on the Disabled profile any more -- 0
+        // incidents. (Where the suspend was refused the account stays Active and
+        // the earlier two incidents persist; the proxy-backed CI steps do not
+        // assert this reconcile.) Cleaning up is the governed caller's act on
+        // DERIVED state; the policy engine still only advises.
         "mov x0, {sys_data_reconcile}",
         "svc #0",
-        // SYS_DATA_SESSION_CLOSE(0, 0, 0) -- the caller applying the rest of
-        // the restriction (audited).
+        // SYS_DATA_SESSION_CLOSE(0, 0, 0) -- the caller's own close, now too late:
+        // the session is already gone, so this FAILS (CLOSE_NOT_OPEN) and is
+        // audited as a rejection. Where the suspend was refused the session is
+        // still open and this closes it normally.
         "mov x0, {sys_data_session_close}",
         "mov x1, #0",
         "mov x2, #0",
         "mov x3, #0",
-        "svc #0",
-        // SYS_DATA_RECONCILE -- clean: no incidents. (Placed while the
-        // account is Suspended: after REACTIVATE it is Active again with
-        // usage still over threshold and no billing reset, which the
-        // reconciler would correctly flag again.)
-        "mov x0, {sys_data_reconcile}",
         "svc #0",
         // SYS_SIM_ENABLE(0, 0) -- now DENIED (MVNO ...): the capability
         // passes, but the owning account is Suspended. Refused before the
@@ -572,7 +591,7 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "svc #0",
         // --- Governed usage-period reset. State here: account 0 Active,
         // profile 0 Enabled and bound, usage 1600/1000, no session open (the
-        // session was closed before the reactivation).
+        // suspend's cleanup closed it before the reactivation).
         // SYS_DATA_SESSION_OPEN(0, 0, 0) -- DENIED CapExceeded: the cap is
         // still in force, so service has not been restored.
         "mov x0, {sys_data_session_open}",
@@ -612,12 +631,10 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         // cleared last_used so 1600 -> 0 is not reported as a UsageRegression.
         "mov x0, {sys_data_reconcile}",
         "svc #0",
-        // SYS_DATA_SESSION_CLOSE(0, 0, 0) -- the caller finishing the session.
-        "mov x0, {sys_data_session_close}",
-        "mov x1, #0",
-        "mov x2, #0",
-        "mov x3, #0",
-        "svc #0",
+        // (No caller close here any more: where this session was opened, it stays
+        // open on purpose until the operator SYS_SIM_DISABLE below, whose governed
+        // path closes it -- ADR 0010. The plain boots never reach this state: the
+        // reset was denied, so the open above was denied too.)
         // SYS_DATA_RESET(99) -- no data:reset:99 capability: DENIED before any
         // state is read, MARSHAL consulted or counter touched.
         "mov x0, {sys_data_reset}",
@@ -698,8 +715,10 @@ pub unsafe extern "C" fn el0_demo() -> ! {
         "mov x2, #0",
         "svc #0",
         // SYS_SIM_DISABLE(0, 0) -- Enabled -> Disabled. No MARSHAL gate
-        // (recoverable direction), still audited. In the plain boots the
-        // profile is already Disabled, so this FAILS (wrong state).
+        // (recoverable direction), still audited. Where the session reopened after
+        // the reset is still open, the governed disable closes it (kernel cleanup,
+        // audited; ADR 0010). In the plain boots the profile is already Disabled,
+        // so this FAILS (wrong state) and nothing is closed.
         "mov x0, {sys_sim_disable}",
         "mov x1, #0",
         "mov x2, #0",

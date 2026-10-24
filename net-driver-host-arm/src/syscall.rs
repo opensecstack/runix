@@ -32,12 +32,14 @@ const SYS_WRITE: u64 = 1;
 /// same reason `net-driver-host/src/syscall.rs`'s own doc comment on this
 /// exact point records as a real, previously-confirmed bug (the compiler
 /// is otherwise free to assume a register it didn't mark clobbered still
-/// holds the value it cached there before the call). `x5`..`x8` genuinely
-/// are clobbered: `el1_vector_common` saves/restores `x1`-`x4`, `x9`-`x18`,
-/// and `x29`/`x30`, but not `x5`-`x8` -- those are caller-saved under
-/// AAPCS64 and `svc.rs::dispatch`'s own Rust codegen is free to use them,
-/// so they are declared `lateout(..) _` (discarded) here rather than
-/// silently assumed preserved.
+/// holds the value it cached there before the call). `x5`..`x8` are declared
+/// `lateout(..) _` (discarded) here as a conservative choice, not a
+/// requirement: `el1_vector_common` saves and restores `x1`-`x18` and
+/// `x29`/`x30` (`stp x5, x6` / `stp x7, x8` on entry, matching `ldp` before
+/// `eret`), so `x5`-`x8` are in fact preserved across the call. They are
+/// caller-saved under AAPCS64 and `svc.rs::dispatch`'s own Rust codegen is
+/// free to use them, which is why the vector saves them, but declaring them
+/// clobbered here costs nothing and does not depend on that detail.
 unsafe fn syscall(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     let ret: u64;
     // SAFETY: `svc #0` from EL0 is the kernel-arm syscall gate

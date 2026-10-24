@@ -138,6 +138,10 @@ name = "net_driver_dns"
 harness = false
 
 [[test]]
+name = "net_driver_dns_mock"
+harness = false
+
+[[test]]
 name = "blk_driver_rw"
 harness = false
 

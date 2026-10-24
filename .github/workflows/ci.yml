@@ -279,6 +279,26 @@ jobs:
           cargo test --target x86_64-unknown-none --test sys_random
           cargo test --target x86_64-unknown-none --test ioport_range
           cargo test --target x86_64-unknown-none --test blk_driver_rw
+      # Deterministic DNS proof (no real internet egress, unlike the
+      # local-only net_driver_dns). SLIRP forwards guest UDP sent to the
+      # gateway 10.0.2.2 to the host's 127.0.0.1, so a mock responder bound
+      # on 127.0.0.1:53 (kernel/tests/support/mock_dns.py, answers every A
+      # query with 192.0.2.53) is enough -- no guestfwd (UDP unsupported).
+      # Port 53 is privileged, hence sudo. The test binary is built first
+      # (--no-run) so the mock's 900s idle timeout only covers the QEMU run.
+      # The mock exits 0 only after answering a query, so `wait` also
+      # asserts the guest's query really reached it. Cleanup kills it by
+      # PID (the sudo wrapper's) only if still alive.
+      - name: cargo test net_driver_dns_mock (DNS via host mock through SLIRP)
+        working-directory: kernel
+        run: |
+          cargo test --target x86_64-unknown-none --test net_driver_dns_mock --no-run
+          sudo env MOCK_DNS_TIMEOUT=900 python3 tests/support/mock_dns.py &
+          MOCK_PID=$!
+          trap 'sudo kill "$MOCK_PID" 2>/dev/null || true' EXIT
+          sleep 1
+          cargo test --target x86_64-unknown-none --test net_driver_dns_mock
+          wait "$MOCK_PID"
       # Filesystem driver, Phase 2 -- points xtask's virtio-blk `-drive` at
       # the real FAT32 fixture built above instead of the plain zero-filled
       # scratch image every test above gets by default. `RUNIX_BLK_IMG` is
@@ -946,14 +966,30 @@ jobs:
           grep -q "SVC: SYS_DATA_RECONCILE incident anomalous-usage-no-escalation account:0: expected 150%, observed 1600/1000" \
             /tmp/arm-boot.log
           grep -q "SVC: SYS_DATA_RECONCILE authorized (2 incident(s);" /tmp/arm-boot.log
-          # After the (existing, MARSHAL-gated) SUSPEND the usage incidents are gone;
-          # the session left open on the force-disabled profile is a real finding.
-          grep -q "SVC: SYS_DATA_RECONCILE incident session-without-enabled-profile session:0@0/0: expected Enabled, observed Disabled" \
-            /tmp/arm-boot.log
-          grep -q "SVC: SYS_DATA_RECONCILE authorized (1 incident(s);" /tmp/arm-boot.log
-          # The caller closes it (audited), and the next reconcile is clean.
-          grep -q "SVC: SYS_DATA_SESSION_CLOSE account 0 slot 0 profile 0 authorized" /tmp/arm-boot.log
+          # After the (existing, MARSHAL-gated) SUSPEND the usage incidents are gone AND
+          # the session is gone too (ADR 0010, THREAT_MODEL gap 17): the governed suspend
+          # closes the suspended account's data sessions itself, right after the forced
+          # disable, so the reconcile reports 0 incidents (no session left on the Disabled
+          # profile) and the old session-without-enabled-profile finding never appears.
+          grep -qF "SVC: data session account 0 slot 0 profile 0 closed by kernel cleanup after MVNO suspend" /tmp/arm-boot.log
+          test "$(grep -c "closed by kernel cleanup after" /tmp/arm-boot.log)" -eq 1
+          if grep -q "SVC: SYS_DATA_RECONCILE incident session-without-enabled-profile" /tmp/arm-boot.log; then exit 1; fi
+          if grep -q "SVC: SYS_DATA_RECONCILE authorized (1 incident(s);" /tmp/arm-boot.log; then exit 1; fi
           grep -q "SVC: SYS_DATA_RECONCILE authorized (0 incident(s);" /tmp/arm-boot.log
+          # The kernel's cleanup is not a caller close: the walk's own SESSION_CLOSE after it
+          # finds nothing open (CLOSE_NOT_OPEN, audited as a rejection), and no SESSION_CLOSE
+          # is ever authorized in this boot.
+          test "$(grep -c "SVC: SYS_DATA_SESSION_CLOSE account 0 slot 0 profile 0 FAILED (no such open session)" /tmp/arm-boot.log)" -eq 1
+          if grep -q "SVC: SYS_DATA_SESSION_CLOSE account 0 slot 0 profile 0 authorized" /tmp/arm-boot.log; then exit 1; fi
+          # The usage feed meters only an Active account that owns a bound profile (ADR 0010,
+          # THREAT_MODEL gap 21). Account 0 is Suspended here: refused (code 8). Account 1 is
+          # Active and entitled and the capability is held, but it owns no profile: refused
+          # (code 9). Neither is a capability denial (the cap-denial.data count below is unchanged).
+          grep -qF "SVC: SYS_DATA_ACCOUNT account 0 bytes 0 DENIED (account is Suspended, not Active; returns code 8)" /tmp/arm-boot.log
+          grep -qF "SVC: SYS_DATA_ACCOUNT account 1 bytes 1 DENIED (account has no bound profile; returns code 9)" /tmp/arm-boot.log
+          grep -q "Runix ARM kernel: data usage capability issued (account 1" /tmp/arm-boot.log
+          if grep -q "SVC: SYS_DATA_ACCOUNT account 1 .*authorized" /tmp/arm-boot.log; then exit 1; fi
+          if grep -q "SVC: SYS_DATA_ACCOUNT account 0 bytes 0 authorized" /tmp/arm-boot.log; then exit 1; fi
           # Fail closed on a profile that is not this account's (installed, never bound).
           grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 1 DENIED (profile not bound to this account" \
             /tmp/arm-boot.log
@@ -1124,6 +1160,8 @@ jobs:
           # A reconcile pass that finds nothing is recorded once, on the state change;
           # the next consecutive clean pass is COALESCED into a counted summary entry
           # (not a new individual entry), and nothing else in this boot comes near a quota.
+          # Pass #1 is the reconcile right after the governed suspend (its session cleanup,
+          # ADR 0010, leaves nothing to find); pass #2 is the reconcile after the denied reset.
           grep -qF "SVC: SYS_DATA_RECONCILE clean pass #1 WORM-recorded (state change: the previous pass was not clean)" /tmp/arm-boot.log
           grep -qF "SVC: SYS_DATA_RECONCILE clean pass #2 coalesced (counted; not a new WORM entry)" /tmp/arm-boot.log
           grep -q "SVC: WORM class clean-pass coalesced: 1 event(s) counted, summary entry committed (entries [0-9]*/[0-9]*, chain verified true)" /tmp/arm-boot.log
@@ -1333,14 +1371,30 @@ jobs:
           grep -q "SVC: SYS_DATA_RECONCILE incident anomalous-usage-no-escalation account:0: expected 150%, observed 1600/1000" \
             /tmp/arm-boot-nosecure.log
           grep -q "SVC: SYS_DATA_RECONCILE authorized (2 incident(s);" /tmp/arm-boot-nosecure.log
-          # After the (existing, MARSHAL-gated) SUSPEND the usage incidents are gone;
-          # the session left open on the force-disabled profile is a real finding.
-          grep -q "SVC: SYS_DATA_RECONCILE incident session-without-enabled-profile session:0@0/0: expected Enabled, observed Disabled" \
-            /tmp/arm-boot-nosecure.log
-          grep -q "SVC: SYS_DATA_RECONCILE authorized (1 incident(s);" /tmp/arm-boot-nosecure.log
-          # The caller closes it (audited), and the next reconcile is clean.
-          grep -q "SVC: SYS_DATA_SESSION_CLOSE account 0 slot 0 profile 0 authorized" /tmp/arm-boot-nosecure.log
+          # After the (existing, MARSHAL-gated) SUSPEND the usage incidents are gone AND
+          # the session is gone too (ADR 0010, THREAT_MODEL gap 17): the governed suspend
+          # closes the suspended account's data sessions itself, right after the forced
+          # disable, so the reconcile reports 0 incidents (no session left on the Disabled
+          # profile) and the old session-without-enabled-profile finding never appears.
+          grep -qF "SVC: data session account 0 slot 0 profile 0 closed by kernel cleanup after MVNO suspend" /tmp/arm-boot-nosecure.log
+          test "$(grep -c "closed by kernel cleanup after" /tmp/arm-boot-nosecure.log)" -eq 1
+          if grep -q "SVC: SYS_DATA_RECONCILE incident session-without-enabled-profile" /tmp/arm-boot-nosecure.log; then exit 1; fi
+          if grep -q "SVC: SYS_DATA_RECONCILE authorized (1 incident(s);" /tmp/arm-boot-nosecure.log; then exit 1; fi
           grep -q "SVC: SYS_DATA_RECONCILE authorized (0 incident(s);" /tmp/arm-boot-nosecure.log
+          # The kernel's cleanup is not a caller close: the walk's own SESSION_CLOSE after it
+          # finds nothing open (CLOSE_NOT_OPEN, audited as a rejection), and no SESSION_CLOSE
+          # is ever authorized in this boot.
+          test "$(grep -c "SVC: SYS_DATA_SESSION_CLOSE account 0 slot 0 profile 0 FAILED (no such open session)" /tmp/arm-boot-nosecure.log)" -eq 1
+          if grep -q "SVC: SYS_DATA_SESSION_CLOSE account 0 slot 0 profile 0 authorized" /tmp/arm-boot-nosecure.log; then exit 1; fi
+          # The usage feed meters only an Active account that owns a bound profile (ADR 0010,
+          # THREAT_MODEL gap 21). Account 0 is Suspended here: refused (code 8). Account 1 is
+          # Active and entitled and the capability is held, but it owns no profile: refused
+          # (code 9). Neither is a capability denial (the cap-denial.data count below is unchanged).
+          grep -qF "SVC: SYS_DATA_ACCOUNT account 0 bytes 0 DENIED (account is Suspended, not Active; returns code 8)" /tmp/arm-boot-nosecure.log
+          grep -qF "SVC: SYS_DATA_ACCOUNT account 1 bytes 1 DENIED (account has no bound profile; returns code 9)" /tmp/arm-boot-nosecure.log
+          grep -q "Runix ARM kernel: data usage capability issued (account 1" /tmp/arm-boot-nosecure.log
+          if grep -q "SVC: SYS_DATA_ACCOUNT account 1 .*authorized" /tmp/arm-boot-nosecure.log; then exit 1; fi
+          if grep -q "SVC: SYS_DATA_ACCOUNT account 0 bytes 0 authorized" /tmp/arm-boot-nosecure.log; then exit 1; fi
           # Fail closed on a profile that is not this account's (installed, never bound).
           grep -q "SVC: SYS_DATA_SESSION_OPEN account 0 slot 0 profile 1 DENIED (profile not bound to this account" \
             /tmp/arm-boot-nosecure.log
@@ -1832,6 +1886,19 @@ jobs:
           grep -qF "SVC: SYS_DATA_RESET account 0 authorized (usage 1600 -> 0; new period; MARSHAL verdict: Execute; " /tmp/arm-boot-marshal-execute.log
           grep -q "SVC: SYS_DATA_RESET account 0 WORM entry: authorized=true reason=.*NORMAL reset.*MARSHAL verdict: Execute" /tmp/arm-boot-marshal-execute.log
           grep -qF "SVC: SYS_SIM_ENABLE slot 0 profile 0 authorized [MARSHAL verdict: Execute]" /tmp/arm-boot-marshal-execute.log
+          # Governed session cleanup (ADR 0010, THREAT_MODEL gap 17). The walk's session is open
+          # when the suspend (Execute) force-disables the profile, so the suspend closes it; the
+          # session reopened after the reset (reactivated account, re-enabled profile) is closed by
+          # the operator SYS_SIM_DISABLE, which succeeds here because the profile is Enabled; the
+          # delete after it finds nothing left. The walk no longer closes this session itself.
+          # (Reasoned from el0.rs/svc.rs, NOT executed locally: needs the guestfwd/nc bridge.)
+          grep -qF "SVC: data session account 0 slot 0 profile 0 closed by kernel cleanup after MVNO suspend" /tmp/arm-boot-marshal-execute.log
+          grep -qF "SVC: data session account 0 slot 0 profile 0 closed by kernel cleanup after operator SIM disable" /tmp/arm-boot-marshal-execute.log
+          test "$(grep -c "closed by kernel cleanup after" /tmp/arm-boot-marshal-execute.log)" -eq 2
+          if grep -q "closed by kernel cleanup after SIM delete" /tmp/arm-boot-marshal-execute.log; then exit 1; fi
+          # The usage feed is refused for the Suspended account 0 and the unbound account 1.
+          grep -qF "SVC: SYS_DATA_ACCOUNT account 0 bytes 0 DENIED (account is Suspended, not Active; returns code 8)" /tmp/arm-boot-marshal-execute.log
+          grep -qF "SVC: SYS_DATA_ACCOUNT account 1 bytes 1 DENIED (account has no bound profile; returns code 9)" /tmp/arm-boot-marshal-execute.log
           # Billing period (SYS_DATA_PERIOD), race-free assertions only: the first call
           # runs >= ~2.3 s into the counter against a 500 ms demo period that started
           # at tick 0, so it reads elapsed (code 1) on any host (the counter only grows);

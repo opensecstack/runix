@@ -100,6 +100,19 @@ not claim.
   MVNO enable gate's refusal (ADR 0009). Capability denials on the RIL and IPC
   syscalls, a malformed `SYS_DATA_SESSION_CLOSE` argument, an unknown reset mode and
   the no-period `SYS_DATA_PERIOD` poll remain serial-only.
+- Fix: a governed path that ends a data session's precondition no longer leaves the
+  session row behind. `SYS_MVNO_SUSPEND`, a successful `SYS_SIM_DELETE` and a successful
+  operator `SYS_SIM_DISABLE` close those sessions in the same syscall, after their own
+  state change, and audit each row (`closed by kernel cleanup after ...`). Before, only an
+  explicit `SYS_DATA_SESSION_CLOSE` removed rows, so stale rows could fill the 16-entry
+  session table, and the reconciler could only report them (ADR 0010).
+- Fix: `SYS_DATA_ACCOUNT` counted bytes for accounts that were Suspended or Closed, and for
+  Active accounts with no bound profile. It now refuses both, with codes `8`
+  (`USAGE_NOT_ACTIVE`) and `9` (`USAGE_NO_PROFILE`), before the counter is touched, and
+  audits each refusal as `Rejected`. The check is `data_codes::usage_feed_refusal` over
+  `mvno::has_bound_profile`, a thin wrapper over the registry's `profiles_of`. The kernel
+  now issues `data:usage:1` for demo account 1, the walk's Active account with no bound
+  profile (demo data). The byte count is still unauthenticated (ADR 0010).
 
 ### Added
 
@@ -126,6 +139,21 @@ not claim.
 - Docs: ADR [0008](docs/adrs/0008-esim-delete-and-mvno-reactivate-fail-closed-when-marshal-unreachable.md)
   records the fail-closed decision for delete and reactivate and the reasons the
   other three gated actions stay fail-open.
+- Docs: ADR [0010](docs/adrs/0010-governed-session-cleanup-and-advisory-data-policy.md)
+  records the session cleanup and the usage-feed refusals, and that the policy engine
+  stays advisory (M3-c), with the conditions for revisiting that.
+- CI: `.github/workflows/fuzz.yml` runs six `cargo-fuzz` targets on demand and weekly,
+  never on push or pull request. It adds `boot_sector_fuzz` to the `blk-driver-host` fuzz
+  crate (`BootSectorInfo::parse`, the `FsInfo` round trip, the reusable directory slot and
+  short-name encoding). The workflow has not yet run on GitHub.
+- CI: `kernel/tests/net_driver_dns_mock.rs` resolves a hostname through the SLIRP gateway
+  (`10.0.2.2`), where a host mock (`kernel/tests/support/mock_dns.py`) answers with
+  `192.0.2.53`. `NetBootInfo` gains a `dns_server` field at offset 124 (zero keeps the
+  default `8.8.8.8`), inside the existing padding, so the struct stays 128 bytes. The step
+  is not yet observed in a CI run, and its Linux assumptions (sudo for port 53, the
+  gateway mapping) are unverified.
+- CI: the kernel-arm boot steps assert the session cleanup lines and the usage-feed
+  refusal codes `8` and `9`. These have not yet been observed in a CI run.
 
 ## [0.1.0-beta.2] - 2026-10-13
 

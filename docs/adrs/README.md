@@ -49,3 +49,4 @@ or a broken link is fine.
 | [0007](0007-dry-run-true-stays-until-operator-identity.md) | Every MARSHAL request stays `dry_run: true` until operator identity exists | Accepted (2026-10-17); qualifies the "simulation" wording |
 | [0008](0008-esim-delete-and-mvno-reactivate-fail-closed-when-marshal-unreachable.md) | `esim.delete` and `mvno.reactivate_account` fail closed when MARSHAL is unreachable | Accepted (2026-10-17); decides two rows of 0003 |
 | [0009](0009-bounded-worm-chain-and-denial-auditing.md) | The kernel-arm WORM chain is bounded per event class, and denials are audited into it | Accepted (2026-10-17); makes the "Refuse/HardStop not audited" note in 0006 out of date |
+| [0010](0010-governed-session-cleanup-and-advisory-data-policy.md) | Governed paths close the data sessions they end; the usage feed meters only Active, bound accounts; the policy engine stays advisory | Accepted (2026-10-18); closes THREAT_MODEL gaps 17 and 21, records M3-c |

@@ -449,6 +449,38 @@ impl DataState {
         self.sessions.len() != before
     }
 
+    /// Remove EVERY session of `account` and return the removed rows (table
+    /// order; empty if none). Derived-state cleanup for a governed caller that
+    /// has just ended the account's right to hold sessions (MVNO suspend): it
+    /// only ever narrows what is open, and, like [`Self::close_session`],
+    /// nothing in the policy path (`decide_and_open`) ever calls it. Other
+    /// accounts' rows are untouched.
+    pub fn close_sessions_for_account(&mut self, account: u64) -> Vec<DataSession> {
+        self.drain_sessions(|s| s.account == account)
+    }
+
+    /// Remove every session on `(slot, profile)` whatever its account and
+    /// return the removed rows (table order; empty if none). For the governed
+    /// paths that end a PROFILE's ability to carry a session (operator
+    /// disable, delete + unbind). Rows on other profiles are untouched.
+    pub fn close_sessions_for_profile(&mut self, slot: usize, profile: u8) -> Vec<DataSession> {
+        self.drain_sessions(|s| s.slot == slot && s.profile == profile)
+    }
+
+    fn drain_sessions(&mut self, matches: impl Fn(&DataSession) -> bool) -> Vec<DataSession> {
+        let mut removed = Vec::new();
+        let mut kept = Vec::with_capacity(self.sessions.len());
+        for s in self.sessions.drain(..) {
+            if matches(&s) {
+                removed.push(s);
+            } else {
+                kept.push(s);
+            }
+        }
+        self.sessions = kept;
+        removed
+    }
+
     /// Copies of both tables for the reconciler's snapshot.
     pub fn snapshot(&self) -> (Vec<UsageEntry>, Vec<DataSession>) {
         (self.usage.clone(), self.sessions.clone())
@@ -928,5 +960,97 @@ mod tests {
             s.assess(0, &ent()).escalation,
             Some(ActionRequest::SuspendAccount)
         );
+    }
+
+    fn open_on(s: &mut DataState, account: u64, slot: usize, profile: u8) {
+        let o = s.decide_and_open(
+            account,
+            slot,
+            profile,
+            false,
+            AccountStandingForData::Active,
+            ProfileLifecycleForData::Enabled,
+            ent(),
+        );
+        assert_eq!(o.recorded, SessionRecorded::Opened);
+    }
+
+    fn row(account: u64, slot: usize, profile: u8) -> DataSession {
+        DataSession {
+            account,
+            slot,
+            profile,
+            roaming: false,
+        }
+    }
+
+    #[test]
+    fn close_for_account_on_an_empty_table_removes_nothing() {
+        let mut s = DataState::new();
+        assert!(s.close_sessions_for_account(0).is_empty());
+        assert!(s.close_sessions_for_profile(0, 0).is_empty());
+        assert!(s.snapshot().1.is_empty());
+    }
+
+    #[test]
+    fn close_for_account_with_no_matching_row_touches_nothing() {
+        let mut s = DataState::new();
+        open_on(&mut s, 1, 0, 0);
+        open_on(&mut s, 2, 0, 1);
+        assert!(s.close_sessions_for_account(0).is_empty());
+        assert_eq!(s.snapshot().1, [row(1, 0, 0), row(2, 0, 1)]);
+    }
+
+    #[test]
+    fn close_for_account_removes_all_its_rows_and_leaves_other_accounts() {
+        let mut s = DataState::new();
+        open_on(&mut s, 0, 0, 0);
+        open_on(&mut s, 1, 0, 1);
+        open_on(&mut s, 0, 1, 0);
+        open_on(&mut s, 0, 0, 2);
+        let closed = s.close_sessions_for_account(0);
+        assert_eq!(closed, [row(0, 0, 0), row(0, 1, 0), row(0, 0, 2)]);
+        assert_eq!(s.snapshot().1, [row(1, 0, 1)]);
+        // Idempotent: a second cleanup finds nothing.
+        assert!(s.close_sessions_for_account(0).is_empty());
+        // Usage and periods are not touched.
+        s.feed_usage(0, 5).unwrap();
+        open_on(&mut s, 0, 0, 0);
+        assert!(!s.close_sessions_for_account(0).is_empty());
+        assert_eq!(s.usage_of(0).used_bytes, 5);
+    }
+
+    #[test]
+    fn close_for_account_frees_room_in_a_full_table() {
+        let mut s = DataState::new();
+        for p in 0..MAX_DATA_SESSIONS {
+            open_on(&mut s, 0, 0, p as u8);
+        }
+        let o = s.decide_and_open(
+            1,
+            1,
+            0,
+            false,
+            AccountStandingForData::Active,
+            ProfileLifecycleForData::Enabled,
+            ent(),
+        );
+        assert_eq!(o.recorded, SessionRecorded::TableFull);
+        assert_eq!(s.close_sessions_for_account(0).len(), MAX_DATA_SESSIONS);
+        open_on(&mut s, 1, 1, 0);
+    }
+
+    #[test]
+    fn close_for_profile_matches_slot_and_profile_only() {
+        let mut s = DataState::new();
+        open_on(&mut s, 0, 0, 0);
+        open_on(&mut s, 0, 0, 1);
+        open_on(&mut s, 0, 1, 0);
+        open_on(&mut s, 3, 0, 0);
+        let closed = s.close_sessions_for_profile(0, 0);
+        assert_eq!(closed, [row(0, 0, 0), row(3, 0, 0)]);
+        assert_eq!(s.snapshot().1, [row(0, 0, 1), row(0, 1, 0)]);
+        assert!(s.close_sessions_for_profile(0, 0).is_empty());
+        assert!(s.close_sessions_for_profile(9, 9).is_empty());
     }
 }

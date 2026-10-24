@@ -737,7 +737,8 @@ fn audit_outcome<T>(r: &Result<T, runix_mobile::account::AccountError>) -> (bool
 /// Releases `(slot, profile_id)`'s MVNO binding after a successful
 /// `sim::delete` so the owning account's capacity frees (kernel-applied, like
 /// the suspend path's forced disable). A profile that was never bound has
-/// nothing to release and is silent. Called with no lock held.
+/// nothing to release and is silent. Also closes any data session still open on
+/// the deleted profile (ADR 0010). Called with no lock held.
 fn release_binding_after_delete(slot: usize, profile_id: u8) {
     let subject = crate::capabilities::sim_profile_resource(slot, profile_id);
     match crate::mvno::unbind(slot, profile_id) {
@@ -775,6 +776,11 @@ fn release_binding_after_delete(slot: usize, profile_id: u8) {
             );
         }
     }
+    // A deleted profile can carry no data session whatever the unbind said
+    // (ADR 0010). The registry lock inside `unbind` is released; the leaf data
+    // lock is taken alone.
+    let closed = crate::data::close_sessions_for_profile(slot, profile_id);
+    audit_closed_sessions(&closed, "SIM delete");
 }
 
 /// Reads the ARM generic timer's physical counter -- this crate's only
@@ -1127,6 +1133,10 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                                 slot,
                                 profile_id
                             );
+                            // A session cannot outlive the Enabled profile it
+                            // runs on (ADR 0010); no lock is held here.
+                            let closed = crate::data::close_sessions_for_profile(slot, profile_id);
+                            audit_closed_sessions(&closed, "operator SIM disable");
                             0
                         }
                         Err(e) => {
@@ -1647,6 +1657,12 @@ fn suspend_account(account: u64, verdict: &str) -> u64 {
         }
     }
 
+    // The account's data sessions end with its standing (ADR 0010): the
+    // forced disable above removed what they ran on. Registry and sim locks are
+    // released; the leaf data lock is taken alone.
+    let closed = crate::data::close_sessions_for_account(account);
+    audit_closed_sessions(&closed, "MVNO suspend");
+
     let leaked = crate::mvno::audit();
     let (entries, chain_ok) = audit_chain_summary();
     if leaked.is_empty() {
@@ -1674,6 +1690,40 @@ fn suspend_account(account: u64, verdict: &str) -> u64 {
     }
 }
 
+/// Drops the data sessions a governed path has just made meaningless and
+/// records each one (ADR 0010). `what` names the governed cause for the audit
+/// and serial line ("MVNO suspend", "operator SIM disable", "SIM delete").
+///
+/// This is the GOVERNED CALLER (already capability- and MARSHAL-gated where
+/// the action is gated) narrowing derived state, the same category as the
+/// suspend's forced disable: a session only exists because an Active account's
+/// Enabled profile allowed it, and that precondition has just been removed. It
+/// is NOT the data policy engine acting on its own advice; no `ActionRequest`
+/// reaches here. One `DataActivity` entry per closed row (at most
+/// `MAX_DATA_SESSIONS`, inside that class's quota like every other data
+/// event) and one serial line each. Lock order: called with no lock held; the
+/// leaf `DATA` lock is taken and released inside `data::close_sessions_*`
+/// BEFORE any audit.
+fn audit_closed_sessions(rows: &[runix_kernel_arm::data_state::DataSession], what: &str) {
+    for r in rows {
+        audit_event(
+            AuditClass::DataActivity,
+            &crate::capabilities::data_session_resource(r.account),
+            "Open",
+            &format!("Closed (kernel cleanup after {what})"),
+            true,
+            Some(format!("slot {} profile {}", r.slot, r.profile)),
+        );
+        serial_println!(
+            "SVC: data session account {} slot {} profile {} closed by kernel cleanup after {}",
+            r.account,
+            r.slot,
+            r.profile,
+            what
+        );
+    }
+}
+
 /// Appends the WORM entry for a data-session decision or refusal. Subject is
 /// the session resource (`data:session:{account}`); the transition is the
 /// session's `Closed -> Open...` intent, `authorized` says whether it
@@ -1696,6 +1746,7 @@ fn audit_data_session(account: u64, authorized: bool, to: &str, reason: String) 
 /// `SYS_DATA_ACCOUNT(account, bytes)`: the usage feed. Capability
 /// `data:usage:{account}` (privileged -- see this module's doc comment), then
 /// the entitlement (DEMO table; unknown account fails closed), then the
+/// standing and binding (Active, with a bound profile: ADR 0010), then the
 /// counter update, then the engine's `evaluate_usage`. The decision and, when
 /// the engine escalates, the REQUEST are WORM-audited; the request is returned
 /// as a code for the caller to act on. This function performs none of it: no
@@ -1703,7 +1754,7 @@ fn audit_data_session(account: u64, authorized: bool, to: &str, reason: String) 
 fn data_account(account: u64, bytes: u64) -> u64 {
     use runix_kernel_arm::data_codes::{
         action_request_code, demo_entitlement, describe_usage_assessment, USAGE_DENIED,
-        USAGE_NO_ENTITLEMENT, USAGE_NO_SUCH_ACCOUNT, USAGE_TABLE_FULL,
+        USAGE_NOT_ACTIVE, USAGE_NO_ENTITLEMENT, USAGE_NO_SUCH_ACCOUNT, USAGE_TABLE_FULL,
     };
     let resource = crate::capabilities::data_usage_resource(account);
     if let Err(e) = check(&resource) {
@@ -1733,7 +1784,7 @@ fn data_account(account: u64, bytes: u64) -> u64 {
         );
         return USAGE_NO_ENTITLEMENT;
     };
-    if crate::mvno::standing(account).is_none() {
+    let Some(status) = crate::mvno::standing(account) else {
         audit_event(
             AuditClass::Rejected,
             &resource,
@@ -1747,6 +1798,35 @@ fn data_account(account: u64, bytes: u64) -> u64 {
             account
         );
         return USAGE_NO_SUCH_ACCOUNT;
+    };
+    // Standing and binding (ADR 0010, THREAT_MODEL gap 21): usage is metered
+    // only for an Active account that owns a bound profile. Registry lock only,
+    // released before the data lock is taken below.
+    if let Some(code) = runix_kernel_arm::data_codes::usage_feed_refusal(
+        status,
+        crate::mvno::has_bound_profile(account),
+    ) {
+        let why = if code == USAGE_NOT_ACTIVE {
+            format!("account is {status:?}, not Active")
+        } else {
+            String::from("account has no bound profile")
+        };
+        audit_event(
+            AuditClass::Rejected,
+            &resource,
+            "Metered",
+            "Metered",
+            false,
+            Some(format!("refused: {why}; bytes {bytes} not counted")),
+        );
+        serial_println!(
+            "\nSVC: SYS_DATA_ACCOUNT account {} bytes {} DENIED ({}; returns code {})",
+            account,
+            bytes,
+            why,
+            code
+        );
+        return code;
     }
     let (before, after) = match crate::data::feed_usage(account, bytes) {
         Ok(v) => v,
@@ -2004,7 +2084,10 @@ fn data_session_open(account: u64, slot: usize, packed: u64) -> u64 {
 
 /// `SYS_DATA_SESSION_CLOSE(account, slot, profile)`: removes the session. This
 /// is the CALLER carrying out a restriction (or finishing normally) -- the
-/// policy path never does it for them -- and it is audited like any other
+/// policy path never does it for them (the governed suspend / operator-disable /
+/// delete paths do drop the sessions they have just made meaningless, via
+/// `audit_closed_sessions`; a caller closing one afterwards gets
+/// `CLOSE_NOT_OPEN`) -- and it is audited like any other
 /// change to what the account may do. It can only ever narrow access, which
 /// is why the same `data:session:{account}` capability as OPEN suffices.
 fn data_session_close(account: u64, slot: usize, arg: u64) -> u64 {

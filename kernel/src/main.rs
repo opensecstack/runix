@@ -160,6 +160,9 @@ struct NetBootInfo {
     /// `kernel/tests/net_driver_dns.rs`. See
     /// `net-driver-host/src/main.rs`'s `NetBootInfo::use_dns` doc comment.
     use_dns: u8,
+    /// `[0; 4]` here -- means the default DNS server. See
+    /// `net-driver-host/src/main.rs`'s `NetBootInfo::dns_server`.
+    dns_server: [u8; 4],
 }
 
 /// `blk-driver-host`, Phase B9's payload (filesystem driver, Phase 1 —
@@ -1047,6 +1050,7 @@ fn load_and_run_net_driver_host(io_base: u16, now: u64, signing_key: &ed25519_da
         serve_sockets: 0,
         use_dhcp: 1,
         use_dns: 0,
+        dns_server: [0; 4],
     };
     unsafe {
         (info_content.as_mut_ptr() as *mut NetBootInfo).write(info);

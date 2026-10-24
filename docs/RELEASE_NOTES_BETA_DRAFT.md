@@ -91,7 +91,7 @@ Read this first. This list mirrors "Not claimed" in BETA_CRITERIA.md.
   caller, nothing polls the billing period, the clock counts from boot, and
   nothing acts on the engine's advice. Everything in the mobile state (accounts,
   usage, sessions, audit chain) is in memory and lost on reboot.
-- **No real carrier or SIM data.** One compiled-in demo account; opaque
+- **No real carrier or SIM data.** Three compiled-in demo accounts (0 to 2); opaque
   `u64` profile identity; no profile download, modem or RIL feed.
 - **Flat capability set on the ARM kernel.**
 - **No real HTTPS.** `tls-client` has no consumer, no clock, a single-CA
@@ -99,8 +99,9 @@ Read this first. This list mirrors "Not claimed" in BETA_CRITERIA.md.
 - **Narrow filesystem IPC.** Named-file read and single-sector in-place
   overwrite only; FAT32 only.
 - **QEMU only.** No hardware has been booted.
-- **Not in CI by design:** `net_driver_dns` (runner gets no DNS answer) and
-  `syscall_cost` (a measurement). DNS is not CI-verified.
+- **Not in CI by design:** `net_driver_dns` (real egress; the runner gets no DNS answer)
+  and `syscall_cost` (a measurement). Real-resolver DNS is not CI-verified. A host-mock DNS
+  test (`net_driver_dns_mock`) is in CI, added 2026-10-19 and not yet observed in a CI run.
 - **Grid Sandbox runs only embedded first-party demo modules.** There is no
   way to load a third-party module, and tiers cap memory and tables only.
 - **RC and v1.0 scope is not started** (desktop shell, app framework,
@@ -145,9 +146,9 @@ in the filesystem driver, and virtio queue-size validation.
 "Verified" means a named test passes in CI under QEMU or on the host; see
 BETA_CRITERIA.md for the exact test or CI step behind each line. Status of the
 eight Beta items: MET as scoped: Grid Sandbox isolation, user-space network
-stack, eSIM lifecycle. PARTIAL: filesystem driver, MVNO core, data policy
-engine, and MARSHAL integration on both desktop and mobile (a real,
-operator-authorized `EXECUTE` does not exist). None is NOT MET.
+stack, eSIM lifecycle, data policy engine. PARTIAL: filesystem driver, MVNO core, and
+MARSHAL integration on both desktop and mobile (a real, operator-authorized `EXECUTE`
+does not exist). None is NOT MET.
 "MET as scoped" is defined in that document and is narrower than the
 roadmap wording.
 

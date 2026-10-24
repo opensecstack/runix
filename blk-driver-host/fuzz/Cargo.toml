@@ -41,3 +41,10 @@ path = "fuzz_targets/fat32_parse_fuzz.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "boot_sector_fuzz"
+path = "fuzz_targets/boot_sector_fuzz.rs"
+test = false
+doc = false
+bench = false
